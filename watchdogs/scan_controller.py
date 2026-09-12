@@ -1,5 +1,6 @@
-"""Acknowledged continuous scan lifecycle, independent of the UI frame rate."""
+"""Acknowledged scan lifecycle with monotonic deadlines and liveness diagnostics."""
 import secrets
+from collections import Counter
 
 class ScanController:
     def __init__(self, send, clock):
@@ -9,6 +10,14 @@ class ScanController:
     def reset(self):
         self.supported = None
         self.hs_supported = None
+        self.wifi_supported = None
+        self.wifi_only = False
+        self.diagnostic = False
+        self.record_counts = Counter()
+        self.seq_gaps = 0
+        self.false_timeouts = 0
+        self._old_timeout = False
+        self.last_stats = self.clock()
         self.mode = "wardrive"
         self.probing = False
         self.probe_deadline = 0
@@ -34,6 +43,7 @@ class ScanController:
             return False
         self.supported = None
         self.hs_supported = None
+        self.wifi_supported = None
         self.probing = True
         self.probe_error = ""
         self.probe_attempts = 1
@@ -42,11 +52,20 @@ class ScanController:
         self.send("get_capabilities")
         return True
 
-    def start(self, mode="wardrive"):
-        supported = self.hs_supported if mode == "hs_sniff" else self.supported
+    def start(self, mode="wardrive", wifi_only=False, diagnostic=False):
+        if mode == "hs_sniff":
+            supported = self.hs_supported
+        else:
+            supported = self.wifi_supported if wifi_only else self.supported
         if not supported or self.active:
             return False
         self.mode = mode
+        self.wifi_only = wifi_only and mode == "wardrive"
+        self.diagnostic = diagnostic
+        self.record_counts.clear()
+        self.seq_gaps = self.false_timeouts = 0
+        self._old_timeout = False
+        self.last_stats = self.clock()
         self.session = secrets.token_hex(8)
         self.seq = 0
         self.last_seen.clear()
@@ -57,6 +76,8 @@ class ScanController:
         self.last_heartbeat = self.clock()
         self.next_keepalive = self.clock() + 5
         command = "start_hs_sniff_serial" if mode == "hs_sniff" else "start_wardrive_serial"
+        if self.wifi_only:
+            command = "start_wardrive_wifi_serial"
         self.send(command + " " + self.session)
         return True
 
@@ -69,12 +90,18 @@ class ScanController:
         if d["kind"] == "capabilities":
             self.supported = d["wardrive_serial_v1"]
             self.hs_supported = d.get("hs_sniff_serial_v1", False) is True
+            self.wifi_supported = d.get("wardrive_wifi_serial_v1", False) is True
             self.probing = False
             self.probe_error = ""
             return False
         if not self.active or d["session"] != self.session or d["seq"] <= self.seq:
             return False
+        self.seq_gaps += max(0, d["seq"] - self.seq - 1)
         self.seq = d["seq"]
+        self.record_counts[d["kind"]] += 1
+        # Any validated, current-session record proves the firmware is alive.
+        # A dropped stats line must not terminate an otherwise flowing capture.
+        self.last_heartbeat = self.clock()
         kind = d["kind"]
         if kind == "started" and self.state == "starting":
             self.state = "running"
@@ -85,6 +112,8 @@ class ScanController:
             self.state = "stopping"
             self.deadline = self.clock() + 6
         if kind in ("started", "stats"):
+            self.last_stats = self.clock()
+            self._old_timeout = False
             self.last_heartbeat = self.clock()
             self.stats = d
         if kind in ("wifi", "ble"):
@@ -95,6 +124,10 @@ class ScanController:
 
     def tick(self):
         now = self.clock()
+        if (self.state == "running" and now - self.last_stats > 7
+                and now - self.last_heartbeat <= 7 and not self._old_timeout):
+            self.false_timeouts += 1
+            self._old_timeout = True
         if self.probing:
             if now >= self.probe_deadline:
                 self.probing = False
@@ -108,7 +141,7 @@ class ScanController:
             self.error = "Scan acknowledgement timed out; STOP before retry"
             self.send("stop")
         elif self.state == "running" and now - self.last_heartbeat > 7:
-            self.error = "Firmware heartbeat lost; stopping"
+            self.error = "No firmware records for 7s; stopping"
             self.stop()
             self.send("stop")
         if self.state in ("starting", "running") and now >= self.next_keepalive:

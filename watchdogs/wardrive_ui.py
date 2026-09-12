@@ -11,6 +11,7 @@ from .notable_detector import NotableDetector, ble_name
 from .wardrive_trail import FixHistory, WardriveTrail
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
+from .host_ble import HostBleScanner
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
 DEFAULTS = {"flock": True, "axon": True, "precise": True, "trail": False,
@@ -20,6 +21,7 @@ class WardriveUI:
     def __init__(self, app):
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
+        self.host_ble = HostBleScanner()
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
         self.detector = NotableDetector()
@@ -49,8 +51,12 @@ class WardriveUI:
         self.invalid_records = 0
         self.last_error = ""
         self.last_probe_error = ""
+        self.diagnostic_next = 0
+        self.diagnostic_state = ""
+        self.reported_false_timeouts = 0
 
     def on_stop(self):
+        self.host_ble.stop()
         self.scan.stop()
         self.app._clear_scan_state()
         self.app._gps_wait = False
@@ -63,6 +69,11 @@ class WardriveUI:
         app = self.app
         connection = app.serial if app.serial and app.serial.is_open else None
         if connection is not self.connection:
+            if self.scan.diagnostic and self.scan.active:
+                self.scan.state = "error"
+                self.scan.error = "Serial connection lost or changed"
+                self.write_diagnostics(time.monotonic())
+            self.host_ble.stop()
             self.connection = connection
             self.close_passive()
             self.scan.reset()
@@ -74,6 +85,12 @@ class WardriveUI:
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
+        self.poll_host_ble(now)
+        self.write_diagnostics(now)
+        if self.scan.false_timeouts > self.reported_false_timeouts:
+            self.reported_false_timeouts = self.scan.false_timeouts
+            app._term_add("[TEST] Old heartbeat rule would stop, but valid ESP32 records are still arriving.", raw=True)
+            app.msg("[TEST] Stats late; ESP32 data still arriving. Old timeout avoided.", ORANGE)
         if not self.scan.active and self.passive.file:
             self.close_passive()
         if self.scan.probe_error != self.last_probe_error:
@@ -84,6 +101,7 @@ class WardriveUI:
         if self.scan.error and self.scan.error != self.last_error:
             self.last_error = self.scan.error
             app.msg("[WDG] " + self.last_error, 8)
+            app._term_add("[WDG] " + self.last_error, raw=True)
         session = Path(app.loot.session_path) if app.loot and app.loot.active else None
         path = session / "notable_detections.jsonl" if session else None
         if path != self.store_path:
@@ -124,8 +142,9 @@ class WardriveUI:
             if self.app.loot:
                 self.app.loot.log_serial(s)
             if d["kind"] == "capabilities":
-                support = "supported" if d["wardrive_serial_v1"] else "unsupported"
-                self.app._term_add("[WDG] Firmware replied: All Wardrive " + support, raw=True)
+                support = "supported" if d.get("wardrive_wifi_serial_v1") is True else "needs firmware 1.7.3+"
+                self.app._term_add("[WDG] WiFi-only serial for host BLE: " + support, raw=True)
+            previous = self.scan.state
             if self.scan.handle(d):
                 if d["kind"] == "hs_packet":
                     try:
@@ -136,7 +155,13 @@ class WardriveUI:
                         self.close_passive()
                 else:
                     self.observation(d)
+            if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
+                if not self.host_ble.start(self.scan.session):
+                    self.host_ble_error("Previous Bluetooth scan is still closing; retry shortly")
+                else:
+                    self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
             if d["kind"] == "stopped" and not self.scan.active:
+                self.host_ble.stop()
                 self.close_passive()
             return True
         # Completion, not the early 'stop command received' message.
@@ -151,7 +176,7 @@ class WardriveUI:
             if app._pending_cmd:
                 cmd, state, name = app._pending_cmd, app._pending_state, app._pending_cmd_name
                 app._pending_cmd = None
-                if state in ("all_wardrive", "hs_sniff"):
+                if state in ("all_wardrive", "all_wardrive_test", "hs_sniff"):
                     self.detector.clear()
                     if state == "hs_sniff":
                         if not self.app.loot or not self.app.loot.active:
@@ -162,10 +187,17 @@ class WardriveUI:
                         except OSError as exc:
                             app.msg("[HS SNIFF] Cannot save capture: " + str(exc)[:60], 8)
                             return True
-                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive"):
+                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive", wifi_only=state == "all_wardrive", diagnostic=state == "all_wardrive_test"):
                         self.close_passive()
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
+                    self.last_error = ""
+                    self.reported_false_timeouts = 0
+                    self.diagnostic_next = 0
+                    if self.scan.diagnostic:
+                        app._term_add("[TEST] ESP32 WiFi + BLE; comparing stats heartbeat with all valid records.", raw=True)
+                        if app.loot and app.loot.active:
+                            app._term_add("[TEST] Timing log: " + str(Path(app.loot.session_path) / "wardrive_diagnostics.jsonl"), raw=True)
                 else:
                     app._send(cmd)
                     app._set_running(state, True)
@@ -176,6 +208,59 @@ class WardriveUI:
             if self.scan.state == "running":
                 return True  # delayed legacy text cannot stop a confirmed new session
         return False
+
+    def host_ble_error(self, message):
+        self.scan.error = "uConsole BLE: " + message[:150]
+        self.app._term_add("[ALL] " + self.scan.error, raw=True)
+        self.app._term_add("[ALL] Enable Bluetooth in the OS and check that bleak is installed.", raw=True)
+        self.app._send("stop")
+
+    def write_diagnostics(self, now):
+        scan = self.scan
+        if not scan.diagnostic or not self.app.loot or not self.app.loot.active:
+            return
+        if now < self.diagnostic_next and scan.state == self.diagnostic_state:
+            return
+        if not scan.active and scan.state == self.diagnostic_state:
+            return
+        self.diagnostic_next = now + 1
+        self.diagnostic_state = scan.state
+        entry = dict(time=time.time(), session=scan.session, state=scan.state,
+                     stats_age=round(now-scan.last_stats, 3),
+                     record_age=round(now-scan.last_heartbeat, 3),
+                     received=dict(scan.record_counts), sequence_gaps=scan.seq_gaps,
+                     false_timeouts=scan.false_timeouts, firmware_stats=scan.stats,
+                     invalid_records=self.invalid_records, error=scan.error)
+        try:
+            path = Path(self.app.loot.session_path) / "wardrive_diagnostics.jsonl"
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.app._term_add("[TEST] Cannot save timing log: " + str(exc), raw=True)
+
+    def poll_host_ble(self, now):
+        active = self.scan.state == "running" and self.scan.wifi_only
+        if not active:
+            self.host_ble.stop()
+        for session, kind, data in self.host_ble.poll():
+            if not active or session != self.scan.session:
+                continue
+            if kind == "error":
+                self.host_ble_error(data)
+                active = False
+            elif kind == "started":
+                self.host_ble.state = "running"
+                self.app._term_add("[ALL] uConsole BLE scanning", raw=True)
+            elif kind == "ble":
+                received, record = data
+                age = max(0, now - received)
+                if age > 2:
+                    self.host_ble.drops += 1
+                    continue
+                record["age_ms"] = int(age * 1000)
+                self.scan.last_seen["ble"] = received
+                # Host BLE must never renew the ESP32 heartbeat.
+                self.observation(record)
 
     def close_passive(self):
         had_file = self.passive.file is not None
@@ -457,6 +542,10 @@ class WardriveUI:
                 now = time.monotonic()
                 ages = " ".join(k+":"+(str(int(now-self.scan.last_seen[k]))+"s" if k in self.scan.last_seen else "--") for k in ("wifi","ble"))
                 text = "Last heard "+ages+" drops:"+str(self.scan.stats.get("drops",0))+" bad:"+str(self.invalid_records)
+                if self.scan.wifi_only:
+                    text = "ESP WiFi / host BLE:"+self.host_ble.state+" "+ages+" drops:"+str(self.scan.stats.get("drops",0))+"/"+str(self.host_ble.drops)
+                elif self.scan.diagnostic:
+                    text = f"TEST stats:{now-self.scan.last_stats:.1f}s data:{now-self.scan.last_heartbeat:.1f}s false stops:{self.scan.false_timeouts} gaps:{self.scan.seq_gaps}"
                 if not self.app.gps_fix: text += " GPS unavailable"
             px.rect(4,218,520,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)

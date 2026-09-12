@@ -421,7 +421,7 @@ def test_sd_warning_matches_command_not_shared_state():
 
 def test_passive_ui_capture_and_switch_back_to_wardrive(game):
     w=game.wardrive
-    w.handle_line(wire(dict(v=1,kind="capabilities",wardrive_serial_v1=True,hs_sniff_serial_v1=True)))
+    w.handle_line(wire(dict(v=1,kind="capabilities",wardrive_serial_v1=True,wardrive_wifi_serial_v1=True,hs_sniff_serial_v1=True)))
     game._start_scan_cmd("start_hs_sniff_serial","hs_sniff","HS Sniff")
     w.handle_line("All operations stopped.")
     assert w.passive.file and w.scan.mode=="hs_sniff"
@@ -438,6 +438,7 @@ def test_passive_ui_capture_and_switch_back_to_wardrive(game):
     assert w.passive.file is None
     w.handle_line("All operations stopped.")
     assert w.scan.mode=="wardrive" and w.scan.state=="starting"
+    assert w.scan.wifi_only
 
 
 @pytest.mark.parametrize("message,key_info,nonce", [(1,0x008a,True),(2,0x010a,True),(3,0x13ca,True),(4,0x030a,False),(0,0x0382,False)])
@@ -474,3 +475,79 @@ def test_passive_menu_back_and_reopen_keeps_capture(game,monkeypatch):
     game._execute_item("_hs_sniff_menu","_hs_sniff_menu","HS Sniff",[])
     assert w.hs_screen.open and w.scan.state=="running"
     game.serial.send_command.assert_not_called()
+
+
+def test_split_wardrive_host_ble_detection_and_stop(game):
+    from watchdogs.host_ble import advertisement_record
+    w = game.wardrive
+    w.scan.clock = lambda:10
+    w.host_ble = Mock(state="idle", drops=0)
+    w.host_ble.start.return_value = True
+    w.host_ble.poll.return_value = []
+    w.handle_line(wire(dict(v=1,kind="capabilities",wardrive_serial_v1=True,wardrive_wifi_serial_v1=True)))
+    game._start_scan_cmd("start_wardrive_wifi_serial", "all_wardrive", "All Wardrive")
+    w.handle_line("All operations stopped.")
+    token = w.scan.session
+    assert w.scan.wifi_only
+    assert game.serial.send_command.call_args.args[0] == "start_wardrive_wifi_serial " + token
+    w.handle_line(wire(record("started", session=token, seq=1)))
+    w.host_ble.start.assert_called_once_with(token)
+    device = NS(address="C2:00:00:00:00:01", details={"props":{"AddressType":"random"}})
+    adv = NS(local_name="Penguin-123", rssi=-52, manufacturer_data={}, service_data={}, service_uuids=[])
+    d = advertisement_record(device, adv)
+    w.host_ble.poll.return_value = [(token,"started",None), (token,"ble",(10,d))]
+    w.poll_host_ble(10)
+    assert len(game.ble_devices) == 1 and game.ble_devices[0].name == "Penguin-123"
+    item = next(iter(w.notables.values()))
+    assert w.position(item) == (40,-90) and item["category"] == "flock"
+    assert w.scan.last_heartbeat == 10  # only the firmware started event renewed this
+    # Bluetooth records cannot keep a silent firmware session alive.
+    w.host_ble.poll.return_value = [(token,"ble",(18,d))]
+    w.poll_host_ble(18)
+    assert w.scan.last_heartbeat == 10
+    game._send("stop")
+    assert w.scan.state == "stopping"
+    w.host_ble.stop.assert_called()
+    w.observation = Mock()
+    w.poll_host_ble(18)
+    w.observation.assert_not_called()
+
+
+def test_host_ble_failure_stops_wifi_and_ignores_old_session(game):
+    w = game.wardrive
+    w.scan.wifi_supported = True
+    w.scan.start(wifi_only=True)
+    w.scan.state = "running"
+    w.host_ble = Mock()
+    w.host_ble.poll.return_value = [("old", "error", "ignore")]
+    w.poll_host_ble(10)
+    assert w.scan.state == "running"
+    w.host_ble.poll.return_value = [(w.scan.session, "error", "No powered Bluetooth adapter")]
+    w.poll_host_ble(10)
+    assert w.scan.state == "stopping" and "Bluetooth adapter" in w.scan.error
+    assert game.serial.send_command.call_args.args[0] == "stop"
+
+
+def test_dual_diagnostic_works_on_previous_firmware_and_saves_timing(game, monkeypatch):
+    import watchdogs.wardrive_ui as ui
+    w = game.wardrive
+    w.scan.clock = lambda:ui.time.monotonic()
+    w.scan.supported = True
+    game._start_scan_cmd("start_wardrive_serial", "all_wardrive_test", "ESP Dual Test")
+    w.handle_line("All operations stopped.")
+    assert w.scan.diagnostic and not w.scan.wifi_only
+    token = w.scan.session
+    w.handle_line(wire(record("started",session=token,seq=1)))
+    monkeypatch.setattr(ui.time,"monotonic",lambda:18)
+    w.handle_line(wire(record("wifi",session=token,seq=2)))
+    w.tick()
+    assert w.scan.state == "running" and w.scan.false_timeouts == 1
+    path = Path(game.loot.session_path) / "wardrive_diagnostics.jsonl"
+    last = json.loads(path.read_text().splitlines()[-1])
+    assert last["stats_age"] == 8 and last["record_age"] == 0 and last["false_timeouts"] == 1
+    assert w.host_ble._thread is None
+    monkeypatch.setattr(ui.time,"monotonic",lambda:26)
+    w.tick()
+    assert w.scan.state == "stopping"
+    last = json.loads(path.read_text().splitlines()[-1])
+    assert "No firmware records" in last["error"]

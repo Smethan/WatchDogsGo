@@ -46,3 +46,11 @@ Example observation:
 - Capture time is firmware uptime, not UTC. WDG estimates observation time as host receipt time minus age_ms and selects a valid host fix no older than three seconds at that time. Serial transit adds residual uncertainty; this is not clock synchronization or camera localization.
 
 A missing `started` or heartbeat is an error, not proof of successful dual capture. ESP-IDF describes C5 sniffer/BLE coexistence as supported with unstable performance: [ESP-IDF 6.0.1 coexistence](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html). Hardware validation remains necessary.
+
+Firmware 1.7.3 adds `wardrive_wifi_serial_v1: true` and
+`start_wardrive_wifi_serial <session>`. The new command emits the same Wi-Fi
+records and stats, with no ESP32 BLE discovery. WDG 0.9.16 All Wardrive uses this
+command with host BlueZ BLE; ESP Dual Test retains the combined ESP32 command.
+All validated current-session records now renew WDG's liveness timer, while the
+test separately measures the old stats-only watchdog. See
+[host BLE and diagnostics](HOST_BLE_WARDRIVE.md).

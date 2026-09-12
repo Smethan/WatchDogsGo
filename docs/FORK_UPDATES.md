@@ -47,6 +47,11 @@ it is not retried automatically at the next WDG launch.
 
 ## Firmware
 
+WDG 0.9.16 uses host Bluetooth for All Wardrive and requires firmware 1.7.3+ for
+Wi-Fi-only serial capture. ESP Dual Test can diagnose heartbeat behavior on
+the previous serial-wardrive firmware before updating the ESP32. See
+[All Wardrive and diagnostics](HOST_BLE_WARDRIVE.md).
+
 **SYSTEM → Flash ESP32** shows the Smethan source and current/available version.
 Choose XIAO for the XIAO ESP32-C5 USB board. The downloader selects an exact ZIP
 from the latest stable Smethan/projectZero release. It checks SHA256SUMS and the

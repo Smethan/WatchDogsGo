@@ -153,6 +153,7 @@ MENU_CATS = [
         ("1", "WiFi Wardrive",   "scan_networks",          "wardriving",   None),
         ("2", "BT Wardrive",     "scan_bt",                "bt_scanning",  None),
         ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
+        ("8", "ESP Dual Test", "start_wardrive_serial", "all_wardrive_test", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "handshake",    None),
@@ -1649,15 +1650,19 @@ class WatchDogsGame:
                     scan.probe()
                     self.msg("[HS SNIFF] Checking firmware; retry in a few seconds.", C_WARNING)
                 return
-        if state_key == "all_wardrive" and not self.wardrive.scan.active and not self.wardrive.scan.supported:
+        if state_key == "all_wardrive" and not self._is_running("all_wardrive") and not self.wardrive.scan.wifi_supported:
             scan = self.wardrive.scan
             if not self.serial or not self.serial.is_open:
                 self.msg("[WDG] ESP32 disconnected; reconnect and retry All Wardrive.", C_WARNING)
-            elif scan.supported is False:
-                self.msg("[WDG] Firmware reports no All Wardrive support; use the fork build.", C_WARNING)
+            elif scan.wifi_supported is False:
+                self.msg("[WDG] All Wardrive needs firmware 1.7.3+ for ESP WiFi + uConsole BLE.", C_WARNING)
             else:
                 scan.probe()
                 self.msg("[WDG] Checking firmware; retry All Wardrive in a few seconds.", C_WARNING)
+            return
+        if state_key == "all_wardrive_test" and not self._is_running(state_key) and not self.wardrive.scan.supported:
+            self.wardrive.scan.probe()
+            self.msg("[TEST] Needs serial wardrive firmware; checking capabilities.", C_WARNING)
             return
         if state_key == "_stop_all":
             self._send("stop")
@@ -1781,7 +1786,7 @@ class WatchDogsGame:
                 return
 
         # GPS fix check — only wardriving modes (SNIFF tab) need GPS for loot
-        _is_wardrive = state_key in ("wardriving", "bt_scanning", "all_wardrive")
+        _is_wardrive = state_key in ("wardriving", "bt_scanning", "all_wardrive", "all_wardrive_test")
         running = self._is_running(state_key)
         if _is_wardrive and not running and not self.gps_fix:
             # No GPS fix — show wait/cancel dialog
@@ -1836,7 +1841,8 @@ class WatchDogsGame:
 
     def _is_running(self, state_key: str) -> bool:
         return {
-            "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive",
+            "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and not self.wardrive.scan.diagnostic,
+            "all_wardrive_test": self.wardrive.scan.active and self.wardrive.scan.diagnostic,
             "hs_sniff": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
             "_hs_sniff_menu": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
             "wardriving":    self.wifi_scanning,
@@ -4631,7 +4637,7 @@ class WatchDogsGame:
                 p = self.wardrive.passive
                 tool_name = f"HS SNIFF {self.wardrive.scan.state.upper()} EAPOL:{p.eapol} PMKID:{p.pmkids}"
             else:
-                tool_name = "ALL WARDRIVE " + self.wardrive.scan.state.upper()
+                tool_name = ("ESP DUAL TEST " if self.wardrive.scan.diagnostic else "ALL WARDRIVE ") + self.wardrive.scan.state.upper()
         elif self.capturing_hs: tool_name = "HANDSHAKE"
         elif self.wifi_scanning or self._wifi_scan_only: tool_name = "WiFi SCAN"
         elif self.ble_scanning or self._ble_scan_only: tool_name = "BT SCAN"
