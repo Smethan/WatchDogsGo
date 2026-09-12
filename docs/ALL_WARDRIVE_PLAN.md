@@ -1,6 +1,6 @@
 # All Wardrive, notable detections and route trail plan
 
-Status: planned, not implemented. Repository setup and this document are complete.
+Status: implemented and under final offline verification (2026-09-12). See IMPLEMENTATION_STATUS.md for delivered behavior, tests, build provenance and remaining hardware checks. The sections below retain the original design intent; the implementation notes take precedence where details changed.
 Date: 2026-09-12. Expanded on 2026-09-12 with Flock/Axon detection, configurable notable-marker placement and optional route recording. Ordinary marker placement remains unchanged.
 
 ## Objective and ownership
@@ -79,7 +79,7 @@ Primary files: new watchdogs/wardrive_protocol.py and watchdogs/scan_controller.
 
 ## 4. WDG: All Wardrive and truthful status
 
-- Add **All Wardrive** under SNIFF, shortcut **3** (currently unused there). Existing WiFi Wardrive and BT Wardrive stay available.
+- Add **All Wardrive** under SNIFF, shortcut **6** (the actual checkout already uses 3 for Packet Sniffer). Existing WiFi Wardrive and BT Wardrive stay available.
 - All Wardrive starts one continuous firmware session; it must not enable either legacy auto-repeat loop.
 - Model scan mode (none, Wi-Fi, BLE, all) separately from lifecycle (idle, starting, running, stopping, disconnected/error). Track requested state separately from confirmed activity. This is a focused scan controller, not a rewrite of every tool state.
 - On any scan transition, cancel pending commands and clear the previous scan's completion/start timers before issuing the next request.
@@ -181,3 +181,13 @@ Commit coherent, reviewable changes and push each validated checkpoint to origin
 ## Completion criteria
 
 The forks contain committed/pushed source and documentation, supported firmware can stream Wi-Fi and BLE without ESP32 GPS/SD dependencies, WDG provides All Wardrive with host GPS/storage and accurate state, Flock/Axon matching with evidence-aware colored alerts and purple dots with configurable precise placement works while ordinary marker placement stays unchanged, the optional segmented GPS trail records/displays/reloads correctly, focused tests pass, both firmware variants build, and all unperformed hardware checks are explicitly reported. Field reliability is not claimed until the separate device tests pass.
+
+## Implementation decisions (2026-09-12)
+
+- All Wardrive uses SNIFF shortcut 6; shortcut 3 was already occupied. Wardrive Settings uses O.
+- Firmware uses a separate small management decoder and the existing NimBLE/coexistence initialization hooks. Standalone GPS/SD decoding and logging remain intact. Initial channel hopping is bounded round-robin, avoiding standalone configuration/dedup dependencies.
+- Main console registration passes through an ownership gate so conflicting existing operations cannot start during serial capture.
+- Raw payloads provide independently implemented public Flock/Axon rules. OEM-only Flock clues are logged/listed but do not trigger camera-style alerts. Receiver-only matches and unpublished suspected OUIs are deliberately excluded.
+- Wardrive Settings provides the detection detail list, local device muting and saved-route selection. Display uses up to 4096 route points and 1024 notable identities; full records remain on disk.
+- A precise marker retains its last valid observation fix during GPS loss and fades based on that fix's age. Current observations with unavailable GPS remain explicitly unlocated.
+- Existing map source is retained. Close-up tile selection rises to z15/z16 with small download radii and cropped parent fallback. No new paid service or account change is introduced. The provider's normal account, quota and cache conditions still apply.

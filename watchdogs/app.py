@@ -23,6 +23,7 @@ import pyxel
 
 from .serial_manager import SerialManager, detect_esp32_port
 from .gps_manager import GpsManager
+from .wardrive_ui import WardriveUI
 from .loot_manager import LootManager
 from .app_state import AppState, Network
 from .network_manager import NetworkManager
@@ -150,6 +151,8 @@ MENU_CATS = [
     ("SNIFF", [
         ("1", "WiFi Wardrive",   "scan_networks",          "wardriving",   None),
         ("2", "BT Wardrive",     "scan_bt",                "bt_scanning",  None),
+        ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
+        ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "handshake",    None),
         ("5", "HS Capture no SD","start_handshake_serial", "handshake",    None),
@@ -818,6 +821,7 @@ class WatchDogsGame:
             except Exception:
                 pass
 
+        self.wardrive = WardriveUI(self)
         pyxel.run(self.update, self.draw)
 
     # ------------------------------------------------------------------
@@ -1275,6 +1279,8 @@ class WatchDogsGame:
             pass
 
     def _send(self, cmd: str):
+        if cmd == "stop" and hasattr(self, "wardrive"):
+            self.wardrive.on_stop()
         if self.serial and self.serial.is_open:
             self.serial.send_command(cmd)
             self._term_add(f"[TX] {cmd}", raw=True)
@@ -1348,8 +1354,8 @@ class WatchDogsGame:
                 self._finish_boot()
             return
 
-        self._poll_serial()
         self._poll_gps()
+        self._poll_serial()
         self._poll_lora()
         self._poll_sdr()
         self._poll_watch()
@@ -1362,15 +1368,16 @@ class WatchDogsGame:
 
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
-        # Delayed command (stop → wait → new cmd)
-        if self._pending_cmd and pyxel.frame_count >= self._pending_cmd_frame:
-            self._send(self._pending_cmd)
-            self.msg(f"[START] {self._pending_cmd_name}...", C_HACK_CYAN)
-            self.glitch_timer = 5
+        self.wardrive.tick()
+        if self._pending_cmd and time.monotonic() > self._pending_deadline:
             self._pending_cmd = None
+            self.msg("[ERR] Stop not confirmed; command cancelled. Retry STOP.", C_ERROR)
 
         self._update_hack()
         self._update_wardriving_loop()
+        if self.wardrive.settings_open:
+            self.wardrive.update_settings()
+            return
 
         # Particles
         for p in self.particles:
@@ -1614,6 +1621,12 @@ class WatchDogsGame:
 
     def _execute_item(self, cmd: str, state_key: str, name: str,
                       field_values: list):
+        if state_key == "_wardrive_settings":
+            self.wardrive.settings_open = True
+            return
+        if state_key == "all_wardrive" and not self.wardrive.scan.active and not self.wardrive.scan.supported:
+            self.msg("[WDG] All Wardrive needs the updated fork firmware (capability probe).", C_WARNING)
+            return
         if state_key == "_stop_all":
             self._send("stop")
             self.wifi_scanning = False
@@ -1736,7 +1749,7 @@ class WatchDogsGame:
                 return
 
         # GPS fix check — only wardriving modes (SNIFF tab) need GPS for loot
-        _is_wardrive = state_key in ("wardriving", "bt_scanning")
+        _is_wardrive = state_key in ("wardriving", "bt_scanning", "all_wardrive")
         running = self._is_running(state_key)
         if _is_wardrive and not running and not self.gps_fix:
             # No GPS fix — show wait/cancel dialog
@@ -1765,33 +1778,33 @@ class WatchDogsGame:
 
     def _anything_running_on_esp(self) -> bool:
         """True if any ESP32 operation is currently active."""
-        return (self.wifi_scanning or self.ble_scanning
+        return (self.wardrive.scan.active or self.wifi_scanning or self.ble_scanning
                 or self._wifi_scan_only or self._ble_scan_only
                 or self._bt_tracking or self._bt_airtag
                 or self.sniffing or self.capturing_hs
                 or self.state.portal_running
                 or self.state.evil_twin_running)
 
+    def _clear_scan_state(self):
+        self.wifi_scanning = self.ble_scanning = False
+        self._wifi_scan_only = self._ble_scan_only = False
+        self._wifi_scan_done_time = self._bt_scan_done_time = 0.0
+        self._bt_scan_start_time = 0.0
+        self._pending_cmd = None
+
     def _start_scan_cmd(self, final_cmd: str, state_key: str, name: str):
-        """Start an ESP32 command. Send stop first only if something is running."""
-        if self._anything_running_on_esp():
-            # Something running — stop first, then send after delay
-            self._send("stop")
-            self._pending_cmd = final_cmd
-            self._pending_cmd_frame = pyxel.frame_count + 15  # ~500ms
-            self._pending_cmd_name = name
-        else:
-            # Nothing running — send directly
-            self._send(final_cmd)
-            self.msg(f"[START] {name}...", C_HACK_CYAN)
-            self.glitch_timer = 5
-        self._set_running(state_key, True)
-        if state_key in ("bt_scanning", "ble_scan"):
-            self._bt_scan_start_time = time.time()
-        self.msg(f"[INIT] {name}...", C_DIM)
+        # All transitions wait for firmware's final stop message, never just a timer.
+        self._send("stop")
+        self._clear_scan_state()
+        self._pending_cmd = final_cmd
+        self._pending_state = state_key
+        self._pending_cmd_name = name
+        self._pending_deadline = time.monotonic() + 10
+        self.msg(f"[INIT] Stopping before {name}...", C_DIM)
 
     def _is_running(self, state_key: str) -> bool:
         return {
+            "all_wardrive": self.wardrive.scan.active,
             "wardriving":    self.wifi_scanning,
             "bt_scanning":   self.ble_scanning,
             "wifi_scan":     self._wifi_scan_only,
@@ -2897,6 +2910,8 @@ class WatchDogsGame:
     def _update_wardriving_loop(self):
         """Auto-repeat WiFi/BT scans for continuous wardriving (like JanOS)."""
         now = time.time()
+        if self.wardrive.scan.active:
+            return
 
         # GPS wait — start scanning once fix is acquired
         if self._gps_wait:
@@ -3288,6 +3303,8 @@ class WatchDogsGame:
             self._handle_serial_line(line)
 
     def _handle_serial_line(self, line: str):
+        if self.wardrive.handle_line(line):
+            return
         s = line.strip()
         if not s:
             return
@@ -3338,99 +3355,14 @@ class WatchDogsGame:
                 self.msg(f"[TAG] {' '.join(parts)}", C_WARNING)
             return
 
-        # --- BLE device ---
         m = _BLE_RE.match(s)
         if m:
-            mac = m.group(1)
-            if self._whitelist.is_blocked(mac):
-                return  # silently skip whitelisted BLE device
-            rssi = int(m.group(2))
-            name = (m.group(3) or "").strip() or "?"
-            tag_type = (m.group(4) or "").strip()  # [AirTag] or [SmartTag]
-            mac_upper = mac.upper()
-            is_new = mac_upper not in self._known_ble
-            if is_new:
-                self._known_ble.add(mac_upper)
-                if self.gps_fix:
-                    _dlat = (random.random()-0.5) * 0.002
-                    _dlon = (random.random()-0.5) * 0.002
-                else:
-                    _dlat = _dlon = 0.0
-                d = BleDevice(
-                    self.player_lat + _dlat,
-                    self.player_lon + _dlon,
-                    mac, name, rssi)
-                d.spawn_frame = pyxel.frame_count
-                self.ble_devices.append(d)
-                self.msg(f"[BLE] {d.name} {mac[-8:]} {rssi}dBm", C_HACK_CYAN)
-                self.gain_xp(10)  # new device: full XP
-            else:
-                self.gain_xp(1)   # duplicate: minimal XP
-            # Always save to loot (dedup + RSSI update handled by loot_manager)
-            if self.loot:
-                try:
-                    self.loot.save_bt_device(mac, rssi, name, False, False)
-                    self.loot.save_wardriving_bt(mac, rssi, name)
-                except Exception:
-                    pass
-            # Pretty terminal line instead of raw
-            new_mark = "*" if is_new else " "
-            suffix = f" {tag_type}" if tag_type else ""
-            self._term_add(
-                f"[BLE]{new_mark} {name[:16]:<16} {mac} {rssi}dBm{suffix}",
-                raw=True)
+            self._ingest_ble(m.group(1), int(m.group(2)), (m.group(3) or "").strip() or "?", (m.group(4) or "").strip())
             return
-
-        # --- WiFi network (CSV format) ---
         net = self.net_mgr.parse_network_line(s)
         if net:
-            bssid = net.bssid
-            if bssid:
-                if self._whitelist.is_blocked(bssid):
-                    return  # silently skip whitelisted WiFi
-                # Keep full Network objects for Evil Twin target selection
-                self.state.networks.append(net)
-                bssid_upper = bssid.upper()
-                is_new = bssid_upper not in self._known_wifi
-                if is_new:
-                    self._known_wifi.add(bssid_upper)
-                    try:
-                        ch = int(net.channel)
-                    except (ValueError, TypeError):
-                        ch = 0
-                    try:
-                        rssi_v = int(net.rssi)
-                    except (ValueError, TypeError):
-                        rssi_v = -80
-                    if self.gps_fix:
-                        _dlat = (random.random()-0.5) * 0.002
-                        _dlon = (random.random()-0.5) * 0.002
-                    else:
-                        _dlat = _dlon = 0.0
-                    n = WifiNetwork(
-                        self.player_lat + _dlat,
-                        self.player_lon + _dlon,
-                        bssid, net.ssid, ch, rssi_v)
-                    n.spawn_frame = pyxel.frame_count
-                    self.wifi_networks.append(n)
-                    self.msg(f"[WiFi] {n.ssid} Ch:{ch}", C_WARNING)
-                    self.gain_xp(15)  # new network: full XP
-                else:
-                    self.gain_xp(1)   # duplicate: minimal XP
-                # Always save to loot (dedup + RSSI update handled by loot_manager)
-                if self.loot:
-                    try:
-                        self.loot.save_wardriving_network(net)
-                    except Exception:
-                        pass
-                # Pretty terminal line instead of raw CSV
-                tag = "*" if is_new else " "
-                ssid = net.ssid[:20] if net.ssid else "<hidden>"
-                self._term_add(
-                    f"[WiFi]{tag} {ssid:<20} Ch:{net.channel:>2} "
-                    f"{net.rssi:>4}dBm {net.auth[:8]:<8} {bssid}",
-                    raw=True)
-                return
+            self._ingest_wifi(net)
+            return
 
         # --- Operation state from serial output ---
         sl = s.lower()
@@ -3438,7 +3370,7 @@ class WatchDogsGame:
             self.sniffing = True
         elif "handshake" in sl and ("start" in sl or "captur" in sl):
             self.capturing_hs = True
-        elif "stop command" in sl or "all stopped" in sl:
+        elif "all operations stopped" in sl or "all stopped" in sl:
             if not self._pending_cmd:
                 self.wifi_scanning = False
                 self.ble_scanning = False
@@ -3545,16 +3477,119 @@ class WatchDogsGame:
     # GPS polling
     # ------------------------------------------------------------------
 
+    def _ingest_ble(self, mac, rssi, name, tag_type="", observation=None):
+        if self._whitelist.is_blocked(mac):
+            return  # silently skip whitelisted BLE device
+        self.wardrive.observe_legacy("ble", mac, name, rssi, observation)
+        mac_upper = mac.upper()
+        is_new = mac_upper not in self._known_ble
+        if is_new:
+            self._known_ble.add(mac_upper)
+            if self.gps_fix:
+                _dlat = (random.random()-0.5) * 0.002
+                _dlon = (random.random()-0.5) * 0.002
+            else:
+                _dlat = _dlon = 0.0
+            d = BleDevice(
+                self.player_lat + _dlat,
+                self.player_lon + _dlon,
+                mac, name, rssi)
+            d.spawn_frame = pyxel.frame_count
+            self.ble_devices.append(d)
+            self.msg(f"[BLE] {d.name} {mac[-8:]} {rssi}dBm", C_HACK_CYAN)
+            self.gain_xp(10)  # new device: full XP
+        else:
+            if observation is None:
+                self.gain_xp(1)   # legacy duplicate XP only
+        # Always save to loot (dedup + RSSI update handled by loot_manager)
+        if self.loot:
+            try:
+                self.loot.save_bt_device(mac, rssi, name, False, False, **self.wardrive.save_args(observation))
+                self.loot.save_wardriving_bt(mac, rssi, name, **self.wardrive.save_args(observation))
+            except Exception:
+                pass
+        # Pretty terminal line instead of raw
+        new_mark = "*" if is_new else " "
+        suffix = f" {tag_type}" if tag_type else ""
+        self._term_add(
+            f"[BLE]{new_mark} {name[:16]:<16} {mac} {rssi}dBm{suffix}",
+            raw=True)
+        return
+
+
+    def _ingest_wifi(self, net, observation=None):
+        bssid = net.bssid
+        if bssid:
+            if self._whitelist.is_blocked(bssid):
+                return  # silently skip whitelisted WiFi
+            try:
+                detection_rssi = int(net.rssi)
+            except (TypeError, ValueError):
+                detection_rssi = -100
+            self.wardrive.observe_legacy("wifi", bssid, net.ssid, detection_rssi, observation)
+            # Keep full Network objects for Evil Twin target selection
+            for i, existing in enumerate(self.state.networks):
+                if existing.bssid.upper() == bssid.upper():
+                    self.state.networks[i] = net
+                    break
+            else:
+                self.state.networks.append(net)
+            bssid_upper = bssid.upper()
+            is_new = bssid_upper not in self._known_wifi
+            if is_new:
+                self._known_wifi.add(bssid_upper)
+                try:
+                    ch = int(net.channel)
+                except (ValueError, TypeError):
+                    ch = 0
+                try:
+                    rssi_v = int(net.rssi)
+                except (ValueError, TypeError):
+                    rssi_v = -80
+                if self.gps_fix:
+                    _dlat = (random.random()-0.5) * 0.002
+                    _dlon = (random.random()-0.5) * 0.002
+                else:
+                    _dlat = _dlon = 0.0
+                n = WifiNetwork(
+                    self.player_lat + _dlat,
+                    self.player_lon + _dlon,
+                    bssid, net.ssid, ch, rssi_v)
+                n.spawn_frame = pyxel.frame_count
+                self.wifi_networks.append(n)
+                self.msg(f"[WiFi] {n.ssid} Ch:{ch}", C_WARNING)
+                self.gain_xp(15)  # new network: full XP
+            else:
+                if observation is None:
+                    self.gain_xp(1)   # legacy duplicate XP only
+            # Always save to loot (dedup + RSSI update handled by loot_manager)
+            if self.loot:
+                try:
+                    self.loot.save_wardriving_network(net, **self.wardrive.save_args(observation))
+                except Exception:
+                    pass
+            # Pretty terminal line instead of raw CSV
+            tag = "*" if is_new else " "
+            ssid = net.ssid[:20] if net.ssid else "<hidden>"
+            self._term_add(
+                f"[WiFi]{tag} {ssid:<20} Ch:{net.channel:>2} "
+                f"{net.rssi:>4}dBm {net.auth[:8]:<8} {bssid}",
+                raw=True)
+            return
+
+
     def _poll_gps(self):
         if not self.gps.available:
+            self.gps_fix = False
             return
         sentences = self.gps.read_available()
         if sentences:
             self.gps.process_sentences(sentences)
         fix = self.gps.fix
+        self.wardrive.fixes.update(fix, time.monotonic())
         self.gps_sats = fix.satellites
         self.gps_sats_vis = fix.satellites_visible
-        if fix.valid and fix.latitude != 0 and fix.longitude != 0:
+        if fix.valid and time.monotonic() - fix.received_at <= 3:
             # Jitter filter: ignore moves < ~30 m (0.0003°)
             dlat = abs(fix.latitude - self.player_lat)
             dlon = abs(fix.longitude - self.player_lon)
@@ -3786,10 +3821,10 @@ class WatchDogsGame:
             if wd.is_file():
                 try:
                     with open(wd, encoding="utf-8") as fh:
-                        for i, line in enumerate(fh):
-                            if i <= 1:
+                        next(fh, None)
+                        for i, p in enumerate(_csv.reader(fh)):
+                            if i == 0:
                                 continue
-                            p = line.strip().split(",")
                             if len(p) < 8:
                                 continue
                             try:
@@ -3885,6 +3920,8 @@ class WatchDogsGame:
 
     def _cleanup(self):
         """Send stop to ESP32, close serial and GPS."""
+        if hasattr(self, "wardrive"):
+            self.wardrive.on_stop()
         if self.serial and self.serial.is_open:
             try:
                 self.serial.send_command("stop")
@@ -3924,6 +3961,7 @@ class WatchDogsGame:
     def draw(self):
         self._draw_inner()
         self._draw_plugin_pin()
+        self.wardrive.draw_overlay()
 
     def _draw_inner(self):
         if self._boot_phase:
@@ -3974,11 +4012,13 @@ class WatchDogsGame:
         if not tiles_drawn:
             self._draw_coastlines()
         self._draw_grid()
+        self.wardrive.draw_trail()
         self._draw_loot_points()
         self._draw_wifi()
         self._draw_ble()
         self._draw_scan_fx()
         self._draw_player()
+        self.wardrive.draw_markers()
         # Radar-style overlays go on top of the player skull so they're
         # visible even at low zoom, where every source within the dongle
         # range lands within the 12-pixel ring around the centre.
@@ -4412,6 +4452,8 @@ class WatchDogsGame:
 
     def _draw_wifi(self):
         for net in self.wifi_networks:
+            if self.wardrive.is_notable("wifi", net.bssid):
+                continue
             if net.lat == 0.0 and net.lon == 0.0:
                 continue  # no GPS fix when discovered — skip
             sx, sy = self.proj.geo_to_screen(net.lat, net.lon)
@@ -4433,6 +4475,8 @@ class WatchDogsGame:
 
     def _draw_ble(self):
         for d in self.ble_devices:
+            if self.wardrive.is_notable("ble", d.mac):
+                continue
             if d.lat == 0.0 and d.lon == 0.0:
                 continue  # no GPS fix when discovered — skip
             sx, sy = self.proj.geo_to_screen(d.lat, d.lon)
@@ -4583,7 +4627,8 @@ class WatchDogsGame:
         pyxel.text(3, TERM_Y + 1, "> OUTPUT", C_HACK_CYAN)
 
         tool_name = ""
-        if self.capturing_hs: tool_name = "HANDSHAKE"
+        if self.wardrive.scan.active: tool_name = "ALL WARDRIVE " + self.wardrive.scan.state.upper()
+        elif self.capturing_hs: tool_name = "HANDSHAKE"
         elif self.wifi_scanning or self._wifi_scan_only: tool_name = "WiFi SCAN"
         elif self.ble_scanning or self._ble_scan_only: tool_name = "BT SCAN"
         elif self._bt_airtag:
@@ -4811,6 +4856,7 @@ class WatchDogsGame:
         pyxel.text(220, y, f"PWN:{n_pwn}",  C_SUCCESS)
 
         tools = []
+        if self.wardrive.scan.active: tools.append("WiFi+BLE " + self.wardrive.scan.state)
         if self.wifi_scanning: tools.append("WiFi")
         if self.ble_scanning: tools.append("BT")
         if self.sniffing: tools.append("SNF")
@@ -4871,11 +4917,15 @@ class WatchDogsGame:
         pyxel.line(rx, ry, rx+int(math.cos(sa)*rr), ry+int(math.sin(sa)*rr), C_HACK_CYAN)
         scale = rr / max(self.proj.lon_span * 0.5, 0.001)
         for d in self.ble_devices:
+            if self.wardrive.is_notable("ble", d.mac):
+                continue
             dx = (d.lon - self.player_lon) * scale
             dy = (self.player_lat - d.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
                 pyxel.pset(rx+int(dx), ry+int(dy), C_SUCCESS if d.hacked else d.color)
         for n in self.wifi_networks:
+            if self.wardrive.is_notable("wifi", n.bssid):
+                continue
             dx = (n.lon - self.player_lon) * scale
             dy = (self.player_lat - n.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
@@ -4907,6 +4957,7 @@ class WatchDogsGame:
         except Exception:
             pass
 
+        self.wardrive.draw_radar(rx, ry, rr, scale)
         pyxel.pset(rx, ry, C_TEXT)
 
         # MeshCore: CB radio sprite + message bubbles (under radar)

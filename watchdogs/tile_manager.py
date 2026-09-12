@@ -38,13 +38,15 @@ PYXEL_PALETTE = [
 # Game zoom → OSM tile zoom mapping (limited for RPi performance)
 GAME_TO_OSM = {
     7: 12, 8: 12, 9: 13, 10: 13,
-    11: 14, 12: 14, 13: 14,
+    11: 14, 12: 15, 13: 16,
 }
 
 # Download tiers: fewer zoom levels = less disk, faster rendering
 DOWNLOAD_TIERS = [
     (12, 10),    # z12: 10km radius (~6 tiles)
     (13, 5),     # z13: 5km  radius (~12 tiles)
+    (15, 1.5),   # street detail near the download center
+    (16, 0.75),  # close-up detail, bounded area and request count
     (14, 3),     # z14: 3km  radius (~24 tiles)
 ]
 
@@ -350,10 +352,10 @@ class TileRenderer:
             return False  # Too far out for tiles
 
         # Viewport bounds in lat/lon
-        lat_n = proj.center_lat + proj.lat_span
-        lat_s = proj.center_lat - proj.lat_span
-        lon_w = proj.center_lon - proj.lon_span
-        lon_e = proj.center_lon + proj.lon_span
+        lat_n = proj.center_lat + proj.lat_span / 2
+        lat_s = proj.center_lat - proj.lat_span / 2
+        lon_w = proj.center_lon - proj.lon_span / 2
+        lon_e = proj.center_lon + proj.lon_span / 2
 
         # Tile range
         tx_min, ty_min = _lat_lon_to_tile(lat_n, lon_w, osm_zoom)
@@ -387,6 +389,17 @@ class TileRenderer:
             return False
 
         img = self._get_tile_image(z, tx, ty)
+        source_size, source_x, source_y = OSM_TILE_SIZE, 0, 0
+        if img is None:
+            # Existing caches remain usable; missing fine tiles use a cropped parent.
+            for parent_z in range(z - 1, 11, -1):
+                factor = 2 ** (z - parent_z)
+                img = self._get_tile_image(parent_z, tx // factor, ty // factor)
+                if img is not None:
+                    source_size = OSM_TILE_SIZE / factor
+                    source_x = (tx % factor) * source_size
+                    source_y = (ty % factor) * source_size
+                    break
         if img is None:
             return False
 
@@ -408,30 +421,30 @@ class TileRenderer:
         except Exception:
             fb = None
 
-        inv_tw = OSM_TILE_SIZE / tile_w
-        inv_th = OSM_TILE_SIZE / tile_h
+        inv_tw = source_size / tile_w
+        inv_th = source_size / tile_h
 
         if fb is not None:
             # Fast path: direct numpy/memoryview write
             for sy in range(y_start, y_end):
-                tp_y = int((sy - sy_tl) * inv_th)
+                tp_y = int(source_y + (sy - sy_tl) * inv_th)
                 if tp_y < 0 or tp_y >= OSM_TILE_SIZE:
                     continue
                 row_off = tp_y * OSM_TILE_SIZE
                 fb_row = sy * fb_w
                 for sx in range(x_start, x_end):
-                    tp_x = int((sx - sx_tl) * inv_tw)
+                    tp_x = int(source_x + (sx - sx_tl) * inv_tw)
                     if 0 <= tp_x < OSM_TILE_SIZE:
                         fb[fb_row + sx] = img[row_off + tp_x]
         else:
             # Fallback: pset (slow but works everywhere)
             for sy in range(y_start, y_end):
-                tp_y = int((sy - sy_tl) * inv_th)
+                tp_y = int(source_y + (sy - sy_tl) * inv_th)
                 if tp_y < 0 or tp_y >= OSM_TILE_SIZE:
                     continue
                 row_off = tp_y * OSM_TILE_SIZE
                 for sx in range(x_start, x_end):
-                    tp_x = int((sx - sx_tl) * inv_tw)
+                    tp_x = int(source_x + (sx - sx_tl) * inv_tw)
                     if 0 <= tp_x < OSM_TILE_SIZE:
                         px.pset(sx, sy, img[row_off + tp_x])
 
@@ -451,6 +464,8 @@ class TileRenderer:
         try:
             compressed = tile_path.read_bytes()
             raw = zlib.decompress(compressed)
+            if len(raw) != OSM_TILE_SIZE * OSM_TILE_SIZE // 2:
+                return None
             # Unpack 4-bit pairs to flat array
             pixels = bytearray(OSM_TILE_SIZE * OSM_TILE_SIZE)
             for i, byte in enumerate(raw):

@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "flock-oui",
+      "category": "flock",
+      "method": "oui",
+      "value": "B4:1E:52",
+      "strength": 1,
+      "source": "https://codehedge.github.io/Biscuit-Wiki/3rd-party-integration/wardrive.html",
+      "checked": "2026-09-12",
+      "provenance": "Public identifier fact; independently implemented matcher"
+    },
+    {
+      "id": "flock-name",
+      "category": "flock",
+      "method": "name",
+      "value": "(?i)(?:Penguin-[A-Za-z0-9-]+|Flock-[A-Za-z0-9-]+|pigvision|FS Ext Battery)",
+      "strength": 2,
+      "source": "https://codehedge.github.io/Biscuit-Wiki/3rd-party-integration/wardrive.html",
+      "checked": "2026-09-12",
+      "provenance": "Public identifier fact; independently implemented matcher"
+    },
+    {
+      "id": "flock-oem",
+      "category": "flock",
+      "method": "company",
+      "value": 2504,
+      "strength": 0,
+      "source": "https://codehedge.github.io/Biscuit-Wiki/3rd-party-integration/wardrive.html",
+      "checked": "2026-09-12",
+      "provenance": "Public identifier fact; independently implemented matcher"
+    },
+    {
+      "id": "axon-oui",
+      "category": "axon",
+      "method": "oui",
+      "value": "00:25:DF",
+      "strength": 1,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/axon.md",
+      "checked": "2026-09-12",
+      "provenance": "Public identifier fact; independently implemented matcher"
+    },
+    {
+      "id": "axon-body-tag",
+      "category": "axon",
+      "method": "service_tag",
+      "value": "BWCDEVICE",
+      "strength": 3,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/axon.md",
+      "checked": "2026-09-12",
+      "provenance": "Public identifier fact; independently implemented matcher"
+    },
+    {
+      "id": "axon-company",
+      "category": "axon",
+      "method": "company",
+      "value": 845,
+      "strength": 1,
+      "source": "https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/company_identifiers/company_identifiers.yaml",
+      "checked": "2026-09-12",
+      "provenance": "Bluetooth SIG assigned number; independently implemented matcher"
+    },
+    {
+      "id": "axon-service",
+      "category": "axon",
+      "method": "service_uuid",
+      "value": 64641,
+      "strength": 1,
+      "source": "https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/uuids/member_uuids.yaml",
+      "checked": "2026-09-12",
+      "provenance": "Bluetooth SIG assigned number; independently implemented matcher"
+    }
+  ]
+}

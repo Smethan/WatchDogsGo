@@ -1,5 +1,6 @@
 """GPS receiver — NMEA parser for UART/USB GPS modules."""
 
+import time
 import glob
 import logging
 import os
@@ -25,6 +26,7 @@ class GpsFix:
     fix_quality: int = 0       # 0=no fix, 1=GPS, 2=DGPS
     hdop: float = 99.9
     timestamp: str = ""        # UTC time from NMEA (hhmmss.ss)
+    received_at: float = 0.0
     valid: bool = False
 
 
@@ -205,6 +207,7 @@ class GpsManager:
                 log.debug("GPS parse error: %s — %s", s.strip(), exc)
 
     def _parse(self, sentence: str) -> None:
+        old_timestamp = self.fix.timestamp
         # Strip checksum
         if "*" in sentence:
             sentence = sentence.split("*")[0]
@@ -218,13 +221,17 @@ class GpsManager:
             self._parse_rmc(parts)
         elif kind in ("$GPGSV", "$GLGSV", "$GNGSV", "$GBGSV", "$GAGSV"):
             self._parse_gsv(parts)
+        if kind in ("$GPGGA", "$GNGGA", "$GPRMC", "$GNRMC"):
+            if self.fix.timestamp != old_timestamp or not self.fix.valid:
+                self.fix.received_at = time.monotonic()
+
 
     def _parse_gga(self, p: List[str]) -> None:
         """$GPGGA: time, lat, N/S, lon, E/W, quality, sats, hdop, alt, ..."""
         if len(p) < 10:
             return
         self.fix.fix_quality = int(p[6]) if p[6] else 0
-        self.fix.valid = self.fix.fix_quality > 0
+        self.fix.valid = self.fix.fix_quality > 0 and bool(p[2] and p[3] and p[4] and p[5])
         if p[1]:
             self.fix.timestamp = p[1]
         self.fix.satellites = int(p[7]) if p[7] else 0
@@ -240,7 +247,7 @@ class GpsManager:
         """$GPRMC: time, status, lat, N/S, lon, E/W, speed, ..."""
         if len(p) < 8:
             return
-        self.fix.valid = (p[2] == "A")
+        self.fix.valid = (p[2] == "A") and bool(p[3] and p[4] and p[5] and p[6])
         if p[1]:
             self.fix.timestamp = p[1]
         if p[2] == "A":

@@ -133,17 +133,34 @@ class SerialLineBuffer:
     and may deliver partial lines.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_line=8192) -> None:
+        # Legacy handshake/base64 lines need more than the WDG protocol's 1024.
         self._buf = b""
+        self.max_line = max_line
+        self.discarding = False
+        self.dropped_lines = 0
 
     def feed(self, raw: bytes) -> List[str]:
-        self._buf += raw
-        lines: List[str] = []
-        while b"\n" in self._buf:
-            line, self._buf = self._buf.split(b"\n", 1)
-            decoded = line.decode("utf-8", errors="replace").strip()
-            if decoded:
-                lines.append(decoded)
+        lines = []
+        parts = raw.split(b"\n")
+        for i, part in enumerate(parts):
+            end = i < len(parts)-1
+            if end:
+                part += b"\n"
+            if not self.discarding:
+                if len(self._buf) + len(part) > self.max_line:
+                    self._buf = b""
+                    self.discarding = True
+                    self.dropped_lines += 1
+                else:
+                    self._buf += part
+            if end:
+                if not self.discarding:
+                    line = self._buf.decode("utf-8", "replace").strip()
+                    if line:
+                        lines.append(line)
+                self._buf = b""
+                self.discarding = False
         return lines
 
 
@@ -171,6 +188,7 @@ class SerialManager:
                 "Try: sudo usermod -a -G dialout $USER"
             )
 
+        self.line_buffer = SerialLineBuffer()
         self.serial_conn = serial.Serial(
             port=self.device,
             baudrate=self.baud_rate,

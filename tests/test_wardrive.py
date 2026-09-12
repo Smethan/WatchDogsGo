@@ -1,0 +1,297 @@
+"""Synthetic-only protocol, lifecycle, geotagging, detection and route tests."""
+import csv
+from dataclasses import asdict
+import json
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+import pytest
+from watchdogs.wardrive_protocol import parse_record
+from watchdogs.serial_manager import SerialLineBuffer
+from watchdogs.scan_controller import ScanController
+from watchdogs.notable_detector import NotableDetector, ad_fields
+from watchdogs.wardrive_trail import FixHistory, WardriveTrail
+from watchdogs.gps_manager import GpsFix, GpsManager
+from watchdogs.loot_manager import LootManager
+from watchdogs.app_state import AppState, Network
+from watchdogs.app import WatchDogsGame
+from watchdogs.wardrive_ui import WardriveUI
+
+def record(kind="wifi", **kwargs):
+    d = dict(v=1,kind=kind,session="test",seq=2,mac="B4:1E:52:00:00:01",rssi=-60,
+             channel=6,ssid_hex="466c6f636b2d313233",capture_ms=100,age_ms=0,
+             addr_type=0,event=0,data_hex="",truncated=False,
+             wifi_count=1,ble_count=1,drops=0)
+    d.update(kwargs)
+    return d
+
+def ad(t, data):
+    return bytes([len(data)+1,t])+data
+
+def wire(d):
+    return "WDG:"+json.dumps(d,separators=(",", ":"))
+
+@pytest.mark.parametrize("chunk", [1,2,7,1024])
+def test_framing(chunk):
+    text = (wire(record())+"\r\n"+wire(record("ble"))+"\n").encode()
+    buf=SerialLineBuffer();lines=[]
+    for i in range(0,len(text),chunk): lines += buf.feed(text[i:i+chunk])
+    assert [parse_record(l)["kind"] for l in lines]==["wifi","ble"]
+
+def test_oversize_recovery():
+    b=SerialLineBuffer(32)
+    assert b.feed(b"x"*100000)==[] and len(b._buf)==0
+    assert b.feed(b"fragment\nhello\n")==["hello"]
+    assert b.dropped_lines==1
+
+@pytest.mark.parametrize("change", [dict(v=2),dict(v=True),dict(seq=-1),dict(age_ms=2001),dict(rssi="-50"),dict(mac="??"),dict(ssid_hex="aa " ),dict(ssid_hex="aa"*33),dict(session="bad\n"),dict(channel=0)])
+def test_bad_records(change):
+    assert parse_record(wire(record(**change))) is None
+
+def test_malformed_json():
+    for s in ('WDG:[]','WDG:null','WDG:{','WDG:'+ '['*1100):
+        assert parse_record(s) is None
+
+def test_scan_lifecycle():
+    now=[0];sent=[];c=ScanController(sent.append,lambda:now[0]);c.supported=True
+    assert c.start() and c.state=="starting"
+    token=c.session
+    assert not c.handle(record("started",session="old",seq=1))
+    c.handle(record("started",session=token,seq=1));assert c.state=="running"
+    assert c.handle(record("ble",session=token,seq=2))
+    assert not c.handle(record("ble",session=token,seq=2))
+    now[0]=5;c.tick();assert sent[-1]=="wardrive_keepalive "+token
+    c.stop();assert not c.handle(record("wifi",session=token,seq=3))
+    c.handle(record("stopped",session=token,seq=4));assert c.state=="idle"
+    assert not c.handle(record("started",session=token,seq=5))
+
+def test_timeouts_and_disconnect():
+    now=[0];sent=[];c=ScanController(sent.append,lambda:now[0]);c.probe()
+    now[0]=5;c.tick();assert c.supported is False and not c.start()
+    c.supported=True;c.start();now[0]=14;c.tick();assert c.state=="error" and sent[-1]=="stop"
+    c.reset();assert c.session=="" and c.supported is None
+
+@pytest.mark.parametrize("name,expected", [("Penguin-123",True),("Flock-abc",True),("pigvision",True),("FS Ext Battery",True),("myFlock-router",False),("Penguin",False),("1234567890",False)])
+def test_names(name,expected):
+    d=NotableDetector();hits=d.classify(record("ble",mac="C2:00:00:00:00:01",addr_type=1,data_hex=ad(9,name.encode()).hex()),0)
+    assert bool(hits)==expected
+
+def test_oem_is_not_camera_and_scan_response_upgrade():
+    d=NotableDetector();e=record("ble",mac="C2:00:00:00:00:01",addr_type=1,data_hex=ad(255,b"\xc8\x09\x00").hex())
+    assert d.classify(e,0)[0]["strength"]==0
+    e.update(event=4,data_hex=ad(9,b"Penguin-123").hex())
+    hits=d.classify(e,1);assert hits[0]["strength"]==2 and len(hits[0]["evidence"])==2
+    d.clear();assert not d.cache
+
+def test_random_addresses_and_axon_networks_excluded():
+    d=NotableDetector()
+    assert not d.classify(record("ble",mac="00:25:DF:00:00:01",addr_type=1),0)
+    assert not d.classify(record("wifi",mac="00:58:28:00:00:01",ssid_hex=""),0)
+    assert d.classify(record("ble",mac="00:25:DF:00:00:01"),0)[0]["label"]=="Possible Axon device"
+
+def test_body_tag_requires_service_data():
+    d=NotableDetector();base=record("ble",mac="C2:00:00:00:00:01",addr_type=1)
+    base["data_hex"]=ad(255,b"\x81\xfcBWCDEVICE").hex()
+    assert not d.classify(base,0)
+    base["data_hex"]=ad(0x16,b"\x81\xfcBWCDEVICE").hex()
+    assert d.classify(base,1)[0]["strength"]==3
+    assert ad_fields(b"\xff\x09Flock-123")==[]
+
+def test_probe_role_and_whitelist():
+    d=NotableDetector();e=record("wifi_mgmt",subtype=4,ssid_present=True,ssid_hex="",receiver="ff:ff:ff:ff:ff:ff")
+    assert d.classify(e,0)[0]["strength"]==2
+    assert not d.classify(e,0,lambda _:True)
+    e.update(mac="00:11:22:00:00:01",receiver="B4:1E:52:00:00:01")
+    assert not d.classify(e,0)  # receiver does not identify transmitter
+
+def test_fix_history_and_stale():
+    h=FixHistory();f=GpsFix(latitude=0,longitude=0,valid=True,received_at=10)
+    h.update(f,10);assert h.at(10)["latitude"]==0
+    f.latitude=2;f.received_at=12;h.update(f,12)
+    assert h.at(11)["latitude"]==0 and h.at(12)["latitude"]==2
+    assert h.at(16) is None
+    f.valid=False;f.received_at=13;h.update(f,13);assert h.at(13) is None
+
+def test_frozen_nmea_does_not_refresh(monkeypatch):
+    import watchdogs.gps_manager as g
+    now=[10];monkeypatch.setattr(g.time,"monotonic",lambda:now[0])
+    m=GpsManager();sentence="$GPGGA,120000,0000.000,N,00000.000,E,1,8,1.0,10,M,,M,,"
+    m._parse(sentence);assert m.fix.received_at==10
+    now[0]=20;m._parse(sentence);assert m.fix.received_at==10
+
+@pytest.fixture
+def loot(tmp_path):
+    l=LootManager.__new__(LootManager);l._session=tmp_path;l._session_active=True;l._gps=None
+    l.log_serial=Mock();l.save_bt_device=Mock()
+    return l
+
+def test_csv_escaping_dedup_and_unknown_gps(loot):
+    n=Network(bssid="00:11:22:33:44:55",ssid='a,"b\nline',rssi="-60",channel="6",auth="OPEN")
+    fix=asdict(GpsFix(valid=True,latitude=0,longitude=0))
+    assert not loot.save_wardriving_network(n,observation_fix=None)
+    assert loot.save_wardriving_network(n,observation_fix=fix,observed_at=10)
+    assert not loot.save_wardriving_network(n,observation_fix=fix,observed_at=11)
+    n.rssi="-50";assert loot.save_wardriving_network(n,observation_fix=fix,observed_at=12)
+    with (loot._session/"wardriving.csv").open(newline="") as f:
+        next(f);rows=list(csv.reader(f))
+    assert len(rows)==2 and rows[1][1]=='a,"b\nline' and rows[1][-1]=="WIFI"
+
+@pytest.fixture
+def game(tmp_path,loot,monkeypatch):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod,"pyxel",NS(frame_count=100))
+    app=WatchDogsGame.__new__(WatchDogsGame)
+    app._app_dir=str(tmp_path);app.loot=loot;app._pending_cmd=None
+    app.gps=NS(available=True,fix=GpsFix(valid=True,latitude=40,longitude=-90,received_at=10))
+    app.serial=NS(is_open=True,send_command=Mock());app._esp32=True
+    app._term_add=Mock();app.msg=Mock();app.gain_xp=Mock();app._earn_badge=Mock()
+    app._clear_scan_state();app._gps_wait=False;app._gps_wait_cmd="";app._whitelist=NS(is_blocked=lambda _:False)
+    app.player_lat=40;app.player_lon=-90;app.gps_fix=True;app.ble_devices=[];app.wifi_networks=[]
+    app._known_ble=set();app._known_wifi=set();app.state=AppState()
+    app.wardrive=WardriveUI(app)
+    import watchdogs.wardrive_ui as ui
+    monkeypatch.setattr(ui.time,"monotonic",lambda:10)
+    app.wardrive.tick()
+    return app
+
+def test_integration_both_radios_precise_toggle_and_raw_gps(game):
+    w=game.wardrive;w.scan.supported=True;w.scan.start();token=w.scan.session
+    w.handle_line(wire(record("started",session=token,seq=1)))
+    w.handle_line(wire(record("wifi",session=token,seq=2)))
+    w.handle_line(wire(record("ble",session=token,seq=3,mac="00:25:DF:00:00:01")))
+    assert len(game.wifi_networks)==len(game.ble_devices)==1
+    item=next(iter(w.notables.values()));assert w.position(item)==(40,-90)
+    w.settings["precise"]=False;assert w.position(item)==(game.wifi_networks[0].lat,game.wifi_networks[0].lon)
+    assert item["fix"]["latitude"]==40
+    before=game.gain_xp.call_count
+    w.handle_line(wire(record("wifi",session=token,seq=4)))
+    assert game.gain_xp.call_count==before and len(game.state.networks)==1
+    assert len(w.alerts)==2
+    with (game.loot._session/"wardriving.csv").open(newline="") as f:
+        next(f);rows=list(csv.reader(f))[1:]
+    assert {row[-1] for row in rows}=={"WIFI","BLE"}
+
+def test_transition_cancels_old_timers_and_waits_for_final_stop(game):
+    game.wifi_scanning=True;game._wifi_scan_done_time=1;game._bt_scan_done_time=1
+    game._start_scan_cmd("scan_bt","bt_scanning","BT Wardrive")
+    assert not game.wifi_scanning and not game.ble_scanning and game._wifi_scan_done_time==0
+    assert not game.wardrive.handle_line("Stop command received")
+    assert game._pending_cmd=="scan_bt"
+    assert game.wardrive.handle_line("All operations stopped.")
+    assert game.ble_scanning and not game.wifi_scanning and game._pending_cmd is None
+    assert game.serial.send_command.call_args.args==("scan_bt",)
+    game._send("stop");assert not game.ble_scanning and game._pending_cmd is None
+
+def test_all_never_runs_legacy_timers(game):
+    game.wardrive.scan.state="running";game.wifi_scanning=True;game.ble_scanning=True
+    game._wifi_scan_done_time=game._bt_scan_done_time=1
+    before=game.serial.send_command.call_count;game._update_wardriving_loop()
+    assert game.serial.send_command.call_count==before
+
+def test_route_segments_reload_and_no_discoveries(tmp_path):
+    t=WardriveTrail();t.set_path(tmp_path/"trail.jsonl")
+    f=asdict(GpsFix(valid=True,latitude=40,longitude=-90,received_at=1,hdop=1))
+    t.sample(f,1,True)
+    f.update(latitude=40.0001,received_at=2);t.sample(f,2,True)
+    assert len(t.points)==2 and t.points[0]["segment"]==t.points[1]["segment"]
+    t.sample(None,3,True)
+    f.update(latitude=40.0002,received_at=4);t.sample(f,4,True)
+    assert t.points[1]["segment"]!=t.points[2]["segment"]
+    count=len(t.points);t.sample(f,5,False);assert len(t.points)==count
+    with t.path.open("a") as out:out.write('{"incomplete":')
+    restored=WardriveTrail();restored.set_path(t.path);assert len(restored.points)==3
+
+
+def test_map_detail_and_parent_fallback(tmp_path):
+    from watchdogs.tile_manager import GAME_TO_OSM,TileRenderer
+    assert GAME_TO_OSM[13]==16 and GAME_TO_OSM[12]==15
+    renderer=TileRenderer(tmp_path)
+    renderer._get_tile_image=Mock(side_effect=lambda z,x,y: bytearray([7]*65536) if z==14 else None)
+    px=NS(screen=NS(data_ptr=lambda:bytearray(640*360)),pset=Mock())
+    proj=NS(geo_to_screen=Mock(side_effect=[(0,16),(256,234)]))
+    assert renderer._draw_tile(px,proj,16,100,100,640,360,16,234)
+
+
+def test_delayed_observation_keeps_original_fix(game, monkeypatch):
+    import watchdogs.wardrive_ui as ui
+    w=game.wardrive
+    monkeypatch.setattr(ui.time,"monotonic",lambda:12)
+    game.gps.fix.latitude=41;game.gps.fix.received_at=12
+    w.fixes.update(game.gps.fix,12)
+    w.observation(record(age_ms=2000))
+    item=next(iter(w.notables.values()))
+    assert item["observation_fix"]["latitude"]==40
+    game.gps.available=False
+    w.observation(record(mac="00:25:DF:00:00:02"))
+    item=list(w.notables.values())[-1]
+    assert item["observation_fix"] is None and w.position(item) is None
+
+
+def test_zero_discoveries_trail_stationary_and_freeze(tmp_path):
+    t=WardriveTrail();t.set_path(tmp_path/"route.jsonl")
+    f=asdict(GpsFix(latitude=40,longitude=-90,valid=True,received_at=1,hdop=1))
+    for now in range(1,13):
+        f["received_at"]=now;t.sample(f,now,True)
+    assert len(t.points)==2
+    assert t.points[0]["segment"]==t.points[1]["segment"]
+    t.sample(f,15,True);assert len(t.points)==2
+    f.update(received_at=16,latitude=40.0001);t.sample(f,16,True)
+    assert t.points[-1]["segment"]!=t.points[-2]["segment"]
+
+
+def test_route_append_after_crash(tmp_path):
+    path=tmp_path/"route.jsonl";path.write_text('{"partial":')
+    t=WardriveTrail();t.set_path(path)
+    f=asdict(GpsFix(latitude=1,longitude=1,valid=True,received_at=1))
+    t.sample(f,1,True)
+    reloaded=WardriveTrail();reloaded.set_path(path)
+    assert len(reloaded.points)==1
+
+
+@pytest.mark.parametrize("payload", [ad(255,b"\x4d\x03\x00"),ad(3,b"\x81\xfc"),ad(0x16,b"\x81\xfc\x00")])
+def test_registry_axon_ids_on_random_addresses(payload):
+    hits=NotableDetector().classify(record("ble",mac="C2:00:00:00:00:01",addr_type=1,data_hex=payload.hex()),0)
+    assert hits[0]["label"]=="Possible Axon device" and hits[0]["strength"]==1
+
+
+def test_ble_cache_is_bounded_and_does_not_cross_addresses():
+    d=NotableDetector()
+    for i in range(600):
+        mac=f"C2:00:00:00:{i//256:02X}:{i%256:02X}"
+        d.classify(record("ble",mac=mac,addr_type=1,data_hex=ad(9,b"Flock-123").hex()),i)
+    assert len(d.cache)==512
+    assert not d.classify(record("ble",mac="C2:11:22:33:44:55",addr_type=1),601)
+
+
+def test_real_pty_serial_stream():
+    # A local pseudo-terminal; no physical USB or radio device is opened.
+    import os,pty,select
+    from watchdogs.serial_manager import SerialManager
+    master,slave=pty.openpty();s=SerialManager(os.ttyname(slave))
+    try:
+        s.setup()
+        payload=(wire(record())+"\n"+wire(record("ble"))+"\n").encode()
+        os.write(master,payload[:25]);select.select([s.fd],[],[],1)
+        assert s.read_available()==[]
+        os.write(master,payload[25:]);select.select([s.fd],[],[],1)
+        assert [parse_record(l)["kind"] for l in s.read_available()]==["wifi","ble"]
+    finally:
+        s.close();os.close(master);os.close(slave)
+
+
+def test_late_legacy_stop_cannot_start_over_active_session(game):
+    w=game.wardrive;w.scan.supported=True;w.scan.start();token=w.scan.session
+    game._start_scan_cmd("scan_bt","bt_scanning","BT Wardrive")
+    assert w.scan.state=="stopping"
+    w.handle_line("All operations stopped.")
+    assert game._pending_cmd=="scan_bt" and not game.ble_scanning
+    w.handle_line(wire(record("stopped",session=token,seq=1)))
+    w.handle_line("All operations stopped.")
+    assert game._pending_cmd is None and game.ble_scanning
+
+
+def test_suppressed_body_rule_downgrades_label():
+    d=NotableDetector()
+    e=record("ble",mac="00:25:DF:00:00:01",data_hex=ad(0x16,b"\x81\xfcBWCDEVICE").hex())
+    h=d.classify(e,0,suppressed_rules=["axon-body-tag"])
+    assert h[0]["label"]=="Possible Axon device" and h[0]["strength"]==1

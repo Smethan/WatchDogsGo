@@ -1,0 +1,9 @@
+# Close-up map detail
+
+The old renderer used zoom-14 source tiles at all three closest game zooms. At CLOSE-UP, one z14 tile spans about 703 screen pixels but contains only 256 source pixels, so each source pixel expands to nearly three screen pixels.
+
+The new mapping uses z15 at BUILDING and z16 at CLOSE-UP. A z16 tile spans about 176 screen pixels there, so streets use finer geographic source detail rather than enlarged z14 pixels. Downloads add bounded detail areas: 1.5 km radius at z15 and 0.75 km at z16. Existing tiles are reusable; missing detailed tiles are replaced with the correct crop of a cached parent, avoiding blank gaps while transitioning caches. Viewport enumeration now uses the actual visible half-spans instead of fetching four times the visible area from disk.
+
+Use the existing Download Map action around the desired location to obtain fine tiles. The render change alone cannot invent streets absent from an existing z14 cache. The game remains 640×360 with a 16-color palette: this improves street detail, not the engine's pixel-art resolution.
+
+No account upgrade, new API provider, map download or charge was performed during development. The existing Stadia Maps key mechanism is retained. [Alidade Smooth Dark documentation](https://docs.stadiamaps.com/map-styles/alidade-smooth-dark/) offers raster tiles through zoom 20 on the same style. The [free plan](https://stadiamaps.com/pricing/) covers noncommercial standard basemaps within its credit allowance; this change does not enable paid overages or change account settings. Provider quota/authentication/cache conditions still apply, including the [on-device caching conditions](https://docs.stadiamaps.com/tutorials/offline-maps-with-flutter-maplibre-gl/). No assumption is made that an API key grants unlimited offline redistribution.

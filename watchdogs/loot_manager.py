@@ -306,11 +306,10 @@ class LootManager:
             try:
                 gps_count = 0
                 total = 0
-                for i, line in enumerate(open(bt_dev_file, encoding="utf-8")):
+                for i, parts in enumerate(csv.reader(open(bt_dev_file, newline="", encoding="utf-8"))):
                     if i == 0:
                         continue  # skip header
                     total += 1
-                    parts = line.strip().split(",")
                     # lat,lon are last two columns
                     if len(parts) >= 8:
                         try:
@@ -349,8 +348,10 @@ class LootManager:
         wd_file = session_path / "wardriving.csv"
         if wd_file.is_file():
             try:
-                lines = sum(1 for _ in open(wd_file, encoding="utf-8"))
-                counts["wardriving"] = max(0, lines - 2)  # minus pre-header + header
+                with open(wd_file, newline="", encoding="utf-8") as f:
+                    next(f, None)
+                    lines = sum(1 for _ in csv.reader(f))
+                counts["wardriving"] = max(0, lines - 1)  # minus pre-header + header
             except OSError:
                 pass
         adsb_file = session_path / "adsb_aircraft.csv"
@@ -884,155 +885,67 @@ class LootManager:
         """Convert ESP32 auth string to WiGLE AuthMode format."""
         return self._AUTH_MAP.get(auth.strip(), f"[{auth}][ESS]")
 
-    def save_wardriving_network(self, network: Network) -> bool:
-        """Append a geo-tagged network to wardriving.csv (WiGLE format, dedup by BSSID).
-
-        Returns True if the network was new or updated (stronger RSSI).
-        """
-        if not self._session_active or not network.bssid:
-            return False
-        path = self._session / "wardriving.csv"
-        # Get GPS coords + accuracy
-        lat, lon, alt, accuracy = 0.0, 0.0, 0.0, 0.0
-        if self._gps and self._gps.available:
-            fix = self._gps.fix
-            if fix.valid:
-                lat = round(fix.latitude, 7)
-                lon = round(fix.longitude, 7)
-                alt = round(fix.altitude, 1)
-                accuracy = round(fix.hdop * 5.0, 1) if fix.hdop < 99 else 0.0
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            rssi_val = int(network.rssi)
-        except (ValueError, TypeError):
-            rssi_val = -100
-        auth_mode = self._wigle_auth(network.auth)
-        # WiGLE row: MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,Lat,Lon,Alt,Accuracy,Type
-        new_row = (
-            f"{network.bssid},{network.ssid},{auth_mode},{ts},"
-            f"{network.channel},{network.rssi},{lat},{lon},{alt},"
-            f"{accuracy},WIFI\n"
-        )
-        # Read existing to dedup by BSSID (MAC = column 0, RSSI = column 5)
-        existing: dict[str, tuple[int, int]] = {}  # bssid -> (line_index, rssi)
-        lines: list[str] = []
-        if path.is_file():
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    for i, line in enumerate(fh):
-                        lines.append(line)
-                        if i <= 1:
-                            continue  # pre-header + header
-                        parts = line.strip().split(",")
-                        if len(parts) >= 6:
-                            bssid = parts[0]  # MAC column
-                            try:
-                                existing[bssid] = (i, int(parts[5]))
-                            except (ValueError, IndexError):
-                                existing[bssid] = (i, -100)
-            except OSError:
-                lines = []
-                existing = {}
-        bssid = network.bssid
-        if bssid in existing:
-            old_idx, old_rssi = existing[bssid]
-            if rssi_val <= old_rssi:
-                return False  # existing is stronger or equal
-            lines[old_idx] = new_row
-            try:
-                with open(path, "w", newline="", encoding="utf-8") as fh:
-                    fh.writelines(lines)
-                    _fsync_file(fh)
-            except OSError as exc:
-                log.error("Cannot update wardriving CSV: %s", exc)
-            return True
-        else:
-            try:
-                if not lines:
-                    with open(path, "w", newline="", encoding="utf-8") as fh:
-                        fh.write(self._WIGLE_PRE_HEADER)
-                        fh.write(self._WIGLE_HEADER)
-                        fh.write(new_row)
-                        _fsync_file(fh)
-                else:
-                    with open(path, "a", newline="", encoding="utf-8") as fh:
-                        fh.write(new_row)
-                        _fsync_file(fh)
-            except OSError as exc:
-                log.error("Cannot save wardriving network: %s", exc)
-            return True
-
-    def save_wardriving_bt(self, mac: str, rssi: int, name: str) -> bool:
-        """Append a geo-tagged BLE device to wardriving.csv (WiGLE format, dedup by MAC).
-
-        Uses the same CSV file as WiFi wardriving with Type=BLE.
-        Returns True if the device was new or updated (stronger RSSI).
-        """
+    def _save_wardrive_row(self, mac, name, auth, channel, rssi, kind,
+                           observation_fix="current", observed_at=None):
         if not self._session_active or not mac:
             return False
-        path = self._session / "wardriving.csv"
-        # Get GPS coords + accuracy
-        lat, lon, alt, accuracy = 0.0, 0.0, 0.0, 0.0
-        if self._gps and self._gps.available:
-            fix = self._gps.fix
-            if fix.valid:
-                lat = round(fix.latitude, 7)
-                lon = round(fix.longitude, 7)
-                alt = round(fix.altitude, 1)
-                accuracy = round(fix.hdop * 5.0, 1) if fix.hdop < 99 else 0.0
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # WiGLE row: MAC,SSID(=name),AuthMode,FirstSeen,Channel,RSSI,Lat,Lon,Alt,Accuracy,Type
-        new_row = (
-            f"{mac},{name},[BLE],{ts},"
-            f",{rssi},{lat},{lon},{alt},"
-            f"{accuracy},BLE\n"
-        )
-        # Read existing to dedup by MAC (column 0, RSSI = column 5)
-        existing: dict[str, tuple[int, int]] = {}
-        lines: list[str] = []
-        if path.is_file():
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    for i, line in enumerate(fh):
-                        lines.append(line)
-                        if i <= 1:
-                            continue  # pre-header + header
-                        parts = line.strip().split(",")
-                        if len(parts) >= 6:
-                            try:
-                                existing[parts[0]] = (i, int(parts[5]))
-                            except (ValueError, IndexError):
-                                existing[parts[0]] = (i, -100)
-            except OSError:
-                lines = []
-                existing = {}
-        if mac in existing:
-            old_idx, old_rssi = existing[mac]
-            if rssi <= old_rssi:
-                return False  # existing is stronger or equal
-            lines[old_idx] = new_row
-            try:
-                with open(path, "w", newline="", encoding="utf-8") as fh:
-                    fh.writelines(lines)
-                    _fsync_file(fh)
-            except OSError as exc:
-                log.error("Cannot update wardriving BT CSV: %s", exc)
-            return True
+        if observation_fix == "current":
+            fix = self._gps.fix if self._gps and self._gps.available else None
+        elif observation_fix is None:
+            return False  # explicit unknown location: never fabricate a geotag
         else:
-            try:
-                if not lines:
-                    with open(path, "w", newline="", encoding="utf-8") as fh:
-                        fh.write(self._WIGLE_PRE_HEADER)
-                        fh.write(self._WIGLE_HEADER)
-                        fh.write(new_row)
-                        _fsync_file(fh)
-                else:
-                    with open(path, "a", newline="", encoding="utf-8") as fh:
-                        fh.write(new_row)
-                        _fsync_file(fh)
-            except OSError as exc:
-                log.error("Cannot save wardriving BT device: %s", exc)
+            from types import SimpleNamespace
+            fix = SimpleNamespace(**observation_fix)
+        lat = lon = alt = accuracy = 0.0
+        if fix and fix.valid:
+            lat, lon = round(fix.latitude, 7), round(fix.longitude, 7)
+            alt = round(fix.altitude, 1)
+            accuracy = round(fix.hdop * 5, 1) if fix.hdop < 99 else 0.0
+        ts = datetime.fromtimestamp(observed_at).strftime("%Y-%m-%d %H:%M:%S") if observed_at is not None else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        path = self._session / "wardriving.csv"
+        try:
+            rows = []
+            if path.is_file():
+                with path.open(newline="", encoding="utf-8") as f:
+                    next(f, None)  # WiGLE pre-header
+                    rows = list(csv.reader(f))
+                rows = rows[1:]  # column names
+            rssi = int(rssi)
+            row = [mac, name, auth, ts, channel, rssi, lat, lon, alt, accuracy, kind]
+            for i, old in enumerate(rows):
+                if len(old) == 11 and old[0].upper() == mac.upper() and old[10] == kind:
+                    try:
+                        if rssi <= int(old[5]):
+                            return False
+                    except ValueError:
+                        pass
+                    row[3] = old[3]  # preserve FirstSeen
+                    rows[i] = row
+                    break
+            else:
+                rows.append(row)
+            temp = path.with_suffix(".csv.tmp")
+            with temp.open("w", newline="", encoding="utf-8") as f:
+                f.write(self._WIGLE_PRE_HEADER)
+                f.write(self._WIGLE_HEADER)
+                csv.writer(f).writerows(rows)
+                _fsync_file(f)
+            temp.replace(path)
             return True
+        except (OSError, ValueError) as exc:
+            log.error("Cannot save wardriving observation: %s", exc)
+            return False
+
+    def save_wardriving_network(self, network: Network, *,
+                               observation_fix="current", observed_at=None) -> bool:
+        return self._save_wardrive_row(network.bssid, network.ssid,
+            self._wigle_auth(network.auth), network.channel, network.rssi, "WIFI",
+            observation_fix, observed_at)
+
+    def save_wardriving_bt(self, mac: str, rssi: int, name: str, *,
+                         observation_fix="current", observed_at=None) -> bool:
+        return self._save_wardrive_row(mac, name, "[BLE]", "", rssi, "BLE",
+                                      observation_fix, observed_at)
 
     def save_scan_results(self, networks: List[Network]) -> None:
         """Save scan results as CSV. fsync'd."""
@@ -1174,33 +1087,34 @@ class LootManager:
     # ------------------------------------------------------------------
 
     def save_bt_device(self, mac: str, rssi: int, name: str,
-                       is_airtag: bool, is_smarttag: bool) -> None:
-        """Append BLE device to bt_devices.csv (dedup by MAC). fsync'd."""
+                       is_airtag: bool, is_smarttag: bool, *,
+                       observation_fix="current", observed_at=None) -> None:
+        """Save BLE inventory with explicit observation GPS when provided."""
         if not self._session_active:
             return
         path = self._session / "bt_devices.csv"
-        # Get GPS coords if available
-        lat, lon = 0.0, 0.0
-        if self._gps and self._gps.available:
-            fix = self._gps.fix
-            if fix.valid:
-                lat = round(fix.latitude, 7)
-                lon = round(fix.longitude, 7)
-        if path.is_file():
-            try:
-                existing = path.read_text(encoding="utf-8")
-            except OSError:
-                existing = ""
-            if f",{mac}," in existing or existing.startswith(f"{mac},"):
-                return  # already known
+        lat = lon = ""
+        if observation_fix == "current":
+            fix = self._gps.fix if self._gps and self._gps.available else None
+        elif observation_fix:
+            from types import SimpleNamespace
+            fix = SimpleNamespace(**observation_fix)
         else:
-            _sync_write(path,
-                        "timestamp,mac,rssi,name,airtag,smarttag,lat,lon\n")
-        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        _sync_append(
-            path,
-            f"{ts},{mac},{rssi},{name},{is_airtag},{is_smarttag},"
-            f"{lat},{lon}\n")
+            fix = None
+        if fix and fix.valid:
+            lat, lon = round(fix.latitude, 7), round(fix.longitude, 7)
+        if path.is_file():
+            with path.open(newline="", encoding="utf-8") as f:
+                if any(len(row)>1 and row[1].upper()==mac.upper() for row in csv.reader(f)):
+                    return
+        empty = not path.exists()
+        ts = datetime.fromtimestamp(observed_at).isoformat(timespec="seconds") if observed_at is not None else datetime.now().isoformat(timespec="seconds")
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if empty:
+                writer.writerow(["timestamp","mac","rssi","name","airtag","smarttag","lat","lon"])
+            writer.writerow([ts,mac,rssi,name,is_airtag,is_smarttag,lat,lon])
+            _fsync_file(f)
         self.update_session_loot()
 
     def save_bt_airtag_event(self, airtags: int, smarttags: int) -> None:
