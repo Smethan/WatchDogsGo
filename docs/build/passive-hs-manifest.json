@@ -1,0 +1,43 @@
+{
+  "firmware_source_commit": "c8d35681ac73222f5fe8af50ef53c3303ea17db9",
+  "wdg_source_commit": "25b5df3434440bdd35b7822fd0d8fab5e100175f",
+  "toolchain": "espressif/idf:v6.0.1",
+  "container_digest": "espressif/idf@sha256:efc19fae2f52fc6873630c668da26aa834139a063b5fb73a46ebc0dbd217b587",
+  "hardware_tested": false,
+  "python_tests_passed": 61,
+  "firmware_native_tests": "passed",
+  "boards": {
+    "xiao": {
+      "application_image_bytes": 2242509,
+      "static_hp_sram_bytes": 216907,
+      "flash_files": {
+        "0x2000": "bootloader/bootloader.bin",
+        "0x8000": "partition_table/partition-table.bin",
+        "0xf000": "ota_data_initial.bin",
+        "0x20000": "projectZerobyLOCOSP.bin"
+      },
+      "sha256": {
+        "bootloader/bootloader.bin": "e52ecd6c70e038e689c2e3d1f8511adac1bc249f71842455ec50cc958cf38ac1",
+        "partition_table/partition-table.bin": "23dde662052a6acc2ed73494932a349b7c87102bce5987b9141fb7545578210c",
+        "ota_data_initial.bin": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f",
+        "projectZerobyLOCOSP.bin": "7c25702d560a715276d168fd8ce698e19456d789162bd0b5b38108af464f349d"
+      }
+    },
+    "standard": {
+      "application_image_bytes": 2246311,
+      "static_hp_sram_bytes": 216719,
+      "flash_files": {
+        "0x2000": "bootloader/bootloader.bin",
+        "0x8000": "partition_table/partition-table.bin",
+        "0xf000": "ota_data_initial.bin",
+        "0x20000": "projectZerobyLOCOSP.bin"
+      },
+      "sha256": {
+        "bootloader/bootloader.bin": "5b1f2a2546a20aa8391bcb72061bfb38c26e9c82849b63860f19f9cdcda52abf",
+        "partition_table/partition-table.bin": "23dde662052a6acc2ed73494932a349b7c87102bce5987b9141fb7545578210c",
+        "ota_data_initial.bin": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f",
+        "projectZerobyLOCOSP.bin": "f3f869e75554420acfadb89120732ff17c4a310b8599703a50b09ebf816167c7"
+      }
+    }
+  }
+}
