@@ -101,7 +101,7 @@ if command -v apt-get &>/dev/null; then
         tcpdump aircrack-ng iw rtl-433
         bluez bluez-tools pulseaudio-utils
         # Build deps for dump1090 (built from source in step 7)
-        librtlsdr-dev git
+        librtlsdr-dev libusb-1.0-0-dev libncurses-dev git
     )
 
     # RPi-only packages — skipped on non-RPi systems (no fail)
@@ -276,21 +276,22 @@ else
 fi
 
 # --- 7. dump1090 from source + aiov2_ctl (uConsole only) ---
-echo "[7/8] Building dump1090 + uConsole tools..."
+echo "[7/8] Checking dump1090 + uConsole tools..."
 
-if ! command -v dump1090 &>/dev/null; then
+if DUMP1090_PATH=$(python3 -m watchdogs.sdr_tools); then
+    ok "dump1090 present ($DUMP1090_PATH) — reusing existing installation"
+else
     info "Building FlightAware dump1090 from source..."
     TMP=$(mktemp -d)
     if git clone --depth=1 https://github.com/flightaware/dump1090.git "$TMP/dump1090" >>"$APT_LOG" 2>&1 \
        && (cd "$TMP/dump1090" && make -j"$(nproc)" >>"$APT_LOG" 2>&1) \
-       && sudo cp "$TMP/dump1090/dump1090" /usr/local/bin/ ; then
+       && sudo install -m 755 "$TMP/dump1090/dump1090" /usr/local/bin/dump1090 >>"$APT_LOG" 2>&1 ; then
         ok "dump1090 installed (/usr/local/bin/dump1090)"
     else
+        dump_log_on_fail "dump1090 build/install" "$APT_LOG"
         warn "dump1090 build failed — ADS-B Radar will not work (see $APT_LOG)"
     fi
     rm -rf "$TMP"
-else
-    ok "dump1090 present ($(command -v dump1090))"
 fi
 
 # AIO v2 control (uConsole only)

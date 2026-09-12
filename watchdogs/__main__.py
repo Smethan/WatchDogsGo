@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .sdr_tools import find_dump1090
+
 
 # ---------------------------------------------------------------------------
 # Pre-flight dependency check (runs BEFORE importing anything heavy)
@@ -15,7 +17,7 @@ def _check_deps() -> list[tuple[str, str, bool, bool]]:
 
     Returns list of (name, status, ok, required).
     required=True  → game won't start without it
-    required=False → optional (advanced attacks / LoRa), warn only
+    required=False → optional (advanced attacks / LoRa / SDR), warn only
     """
     checks: list[tuple[str, str, bool, bool]] = []
 
@@ -96,7 +98,7 @@ def _check_deps() -> list[tuple[str, str, bool, bool]]:
 
     # dump1090 — ADS-B aircraft tracking (SDR)
     import shutil
-    if shutil.which("dump1090"):
+    if find_dump1090():
         checks.append(("dump1090", "OK", True, False))
     else:
         checks.append(("dump1090", "NOT INSTALLED", False, False))
@@ -128,7 +130,7 @@ def _run_setup():
 
 
 def preflight():
-    """Check dependencies, offer to run setup if anything missing."""
+    """Install missing required dependencies; only warn about optional tools."""
     checks = _check_deps()
     required_ok = all(ok for _, _, ok, req in checks if req)
     all_ok = all(ok for _, _, ok, _ in checks)
@@ -152,7 +154,7 @@ def preflight():
 
     # Optional deps
     print()
-    print("  Optional (advanced attacks / LoRa):")
+    print("  Optional (advanced attacks / LoRa / SDR):")
     for name, status, ok, req in checks:
         if req:
             continue
@@ -184,15 +186,13 @@ def preflight():
             print("  [ERR] setup.sh failed. Fix errors and try again.")
             sys.exit(1)
     else:
-        # Required OK but optional missing — offer to install
+        # Optional failures must not trigger an installer on every launch.
         missing_opt = [n for n, _, ok, req in checks if not req and not ok]
         if missing_opt:
             print(f"  Optional packages missing: {', '.join(missing_opt)}")
-            print("  Some attacks (MITM, Dragon Drain, BlueDucky, RACE, LoRa)")
-            print("  won't work without them.")
+            print("  Features that need these packages will be unavailable.")
             print()
-            print("  Install now? Running setup.sh...")
-            _run_setup()
+            print("  To install them, exit WDG and run: bash setup.sh")
             print()
             print("  Starting game...")
             print()

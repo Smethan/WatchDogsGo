@@ -1046,7 +1046,7 @@ class WatchDogsGame:
 
         # SDR tools
         _sdr_tools = []
-        if shutil.which("dump1090"):
+        if SDRManager.has_dump1090():
             _sdr_tools.append("dump1090")
         if shutil.which("rtl_433"):
             _sdr_tools.append("rtl_433")

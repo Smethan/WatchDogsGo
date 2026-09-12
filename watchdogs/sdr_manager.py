@@ -16,14 +16,16 @@ from dataclasses import dataclass, field
 from queue import Queue
 from typing import Callable, Optional
 
+from .sdr_tools import find_dump1090
+
 log = logging.getLogger(__name__)
 
 # --- ADS-B Constants ---
 # dump1090-fa/mutability: --net enables SBS on 30003 by default
 # --quiet suppresses interactive output
-DUMP1090_CMD = ["dump1090", "--net", "--quiet"]
+DUMP1090_ARGS = ["--net", "--quiet"]
 # Fallback without --quiet (some builds don't support it)
-DUMP1090_CMD_FALLBACK = ["dump1090", "--net"]
+DUMP1090_ARGS_FALLBACK = ["--net"]
 
 # --- rtl_433 Constants ---
 RTL433_CMD = [
@@ -107,7 +109,7 @@ class SDRManager:
 
     @staticmethod
     def has_dump1090() -> bool:
-        return shutil.which("dump1090") is not None
+        return find_dump1090() is not None
 
     @staticmethod
     def has_rtl433() -> bool:
@@ -115,7 +117,8 @@ class SDRManager:
 
     def start_adsb(self, loot_dir: str = "") -> bool:
         """Start ADS-B tracking via dump1090."""
-        if not self.has_dump1090():
+        executable = find_dump1090()
+        if not executable:
             self._events.put(("error", "dump1090 not installed"))
             return False
         if self._dump1090_proc:
@@ -126,14 +129,14 @@ class SDRManager:
         # Stop system dump1090 service if running (holds RTL-SDR device)
         try:
             subprocess.run(
-                ["systemctl", "stop", "dump1090-mutability"],
+                ["systemctl", "stop", "dump1090-mutability", "dump1090-fa"],
                 capture_output=True, timeout=5)
         except Exception:
             pass
 
         try:
             self._dump1090_proc = subprocess.Popen(
-                DUMP1090_CMD,
+                [executable, *DUMP1090_ARGS],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
@@ -143,7 +146,7 @@ class SDRManager:
             if self._dump1090_proc.poll() is not None:
                 # Retry without --quiet
                 self._dump1090_proc = subprocess.Popen(
-                    DUMP1090_CMD_FALLBACK,
+                    [executable, *DUMP1090_ARGS_FALLBACK],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid,

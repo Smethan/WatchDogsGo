@@ -30,6 +30,21 @@ When WDG runs as root, Git runs as the checkout directory's owner so new files
 do not become root-owned. Dependency changes, if any, are documented in release
 notes; the updater does not run arbitrary installers automatically.
 
+## Optional tools and dump1090
+
+Startup reports missing optional dependencies without rerunning setup. To install
+them, exit WDG and run `bash setup.sh` from the checkout once. Required startup
+dependencies still trigger setup if missing.
+
+Setup, startup checks and ADS-B radar share the same executable detection:
+`dump1090`, `dump1090-fa`, or `dump1090-mutability`, on PATH or in standard system
+binary directories (including `/usr/local/bin` when sudo omits it from PATH).
+An existing executable is reused. If none is installed, setup builds FlightAware
+dump1090 and installs it persistently as `/usr/local/bin/dump1090`. The build
+dependencies include RTL-SDR, USB and ncurses development headers. A failed build
+prints the end of its log and preserves the full log path for troubleshooting;
+it is not retried automatically at the next WDG launch.
+
 ## Firmware
 
 **SYSTEM → Flash ESP32** shows the Smethan source and current/available version.
