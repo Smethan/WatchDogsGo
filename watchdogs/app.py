@@ -1281,14 +1281,18 @@ class WatchDogsGame:
             pass
 
     def _send(self, cmd: str):
+        # Session lease renewals are transport housekeeping, not user actions.
+        quiet = cmd.startswith("wardrive_keepalive ")
         if cmd == "stop" and hasattr(self, "wardrive"):
             self.wardrive.on_stop()
         if self.serial and self.serial.is_open:
             self.serial.send_command(cmd)
-            self._term_add(f"[TX] {cmd}", raw=True)
+            if not quiet:
+                self._term_add(f"[TX] {cmd}", raw=True)
         elif self._try_reconnect_esp32():
             self.serial.send_command(cmd)
-            self._term_add(f"[TX] {cmd} (after reconnect)", raw=True)
+            if not quiet:
+                self._term_add(f"[TX] {cmd} (after reconnect)", raw=True)
         else:
             self._term_add("[ERR] No serial connection", raw=True)
 
