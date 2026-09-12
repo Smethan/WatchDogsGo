@@ -13,6 +13,8 @@ main automatically. Restart WDG after an update to load the new code.
 verifies archive/file checksums, board identity, version and offsets, and then
 flashes the selected board. The XIAO and standard images stay separate. There
 is no fallback to LOCOSP downloads and no reuse of stale cached firmware files.
+WDG reserves the serial port during flashing so its reconnect loop and capture
+keepalives cannot compete with esptool. Normal polling reconnects afterward.
 
 Source releases and tests use standard public GitHub Actions runners. See
 `docs/FORK_UPDATES.md` for migration and release instructions.

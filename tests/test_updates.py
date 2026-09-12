@@ -6,6 +6,25 @@ import subprocess
 import zipfile
 import pytest
 from watchdogs import updates
+from watchdogs.app import WatchDogsGame
+from unittest.mock import Mock
+
+def test_flashing_reserves_serial_and_releases_on_failure():
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._flash_io_active = True
+    app.serial = Mock()
+    app._term_add = Mock()
+    app._send('wardrive_keepalive session')
+    app._send('version')
+    app._poll_serial()
+    assert not app._try_reconnect_esp32()
+    app.serial.send_command.assert_not_called()
+    app.serial.read_available.assert_not_called()
+    app._flash_running = True
+    app._flash_firmware = Mock(side_effect=RuntimeError('flash failed'))
+    with pytest.raises(RuntimeError):
+        app._flash_do('xiao')
+    assert not app._flash_io_active and not app._flash_running
 
 def bundle(board='xiao', version='1.7.1', corrupt=False, extra=False):
     files = {name:b'firmware-'+name.encode() for name in updates.FLASH_BOARDS[board]['offsets']}

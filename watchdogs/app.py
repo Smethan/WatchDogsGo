@@ -1233,6 +1233,8 @@ class WatchDogsGame:
 
     def _try_reconnect_esp32(self) -> bool:
         """Try to detect and reconnect ESP32. Like JanOS wait_for_esp32."""
+        if getattr(self, '_flash_io_active', False):
+            return False
         port = detect_esp32_port()
         if not port:
             return False
@@ -1272,6 +1274,10 @@ class WatchDogsGame:
     def _send(self, cmd: str):
         # Session lease renewals are transport housekeeping, not user actions.
         quiet = cmd.startswith("wardrive_keepalive ")
+        if getattr(self, '_flash_io_active', False):
+            if not quiet:
+                self._term_add("[FLASH] Serial reserved until flashing finishes", raw=True)
+            return
         if cmd == "stop" and hasattr(self, "wardrive"):
             self.wardrive.on_stop()
         if self.serial and self.serial.is_open:
@@ -2770,6 +2776,9 @@ class WatchDogsGame:
 
     def _start_flash_esp32(self):
         """Start firmware flash wizard — board picker → download → flash."""
+        if getattr(self, '_serial_busy', False):
+            self.msg("[FLASH] Serial is busy; finish the current operation first", C_WARNING)
+            return
         from .config import FLASH_BOARDS
         self._flash_boards = list(FLASH_BOARDS.keys())
         self._flash_sel = 0
@@ -2802,6 +2811,7 @@ class WatchDogsGame:
         try:
             self._flash_firmware(board)
         finally:
+            self._flash_io_active = False
             self._flash_running = False
 
     def _flash_firmware(self, board: str):
@@ -2822,6 +2832,7 @@ class WatchDogsGame:
             return
 
         # Step 2: Close serial
+        self._flash_io_active = True
         port = self._boot_serial_port
         if self.serial and self.serial.is_open:
             self.serial.close()
@@ -2876,7 +2887,7 @@ class WatchDogsGame:
                 time.sleep(3)
                 self._fw_version = ""
                 self._fw_update_available = False
-                self._try_reconnect_esp32()
+                # Normal polling reconnects after the worker releases serial.
             else:
                 self._term_add(f"[FLASH] esptool error (code {proc.returncode})", raw=True)
                 self.msg("[FLASH] Flash failed!", C_ERROR)
@@ -3261,7 +3272,7 @@ class WatchDogsGame:
             return -1
 
     def _poll_serial(self):
-        if getattr(self, '_serial_busy', False):
+        if getattr(self, '_serial_busy', False) or getattr(self, '_flash_io_active', False):
             return
         if not self.serial or not self.serial.is_open:
             # Auto-reconnect: try every ~3s (90 frames at 30 FPS)
