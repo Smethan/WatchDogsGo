@@ -1,5 +1,10 @@
 # Watch Dogs Go
 
+**Smethan fork:** custom features and updates live on `main`. Use
+[fork update instructions](docs/FORK_UPDATES.md) for existing installations,
+**SYSTEM → Update WDG** for app updates, and **SYSTEM → Flash ESP32** for
+[firmware releases](https://github.com/Smethan/projectZero/releases/latest).
+
 Open-world hacking RPG with real cybersecurity tooling. A pyxel game frontend for the ESP32-C5 security device, inspired by Watch Dogs aesthetics.
 
 ![Watch Dogs Go — main screen](docs/screenshots/01_main_screen.png)
@@ -31,7 +36,7 @@ Landing page: [locosp.org](https://locosp.org) — choose your path.
 ### Quick Install (uConsole / Raspberry Pi OS / Debian)
 
 ```bash
-curl -sL https://locosp.github.io/WatchDogsGo/install | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Smethan/WatchDogsGo/main/docs/install | sudo bash
 ```
 
 The installer clones the repo to `~/python/esp32-watch-dogs/`, creates a Python virtual environment, installs all dependencies, and adds a desktop launcher.

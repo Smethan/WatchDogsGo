@@ -194,6 +194,7 @@ MENU_CATS = [
         ("u", "Upload WPA-SEC",  "_wpasec_upload",         "_wpasec_up",   None),
         ("p", "Download WPA-SEC","_wpasec_download",       "_wpasec_dl",   None),
         ("f", "Flash ESP32",    "_flash_esp32",           "_flash_esp",   None),
+        ("a", "Update WDG",      "_update_app",            "_update_app",  None),
     ]),
 ]
 
@@ -1254,31 +1255,19 @@ class WatchDogsGame:
             return False
 
     def _check_fw_update(self) -> None:
-        """Background: check GitHub for newer firmware release."""
-        from .config import FIRMWARE_RELEASE_URL
-        import json
-        from urllib.request import Request, urlopen
+        """Check only the fork's published firmware releases."""
+        from .updates import latest_release, release_version
         try:
-            req = Request(FIRMWARE_RELEASE_URL)
-            req.add_header("User-Agent", "ESP32-Watch-Dogs")
-            with urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            tag = data.get("tag_name", "")
-            remote = tag.lstrip("v")
-            local = self._fw_version.lstrip("v")
-            if remote and local:
-                r_parts = [int(x) for x in remote.split(".")]
-                l_parts = [int(x) for x in local.split(".")]
-                if r_parts > l_parts:
-                    self._fw_remote_version = remote
-                    self._fw_update_available = True
-                    self.msg(f"[FW] Update available: v{local} -> v{remote}",
-                             C_WARNING)
-                    self._term_add(
-                        f"[FW] New firmware v{remote} available! "
-                        f"(current: v{local})", raw=True)
-        except Exception:
-            pass
+            data = latest_release()
+            remote = data["tag_name"].removeprefix("v")
+            self._fw_remote_version = remote
+            if self._fw_version:
+                self._fw_update_available = release_version(remote) > release_version(self._fw_version)
+                if self._fw_update_available:
+                    self.msg(f"[FW] Smethan fork v{remote} available", C_WARNING)
+                    self._term_add(f"[FW] Smethan fork update: v{self._fw_version} -> v{remote}", raw=True)
+        except Exception as exc:
+            self._term_add(f"[FW] Fork update check unavailable: {exc}", raw=True)
 
     def _send(self, cmd: str):
         # Session lease renewals are transport housekeeping, not user actions.
@@ -1632,6 +1621,13 @@ class WatchDogsGame:
 
     def _execute_item(self, cmd: str, state_key: str, name: str,
                       field_values: list):
+        if state_key == "_update_app":
+            if getattr(self, '_app_update_running', False):
+                self.msg("[UPDATE] Already checking for updates", C_DIM)
+                return
+            self._app_update_running = True
+            threading.Thread(target=self._update_app, daemon=True).start()
+            return
         if state_key == "_hs_sniff_menu":
             self.wardrive.hs_screen.open = True
             return
@@ -2760,13 +2756,25 @@ class WatchDogsGame:
     # Flash ESP32
     # ------------------------------------------------------------------
 
+    def _update_app(self):
+        from .updates import update_app
+        from pathlib import Path
+        try:
+            changed = update_app(Path(__file__).resolve().parents[1], lambda line: self._term_add(line, raw=True))
+            self.msg("[UPDATE] Restart WDG to apply changes" if changed else "[UPDATE] Already up to date", C_SUCCESS)
+        except Exception as exc:
+            self._term_add(f"[UPDATE] Stopped: {exc}", raw=True)
+            self.msg("[UPDATE] Could not update; see console", C_WARNING)
+        finally:
+            self._app_update_running = False
+
     def _start_flash_esp32(self):
         """Start firmware flash wizard — board picker → download → flash."""
         from .config import FLASH_BOARDS
         self._flash_boards = list(FLASH_BOARDS.keys())
         self._flash_sel = 0
         self._flash_screen = True
-        self._flash_running = False
+        self._flash_running = getattr(self, '_flash_running', False)
         self.menu_open = False
 
     def _update_flash_screen(self):
@@ -2791,84 +2799,26 @@ class WatchDogsGame:
             self._esc_consumed_frame = pyxel.frame_count
 
     def _flash_do(self, board: str):
-        """Download firmware and flash in background thread."""
-        from .config import FLASH_BOARDS, FIRMWARE_RELEASE_URL
-        import json
-        import zipfile
-        import subprocess
-        import shutil
-        from urllib.request import Request, urlopen
-        from pathlib import Path
-
-        profile = FLASH_BOARDS[board]
-        fw_dir = Path(self._app_dir) / "firmware_cache"
-        fw_dir.mkdir(exist_ok=True)
-
-        self._term_add(f"[FLASH] Board: {profile['label']}", raw=True)
-
-        if board == "xiao":
-            self._term_add("[FLASH] XIAO: auto-reset via USB-JTAG (no BOOT button needed)", raw=True)
-
-        # Step 1: Download
-        self._term_add("[FLASH] Fetching latest release...", raw=True)
         try:
-            req = Request(FIRMWARE_RELEASE_URL)
-            req.add_header("User-Agent", "ESP32-Watch-Dogs")
-            with urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
+            self._flash_firmware(board)
+        finally:
+            self._flash_running = False
 
-            tag = data["tag_name"]
-            self._term_add(f"[FLASH] Release: {tag}", raw=True)
-
-            # Find ZIP
-            zip_suffix = "-xiao" if board == "xiao" else ""
-            zip_url = None
-            target = f"projectzerobylocosp{zip_suffix}"
-            for asset in data.get("assets", []):
-                name = asset["name"].lower()
-                if name.startswith(target) and name.endswith(".zip") \
-                        and "fap" not in name and "with" not in name:
-                    zip_url = asset["browser_download_url"]
-                    break
-
-            if not zip_url:
-                ver = tag.lstrip("v")
-                zip_url = (
-                    f"https://github.com/LOCOSP/projectZero/releases"
-                    f"/download/{tag}/projectZerobyLOCOSP{zip_suffix}-{ver}.zip"
-                )
-
-            self._term_add(f"[FLASH] Downloading...", raw=True)
-            self.msg("[FLASH] Downloading firmware...", C_DIM)
-
-            zip_path = fw_dir / "firmware.zip"
-            req = Request(zip_url)
-            req.add_header("User-Agent", "ESP32-Watch-Dogs")
-            with urlopen(req, timeout=120) as resp:
-                with open(zip_path, "wb") as f:
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-
-            self._term_add("[FLASH] Extracting...", raw=True)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(fw_dir)
-
-            # Verify required files
-            missing = [fn for fn in profile["offsets"]
-                       if not (fw_dir / fn).exists()]
-            if missing:
-                self._term_add(f"[FLASH] Missing: {', '.join(missing)}", raw=True)
-                self.msg("[FLASH] Download failed — missing files", C_ERROR)
-                return
-
-            self._term_add("[FLASH] Firmware ready", raw=True)
-
+    def _flash_firmware(self, board: str):
+        """Verify a fork release before closing serial or writing the ESP."""
+        from .config import FLASH_BOARDS
+        from .updates import prepare_firmware
+        import subprocess
+        from pathlib import Path
+        profile = FLASH_BOARDS[board]
+        self._term_add("[FLASH] Source: Smethan/projectZero", raw=True)
+        self._term_add(f"[FLASH] Board: {profile['label']}", raw=True)
+        try:
+            tag, fw_dir = prepare_firmware(Path(self._app_dir) / "firmware_cache", board)
+            self._term_add(f"[FLASH] {tag}: board and checksums verified", raw=True)
         except Exception as exc:
-            self._term_add(f"[FLASH] Download error: {exc}", raw=True)
-            self.msg("[FLASH] Download failed", C_ERROR)
+            self._term_add(f"[FLASH] Download/verification failed: {exc}", raw=True)
+            self.msg("[FLASH] Download failed; device untouched", C_ERROR)
             return
 
         # Step 2: Close serial
@@ -2894,7 +2844,7 @@ class WatchDogsGame:
         self._term_add("[FLASH] Flashing...", raw=True)
         self.msg("[FLASH] Flashing ESP32...", C_WARNING)
 
-        after = "hard_reset"
+        after = "hard-reset"
         cmd = [
             sys.executable, "-m", "esptool",
             "-p", port, "-b", str(profile["baud"]),
@@ -2904,7 +2854,7 @@ class WatchDogsGame:
             "write-flash",
             "--flash-mode", "dio",
             "--flash-freq", "80m",
-            "--flash-size", "detect",
+            "--flash-size", "8MB",
         ]
         for filename, offset in profile["offsets"].items():
             cmd.extend([offset, str(fw_dir / filename)])
@@ -2924,6 +2874,8 @@ class WatchDogsGame:
                 self.msg("[FLASH] Success! ESP32 rebooting...", C_SUCCESS)
                 # Reconnect after short delay
                 time.sleep(3)
+                self._fw_version = ""
+                self._fw_update_available = False
                 self._try_reconnect_esp32()
             else:
                 self._term_add(f"[FLASH] esptool error (code {proc.returncode})", raw=True)
@@ -5103,7 +5055,7 @@ class WatchDogsGame:
             is_na = cmd.startswith("_") and state_key not in (
                 "_stop_all", "_reboot", "_dl_map", "_gps_toggle",
                 "_lora_toggle", "_sdr_toggle", "_usb_toggle",
-                "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp",
+                "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp", "_update_app",
                 "_bt_hid_wip", "_bd_wip", "_race_wip", "_hs_sniff_menu"
             ) and not state_key.startswith("_p_")
             if sel:
@@ -5912,7 +5864,7 @@ class WatchDogsGame:
         pyxel.rect(dx, dy, dw, dh, 0)
         pyxel.rectb(dx, dy, dw, dh, C_WARNING)
         pyxel.rectb(dx + 1, dy + 1, dw - 2, dh - 2, C_COAST)
-        pyxel.text(dx + 4, dy + 4, "FLASH ESP32 — Select Board", C_WARNING)
+        pyxel.text(dx + 4, dy + 4, "FLASH ESP32 / Smethan fork", C_WARNING)
         pyxel.line(dx + 2, dy + 14, dx + dw - 3, dy + 14, C_COAST)
 
         if self._flash_running:

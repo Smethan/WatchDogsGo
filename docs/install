@@ -1,6 +1,6 @@
 #!/bin/bash
 # ESP32 Watch Dogs — one-line installer
-# curl -sL https://locosp.github.io/WatchDogsGo/install | sudo bash
+# curl -fsSL https://raw.githubusercontent.com/Smethan/WatchDogsGo/main/docs/install | sudo bash
 
 set -e
 
@@ -35,7 +35,7 @@ TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 [ -n "$TARGET_HOME" ] || err "Cannot resolve home directory for user '$TARGET_USER'."
 
 INSTALL_DIR="${INSTALL_DIR:-$TARGET_HOME/python/WatchDogsGo}"
-REPO_URL="https://github.com/LOCOSP/WatchDogsGo.git"
+REPO_URL="https://github.com/Smethan/WatchDogsGo.git"
 REPO_BRANCH="main"
 
 echo -e "${CYAN}"
@@ -56,16 +56,9 @@ if [ -d "$INSTALL_DIR/.git" ]; then
     echo "  Directory exists — pulling latest..."
     cd "$INSTALL_DIR" || err "Cannot enter $INSTALL_DIR"
 
-    # Detect the actual default remote branch — repo may use main OR master
-    # depending on when it was first cloned. Hardcoding either name breaks
-    # for users on the other one (this caused real install failures before).
-    DEFAULT_BRANCH=$(sudo -u "$TARGET_USER" git remote show origin 2>/dev/null \
-        | awk '/HEAD branch/ {print $NF}')
-    [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="$REPO_BRANCH"
-
-    if ! sudo -u "$TARGET_USER" git pull --ff-only origin "$DEFAULT_BRANCH"; then
-        warn "git pull failed — continuing with existing copy"
-    fi
+    # Use the fork updater so branch migration and local edits are checked.
+    [ -f scripts/update_app.py ] || err "Older checkout: pull Smethan/WatchDogsGo main once, then rerun."
+    sudo -u "$TARGET_USER" python3 scripts/update_app.py || err "Update stopped; resolve the reported Git issue first."
 elif [ -d "$INSTALL_DIR" ]; then
     err "$INSTALL_DIR exists but is not a git repo. Remove it first or set INSTALL_DIR=..."
 else

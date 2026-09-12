@@ -1,0 +1,48 @@
+name: Fork tests and releases
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: wdg-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    if: github.repository == 'Smethan/WatchDogsGo' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install pytest pyxel pyserial 'esptool>=5.0,<6' Pillow requests cryptography PyNaCl scapy bleak netifaces
+      - name: Test
+        run: |
+          python -m pytest -q tests
+          bash -n update.sh docs/install
+      - name: Check tag matches application version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python -c 'import os; from watchdogs import __version__; assert os.environ["GITHUB_REF_NAME"] == "v" + __version__'
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" --verify-tag --title "Smethan WDG $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md --latest

@@ -110,10 +110,14 @@ CMD_SCAN_BT = "scan_bt"
 CMD_SCAN_AIRTAG = "scan_airtag"
 
 # Auto-update check (Watch Dogs Go)
-APP_UPDATE_URL = "https://raw.githubusercontent.com/LOCOSP/esp32-watch-dogs/master/watchdogs/__init__.py"
+APP_UPDATE_REPO = "Smethan/WatchDogsGo"
+APP_UPDATE_BRANCH = "main"
+APP_UPDATE_URL = "https://raw.githubusercontent.com/Smethan/WatchDogsGo/main/watchdogs/__init__.py"
+UPDATE_SOURCE_LABEL = "Smethan fork"
 
 # Firmware flash settings (ESP32-C5)
-FIRMWARE_RELEASE_URL = "https://api.github.com/repos/LOCOSP/projectZero/releases/latest"
+FIRMWARE_REPO = "Smethan/projectZero"
+FIRMWARE_RELEASE_URL = f"https://api.github.com/repos/{FIRMWARE_REPO}/releases/latest"
 FLASH_CHIP = "esp32c5"
 FLASH_MODE = "dio"
 FLASH_FREQ = "80m"
@@ -129,6 +133,7 @@ FLASH_BOARDS = {
         "offsets": {
             "bootloader.bin": "0x2000",
             "partition-table.bin": "0x8000",
+            "ota_data_initial.bin": "0xf000",
             "projectZerobyLOCOSP.bin": "0x20000",
         },
     },
@@ -140,6 +145,7 @@ FLASH_BOARDS = {
         "offsets": {
             "bootloader.bin": "0x2000",
             "partition-table.bin": "0x8000",
+            "ota_data_initial.bin": "0xf000",
             "projectZerobyLOCOSP-xiao.bin": "0x20000",
         },
     },
@@ -164,33 +170,6 @@ WIGLE_API_TOKEN = _secret("WDG_WIGLE_TOKEN", "JANOS_WIGLE_TOKEN")
 WPASEC_URL = "https://wpa-sec.stanev.org/?submit"
 WPASEC_DL_URL = "https://wpa-sec.stanev.org/?api&dl=1"
 WPASEC_KEY = _secret("WDG_WPASEC_KEY", "JANOS_WPASEC_KEY")
-
-# Firmware update check
-FIRMWARE_RELEASE_URL = "https://api.github.com/repos/LOCOSP/projectZero/releases/latest"
-FLASH_BOARDS = {
-    "wroom": {
-        "label": "ESP32-C5 WROOM-1 (Dev Kit)",
-        "baud": 460800,
-        "before": "default-reset",
-        "bin_name": "projectZerobyLOCOSP.bin",
-        "offsets": {
-            "bootloader.bin": "0x2000",
-            "partition-table.bin": "0x8000",
-            "projectZerobyLOCOSP.bin": "0x20000",
-        },
-    },
-    "xiao": {
-        "label": "XIAO ESP32-C5 (Seeed Studio, USB-JTAG)",
-        "baud": 460800,
-        "before": "usb-reset",
-        "bin_name": "projectZerobyLOCOSP-xiao.bin",
-        "offsets": {
-            "bootloader.bin": "0x2000",
-            "partition-table.bin": "0x8000",
-            "projectZerobyLOCOSP-xiao.bin": "0x20000",
-        },
-    },
-}
 
 # Sound notifications (terminal bell)
 SOUND_ENABLED = _env("WDG_SOUND", "JANOS_SOUND", default="1") != "0"
