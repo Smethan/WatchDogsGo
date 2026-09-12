@@ -44,6 +44,7 @@ class WardriveUI:
         self.store_path = None
         self.invalid_records = 0
         self.last_error = ""
+        self.last_probe_error = ""
 
     def on_stop(self):
         self.scan.stop()
@@ -68,6 +69,11 @@ class WardriveUI:
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
+        if self.scan.probe_error != self.last_probe_error:
+            self.last_probe_error = self.scan.probe_error
+            if self.last_probe_error:
+                app.msg("[WDG] " + self.last_probe_error, 8)
+                app._term_add("[WDG] " + self.last_probe_error, raw=True)
         if self.scan.error and self.scan.error != self.last_error:
             self.last_error = self.scan.error
             app.msg("[WDG] " + self.last_error, 8)
@@ -110,6 +116,9 @@ class WardriveUI:
                 return True
             if self.app.loot:
                 self.app.loot.log_serial(s)
+            if d["kind"] == "capabilities":
+                support = "supported" if d["wardrive_serial_v1"] else "unsupported"
+                self.app._term_add("[WDG] Firmware replied: All Wardrive " + support, raw=True)
             if self.scan.handle(d):
                 self.observation(d)
             return True

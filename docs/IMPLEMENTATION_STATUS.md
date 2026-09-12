@@ -56,3 +56,23 @@ Local artifact directory: `/home/sam/Projects/uConsole-work/artifacts/all-wardri
 WDG's existing firmware release picker still fetches LOCOSP assets. Those upstream assets do not include this feature; any later installation must use the matching fork build. No firmware installation was performed or inferred from this implementation request.
 
 Still unperformed: real XIAO start/stop and cable replug, no-SD/no-ESP-GPS operation, reception on both Wi-Fi bands, BLE discovery rates, sparse/dense environments and a 30-minute coexistence soak. C5 Wi-Fi sniffer/BLE reception shares airtime and is documented as supported with unstable performance. The software/build tests do not establish field completeness or exact camera identity/location. Host SD write latency and renderer performance on the uConsole also need field measurement.
+
+## Capability handshake follow-up
+
+A user reported that ordinary Wi-Fi works after installing the fork, but All
+Wardrive shows the old-firmware warning. That warning previously conflated a
+missing four-second startup reply with an explicit negative capability reply.
+The host now makes three bounded attempts across eight seconds, keeps a timeout
+as unknown support, and allows another probe when All Wardrive is selected.
+Explicit positive/negative replies are shown in the terminal. Scan commands still
+require positive capability confirmation. No firmware rebuild is needed for this
+host fix; the actual cause on the user's board still requires serial evidence.
+
+With WDG closed, query the ESP32 directly (substitute its actual port):
+
+```sh
+sudo .venv/bin/python -m watchdogs.diagnose_firmware --port /dev/ttyACM0
+```
+
+This prints the version response, raw capability responses, and a result. It sends
+only version/capability queries and neither starts scanning nor flashes firmware.

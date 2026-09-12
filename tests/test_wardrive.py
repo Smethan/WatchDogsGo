@@ -67,8 +67,8 @@ def test_scan_lifecycle():
 
 def test_timeouts_and_disconnect():
     now=[0];sent=[];c=ScanController(sent.append,lambda:now[0]);c.probe()
-    now[0]=5;c.tick();assert c.supported is False and not c.start()
-    c.supported=True;c.start();now[0]=14;c.tick();assert c.state=="error" and sent[-1]=="stop"
+    now[0]=9;c.tick();assert c.supported is None and c.probe_error and not c.start()
+    c.supported=True;c.start();now[0]=18;c.tick();assert c.state=="error" and sent[-1]=="stop"
     c.reset();assert c.session=="" and c.supported is None
 
 @pytest.mark.parametrize("name,expected", [("Penguin-123",True),("Flock-abc",True),("pigvision",True),("FS Ext Battery",True),("myFlock-router",False),("Penguin",False),("1234567890",False)])
@@ -295,3 +295,37 @@ def test_suppressed_body_rule_downgrades_label():
     e=record("ble",mac="00:25:DF:00:00:01",data_hex=ad(0x16,b"\x81\xfcBWCDEVICE").hex())
     h=d.classify(e,0,suppressed_rules=["axon-body-tag"])
     assert h[0]["label"]=="Possible Axon device" and h[0]["strength"]==1
+
+
+def test_capability_retries_and_late_reply():
+    now = [0]
+    sent = []
+    c = ScanController(sent.append, lambda: now[0])
+    assert c.probe()
+    assert not c.probe()  # repeated clicks cannot postpone the timeout
+    for t in (2, 4, 6, 8):
+        now[0] = t
+        c.tick()
+    assert sent == ["get_capabilities"] * 3
+    assert c.supported is None and not c.probing and c.probe_error
+    assert c.probe()  # selecting All Wardrive retries a missed handshake
+    c.handle({"kind": "capabilities", "wardrive_serial_v1": True})
+    now[0] = 20
+    c.tick()
+    assert c.supported is True and not c.probing and not c.probe_error
+    assert c.start()
+    assert not c.probe()  # never inject a new probe cycle into an active scan
+
+
+def test_capability_negative_reply_and_reset():
+    now = [0]
+    sent = []
+    c = ScanController(sent.append, lambda: now[0])
+    c.probe()
+    c.handle({"kind": "capabilities", "wardrive_serial_v1": False})
+    now[0] = 10
+    c.tick()
+    assert c.supported is False and not c.start() and len(sent) == 1
+    c.reset()
+    c.tick()
+    assert c.supported is None and not c.probe_error and not c.probing

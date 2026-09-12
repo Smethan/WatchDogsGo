@@ -8,6 +8,11 @@ class ScanController:
 
     def reset(self):
         self.supported = None
+        self.probing = False
+        self.probe_deadline = 0
+        self.next_probe = 0
+        self.probe_attempts = 0
+        self.probe_error = ""
         self.session = ""
         self.state = "idle"
         self.seq = 0
@@ -23,9 +28,16 @@ class ScanController:
         return self.state in ("starting", "running", "stopping")
 
     def probe(self):
+        if self.active or self.probing:
+            return False
         self.supported = None
+        self.probing = True
+        self.probe_error = ""
+        self.probe_attempts = 1
+        self.probe_deadline = self.clock() + 8
+        self.next_probe = self.clock() + 2
         self.send("get_capabilities")
-        self.probe_deadline = self.clock() + 4
+        return True
 
     def start(self):
         if not self.supported or self.active:
@@ -50,6 +62,8 @@ class ScanController:
     def handle(self, d):
         if d["kind"] == "capabilities":
             self.supported = d["wardrive_serial_v1"]
+            self.probing = False
+            self.probe_error = ""
             return False
         if not self.active or d["session"] != self.session or d["seq"] <= self.seq:
             return False
@@ -72,8 +86,14 @@ class ScanController:
 
     def tick(self):
         now = self.clock()
-        if self.supported is None and now > getattr(self, "probe_deadline", float("inf")):
-            self.supported = False
+        if self.probing:
+            if now >= self.probe_deadline:
+                self.probing = False
+                self.probe_error = "No capability reply; check serial connection or retry All Wardrive"
+            elif now >= self.next_probe and self.probe_attempts < 3:
+                self.probe_attempts += 1
+                self.next_probe = now + 2
+                self.send("get_capabilities")
         if self.state in ("starting", "stopping") and now > self.deadline:
             self.state = "error"
             self.error = "Scan acknowledgement timed out; STOP before retry"

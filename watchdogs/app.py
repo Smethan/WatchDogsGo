@@ -1625,7 +1625,14 @@ class WatchDogsGame:
             self.wardrive.settings_open = True
             return
         if state_key == "all_wardrive" and not self.wardrive.scan.active and not self.wardrive.scan.supported:
-            self.msg("[WDG] All Wardrive needs the updated fork firmware (capability probe).", C_WARNING)
+            scan = self.wardrive.scan
+            if not self.serial or not self.serial.is_open:
+                self.msg("[WDG] ESP32 disconnected; reconnect and retry All Wardrive.", C_WARNING)
+            elif scan.supported is False:
+                self.msg("[WDG] Firmware reports no All Wardrive support; use the fork build.", C_WARNING)
+            else:
+                scan.probe()
+                self.msg("[WDG] Checking firmware; retry All Wardrive in a few seconds.", C_WARNING)
             return
         if state_key == "_stop_all":
             self._send("stop")
