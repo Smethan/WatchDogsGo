@@ -1,0 +1,46 @@
+{
+  "firmware_source_commit": "69550cfd150da2e54772cdf1932620c6bdec7f7a",
+  "wdg_source_commit": "3f296fd7833ec6c6dff02959d484ce65c5830393",
+  "toolchain": "espressif/idf:v6.0.1",
+  "container_digest": "sha256:efc19fae2f52fc6873630c668da26aa834139a063b5fb73a46ebc0dbd217b587",
+  "hardware_tested": false,
+  "boards": {
+    "standard": {
+      "application_image_bytes": 2244395,
+      "static_hp_sram_bytes": 216703,
+      "flash_files": {
+        "0x2000": "bootloader/bootloader.bin",
+        "0x8000": "partition_table/partition-table.bin",
+        "0xf000": "ota_data_initial.bin",
+        "0x20000": "projectZerobyLOCOSP.bin"
+      },
+      "sha256": {
+        "bootloader/bootloader.bin": "5b1f2a2546a20aa8391bcb72061bfb38c26e9c82849b63860f19f9cdcda52abf",
+        "partition_table/partition-table.bin": "23dde662052a6acc2ed73494932a349b7c87102bce5987b9141fb7545578210c",
+        "ota_data_initial.bin": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f",
+        "projectZerobyLOCOSP.bin": "7b05ca5e65c34d4c2223e53b8848ee619ad1f567650054fe812c6f4fe00b343f"
+      }
+    },
+    "xiao": {
+      "application_image_bytes": 2240593,
+      "static_hp_sram_bytes": 216891,
+      "flash_files": {
+        "0x2000": "bootloader/bootloader.bin",
+        "0x8000": "partition_table/partition-table.bin",
+        "0xf000": "ota_data_initial.bin",
+        "0x20000": "projectZerobyLOCOSP.bin"
+      },
+      "sha256": {
+        "bootloader/bootloader.bin": "e52ecd6c70e038e689c2e3d1f8511adac1bc249f71842455ec50cc958cf38ac1",
+        "partition_table/partition-table.bin": "23dde662052a6acc2ed73494932a349b7c87102bce5987b9141fb7545578210c",
+        "ota_data_initial.bin": "7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f",
+        "projectZerobyLOCOSP.bin": "9d183fb6b83bb0aa36c28c1305b4539fb3f3e4e89316b3e62bfdedf86d78b88c"
+      }
+    }
+  },
+  "baseline": {
+    "firmware_commit": "ef35e9bbed28c441f53abdb6e634cf46428f912b",
+    "standard_image_bytes": 2238713,
+    "static_hp_sram_bytes": 204161
+  }
+}

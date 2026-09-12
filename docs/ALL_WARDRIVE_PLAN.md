@@ -1,6 +1,6 @@
 # All Wardrive, notable detections and route trail plan
 
-Status: implemented and under final offline verification (2026-09-12). See IMPLEMENTATION_STATUS.md for delivered behavior, tests, build provenance and remaining hardware checks. The sections below retain the original design intent; the implementation notes take precedence where details changed.
+Status: implemented; offline verification complete (2026-09-12). Hardware validation remains separate. See IMPLEMENTATION_STATUS.md for delivered behavior, tests, build provenance and remaining hardware checks. The sections below retain the original design intent; the implementation notes take precedence where details changed.
 Date: 2026-09-12. Expanded on 2026-09-12 with Flock/Axon detection, configurable notable-marker placement and optional route recording. Ordinary marker placement remains unchanged.
 
 ## Objective and ownership
