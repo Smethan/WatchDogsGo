@@ -140,6 +140,7 @@ HACKER_QUIPS = [
 # cmd starting with "_" = special Python-side action (not ESP32 serial)
 # Attacks that require an external WiFi adapter (monitor mode)
 _NEEDS_EXT_WIFI = {"dragon_drain"}
+_NEEDS_ESP_SD = {"start_handshake"}
 
 MENU_CATS = [
     ("SCAN", [
@@ -156,6 +157,7 @@ MENU_CATS = [
         ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "handshake",    None),
         ("5", "HS Capture no SD","start_handshake_serial", "handshake",    None),
+        ("7", "HS Sniff",        "_hs_sniff_menu",        "_hs_sniff_menu", None),
     ]),
     ("ATTACK", [
         ("1", "Deauth",          "start_deauth",           "deauth",       "bssid_ch"),
@@ -1378,6 +1380,11 @@ class WatchDogsGame:
         if self.wardrive.settings_open:
             self.wardrive.update_settings()
             return
+        if self.wardrive.hs_screen.open:
+            self.wardrive.hs_screen.update()
+            # Keep transient messages aging while the capture screen is open.
+            self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
+            return
 
         # Particles
         for p in self.particles:
@@ -1621,9 +1628,21 @@ class WatchDogsGame:
 
     def _execute_item(self, cmd: str, state_key: str, name: str,
                       field_values: list):
+        if state_key == "_hs_sniff_menu":
+            self.wardrive.hs_screen.open = True
+            return
         if state_key == "_wardrive_settings":
             self.wardrive.settings_open = True
             return
+        if state_key == "hs_sniff" and not self._is_running("hs_sniff"):
+            scan = self.wardrive.scan
+            if scan.hs_supported is not True:
+                if scan.hs_supported is False:
+                    self.msg("[HS SNIFF] Needs firmware with passive serial capture support.", C_WARNING)
+                else:
+                    scan.probe()
+                    self.msg("[HS SNIFF] Checking firmware; retry in a few seconds.", C_WARNING)
+                return
         if state_key == "all_wardrive" and not self.wardrive.scan.active and not self.wardrive.scan.supported:
             scan = self.wardrive.scan
             if not self.serial or not self.serial.is_open:
@@ -1811,7 +1830,9 @@ class WatchDogsGame:
 
     def _is_running(self, state_key: str) -> bool:
         return {
-            "all_wardrive": self.wardrive.scan.active,
+            "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive",
+            "hs_sniff": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
+            "_hs_sniff_menu": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
             "wardriving":    self.wifi_scanning,
             "bt_scanning":   self.ble_scanning,
             "wifi_scan":     self._wifi_scan_only,
@@ -3929,6 +3950,7 @@ class WatchDogsGame:
         """Send stop to ESP32, close serial and GPS."""
         if hasattr(self, "wardrive"):
             self.wardrive.on_stop()
+            self.wardrive.close_passive()
         if self.serial and self.serial.is_open:
             try:
                 self.serial.send_command("stop")
@@ -3973,6 +3995,9 @@ class WatchDogsGame:
     def _draw_inner(self):
         if self._boot_phase:
             self._draw_boot_screen()
+            return
+        if self.wardrive.hs_screen.open:
+            self.wardrive.hs_screen.draw()
             return
         if self._mitm_screen:
             self._draw_mitm_screen()
@@ -4634,7 +4659,12 @@ class WatchDogsGame:
         pyxel.text(3, TERM_Y + 1, "> OUTPUT", C_HACK_CYAN)
 
         tool_name = ""
-        if self.wardrive.scan.active: tool_name = "ALL WARDRIVE " + self.wardrive.scan.state.upper()
+        if self.wardrive.scan.active:
+            if self.wardrive.scan.mode == "hs_sniff":
+                p = self.wardrive.passive
+                tool_name = f"HS SNIFF {self.wardrive.scan.state.upper()} EAPOL:{p.eapol} PMKID:{p.pmkids}"
+            else:
+                tool_name = "ALL WARDRIVE " + self.wardrive.scan.state.upper()
         elif self.capturing_hs: tool_name = "HANDSHAKE"
         elif self.wifi_scanning or self._wifi_scan_only: tool_name = "WiFi SCAN"
         elif self.ble_scanning or self._ble_scan_only: tool_name = "BT SCAN"
@@ -4863,7 +4893,9 @@ class WatchDogsGame:
         pyxel.text(220, y, f"PWN:{n_pwn}",  C_SUCCESS)
 
         tools = []
-        if self.wardrive.scan.active: tools.append("WiFi+BLE " + self.wardrive.scan.state)
+        if self.wardrive.scan.active:
+            label = "HS Sniff" if self.wardrive.scan.mode == "hs_sniff" else "WiFi+BLE"
+            tools.append(label + " " + self.wardrive.scan.state)
         if self.wifi_scanning: tools.append("WiFi")
         if self.ble_scanning: tools.append("BT")
         if self.sniffing: tools.append("SNF")
@@ -5068,7 +5100,7 @@ class WatchDogsGame:
                 "_stop_all", "_reboot", "_dl_map", "_gps_toggle",
                 "_lora_toggle", "_sdr_toggle", "_usb_toggle",
                 "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp",
-                "_bt_hid_wip", "_bd_wip", "_race_wip"
+                "_bt_hid_wip", "_bd_wip", "_race_wip", "_hs_sniff_menu"
             ) and not state_key.startswith("_p_")
             if sel:
                 bg = C_ERROR if is_stop else C_HACK_CYAN
@@ -5080,8 +5112,8 @@ class WatchDogsGame:
                 pyxel.rectb(PX, ty - 1, PW, IH, bc)
                 tc = C_ERROR if is_stop else (C_DIM if is_na else C_TEXT)
             pyxel.text(PX + 4, ty + 2, f"[{hotkey}] {label}", tc)
-            needs_wifi = state_key in _NEEDS_EXT_WIFI
-            if needs_wifi:
+            needs_warning = state_key in _NEEDS_EXT_WIFI or cmd in _NEEDS_ESP_SD
+            if needs_warning:
                 # Red warning triangle with black "!"
                 wx = PX + PW - 32
                 wy = ty + 1
@@ -5097,9 +5129,16 @@ class WatchDogsGame:
         _, sel_items = MENU_CATS[self.menu_cat]
         if self.menu_sel < len(sel_items):
             _sk = sel_items[self.menu_sel][3]
+            _cmd = sel_items[self.menu_sel][2]
             if _sk in _NEEDS_EXT_WIFI:
                 pyxel.text(PX + 3, TERM_Y - 22,
                            "\x17 Requires external WiFi adapter", C_WARNING)
+            elif _cmd in _NEEDS_ESP_SD:
+                pyxel.text(PX + 3, TERM_Y - 22,
+                           "\x17 Requires SD card on ESP32", C_WARNING)
+            elif _sk == "_hs_sniff_menu":
+                pyxel.text(PX + 3, TERM_Y - 22,
+                           "Passive HS/PMKID -> uConsole (no SD)", C_HACK_CYAN)
 
         # Navigation hint
         pyxel.text(PX + 1, TERM_Y - 10,

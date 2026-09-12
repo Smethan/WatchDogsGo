@@ -8,6 +8,8 @@ class ScanController:
 
     def reset(self):
         self.supported = None
+        self.hs_supported = None
+        self.mode = "wardrive"
         self.probing = False
         self.probe_deadline = 0
         self.next_probe = 0
@@ -31,6 +33,7 @@ class ScanController:
         if self.active or self.probing:
             return False
         self.supported = None
+        self.hs_supported = None
         self.probing = True
         self.probe_error = ""
         self.probe_attempts = 1
@@ -39,9 +42,11 @@ class ScanController:
         self.send("get_capabilities")
         return True
 
-    def start(self):
-        if not self.supported or self.active:
+    def start(self, mode="wardrive"):
+        supported = self.hs_supported if mode == "hs_sniff" else self.supported
+        if not supported or self.active:
             return False
+        self.mode = mode
         self.session = secrets.token_hex(8)
         self.seq = 0
         self.last_seen.clear()
@@ -51,7 +56,8 @@ class ScanController:
         self.deadline = self.clock() + 8
         self.last_heartbeat = self.clock()
         self.next_keepalive = self.clock() + 5
-        self.send("start_wardrive_serial " + self.session)
+        command = "start_hs_sniff_serial" if mode == "hs_sniff" else "start_wardrive_serial"
+        self.send(command + " " + self.session)
         return True
 
     def stop(self):
@@ -62,6 +68,7 @@ class ScanController:
     def handle(self, d):
         if d["kind"] == "capabilities":
             self.supported = d["wardrive_serial_v1"]
+            self.hs_supported = d.get("hs_sniff_serial_v1", False) is True
             self.probing = False
             self.probe_error = ""
             return False
@@ -82,6 +89,8 @@ class ScanController:
             self.stats = d
         if kind in ("wifi", "ble"):
             self.last_seen[kind] = self.clock()
+        if self.mode == "hs_sniff":
+            return self.state in ("running", "stopping") and kind == "hs_packet"
         return self.state == "running" and kind in ("wifi", "wifi_mgmt", "ble")
 
     def tick(self):

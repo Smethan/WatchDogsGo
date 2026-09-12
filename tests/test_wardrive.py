@@ -329,3 +329,148 @@ def test_capability_negative_reply_and_reset():
     c.reset()
     c.tick()
     assert c.supported is None and not c.probe_error and not c.probing
+
+
+def passive_frame(pmkid=True):
+    hdr = bytearray(24)
+    hdr[0:2] = b"\x08\x02"
+    hdr[4:10] = bytes.fromhex("020000000001")
+    hdr[10:16] = hdr[16:22] = bytes.fromhex("020000000002")
+    key = bytearray(99)
+    key[0:2] = b"\x02\x03"
+    key[4] = 2
+    key[5:7] = (0x008a).to_bytes(2, "big")
+    data = b"\xdd\x14\x00\x0f\xac\x04" + bytes(range(16)) if pmkid else b""
+    key[97:99] = len(data).to_bytes(2, "big")
+    key[2:4] = (len(key)-4+len(data)).to_bytes(2, "big")
+    return bytes(hdr) + b"\xaa\xaa\x03\x00\x00\x00\x88\x8e" + bytes(key) + data
+
+
+def passive_records(frame, session="test", packet=1, seq=1):
+    for offset in range(0, len(frame), 240):
+        yield dict(v=1,kind="hs_packet",session=session,seq=seq+offset//240,
+                   packet=packet,offset=offset,total=len(frame),capture_ms=1,
+                   age_ms=0,channel=6,rssi=-50,data_hex=frame[offset:offset+240].hex())
+
+
+def test_passive_pcap_pmkid_and_corrupt_fragment(tmp_path):
+    import struct
+    from watchdogs.passive_capture import PassiveCapture
+    p=PassiveCapture();p.open(tmp_path)
+    frame=passive_frame()
+    for d in passive_records(frame):
+        parsed=parse_record(wire(d));assert parsed;p.accept(parsed)
+    assert p.frames==1 and p.eapol==1 and p.pmkids==1
+    # Missing middle chunk must never become a malformed PCAP record.
+    large=frame+b"\x00"*600
+    parts=list(passive_records(large,packet=2,seq=2))
+    p.accept(parts[0]);p.accept(parts[2])
+    assert p.frames==1 and p.lost==1
+    p.close()
+    raw=p.path.read_bytes()
+    assert struct.unpack("<IHHIIII",raw[:24])[-1]==105
+    assert struct.unpack("<IIII",raw[24:40])[2:]==(len(frame),len(frame))
+    assert raw[40:]==frame
+    entry=next(d for d in map(json.loads,p.path.with_suffix(".jsonl").read_text().splitlines()) if d["kind"]=="pmkid")
+    assert entry["pmkid"]==bytes(range(16)).hex()
+    assert entry["bssid"]=="02:00:00:00:00:02" and entry["station"]=="02:00:00:00:00:01"
+
+
+def test_passive_rsn_encrypted_key_data_and_malformed():
+    from watchdogs.passive_capture import inspect_frame, rsn_pmkids
+    pmkid=bytes(range(16))
+    rsn=b"\x01\x00"+b"\x00\x0f\xac\x04"+b"\x01\x00"+b"\x00\x0f\xac\x04"+b"\x01\x00"+b"\x00\x0f\xac\x02"+b"\x00\x00"+b"\x01\x00"+pmkid
+    assert rsn_pmkids(rsn)==[pmkid]
+    assert rsn_pmkids(rsn[:-1])==[]
+    association=bytearray(28);association[0]=0
+    association+=b"\x00\x03lab"+bytes([48,len(rsn)])+rsn
+    info=inspect_frame(association)
+    assert info["pmkids"]==[pmkid.hex()] and info["ssid_hex"]==b"lab".hex()
+    encrypted=bytearray(passive_frame());encrypted[32+5]|=0x10
+    assert inspect_frame(encrypted)["pmkids"]==[]
+    assert not inspect_frame(passive_frame()[:-1])["eapol"]
+    d=next(passive_records(passive_frame()));d["offset"]=1
+    assert parse_record(wire(d)) is None
+
+
+def test_passive_capabilities_and_stop_drain(tmp_path):
+    from watchdogs.passive_capture import PassiveCapture
+    c=ScanController(Mock(),lambda:0)
+    c.handle(dict(kind="capabilities",wardrive_serial_v1=True))
+    assert c.hs_supported is False and not c.start("hs_sniff")
+    c.handle(dict(kind="capabilities",wardrive_serial_v1=True,hs_sniff_serial_v1=True))
+    assert c.start("hs_sniff")
+    assert c.send.call_args.args[0].startswith("start_hs_sniff_serial ")
+    c.handle(record("started",session=c.session,seq=1))
+    c.stop()
+    d=next(passive_records(passive_frame(),session=c.session,seq=2))
+    assert c.handle(d)  # complete queued packets are accepted during stop
+    c.handle(record("stopped",session=c.session,seq=3))
+    assert not c.handle(dict(d,seq=4))
+
+
+def test_sd_warning_matches_command_not_shared_state():
+    from watchdogs.app import MENU_CATS, _NEEDS_ESP_SD
+    for _, items in MENU_CATS:
+        for _, name, cmd, _, _ in items:
+            if name=="HS Capture":
+                assert cmd in _NEEDS_ESP_SD
+            elif name in ("HS Capture no SD", "HS Sniff"):
+                assert cmd not in _NEEDS_ESP_SD
+
+
+def test_passive_ui_capture_and_switch_back_to_wardrive(game):
+    w=game.wardrive
+    w.handle_line(wire(dict(v=1,kind="capabilities",wardrive_serial_v1=True,hs_sniff_serial_v1=True)))
+    game._start_scan_cmd("start_hs_sniff_serial","hs_sniff","HS Sniff")
+    w.handle_line("All operations stopped.")
+    assert w.passive.file and w.scan.mode=="hs_sniff"
+    token=w.scan.session
+    w.handle_line(wire(record("started",session=token,seq=1)))
+    for d in passive_records(passive_frame(),session=token,seq=2):
+        w.handle_line(wire(d))
+    assert w.passive.eapol==1 and w.passive.pmkids==1
+    assert not game.gain_xp.called  # receiving a frame is not a complete handshake
+    game._start_scan_cmd("start_wardrive_serial","all_wardrive","All Wardrive")
+    w.handle_line("All operations stopped.")
+    assert w.scan.state=="stopping" and w.passive.file
+    w.handle_line(wire(record("stopped",session=token,seq=3)))
+    assert w.passive.file is None
+    w.handle_line("All operations stopped.")
+    assert w.scan.mode=="wardrive" and w.scan.state=="starting"
+
+
+@pytest.mark.parametrize("message,key_info,nonce", [(1,0x008a,True),(2,0x010a,True),(3,0x13ca,True),(4,0x030a,False),(0,0x0382,False)])
+def test_passive_message_numbers(message,key_info,nonce):
+    from watchdogs.passive_capture import inspect_frame
+    frame=bytearray(passive_frame(False))
+    frame[37:39]=key_info.to_bytes(2,"big")
+    frame[49:81]=b"\x42"*32 if nonce else b"\x00"*32
+    assert inspect_frame(frame)["message"]==message
+
+
+def test_passive_clients_do_not_share_progress(tmp_path):
+    from watchdogs.passive_capture import PassiveCapture
+    p=PassiveCapture();p.open(tmp_path)
+    m1=passive_frame(False)
+    m4=bytearray(m1);m4[4:10]=bytes.fromhex("020000000099");m4[37:39]=(0x030a).to_bytes(2,"big")
+    for packet,frame in enumerate((m1,m4),1):
+        for d in passive_records(frame,packet=packet,seq=packet):p.accept(d)
+    assert [r["messages"] for r in p.rows.values()]==[[1,0,0,0],[0,0,0,1]]
+    p.close()
+
+
+def test_passive_menu_back_and_reopen_keeps_capture(game,monkeypatch):
+    import sys
+    px=sys.modules["pyxel"]
+    w=game.wardrive;w.scan.hs_supported=True;w.scan.start("hs_sniff")
+    w.scan.state="running"
+    game.serial.send_command.reset_mock()
+    game._execute_item("_hs_sniff_menu","_hs_sniff_menu","HS Sniff",[])
+    assert w.hs_screen.open
+    monkeypatch.setattr(px,"btnp",lambda key:key==px.KEY_ESCAPE)
+    w.hs_screen.update()
+    assert not w.hs_screen.open and w.scan.state=="running"
+    game._execute_item("_hs_sniff_menu","_hs_sniff_menu","HS Sniff",[])
+    assert w.hs_screen.open and w.scan.state=="running"
+    game.serial.send_command.assert_not_called()

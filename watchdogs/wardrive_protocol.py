@@ -3,7 +3,7 @@ import json
 import re
 MAC = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
-KINDS = {"started", "stopped", "error", "stats", "wifi", "wifi_mgmt", "ble"}
+KINDS = {"started", "stopped", "error", "stats", "wifi", "wifi_mgmt", "ble", "hs_packet"}
 
 def integer(d, key, low, high):
     v = d.get(key)
@@ -27,6 +27,17 @@ def parse_record(line):
         if kind not in KINDS or not isinstance(d.get("session"), str) or not TOKEN.fullmatch(d["session"]):
             raise ValueError("session")
         integer(d, "seq", 1, 2**32-1)
+        if kind == "hs_packet":
+            for key, low, high in (("packet",1,2**32-1), ("offset",0,2303),
+                                   ("total",24,2304), ("capture_ms",0,2**63-1),
+                                   ("age_ms",0,2000), ("channel",1,196), ("rssi",-127,20)):
+                integer(d, key, low, high)
+            value = d.get("data_hex")
+            if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2}){1,240}", value):
+                raise ValueError("data_hex")
+            if d["offset"] % 240 or len(value)//2 != min(240, d["total"]-d["offset"]):
+                raise ValueError("offset")
+            return d
         if kind in {"wifi", "wifi_mgmt", "ble"}:
             integer(d, "capture_ms", 0, 2**63-1)
             integer(d, "age_ms", 0, 2000)

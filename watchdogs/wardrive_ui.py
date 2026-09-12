@@ -9,6 +9,8 @@ from .wardrive_protocol import parse_record, display_bytes
 from .scan_controller import ScanController
 from .notable_detector import NotableDetector, ble_name
 from .wardrive_trail import FixHistory, WardriveTrail
+from .passive_capture import PassiveCapture
+from .passive_screen import PassiveScreen
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
 DEFAULTS = {"flock": True, "axon": True, "precise": True, "trail": False,
@@ -18,6 +20,8 @@ class WardriveUI:
     def __init__(self, app):
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
+        self.passive = PassiveCapture()
+        self.hs_screen = PassiveScreen(app, self)
         self.detector = NotableDetector()
         self.fixes = FixHistory()
         self.trail = WardriveTrail()
@@ -60,6 +64,7 @@ class WardriveUI:
         connection = app.serial if app.serial and app.serial.is_open else None
         if connection is not self.connection:
             self.connection = connection
+            self.close_passive()
             self.scan.reset()
             app._clear_scan_state()
             self.detector.clear()
@@ -69,6 +74,8 @@ class WardriveUI:
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
+        if not self.scan.active and self.passive.file:
+            self.close_passive()
         if self.scan.probe_error != self.last_probe_error:
             self.last_probe_error = self.scan.probe_error
             if self.last_probe_error:
@@ -96,7 +103,7 @@ class WardriveUI:
                         except (ValueError, KeyError, TypeError):
                             pass
             self.trail.set_path(session / "wardrive_trail.jsonl" if session else None)
-        active = app.wifi_scanning or app.ble_scanning or self.scan.state == "running"
+        active = app.wifi_scanning or app.ble_scanning or (self.scan.state == "running" and self.scan.mode == "wardrive")
         fix = self.fixes.at(now) if app.gps.available else None
         try:
             self.trail.sample(fix, now, self.settings["trail"] and active)
@@ -120,7 +127,17 @@ class WardriveUI:
                 support = "supported" if d["wardrive_serial_v1"] else "unsupported"
                 self.app._term_add("[WDG] Firmware replied: All Wardrive " + support, raw=True)
             if self.scan.handle(d):
-                self.observation(d)
+                if d["kind"] == "hs_packet":
+                    try:
+                        self.passive.accept(d)
+                    except OSError as exc:
+                        self.app.msg("[HS SNIFF] Storage error: " + str(exc)[:60], 8)
+                        self.app._send("stop")
+                        self.close_passive()
+                else:
+                    self.observation(d)
+            if d["kind"] == "stopped" and not self.scan.active:
+                self.close_passive()
             return True
         # Completion, not the early 'stop command received' message.
         if "all operations stopped" in s.lower() or "all stopped" in s.lower():
@@ -134,10 +151,21 @@ class WardriveUI:
             if app._pending_cmd:
                 cmd, state, name = app._pending_cmd, app._pending_state, app._pending_cmd_name
                 app._pending_cmd = None
-                if state == "all_wardrive":
+                if state in ("all_wardrive", "hs_sniff"):
                     self.detector.clear()
-                    if not self.scan.start():
-                        app.msg("[WDG] Combined scan unavailable; check firmware/connection", 8)
+                    if state == "hs_sniff":
+                        if not self.app.loot or not self.app.loot.active:
+                            app.msg("[HS SNIFF] No writable loot session; capture cancelled.", 8)
+                            return True
+                        try:
+                            self.passive.open(Path(app.loot.session_path) / "handshakes")
+                        except OSError as exc:
+                            app.msg("[HS SNIFF] Cannot save capture: " + str(exc)[:60], 8)
+                            return True
+                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive"):
+                        self.close_passive()
+                        app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
+                        return True
                 else:
                     app._send(cmd)
                     app._set_running(state, True)
@@ -148,6 +176,16 @@ class WardriveUI:
             if self.scan.state == "running":
                 return True  # delayed legacy text cannot stop a confirmed new session
         return False
+
+    def close_passive(self):
+        had_file = self.passive.file is not None
+        try:
+            self.passive.close()
+        except OSError as exc:
+            self.app.msg("[HS SNIFF] Save error: " + str(exc)[:60], 8)
+        if had_file:
+            self.app._term_add("[HS SNIFF] Capture file: " + str(self.passive.path), raw=True)
+            self.app.msg(f"[HS SNIFF] EAPOL:{self.passive.eapol} PMKID:{self.passive.pmkids}", CYAN)
 
     def observation(self, d):
         now = time.monotonic()
@@ -411,11 +449,15 @@ class WardriveUI:
                 px.text(55,293,("Heard: "+time.strftime("%H:%M:%S",time.localtime(item["last"]))+"  "+("GPS recorded" if item["observation_fix"] else "GPS unavailable")),13)
             px.camera()
             self.app._draw_mc_toast()
-        if self.scan.active and not self.settings_open:
-            now = time.monotonic()
-            ages = " ".join(k+":"+(str(int(now-self.scan.last_seen[k]))+"s" if k in self.scan.last_seen else "--") for k in ("wifi","ble"))
-            text = "Last heard "+ages+" drops:"+str(self.scan.stats.get("drops",0))+" bad:"+str(self.invalid_records)
-            if not self.app.gps_fix: text += " GPS unavailable"
+        if self.scan.active and not self.settings_open and not self.hs_screen.open:
+            if self.scan.mode == "hs_sniff":
+                text = f"Passive -> uConsole | EAPOL:{self.passive.eapol} PMKID:{self.passive.pmkids}"
+                text += f" drops:{self.scan.stats.get('drops',0)} incomplete:{self.passive.lost}"
+            else:
+                now = time.monotonic()
+                ages = " ".join(k+":"+(str(int(now-self.scan.last_seen[k]))+"s" if k in self.scan.last_seen else "--") for k in ("wifi","ble"))
+                text = "Last heard "+ages+" drops:"+str(self.scan.stats.get("drops",0))+" bad:"+str(self.invalid_records)
+                if not self.app.gps_fix: text += " GPS unavailable"
             px.rect(4,218,520,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)
         if self.alerts:

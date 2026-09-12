@@ -2,7 +2,38 @@
 
 Implemented in the user's LOCOSP-derived forks on `feature/all-wardrive`. No upstream PR, merge or push. No device connection or flashing.
 
-## Delivered
+## Passive HS Sniff update — 2026-09-12
+
+HS Sniff now has a dedicated status screen with per-AP/client PMKID and M1–M4
+counts, channel, RSSI and age. Enter starts, S stops, and Escape/Tab returns to
+the map while capture continues. Results remain available when reopening the
+screen, and after stopping until the next capture. WDG must remain open.
+The existing HS Capture item alone now warns that it requires an ESP32 SD card.
+
+The new firmware capability `hs_sniff_serial_v1` streams passive raw frames
+over serial without ESP32 SD/GPS or deauth. It runs separately from All Wardrive.
+WDG saves raw PCAP plus JSONL classifications; message counts are observations,
+not validation of a complete exchange. Firmware uses an eight-frame dynamic
+queue (about 18.5 KB) and a 10 KB worker stack only while this mode is active.
+
+Validation: **61 Python tests passed**, including M1–M4/PMKID parsing, malformed
+and encrypted inputs, packet loss, per-client separation, stop drainage,
+background screen navigation and mode changes. The firmware native harness
+passed, and both final IDF 6.0.1 builds passed. Synthetic 640×360 previews
+checked the status screen and SD warning placement. Hardware reception,
+RF silence and uConsole storage/rendering performance still need field testing.
+
+| Passive-capable build | IDF image size | Static HP SRAM |
+|---|---:|---:|
+| Standard ESP32-C5 | 2,246,311 bytes | 216,719 bytes |
+| XIAO ESP32-C5 | 2,242,509 bytes | 216,907 bytes |
+
+The new package is `artifacts/passive-hs-2026-09-12/` under the work folder,
+with separate XIAO/standard images, logs, configurations, source commits and
+checksums. See `build/passive-hs-manifest.json` for its provenance.
+The earlier All Wardrive build documented below remains a historical checkpoint.
+
+## Delivered (original All Wardrive checkpoint)
 
 - projectZero: continuous Wi-Fi management reception plus BLE discovery over a versioned serial stream without ESP32 GPS/SD requirements. Bounded callback queue, evidence-aware throttle, separate counters, two-second heartbeat, host lease, stop cleanup and console ownership guard. Existing standalone mode is retained.
 - WDG: SNIFF → **All Wardrive (6)**. GPS remains on the uConsole. Firmware capability checking, structured acknowledgments, stale-session rejection, heartbeat monitoring and explicit GPS-loss behavior. Legacy transitions clear old timers and wait for final stop completion, fixing conflicting scans/misleading labels.
