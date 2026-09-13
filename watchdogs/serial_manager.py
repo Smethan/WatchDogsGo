@@ -23,25 +23,25 @@ _ESP32_VID_PIDS: List[Tuple[int, int]] = [
     (0x303A, 0x1001),  # Espressif native USB-JTAG (ESP32-S3/C3/C6/C5)
     (0x303A, 0x4001),  # Espressif native USB-CDC (ESP32-S2)
 ]
+_ESP32_NATIVE_VID_PIDS = {(0x303A, 0x1001), (0x303A, 0x4001)}
 
 
 def detect_esp32_port() -> Optional[str]:
-    """Auto-detect ESP32 serial port by scanning USB VID/PID.
+    """Prefer one native Espressif device; never guess from a tty number.
 
-    Checks /dev/ttyUSB0-3 and /dev/ttyACM0-3 for known ESP32 USB-UART
-    bridge chips. Returns the first matching port, or None.
+    USB-UART bridge IDs are candidates, not proof of the attached chip. Multiple
+    candidates require an explicit port instead of picking the first device.
     """
-    candidates = list_usb_serial_devices()
-    esp = [c for c in candidates if c[2]]  # is_esp32 == True
-    if esp:
-        return esp[0][0]
-    # Fallback: check if any ttyUSB/ttyACM devices exist
-    for pattern in ["/dev/ttyUSB", "/dev/ttyACM"]:
-        for i in range(4):
-            dev = f"{pattern}{i}"
-            if os.path.exists(dev):
-                log.info("ESP32 fallback candidate: %s (no VID/PID)", dev)
-                return dev
+    try:
+        ports = list(serial.tools.list_ports.comports())
+    except Exception:
+        return None
+    native = [p for p in ports if (p.vid, p.pid) in _ESP32_NATIVE_VID_PIDS]
+    candidates = native or [p for p in ports if (p.vid, p.pid) in _ESP32_VID_PIDS]
+    if len(candidates) == 1:
+        return candidates[0].device
+    if candidates:
+        log.warning("Multiple ESP32 candidates; select an explicit serial port")
     return None
 
 
@@ -170,6 +170,7 @@ class SerialManager:
     def __init__(self, device: str) -> None:
         self.device = device
         self.serial_conn: Optional[serial.Serial] = None
+        self.usb_port_info = None
         self.baud_rate = BAUD_RATE
         self.line_buffer = SerialLineBuffer()
 
@@ -188,6 +189,16 @@ class SerialManager:
                 "Try: sudo usermod -a -G dialout $USER"
             )
 
+        # Preserve USB identity while the connection is established. The tty
+        # path may later disappear or be reused by another device after BOOT.
+        self.usb_port_info = None
+        try:
+            matches = [p for p in serial.tools.list_ports.comports()
+                       if os.path.realpath(p.device) == os.path.realpath(self.device)]
+            if len(matches) == 1:
+                self.usb_port_info = matches[0]
+        except Exception:
+            pass
         self.line_buffer = SerialLineBuffer()
         self.serial_conn = serial.Serial(
             port=self.device,

@@ -9,7 +9,7 @@ import sys
 import time
 
 from .config import FLASH_BOARDS
-from .serial_manager import _ESP32_VID_PIDS
+from .serial_manager import _ESP32_VID_PIDS, _ESP32_NATIVE_VID_PIDS
 
 MIN_ESPTOOL = (5, 4, 0)
 ESPTOOL_PACKAGE = "esptool>=5.4,<6"
@@ -31,6 +31,10 @@ class FlashTarget:
 
     @classmethod
     def from_port(cls, port):
+        if (port.vid, port.pid) not in _ESP32_VID_PIDS:
+            raise RuntimeError("Selected port is not a recognized ESP32 USB device; refresh the target")
+        if not (port.serial_number or port.location):
+            raise RuntimeError("USB identity unavailable; refusing to select a device by tty number alone")
         return cls(port.device, port.vid, port.pid, port.serial_number, port.location)
 
     def resolve(self, ports=None):
@@ -39,34 +43,38 @@ class FlashTarget:
         candidates = [p for p in ports if (p.vid, p.pid) == (self.vid, self.pid)]
         if self.serial_number:
             candidates = [p for p in candidates if p.serial_number == self.serial_number]
+            if len(candidates) > 1 and self.location:
+                candidates = [p for p in candidates if p.location == self.location]
         elif self.location:
             candidates = [p for p in candidates if p.location == self.location]
         else:
-            candidates = [p for p in candidates if os.path.realpath(p.device) == os.path.realpath(self.device)]
+            raise RuntimeError("USB identity unavailable; reconnect the intended ESP32 first")
         if len(candidates) != 1:
             raise RuntimeError("Selected ESP32 is missing or ambiguous; reconnect that board and retry")
         return candidates[0].device
 
 
 def select_target(preferred=None, ports=None):
-    """Honor the application's live port; otherwise require one known ESP port."""
+    """Validate a preferred port, or choose one unambiguous USB candidate."""
     ports = ports_now() if ports is None else ports
     if preferred:
         exact = [p for p in ports if os.path.realpath(p.device) == os.path.realpath(preferred)]
         if len(exact) == 1:
             return FlashTarget.from_port(exact[0])
-    candidates = [p for p in ports if (p.vid, p.pid) in _ESP32_VID_PIDS]
+        raise RuntimeError("Previous ESP32 port is missing; refresh and check the target before flashing")
+    native = [p for p in ports if (p.vid, p.pid) in _ESP32_NATIVE_VID_PIDS]
+    candidates = native or [p for p in ports if (p.vid, p.pid) in _ESP32_VID_PIDS]
     if len(candidates) != 1:
         raise RuntimeError("Connect one ESP32, or reconnect WDG to the intended board first")
     return FlashTarget.from_port(candidates[0])
 
 
 def wait_for_target(target, timeout=10):
+    if target is None:
+        raise RuntimeError("No ESP32 selected; refresh and check the target before flashing")
     end = time.monotonic() + timeout
     while True:
         try:
-            if target is None:
-                target = select_target()
             return target, target.resolve()
         except RuntimeError:
             if time.monotonic() >= end:

@@ -1,6 +1,6 @@
 # Flashing or rolling back ESP32-C5 firmware
 
-Update to **WDG 0.9.20+**, restart, and open **SYSTEM → Flash ESP32**.
+Update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
 
 1. Use **Up/Down** to choose the correct board. Use **XIAO ESP32-C5** for the Seeed
    XIAO; the WROOM image is a different board build.
@@ -10,9 +10,13 @@ Update to **WDG 0.9.20+**, restart, and open **SYSTEM → Flash ESP32**.
    retries the list request; an explicit unavailable version fails rather than
    switching to latest.
 3. Use **Left/Right** to choose **Automatic** or **Manual BOOT**.
-4. Press **Enter** to download, verify and flash the selected release. Keep USB
+4. Check **Target** and the USB identity below it. **R** refreshes USB metadata
+   without opening or resetting ports. `/dev/ttyACM2` can be correct: Linux may
+   renumber the same ESP32 after BOOT/reset. The serial number/location must
+   still identify the selected board. With no selected target, Enter is blocked.
+5. Press **Enter** to download, verify and flash the selected release. Keep USB
    connected while flashing. The first attempt may also install flashing tools.
-5. After success, release BOOT and press **Escape** to resume WDG's connection.
+6. After success, release BOOT and press **Escape** to resume WDG's connection.
 
 For **Manual BOOT**, enter download mode *while this window is open*: hold BOOT,
 tap RESET (or unplug/reconnect USB while holding BOOT), then release BOOT before
@@ -78,6 +82,16 @@ version, filename, offset and individual file hash checks. No upstream or stale
 cache fallback is used. A serial number identifies the chosen USB device across
 tty renumbering; physical USB location is used when no serial number is exposed.
 Missing or ambiguous devices stop the attempt.
+
+WDG retains USB identity from the original connection rather than trusting its
+old tty path. Without a connection identity, a preferred port must still match a
+recognized USB ID; refresh explicitly if it disappeared. A refresh retains an
+already-bound target, even if another ESP32 is plugged in. There is no arbitrary
+tty fallback or last-second automatic selection inside the flashing worker.
+Native Espressif devices take priority over generic UART bridges during initial
+auto-detection. Bridge IDs alone do not prove an ESP32 is attached; check the
+displayed adapter and board, and connect only the intended candidate if the
+selection is ambiguous. The flasher verifies the target chip before writing.
 
 ## Capture regression and rollback
 

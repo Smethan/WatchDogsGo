@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.9.21 — Identify the USB device before flashing
+
+- Remove arbitrary ttyUSB/ttyACM fallback detection. Auto-detection prefers a
+  single native Espressif device over generic USB-UART adapters and refuses
+  ambiguous candidates instead of choosing the first port.
+- Preserve USB metadata when WDG opens its serial connection, so BOOT/reset
+  renumbering cannot make the flasher trust an unrelated device at the old path.
+  Preferred paths must have recognized USB IDs; a missing preferred path never
+  silently selects another board. Serial/location identity is required.
+- Show the target port and USB ID/serial/location in the flash wizard. **R**
+  refreshes metadata without opening/resetting ports. Enter is blocked without
+  a selected target; a board appearing later is not silently selected by the
+  flashing worker. Bound targets remain bound across failed refreshes.
+- Log both the USB identity and an explicit old-port -> new-port message when
+  the same board renumbers. A shared USB-UART bridge ID identifies an adapter,
+  not the chip behind it; esptool still checks the ESP32-C5 chip before writing.
+
+Update WDG and restart. No firmware update is needed for this selection repair.
+The reported uConsole freeze has not been reproduced or attributed to a
+particular USB device; this release fixes confirmed selection weaknesses.
+
 ## 0.9.20 — uConsole flasher repair and firmware rollback selection
 
 - Remove the uConsole-only USB power cycle before flashing. Automatic mode uses

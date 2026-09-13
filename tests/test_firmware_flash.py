@@ -112,7 +112,7 @@ def app(tmp_path, monkeypatch):
     import watchdogs.app as appmod
     a = WatchDogsGame.__new__(WatchDogsGame)
     a._app_dir = str(tmp_path)
-    a.serial = Mock(device="/dev/ttyACM0",is_open=True)
+    a.serial = Mock(device="/dev/ttyACM0",is_open=True,usb_port_info=None)
     a.state = NS(connected=True)
     a._esp32 = True; a._boot_serial_port = "/dev/ttyACM0"
     a._term_add = Mock(); a.msg = Mock(); a.wardrive = Mock()
@@ -222,3 +222,94 @@ def test_missing_selected_version_fails_without_latest_fallback(app, monkeypatch
     app._flash_do('xiao')
     prepare.assert_not_called()
     assert 'Selected firmware version is unavailable' in app._flash_log_path.read_text()
+
+
+def test_preferred_path_must_have_recognized_usb_identity():
+    unrelated = port('/dev/ttyACM2', vid=0x2c7c, pid=0x0125, serial='MODEM')
+    with pytest.raises(RuntimeError, match='not a recognized'):
+        flash.select_target('/dev/ttyACM2', [unrelated, port()])
+    with pytest.raises(RuntimeError, match='Previous ESP32 port is missing'):
+        flash.select_target('/dev/ttyACM0', [port('/dev/ttyACM2', serial='DIFFERENT')])
+    with pytest.raises(RuntimeError, match='identity unavailable'):
+        flash.select_target(None, [port(serial=None, location=None)])
+
+
+def test_native_esp_is_preferred_to_generic_uart_bridge():
+    bridge = port('/dev/ttyACM0', vid=0x1a86, pid=0x7523, serial='UART')
+    native = port('/dev/ttyACM2')
+    assert flash.select_target(None, [bridge, native]).device == native.device
+    # An explicit recognized connection still wins, for external UART boards.
+    assert flash.select_target(bridge.device, [bridge, native]).device == bridge.device
+
+
+def test_no_target_cannot_silently_choose_new_usb_device(monkeypatch):
+    scan = Mock(return_value=[port()]); monkeypatch.setattr(flash, 'ports_now', scan)
+    with pytest.raises(RuntimeError, match='No ESP32 selected'):
+        flash.wait_for_target(None, timeout=0)
+    scan.assert_not_called()
+
+
+def test_duplicate_serial_number_uses_usb_location():
+    original = port(serial='0001', location='1-2')
+    target = flash.FlashTarget.from_port(original)
+    assert target.resolve([port('/dev/ttyACM1', serial='0001', location='1-3'),
+                           port('/dev/ttyACM2', serial='0001', location='1-2')]) == '/dev/ttyACM2'
+
+
+def test_wizard_uses_connection_identity_when_old_path_is_reused(app, monkeypatch):
+    app.serial.usb_port_info = port()
+    monkeypatch.setattr(flash, 'ports_now', lambda:[
+        port('/dev/ttyACM0', vid=0x2c7c, pid=0x0125, serial='MODEM'), port('/dev/ttyACM2')])
+    app._start_flash_esp32()
+    assert app._flash_target.serial_number == 'ESP-ONE'
+    assert app._flash_target_label == '/dev/ttyACM2'
+    assert app._flash_target.resolve() == '/dev/ttyACM2'
+
+
+def test_missing_wizard_target_blocks_enter_until_explicit_refresh(app, monkeypatch):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(flash, 'ports_now', lambda:[port(vid=0x9999, pid=1)])
+    app._start_flash_esp32(); assert app._flash_target is None
+    worker = Mock(); monkeypatch.setattr(appmod.threading, 'Thread', worker)
+    monkeypatch.setattr(appmod.pyxel, 'btnp', lambda k:k==appmod.pyxel.KEY_RETURN)
+    app._update_flash_screen(); worker.assert_not_called()
+    assert not app._flash_running
+    monkeypatch.setattr(flash, 'ports_now', lambda:[port('/dev/ttyACM2')])
+    monkeypatch.setattr(appmod.pyxel, 'btnp', lambda k:k==appmod.pyxel.KEY_R)
+    app._update_flash_screen()
+    assert app._flash_target_label == '/dev/ttyACM2'
+    assert app._flash_target.serial_number == 'ESP-ONE'
+
+
+def test_refresh_does_not_switch_a_bound_target_to_another_esp(app, monkeypatch):
+    app._start_flash_esp32(); original=app._flash_target
+    monkeypatch.setattr(flash, 'ports_now', lambda:[port(serial='OTHER')])
+    app._flash_refresh_target()
+    assert app._flash_target == original
+    assert 'missing or ambiguous' in app._flash_target_label
+
+
+def test_serial_autodetection_does_not_use_tty_number_or_first_candidate(monkeypatch):
+    from watchdogs import serial_manager as sm
+    monkeypatch.setattr(sm.os.path, 'exists', lambda _:True)
+    readings = iter([[], [port(vid=0x9999, pid=1)],
+                     [port(),port('/dev/ttyACM2',serial='OTHER')],
+                     [port('/dev/ttyUSB0',vid=0x10c4,pid=0xea60),port('/dev/ttyACM2')]])
+    monkeypatch.setattr(sm.serial.tools.list_ports, 'comports', lambda:next(readings))
+    assert sm.detect_esp32_port() is None
+    assert sm.detect_esp32_port() is None
+    assert sm.detect_esp32_port() is None
+    assert sm.detect_esp32_port() == '/dev/ttyACM2'
+
+
+def test_serial_connection_retains_usb_identity_without_probing_other_ports(monkeypatch):
+    from watchdogs import serial_manager as sm
+    original=port(); other=port('/dev/ttyACM2', serial='GPS')
+    monkeypatch.setattr(sm.os.path,'exists',lambda _:True)
+    monkeypatch.setattr(sm.os,'access',lambda *a:True)
+    monkeypatch.setattr(sm.serial.tools.list_ports,'comports',lambda:[original,other])
+    serial_open=Mock();monkeypatch.setattr(sm.serial,'Serial',serial_open)
+    connection=sm.SerialManager(original.device);connection.setup();connection.close()
+    assert connection.usb_port_info is original
+    assert serial_open.call_count==1
+    assert serial_open.call_args.kwargs['port']==original.device

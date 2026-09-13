@@ -2810,7 +2810,7 @@ class WatchDogsGame:
             self.menu_open = False
             return
         from .config import FLASH_BOARDS
-        from .firmware_flash import select_target
+        from .firmware_flash import FlashTarget, select_target
         self._flash_boards = list(FLASH_BOARDS.keys())
         self._flash_sel = getattr(self, '_flash_sel', 0)
         self._flash_manual = getattr(self, '_flash_manual', False)
@@ -2828,11 +2828,14 @@ class WatchDogsGame:
         preferred = getattr(self.serial, 'device', None) or getattr(self, '_boot_serial_port', None)
         if not getattr(self, '_flash_target', None):
             try:
-                self._flash_target = select_target(preferred)
+                identity = getattr(self.serial, 'usb_port_info', None)
+                self._flash_target = (FlashTarget.from_port(identity) if identity is not None
+                                      else select_target(preferred))
             except RuntimeError as exc:
                 self._flash_target = None
                 self._term_add("[FLASH] " + str(exc), raw=True)
         self._reconnect_flash_target = self._flash_target
+        self._flash_refresh_target(discover=False)
         self.wardrive.on_stop()  # local state only: _send is now reserved
         self.wardrive.close_passive()
         self.wardrive.capture.finish("disconnected")
@@ -2842,6 +2845,23 @@ class WatchDogsGame:
         self._esp32 = False
         self.state.connected = False
         self._term_add("[FLASH] WDG serial paused; USB power is left on. ESC resumes normal use.", raw=True)
+
+    def _flash_refresh_target(self, discover=True):
+        """Read USB metadata only; never open/reset a port to identify it."""
+        from .firmware_flash import select_target
+        try:
+            if not getattr(self, '_flash_target', None):
+                if not discover:
+                    raise RuntimeError("No target selected; R refreshes recognized USB devices")
+                self._flash_target = select_target()
+            target = self._flash_target
+            port = target.resolve()
+            self._flash_target_label = port
+            self._reconnect_flash_target = target
+            self._term_add(f"[FLASH] Target: {port}, USB {target.vid:04X}:{target.pid:04X}, "
+                           f"serial {target.serial_number or 'unknown'}, location {target.location or 'unknown'}", raw=True)
+        except RuntimeError as exc:
+            self._flash_target_label = str(exc)
 
     def _flash_load_releases(self):
         from .updates import firmware_releases
@@ -2885,7 +2905,12 @@ class WatchDogsGame:
             self._flash_cycle_version(1)
         elif pyxel.btnp(pyxel.KEY_B):
             self._flash_cycle_version(-1)
+        elif pyxel.btnp(pyxel.KEY_R):
+            self._flash_refresh_target()
         elif pyxel.btnp(pyxel.KEY_RETURN):
+            if not getattr(self, '_flash_target', None):
+                self.msg("[FLASH] No target selected. Press R and check the USB device first", C_WARNING)
+                return
             board = self._flash_boards[self._flash_sel]
             self._flash_running = True
             self._term_add(f"[FLASH] Selected: {board}", raw=True)
@@ -2918,6 +2943,8 @@ class WatchDogsGame:
                 log_file.write(message + "\n")
                 log_file.flush()
         try:
+            if not getattr(self, '_flash_target', None):
+                raise RuntimeError("No ESP32 selected; press R and check the target before flashing")
             cache.mkdir(parents=True, exist_ok=True)
             self._flash_log_path = cache / f"flash-{time.time_ns()}.log"
             log_file = self._flash_log_path.open("x", encoding="utf-8")
@@ -2941,7 +2968,10 @@ class WatchDogsGame:
             target, port = wait_for_target(getattr(self, '_flash_target', None))
             self._flash_target = self._reconnect_flash_target = target
             self._boot_serial_port = port
-            report(f"Port: {port} / USB {target.vid}:{target.pid} / serial {target.serial_number or 'unknown'}")
+            self._flash_target_label = port
+            report(f"Port: {port} / USB {target.vid:04X}:{target.pid:04X} / serial {target.serial_number or 'unknown'} / location {target.location or 'unknown'}")
+            if port != target.device:
+                report(f"Same USB device renumbered: {target.device} -> {port}")
             manual = getattr(self, '_flash_manual', False)
             report("Manual BOOT: no pre-reset, 115200 baud" if manual else "Automatic: script reset sequence, 460800 baud")
             self._flash_status = "Flashing; keep USB connected..."
@@ -5936,7 +5966,7 @@ class WatchDogsGame:
         """Board picker with a manual mode that preserves ROM boot state."""
         from .config import FLASH_BOARDS
         boards = list(FLASH_BOARDS.items())
-        dw, dh = 500, 216
+        dw, dh = 500, 252
         dx, dy = (W - dw) // 2, (H - dh) // 2
         pyxel.rect(dx, dy, dw, dh, 0)
         pyxel.rectb(dx, dy, dw, dh, C_WARNING)
@@ -5970,8 +6000,14 @@ class WatchDogsGame:
         fw_info = "Firmware: " + ("v" + self._fw_version if self._fw_version else "unknown")
         if self._fw_update_available:
             fw_info += " -> v" + self._fw_remote_version
-        pyxel.text(dx + 8, dy + 163, fw_info, C_DIM)
-        pyxel.text(dx + 8, dy + 179, "WDG serial is paused while this window is open.", C_DIM)
+        pyxel.text(dx + 8, dy + 160, "Target: " + getattr(self, '_flash_target_label', 'Not selected')[:110], C_HACK_CYAN)
+        target = getattr(self, '_flash_target', None)
+        if target:
+            identity = f"USB {target.vid:04X}:{target.pid:04X}  Serial: {target.serial_number or 'unknown'}  Location: {target.location or 'unknown'}"
+            pyxel.text(dx + 8, dy + 174, identity[:119], C_DIM)
+        pyxel.text(dx + 8, dy + 192, fw_info, C_DIM)
+        pyxel.text(dx + 8, dy + 206, "R refreshes target (no USB reset). Check it before ENTER.", C_WARNING)
+        pyxel.text(dx + 8, dy + 220, "WDG serial is paused while this window is open.", C_DIM)
         pyxel.text(dx + 8, dy + dh - 16, "UP/DOWN board   ENTER flash   ESC exit / reconnect", C_DIM)
 
     def _draw_captured_data(self):
