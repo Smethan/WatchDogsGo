@@ -192,3 +192,32 @@ def test_capture_draw_unknown_values_and_progress_late(game, monkeypatch):
     text.reset_mock(); w.capture_screen.draw()
     assert any("capture has not been stopped" in c.args[2] for c in text.call_args_list)
     assert w.capture.current.active
+
+
+def test_early_stop_ack_waits_for_file_cleanup_before_next_mode(game):
+    w = game.wardrive
+    w.capture.start(COMMANDS["serial"])
+    w.handle_line(wire(status()))
+    game._start_scan_cmd(COMMANDS["sd"], "handshake_start", "HS Capture")
+    w.handle_line(wire(status("stopped", seq=2)))
+    assert w.capture.current.state == "finishing"
+    w.handle_line("All operations stopped.")
+    assert w.capture_stop_ack and game._pending_cmd == COMMANDS["sd"]
+    assert w.capture.current.active and w.capture.storage == "serial"
+    w.tick()
+    assert game._pending_cmd == COMMANDS["sd"]
+    w.handle_line("Handshake attack cleanup complete.")
+    # Dispatch next tick, so the old cleanup line cannot clear the new HS flag.
+    w.tick()
+    assert game._pending_cmd is None and w.capture.storage == "sd"
+    assert w.capture.current.state == "starting" and game.capturing_hs
+
+
+def test_old_firmware_cleanup_and_forced_stop():
+    c = HandshakeCapture(); c.start(COMMANDS["serial"])
+    c.handle("Handshake attack cleanup...")
+    assert c.current.cleanup_pending
+    c.handle("Handshake attack task forcefully stopped.")
+    assert c.current.state == "error" and not c.current.active
+    c.handle(wire(status("stopped", seq=5)))
+    assert c.current.state == "error"

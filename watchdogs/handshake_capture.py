@@ -50,6 +50,7 @@ class CaptureRun(PassiveCapture):
         self.session = None
         self.seq = self.gaps = self.drops = self.invalid = 0
         self.last_progress = 0
+        self.cleanup_pending = False
         self.note = "Live PMKID/M1-M4 progress requires ESP firmware 1.7.4+."
 
     @property
@@ -74,7 +75,7 @@ class HandshakeCapture:
         run.state = "starting"
 
     def stop(self):
-        if self.current and self.current.active:
+        if self.current and self.current.active and self.current.state != "finishing":
             self.current.state = "stopping"
 
     def finish(self, state="stopped"):
@@ -95,6 +96,11 @@ class HandshakeCapture:
                     run.state = "running"
                 elif "handshake attack cleanup complete" in lower or "handshake attack task finished" in lower:
                     self.finish()
+                elif "handshake attack task forcefully stopped" in lower:
+                    run.note = "Firmware forced capture to stop; file output may be incomplete."
+                    self.finish("error")
+                elif "handshake attack cleanup..." in lower:
+                    run.cleanup_pending = True
                 elif "failed to create handshake attack task" in lower or "failed to enable ap mode" in lower:
                     run.note = line[-110:]
                     self.finish("error")
@@ -129,6 +135,7 @@ class HandshakeCapture:
             run.drops = d["drops"]
             if d["kind"] == "stopped":
                 run.close()
+                run.cleanup_pending = True
                 run.state = "finishing"
                 run.note = "Capture ending; waiting for file output / cleanup."
         return True

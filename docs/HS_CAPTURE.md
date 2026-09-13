@@ -20,7 +20,7 @@ The original SD capture retains its warning triangle and SD requirement.
 
 ## Updates and storage
 
-Use **WDG 0.9.18+** and **Smethan projectZero firmware 1.7.4+** for the live
+Use **WDG 0.9.19+** and **Smethan projectZero firmware 1.7.4+** for the live
 PMKID/M1/M2/M3/M4 table. Update WDG through SYSTEM → Update WDG and restart;
 flash the correct board through SYSTEM → Flash ESP32. The XIAO ESP32-C5 requires
 the XIAO image.
@@ -33,6 +33,8 @@ the XIAO image.
 Progress copies do not create a second PCAP or change when the existing capture
 files are saved. No-SD capture still keeps its capture data on the ESP32 until
 the existing file dump runs; the table does not make it crash-persistent.
+WDG 0.9.19 waits for final capture cleanup even if the firmware's general stop
+acknowledgement arrives first, so a pending mode switch cannot start mid-dump.
 
 With older firmware, capture still works. WDG displays any existing M1–M4
 log sightings under their AP, with unknown client/channel/RSSI. **PMKID: N/A**

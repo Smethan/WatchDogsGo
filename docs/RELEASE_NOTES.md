@@ -1,5 +1,13 @@
 # Smethan WatchDogsGo
 
+## 0.9.19 — Wait for HS Capture file transfer on stop
+
+- Keep the capture finishing indicator and defer pending mode switches when
+  firmware reports "all operations stopped" before its no-SD file dump ends.
+  The final capture cleanup line releases the transition. Forced task stops
+  show an error instead of claiming the capture completed normally.
+- Includes the 0.9.18 progress submenus below; firmware 1.7.4 remains current.
+
 ## 0.9.18 — HS Capture progress screens
 
 - **HS Capture** and **HS Capture no SD** now open background-friendly submenus

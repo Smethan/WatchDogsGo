@@ -28,6 +28,7 @@ class WardriveUI:
         self.hs_screen = PassiveScreen(app, self)
         self.capture = HandshakeCapture()
         self.capture_screen = HandshakeScreen(app, self)
+        self.capture_stop_ack = False
         self.detector = NotableDetector()
         self.fixes = FixHistory()
         self.trail = WardriveTrail()
@@ -82,6 +83,7 @@ class WardriveUI:
             self.connection = connection
             self.close_passive()
             self.capture.finish("disconnected")
+            self.capture_stop_ack = False
             app.capturing_hs = False
             self.scan.reset()
             app._clear_scan_state()
@@ -89,6 +91,11 @@ class WardriveUI:
             self.trail.break_segment()
             if connection:
                 self.scan.probe()
+        # Legacy stop acknowledgement may precede the no-SD base64 dump.
+        # Resume transitions only after its cleanup line was fully processed.
+        if self.capture_stop_ack and self.capture.current and not self.capture.current.active:
+            self.capture_stop_ack = False
+            self.handle_line("All operations stopped.")
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
@@ -178,6 +185,9 @@ class WardriveUI:
         # Completion, not the early 'stop command received' message.
         if "all operations stopped" in s.lower() or "all stopped" in s.lower():
             app = self.app
+            if self.capture.current and self.capture.current.active and self.capture.current.cleanup_pending:
+                self.capture_stop_ack = True
+                return True
             self.capture.finish()
             if self.scan.state != "running":
                 app.sniffing = app.capturing_hs = False
