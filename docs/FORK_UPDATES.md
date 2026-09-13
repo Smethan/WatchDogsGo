@@ -70,8 +70,10 @@ the update; upstream binaries and stale cached files are never substituted.
 The firmware ZIP includes the bootloader, partition table, initial OTA data and
 application for the existing 8 MB layout. Flashing still requires working serial
 access and may need the physical BOOT/RESET buttons depending on the hardware.
-Onboard firmware OTA is fully configured after installing firmware 1.7.2 or
-later; old firmware still has the LOCOSP OTA URL compiled into it. Stable/tagged
+WDG 0.9.22 adds [SYSTEM → Wi-Fi OTA](FIRMWARE_OTA.md). Onboard firmware OTA is
+fully configured after installing firmware 1.7.2 or later; 1.7.1 has an OTA
+project-name validation mismatch, and older upstream firmware may still have
+the LOCOSP OTA URL compiled into it. Stable/tagged
 OTA uses the matching board's standalone application. Development-branch OTA is
 disabled because this fork publishes versioned release assets.
 

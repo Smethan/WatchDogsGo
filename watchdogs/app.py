@@ -22,6 +22,7 @@ from pathlib import Path
 import pyxel
 
 from .serial_manager import SerialManager, detect_esp32_port
+from .ota_ui import OtaMixin
 from .gps_manager import GpsManager
 from .wardrive_ui import WardriveUI
 from .loot_manager import LootManager
@@ -196,6 +197,7 @@ MENU_CATS = [
         ("u", "Upload WPA-SEC",  "_wpasec_upload",         "_wpasec_up",   None),
         ("p", "Download WPA-SEC","_wpasec_download",       "_wpasec_dl",   None),
         ("f", "Flash ESP32",    "_flash_esp32",           "_flash_esp",   None),
+        ("o", "Wi-Fi OTA",       "_ota_esp32",             "_ota_esp",     None),
         ("a", "Update WDG",      "_update_app",            "_update_app",  None),
     ]),
 ]
@@ -348,7 +350,7 @@ class MapProjection:
 # Main game
 # ---------------------------------------------------------------------------
 
-class WatchDogsGame:
+class WatchDogsGame(OtaMixin):
 
     def __init__(self, serial_port=None, loot_path=None):
         pyxel.init(W, H, title="ESP32 Watch Dogs", fps=FPS,
@@ -1385,8 +1387,12 @@ class WatchDogsGame:
             self._pending_cmd = None
             self.msg("[ERR] Stop not confirmed; command cancelled. Retry STOP.", C_ERROR)
 
-        self._update_hack()
+        if not getattr(self, '_ota_screen', False):
+            self._update_hack()
         self._update_wardriving_loop()
+        if getattr(self, '_ota_screen', False):
+            self._update_ota_screen()
+            return
         if self.wardrive.settings_open:
             self.wardrive.update_settings()
             return
@@ -1642,6 +1648,12 @@ class WatchDogsGame:
 
     def _execute_item(self, cmd: str, state_key: str, name: str,
                       field_values: list):
+        if getattr(self, '_ota_reserved', False):
+            self.msg('[OTA] Finish the OTA update and close its result first', C_WARNING)
+            return
+        if state_key == "_ota_esp":
+            self._open_ota()
+            return
         if state_key == "_update_app":
             if getattr(self, '_app_update_running', False):
                 self.msg("[UPDATE] Already checking for updates", C_DIM)
@@ -2488,6 +2500,9 @@ class WatchDogsGame:
         self.glitch_timer = 2
 
     def _toggle_usb(self):
+        if getattr(self, '_flash_io_active', False):
+            self.msg('[UPDATE] USB is reserved; finish the update first', C_WARNING)
+            return
         new_state = not self._usb_enabled
         if not self._aio_available:
             self.msg("[USB] AIO v2 not available", C_ERROR)
@@ -2802,6 +2817,9 @@ class WatchDogsGame:
 
     def _start_flash_esp32(self):
         """Pause normal serial I/O before the user can enter manual BOOT mode."""
+        if getattr(self, '_ota_reserved', False):
+            self.msg('[OTA] Finish the OTA update first', C_WARNING)
+            return
         if getattr(self, '_serial_busy', False):
             self.msg("[FLASH] Serial is busy; finish the current operation first", C_WARNING)
             return
@@ -4160,6 +4178,8 @@ class WatchDogsGame:
             self._draw_confirm_quit()
         if self._gps_wait_dialog:
             self._draw_gps_wait_dialog()
+        if getattr(self, '_ota_screen', False):
+            self._draw_ota_screen()
 
     def _draw_coastlines(self):
         vl = self.proj.center_lat - self.proj.lat_span
@@ -5165,7 +5185,7 @@ class WatchDogsGame:
             is_na = cmd.startswith("_") and state_key not in (
                 "_stop_all", "_reboot", "_dl_map", "_gps_toggle",
                 "_lora_toggle", "_sdr_toggle", "_usb_toggle",
-                "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp", "_update_app",
+                "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp", "_ota_esp", "_update_app",
                 "_bt_hid_wip", "_bd_wip", "_race_wip", "_hs_sniff_menu"
             ) and not state_key.startswith("_p_")
             if sel:

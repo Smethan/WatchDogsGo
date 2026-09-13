@@ -1,5 +1,27 @@
 # Smethan WatchDogsGo
 
+## 0.9.22 — Update ESP32 firmware over Wi-Fi
+
+- Add **SYSTEM → Wi-Fi OTA** with masked network details, published version
+  selection, download progress, and post-reboot verification. The ESP32 downloads
+  its board-specific app directly from **Smethan/projectZero** using existing
+  firmware commands; the firmware image does not pass through USB/esptool.
+- Require running fork firmware **1.7.2+**, its serial capabilities, and a valid
+  two-slot OTA layout before requesting the update. Select explicit stable tags,
+  including older compatible releases. No extra firmware build or SD card needed.
+- Stop scans, reserve serial ownership, and block USB power toggling during the
+  update. Reconnect only to the original USB identity. Report success only after
+  confirming the requested version in the expected, valid OTA slot; uncertain
+  outcomes remain unconfirmed and are never automatically retried.
+- Keep passwords and firmware command echoes out of WDG logs; clear the UI's
+  password on start/exit. Existing firmware may save successful Wi-Fi credentials
+  on its SD card. Keep ESP32 power connected throughout the operation.
+
+See [Wi-Fi OTA instructions and limitations](FIRMWARE_OTA.md). This bypasses bulk
+USB transfers, but still needs working application-mode USB commands and stable
+power. Offline protocol/failure tests, live release-list validation and rendered
+screens were checked. An end-to-end OTA on the affected uConsole is still pending.
+
 ## 0.9.21 — Identify the USB device before flashing
 
 - Remove arbitrary ttyUSB/ttyACM fallback detection. Auto-detection prefers a

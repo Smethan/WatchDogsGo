@@ -175,7 +175,7 @@ A pyxel-based game where you walk around a real-world map while your ESP32 scans
 - Flipper Zero integration — SubGHz scanner/replay, NFC read/emulate
 - MeshCore toast notifications — always-on-top across all screens
 - Auto-reconnect ESP32 after USB replug
-- Firmware version check + OTA update notification + ESP32 flasher
+- Firmware version check + [Wi-Fi OTA updater](docs/FIRMWARE_OTA.md) + ESP32 USB flasher
 
 ## Install
 

@@ -1,6 +1,9 @@
 # Flashing or rolling back ESP32-C5 firmware
 
-Update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
+For a Wi-Fi update that avoids sending the image through USB, use
+[SYSTEM → Wi-Fi OTA](FIRMWARE_OTA.md) in **WDG 0.9.22+**.
+
+For a full USB installation, update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
 
 1. Use **Up/Down** to choose the correct board. Use **XIAO ESP32-C5** for the Seeed
    XIAO; the WROOM image is a different board build.
