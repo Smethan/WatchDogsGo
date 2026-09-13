@@ -1,5 +1,22 @@
 # Smethan WatchDogsGo
 
+## 0.9.18 — HS Capture progress screens
+
+- **HS Capture** and **HS Capture no SD** now open background-friendly submenus
+  in both SNIFF and ATTACK, with per-AP/client PMKID and M1/M2/M3/M4 columns.
+  Enter starts, S stops, Escape/Tab returns to the map without stopping.
+- Live packet progress requires **Smethan projectZero 1.7.4+**. Older firmware
+  retains its capture behavior with coarse M-number logs where available;
+  live PMKIDs are marked unavailable. Channel/RSSI are not guessed.
+- Existing active behavior and SD/no-SD file destinations are unchanged. The
+  SD warning remains visible, and serial capture waits for its file dump on stop.
+- Clarified the note in both capture screens: packet counts do not establish
+  matching handshake pairs. Fixed completion logs re-enabling the HS indicator.
+
+Update WDG and restart, then use SYSTEM → Flash ESP32 with the correct board
+image for full progress support. See [HS Capture](HS_CAPTURE.md) for controls,
+storage timing, counter interpretation and firmware details.
+
 ## 0.9.17 — ESP32 default and explicit host BLE option
 
 - **All Wardrive (6)** uses the ESP32 for both Wi-Fi and BLE again, with the

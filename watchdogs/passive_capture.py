@@ -112,7 +112,10 @@ def inspect_frame(frame):
 
 
 class PassiveCapture:
-    def __init__(self):
+    def __init__(self, *, monitor_only=False):
+        # Active capture already owns its PCAP destination on the firmware.
+        # Reuse bounded frame assembly/observations without a second PCAP.
+        self.monitor_only = monitor_only
         self.file = self.events = None
         self.path = None
         self.frames = self.eapol = self.pmkids = self.lost = 0
@@ -165,7 +168,7 @@ class PassiveCapture:
             raise error
 
     def accept(self, d):
-        if not self.file:
+        if not self.file and not self.monitor_only:
             return
         if d["offset"] == 0:
             if self.partial:
@@ -188,8 +191,9 @@ class PassiveCapture:
         frame = bytes(p["data"])
         self.partial = None
         at = p["at"]
-        self.file.write(struct.pack("<IIII", int(at), int((at % 1)*1000000), len(frame), len(frame)))
-        self.file.write(frame)
+        if self.file:
+            self.file.write(struct.pack("<IIII", int(at), int((at % 1)*1000000), len(frame), len(frame)))
+            self.file.write(frame)
         self.frames += 1
         info = inspect_frame(frame)
         self.eapol += int(info["eapol"])
@@ -209,9 +213,10 @@ class PassiveCapture:
         if info["message"]:
             if row:
                 row["messages"][info["message"]-1] += 1
-            self.events.write(json.dumps(dict(at=at, kind="eapol", message=info["message"],
-                replay=info["replay"], bssid=info["bssid"], station=info["station"],
-                ssid_hex=info["ssid_hex"], channel=d["channel"], rssi=d["rssi"])) + "\n")
+            if self.events:
+                self.events.write(json.dumps(dict(at=at, kind="eapol", message=info["message"],
+                    replay=info["replay"], bssid=info["bssid"], station=info["station"],
+                    ssid_hex=info["ssid_hex"], channel=d["channel"], rssi=d["rssi"])) + "\n")
         for pmkid in info["pmkids"]:
             key = (info["bssid"], info["station"], pmkid)
             if key in self.seen:
@@ -222,9 +227,12 @@ class PassiveCapture:
             self.pmkids += 1
             if row:
                 row["pmkids"] += 1
-            self.events.write(json.dumps(dict(at=at, kind="pmkid", pmkid=pmkid,
-                bssid=info["bssid"], station=info["station"], ssid_hex=info["ssid_hex"],
-                channel=d["channel"], rssi=d["rssi"])) + "\n")
+            if self.events:
+                self.events.write(json.dumps(dict(at=at, kind="pmkid", pmkid=pmkid,
+                    bssid=info["bssid"], station=info["station"], ssid_hex=info["ssid_hex"],
+                    channel=d["channel"], rssi=d["rssi"])) + "\n")
+        if not self.file:
+            return
         self.file.flush()  # preserve complete records even if the app crashes
         self.events.flush()
         if time.monotonic() - self.last_flush >= 1:

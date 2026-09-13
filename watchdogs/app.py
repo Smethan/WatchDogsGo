@@ -157,17 +157,17 @@ MENU_CATS = [
         ("8", "ESP Dual Test", "start_wardrive_serial", "all_wardrive_test", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
-        ("4", "HS Capture",      "start_handshake",        "handshake",    None),
-        ("5", "HS Capture no SD","start_handshake_serial", "handshake",    None),
+        ("4", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
+        ("5", "HS Capture no SD","start_handshake_serial", "_hs_capture_serial_menu",    None),
         ("7", "HS Sniff",        "_hs_sniff_menu",        "_hs_sniff_menu", None),
     ]),
     ("ATTACK", [
         ("1", "Deauth",          "start_deauth",           "deauth",       "bssid_ch"),
         ("2", "Blackout",        "start_blackout",         "blackout",     None),
-        ("3", "HS Capture",      "start_handshake",        "handshake",    None),
+        ("3", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
         ("4", "Evil Twin",       "_evil_twin",             "evil_twin",    None),
         ("5", "SAE Flood",       "sae_overflow",           "sae_flood",    "bssid_ch"),
-        ("6", "HS Capture no SD","start_handshake_serial", "handshake",    None),
+        ("6", "HS Capture no SD","start_handshake_serial", "_hs_capture_serial_menu",    None),
         ("7", "Evil Portal",     "_evil_portal",           "portal",       None),
         ("d", "Dragon Drain",    "_dragon_drain",          "dragon_drain", None),
         ("m", "MITM",            "_mitm",                  "mitm",         None),
@@ -1381,6 +1381,10 @@ class WatchDogsGame:
         if self.wardrive.settings_open:
             self.wardrive.update_settings()
             return
+        if self.wardrive.capture_screen.open:
+            self.wardrive.capture_screen.update()
+            self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
+            return
         if self.wardrive.hs_screen.open:
             self.wardrive.hs_screen.update()
             # Keep transient messages aging while the capture screen is open.
@@ -1636,6 +1640,9 @@ class WatchDogsGame:
             self._app_update_running = True
             threading.Thread(target=self._update_app, daemon=True).start()
             return
+        if state_key in ("_hs_capture_sd_menu", "_hs_capture_serial_menu"):
+            self.wardrive.capture_screen.show("sd" if state_key == "_hs_capture_sd_menu" else "serial")
+            return
         if state_key == "_hs_sniff_menu":
             self.wardrive.hs_screen.open = True
             return
@@ -1855,6 +1862,8 @@ class WatchDogsGame:
             "bt_airtag":     self._bt_airtag,
             "sniffer":       self.sniffing,
             "handshake":     self.capturing_hs,
+            "_hs_capture_sd_menu": self.wardrive.capture.runs["sd"].active,
+            "_hs_capture_serial_menu": self.wardrive.capture.runs["serial"].active,
             "mitm":          self._mitm.running,
             "dragon_drain":  self._dragon_drain.running,
             "blueducky":     self._blueducky.running or self._blueducky.connected,
@@ -1885,7 +1894,7 @@ class WatchDogsGame:
         elif state_key == "bt_tracking":  self._bt_tracking    = val
         elif state_key == "bt_airtag":    self._bt_airtag      = val
         elif state_key == "sniffer":      self.sniffing        = val
-        elif state_key == "handshake":    self.capturing_hs    = val
+        elif state_key in ("handshake", "handshake_start"): self.capturing_hs = val
 
     # ------------------------------------------------------------------
     # Python-native attacks (Dragon Drain, MITM, BlueDucky, RACE)
@@ -3371,8 +3380,11 @@ class WatchDogsGame:
         sl = s.lower()
         if "sniffer start" in sl or "packet sniffer" in sl:
             self.sniffing = True
+        elif "handshake attack cleanup complete" in sl or "handshake attack task finished" in sl:
+            self.capturing_hs = False
         elif "handshake" in sl and ("start" in sl or "captur" in sl):
-            self.capturing_hs = True
+            capture = self.wardrive.capture.current
+            self.capturing_hs = capture.active if capture else True
         elif "all operations stopped" in sl or "all stopped" in sl:
             if not self._pending_cmd:
                 self.wifi_scanning = False
@@ -3970,6 +3982,9 @@ class WatchDogsGame:
     def _draw_inner(self):
         if self._boot_phase:
             self._draw_boot_screen()
+            return
+        if self.wardrive.capture_screen.open:
+            self.wardrive.capture_screen.draw()
             return
         if self.wardrive.hs_screen.open:
             self.wardrive.hs_screen.draw()

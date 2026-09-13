@@ -12,6 +12,9 @@ existing active handshake command. The original **HS Capture** now has a warning
 triangle and the note **Requires SD card on ESP32**, in both menu locations.
 Neither **HS Capture no SD** nor **HS Sniff** gets that SD warning.
 
+The active modes also have [HS Capture progress screens](HS_CAPTURE.md) as of
+WDG 0.9.18, with live PMKID/M-number progress supplied by firmware 1.7.4+.
+
 ## Firmware requirement
 
 This needs the fork firmware advertising `hs_sniff_serial_v1: true`.

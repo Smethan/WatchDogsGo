@@ -38,7 +38,21 @@ class PassiveScreen:
         px.text(8,5,"HS SNIFF / PASSIVE / SERIAL TO uCONSOLE",0)
         px.text(8,25,"Capture: " + state,11 if scan.mode == "hs_sniff" and scan.state == "running" else 9)
         px.text(8,40,f"EAPOL:{capture.eapol}  PMKID:{capture.pmkids}  Frames:{capture.frames}  Drops:{scan.stats.get('drops',0) if scan.mode=='hs_sniff' else 0}  Incomplete:{capture.lost}",7)
-        px.text(8,55,"Received this session, per AP/client. M1-M4 are not validated exchanges.",13)
+        px.text(8,55,"Packet counts only; matching handshake pairs are not checked.",13)
+        self.draw_rows(capture)
+        if capture.path:
+            px.text(8,293,"File: handshakes/"+capture.path.name,13)
+        messages = getattr(self.app,"msgs",[])
+        if messages:
+            px.text(8,309,messages[-1][0][:120],9)
+        elif scan.error or scan.probe_error:
+            px.text(8,309,(scan.error or scan.probe_error)[:120],9)
+        px.line(8,323,631,323,5)
+        px.text(8,331,"[ENTER] Start   [S] Stop   [UP/DOWN] Details   [ESC/TAB] Map",3)
+        px.text(8,345,"Leaving this screen keeps capture running. No ESP32 SD card needed.",13)
+
+    def draw_rows(self, capture, *, active=False):
+        import pyxel as px
         columns = ((8,"NETWORK"),(143,"AP"),(205,"CLIENT"),(269,"CH"),(301,"RSSI"),
                    (345,"PMKID"),(393,"M1"),(433,"M2"),(473,"M3"),(513,"M4"),(563,"AGE"))
         px.line(8,68,631,68,5)
@@ -55,26 +69,16 @@ class PassiveScreen:
             ssid = capture.ssids.get(row["bssid"])
             name = display_bytes(ssid) if ssid else "<unknown SSID>"
             values = ((8,name[:24]),(143,row["bssid"][-8:]),(205,row["station"][-8:] or "--"),
-                      (269,str(row["channel"])),(301,str(row["rssi"])),
+                      (269,str(row["channel"]) if row["channel"] is not None else "--"),(301,str(row["rssi"]) if row["rssi"] is not None else "--"),
                       (563,str(max(0,int(time.time()-row["last"])))+"s"))
             for x, label in values:
                 px.text(x,y,label[:13] if x==563 else label,7)
             for x, count in zip((345,393,433,473,513),(row["pmkids"],*row["messages"])):
-                label = str(count) if count < 1000 else "999+"
-                px.text(x,y,label if count else "-",11 if count else 13)
+                label = "N/A" if count is None else (str(count) if count < 1000 else "999+")
+                px.text(x,y,label if count is None or count else "-",11 if count else 13)
         if not rows:
-            px.text(14,108,"Waiting for naturally occurring EAPOL / PMKID traffic.",13)
+            px.text(14,108,"Waiting for captured EAPOL / PMKID frames." if active else "Waiting for naturally occurring EAPOL / PMKID traffic.",13)
         if rows:
             row=rows[self.selection]
             px.text(8,266,f"AP {row['bssid']}   Client {row['station'] or 'not in this frame'}",7)
-            px.text(8,279,f"Row {self.selection+1}/{len(rows)}  M1-M4 counts include retransmissions.",13)
-        if capture.path:
-            px.text(8,293,"File: handshakes/"+capture.path.name,13)
-        messages = getattr(self.app,"msgs",[])
-        if messages:
-            px.text(8,309,messages[-1][0][:120],9)
-        elif scan.error or scan.probe_error:
-            px.text(8,309,(scan.error or scan.probe_error)[:120],9)
-        px.line(8,323,631,323,5)
-        px.text(8,331,"[ENTER] Start   [S] Stop   [UP/DOWN] Details   [ESC/TAB] Map",3)
-        px.text(8,345,"Leaving this screen keeps capture running. No ESP32 SD card needed.",13)
+            px.text(8,279,f"Row {self.selection+1}/{len(rows)}  " + ("M1-M4 counts reflect forwarded capture frames." if active else "M1-M4 counts include retransmissions."),13)

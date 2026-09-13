@@ -11,6 +11,8 @@ from .notable_detector import NotableDetector, ble_name
 from .wardrive_trail import FixHistory, WardriveTrail
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
+from .handshake_capture import HandshakeCapture, COMMANDS
+from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
@@ -24,6 +26,8 @@ class WardriveUI:
         self.host_ble = HostBleScanner()
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
+        self.capture = HandshakeCapture()
+        self.capture_screen = HandshakeScreen(app, self)
         self.detector = NotableDetector()
         self.fixes = FixHistory()
         self.trail = WardriveTrail()
@@ -56,6 +60,7 @@ class WardriveUI:
         self.reported_false_timeouts = 0
 
     def on_stop(self):
+        self.capture.stop()
         self.host_ble.stop()
         self.scan.stop()
         self.app._clear_scan_state()
@@ -76,6 +81,8 @@ class WardriveUI:
             self.host_ble.stop()
             self.connection = connection
             self.close_passive()
+            self.capture.finish("disconnected")
+            app.capturing_hs = False
             self.scan.reset()
             app._clear_scan_state()
             self.detector.clear()
@@ -134,6 +141,10 @@ class WardriveUI:
 
     def handle_line(self, line):
         s = line.strip()
+        if self.capture.handle(s):
+            return True
+        if self.capture.current and self.capture.current.state in ("stopped", "error", "disconnected"):
+            self.app.capturing_hs = False
         if s.startswith("WDG:"):
             d = parse_record(s)
             if d is None:
@@ -167,6 +178,7 @@ class WardriveUI:
         # Completion, not the early 'stop command received' message.
         if "all operations stopped" in s.lower() or "all stopped" in s.lower():
             app = self.app
+            self.capture.finish()
             if self.scan.state != "running":
                 app.sniffing = app.capturing_hs = False
                 app._bt_tracking = app._bt_airtag = False
@@ -199,6 +211,8 @@ class WardriveUI:
                         if app.loot and app.loot.active:
                             app._term_add("[TEST] Timing log: " + str(Path(app.loot.session_path) / "wardrive_diagnostics.jsonl"), raw=True)
                 else:
+                    if cmd in COMMANDS.values():
+                        self.capture.start(cmd)
                     app._send(cmd)
                     app._set_running(state, True)
                     if state in ("bt_scanning", "ble_scan"):
@@ -535,7 +549,7 @@ class WardriveUI:
                 px.text(55,293,("Heard: "+time.strftime("%H:%M:%S",time.localtime(item["last"]))+"  "+("GPS recorded" if item["observation_fix"] else "GPS unavailable")),13)
             px.camera()
             self.app._draw_mc_toast()
-        if self.scan.active and not self.settings_open and not self.hs_screen.open:
+        if self.scan.active and not self.settings_open and not self.hs_screen.open and not self.capture_screen.open:
             if self.scan.mode == "hs_sniff":
                 text = f"Passive -> uConsole | EAPOL:{self.passive.eapol} PMKID:{self.passive.pmkids}"
                 text += f" drops:{self.scan.stats.get('drops',0)} incomplete:{self.passive.lost}"
