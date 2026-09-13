@@ -2,6 +2,12 @@
 
 ## 0.9.24 — Faster USB OTA
 
+Measured on the uConsole: **53.33 seconds** for a complete published-release
+USB update, versus **445.65 seconds** through the old receiver (about **8.4x
+faster**). Deliberate serial close/lost-ACK recovery finished in **60.23 seconds**.
+Both booted a verified valid slot with no pending transfer. See
+[hardware validation](https://github.com/Smethan/WatchDogsGo/blob/main/docs/USB_OTA_VALIDATION_2026-09-13.md) for method and limits.
+
 - Automatically negotiate 4 KiB base64 blocks with XIAO firmware 1.7.8+.
   Supported receivers get a whole block without the old 64-byte write pauses;
   progress updates once per percentage point instead of once per 256 bytes.
