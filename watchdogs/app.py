@@ -1237,7 +1237,14 @@ class WatchDogsGame:
         """Try to detect and reconnect ESP32. Like JanOS wait_for_esp32."""
         if getattr(self, '_flash_io_active', False):
             return False
-        port = detect_esp32_port()
+        target = getattr(self, '_reconnect_flash_target', None)
+        if target:
+            try:
+                port = target.resolve()
+            except RuntimeError:
+                return False
+        else:
+            port = detect_esp32_port()
         if not port:
             return False
         try:
@@ -1246,6 +1253,8 @@ class WatchDogsGame:
             self._esp32 = True
             self.state.connected = True
             self._boot_serial_port = port
+            self._reconnect_flash_target = None
+            self._flash_target = None
             self._term_add(f"[SYS] ESP32 found on {port}", raw=True)
             # Probe firmware version
             if not self._fw_version:
@@ -2792,19 +2801,75 @@ class WatchDogsGame:
             self._app_update_running = False
 
     def _start_flash_esp32(self):
-        """Start firmware flash wizard — board picker → download → flash."""
+        """Pause normal serial I/O before the user can enter manual BOOT mode."""
         if getattr(self, '_serial_busy', False):
             self.msg("[FLASH] Serial is busy; finish the current operation first", C_WARNING)
             return
+        if getattr(self, '_flash_running', False):
+            self._flash_screen = True
+            self.menu_open = False
+            return
         from .config import FLASH_BOARDS
+        from .firmware_flash import select_target
         self._flash_boards = list(FLASH_BOARDS.keys())
-        self._flash_sel = 0
+        self._flash_sel = getattr(self, '_flash_sel', 0)
+        self._flash_manual = getattr(self, '_flash_manual', False)
         self._flash_screen = True
-        self._flash_running = getattr(self, '_flash_running', False)
+        self._flash_running = False
+        self._flash_status = "Choose board and connection mode"
+        self._flash_release_tag = getattr(self, '_flash_release_tag', None)
+        if not getattr(self, '_flash_releases_loaded', False) and not getattr(self, '_flash_versions_loading', False):
+            self._flash_versions_loading = True
+            threading.Thread(target=self._flash_load_releases, daemon=True).start()
         self.menu_open = False
+        # This runs on the GUI thread, after its last poll/reconnect completes.
+        # Hold the reservation throughout the wizard, including failed attempts.
+        self._flash_io_active = True
+        preferred = getattr(self.serial, 'device', None) or getattr(self, '_boot_serial_port', None)
+        if not getattr(self, '_flash_target', None):
+            try:
+                self._flash_target = select_target(preferred)
+            except RuntimeError as exc:
+                self._flash_target = None
+                self._term_add("[FLASH] " + str(exc), raw=True)
+        self._reconnect_flash_target = self._flash_target
+        self.wardrive.on_stop()  # local state only: _send is now reserved
+        self.wardrive.close_passive()
+        self.wardrive.capture.finish("disconnected")
+        self.sniffing = self.capturing_hs = False
+        if self.serial:
+            self.serial.close()
+        self._esp32 = False
+        self.state.connected = False
+        self._term_add("[FLASH] WDG serial paused; USB power is left on. ESC resumes normal use.", raw=True)
+
+    def _flash_load_releases(self):
+        from .updates import firmware_releases
+        try:
+            self._flash_releases = firmware_releases()
+            self._flash_releases_loaded = True
+            self._flash_release_error = ""
+        except Exception as exc:
+            self._flash_release_error = str(exc)
+            self._term_add("[FLASH] Version list unavailable: " + str(exc), raw=True)
+        finally:
+            self._flash_versions_loading = False
+
+    def _flash_cycle_version(self, direction):
+        if getattr(self, '_flash_versions_loading', False):
+            self.msg("[FLASH] Firmware versions are still loading", C_DIM)
+            return
+        if not getattr(self, '_flash_releases_loaded', False):
+            self._flash_versions_loading = True
+            threading.Thread(target=self._flash_load_releases, daemon=True).start()
+            return
+        tags = [None] + [r['tag_name'] for r in self._flash_releases]
+        current = getattr(self, '_flash_release_tag', None)
+        index = tags.index(current) if current in tags else 0
+        self._flash_release_tag = tags[(index + direction) % len(tags)]
 
     def _update_flash_screen(self):
-        """Handle board picker input."""
+        """Board/mode picker; closing an active flash never releases its port."""
         if self._flash_running:
             if pyxel.btnp(pyxel.KEY_ESCAPE):
                 self._flash_screen = False
@@ -2814,6 +2879,12 @@ class WatchDogsGame:
             self._flash_sel = max(0, self._flash_sel - 1)
         elif pyxel.btnp(pyxel.KEY_DOWN):
             self._flash_sel = min(len(self._flash_boards) - 1, self._flash_sel + 1)
+        elif pyxel.btnp(pyxel.KEY_LEFT) or pyxel.btnp(pyxel.KEY_RIGHT):
+            self._flash_manual = not self._flash_manual
+        elif pyxel.btnp(pyxel.KEY_V):
+            self._flash_cycle_version(1)
+        elif pyxel.btnp(pyxel.KEY_B):
+            self._flash_cycle_version(-1)
         elif pyxel.btnp(pyxel.KEY_RETURN):
             board = self._flash_boards[self._flash_sel]
             self._flash_running = True
@@ -2822,98 +2893,72 @@ class WatchDogsGame:
                              daemon=True).start()
         elif pyxel.btnp(pyxel.KEY_ESCAPE):
             self._flash_screen = False
+            self._flash_io_active = False
             self._esc_consumed_frame = pyxel.frame_count
 
     def _flash_do(self, board: str):
         try:
             self._flash_firmware(board)
         finally:
-            self._flash_io_active = False
+            # Keep ROM/stub untouched while the wizard remains open for retry.
+            self._flash_io_active = bool(getattr(self, '_flash_screen', False))
             self._flash_running = False
 
     def _flash_firmware(self, board: str):
-        """Verify a fork release before closing serial or writing the ESP."""
+        """Verify the release/tools, then flash the same selected USB device."""
         from .config import FLASH_BOARDS
         from .updates import prepare_firmware
-        import subprocess
+        from .firmware_flash import ensure_esptool, wait_for_target, flash_command, run_flash
         from pathlib import Path
-        profile = FLASH_BOARDS[board]
-        self._term_add("[FLASH] Source: Smethan/projectZero", raw=True)
-        self._term_add(f"[FLASH] Board: {profile['label']}", raw=True)
+        cache = Path(self._app_dir) / "firmware_cache"
+        log_file = None
+        def report(message):
+            self._term_add("[FLASH] " + message, raw=True)
+            if log_file:
+                log_file.write(message + "\n")
+                log_file.flush()
         try:
-            tag, fw_dir = prepare_firmware(Path(self._app_dir) / "firmware_cache", board)
-            self._term_add(f"[FLASH] {tag}: board and checksums verified", raw=True)
+            cache.mkdir(parents=True, exist_ok=True)
+            self._flash_log_path = cache / f"flash-{time.time_ns()}.log"
+            log_file = self._flash_log_path.open("x", encoding="utf-8")
+            report("Source: Smethan/projectZero")
+            report("Board: " + FLASH_BOARDS[board]['label'])
+            report("Log: " + str(self._flash_log_path))
+            requested = getattr(self, '_flash_release_tag', None)
+            release = None
+            if requested is not None:
+                release = next((r for r in getattr(self, '_flash_releases', []) if r['tag_name'] == requested), None)
+                if release is None:
+                    raise ValueError("Selected firmware version is unavailable; choose a listed release")
+            report("Requested firmware: " + (requested or "latest stable"))
+            self._flash_status = "Downloading and verifying firmware..."
+            tag, fw_dir = prepare_firmware(cache, board, release=release)
+            report(f"{tag}: board and checksums verified")
+            self._flash_status = "Checking flashing tools..."
+            python, version = ensure_esptool(cache, report)
+            report(f"esptool {version} / {python}")
+            self._flash_status = "Waiting for selected ESP32 port..."
+            target, port = wait_for_target(getattr(self, '_flash_target', None))
+            self._flash_target = self._reconnect_flash_target = target
+            self._boot_serial_port = port
+            report(f"Port: {port} / USB {target.vid}:{target.pid} / serial {target.serial_number or 'unknown'}")
+            manual = getattr(self, '_flash_manual', False)
+            report("Manual BOOT: no pre-reset, 115200 baud" if manual else "Automatic: script reset sequence, 460800 baud")
+            self._flash_status = "Flashing; keep USB connected..."
+            run_flash(flash_command(python, port, board, fw_dir, manual), report)
+            self._fw_version = ""
+            self._fw_update_available = False
+            self._flash_status = "Flash verified. ESC to reconnect."
+            report("Flash verified; watchdog reset requested. Release BOOT. ESC to reconnect WDG.")
+            self.msg("[FLASH] Success! ESC to reconnect.", C_SUCCESS)
+            time.sleep(1)  # allow USB re-enumeration before a hidden wizard resumes polling
         except Exception as exc:
-            self._term_add(f"[FLASH] Download/verification failed: {exc}", raw=True)
-            self.msg("[FLASH] Download failed; device untouched", C_ERROR)
-            return
-
-        # Step 2: Close serial
-        self._flash_io_active = True
-        port = self._boot_serial_port
-        if self.serial and self.serial.is_open:
-            self.serial.close()
-            self._esp32 = False
-            self.state.connected = False
-            self._term_add(f"[FLASH] Serial {port} released", raw=True)
-
-        # Step 3: USB power cycle to reset ESP32 cleanly before flash
-        if self._aio_available and board == "xiao":
-            self._term_add("[FLASH] USB power cycle (reset ESP32)...", raw=True)
-            AioManager.toggle("usb", False)
-            time.sleep(2)
-            AioManager.toggle("usb", True)
-            time.sleep(4)  # wait for ESP32 boot + USB enumerate
-            # Re-detect port (may have changed after power cycle)
-            port = detect_esp32_port() or port
-            self._term_add(f"[FLASH] ESP32 on {port}", raw=True)
-
-        # Flash with esptool
-        self._term_add("[FLASH] Flashing...", raw=True)
-        self.msg("[FLASH] Flashing ESP32...", C_WARNING)
-
-        after = "hard-reset"
-        cmd = [
-            sys.executable, "-m", "esptool",
-            "-p", port, "-b", str(profile["baud"]),
-            "--before", profile["before"],
-            "--after", after,
-            "--chip", "esp32c5",
-            "write-flash",
-            "--flash-mode", "dio",
-            "--flash-freq", "80m",
-            "--flash-size", "8MB",
-        ]
-        for filename, offset in profile["offsets"].items():
-            cmd.extend([offset, str(fw_dir / filename)])
-
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1)
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    self._term_add(f"[FLASH] {line}", raw=True)
-            proc.wait()
-
-            if proc.returncode == 0:
-                self._term_add("[FLASH] Flash complete!", raw=True)
-                self.msg("[FLASH] Success! ESP32 rebooting...", C_SUCCESS)
-                # Reconnect after short delay
-                time.sleep(3)
-                self._fw_version = ""
-                self._fw_update_available = False
-                # Normal polling reconnects after the worker releases serial.
-            else:
-                self._term_add(f"[FLASH] esptool error (code {proc.returncode})", raw=True)
-                self.msg("[FLASH] Flash failed!", C_ERROR)
-        except FileNotFoundError:
-            self._term_add("[FLASH] esptool not found! pip install esptool", raw=True)
-            self.msg("[FLASH] esptool not installed", C_ERROR)
-        except Exception as exc:
-            self._term_add(f"[FLASH] Error: {exc}", raw=True)
-            self.msg("[FLASH] Flash failed", C_ERROR)
+            report("Error: " + str(exc))
+            self._flash_status = "Failed; see console / saved flash log"
+            self.msg("[FLASH] Failed; see console and flash log", C_ERROR)
+        finally:
+            if log_file:
+                log_file.close()
 
     # ------------------------------------------------------------------
     # Wardriving auto-repeat loop
@@ -5888,43 +5933,46 @@ class WatchDogsGame:
                 break
 
     def _draw_flash_screen(self):
-        """Draw board picker overlay for firmware flash."""
+        """Board picker with a manual mode that preserves ROM boot state."""
         from .config import FLASH_BOARDS
-        ROW_H = 14
         boards = list(FLASH_BOARDS.items())
-        dw = 340
-        dh = max(120, 50 + len(boards) * ROW_H + 24)
-        dx = (W - dw) // 2
-        dy = (H - dh) // 2
+        dw, dh = 500, 216
+        dx, dy = (W - dw) // 2, (H - dh) // 2
         pyxel.rect(dx, dy, dw, dh, 0)
         pyxel.rectb(dx, dy, dw, dh, C_WARNING)
-        pyxel.rectb(dx + 1, dy + 1, dw - 2, dh - 2, C_COAST)
-        pyxel.text(dx + 4, dy + 4, "FLASH ESP32 / Smethan fork", C_WARNING)
-        pyxel.line(dx + 2, dy + 14, dx + dw - 3, dy + 14, C_COAST)
-
+        pyxel.text(dx + 8, dy + 6, "FLASH ESP32 / Smethan fork", C_WARNING)
+        pyxel.line(dx + 4, dy + 18, dx + dw - 5, dy + 18, C_COAST)
+        pyxel.text(dx + 8, dy + 25, getattr(self, '_flash_status', '')[:115], C_HACK_CYAN)
         if self._flash_running:
-            pyxel.text(dx + 4, dy + 22, "Flashing in progress...", C_HACK_CYAN)
-            pyxel.text(dx + 4, dy + 36, "Check terminal for status", C_DIM)
-            pyxel.text(dx + 4, dy + dh - 14, "ESC to close", C_DIM)
+            pyxel.text(dx + 8, dy + 48, "Check the console for progress. Full output is saved to firmware_cache/flash-*.log", C_DIM)
+            pyxel.text(dx + 8, dy + 75, "Keep USB connected until flashing finishes.", C_WARNING)
+            pyxel.text(dx + 8, dy + dh - 16, "ESC hides this window; flashing continues", C_DIM)
+            return
+        for i, (_, profile) in enumerate(boards):
+            y = dy + 45 + i * 16
+            selected = i == self._flash_sel
+            if selected:
+                pyxel.rect(dx + 4, y - 2, dw - 8, 15, C_WARNING)
+            pyxel.text(dx + 8, y, profile['label'], 0 if selected else C_TEXT)
+        manual = getattr(self, '_flash_manual', False)
+        version = getattr(self, '_flash_release_tag', None) or "Latest stable"
+        if getattr(self, '_flash_versions_loading', False):
+            version += " (loading older versions...)"
+        elif getattr(self, '_flash_release_error', ''):
+            version += " (V retries version list)"
+        pyxel.text(dx + 8, dy + 84, "V/B version: " + version, C_WARNING)
+        pyxel.text(dx + 8, dy + 104, "LEFT/RIGHT: " + ("Manual BOOT (no reset, 115200)" if manual else "Automatic (script reset, 460800)"), C_HACK_CYAN)
+        if manual:
+            pyxel.text(dx + 8, dy + 126, "Hold BOOT, tap RESET (or reconnect USB), then release BOOT.", C_WARNING)
+            pyxel.text(dx + 8, dy + 140, "Press ENTER once the board is in bootloader mode.", C_DIM)
         else:
-            fw_info = (f"Current: v{self._fw_version}"
-                       if self._fw_version else "Current: unknown")
-            if self._fw_update_available:
-                fw_info += f" -> v{self._fw_remote_version}"
-            pyxel.text(dx + 4, dy + 18, fw_info, C_DIM)
-
-            y = dy + 34
-            for i, (key, profile) in enumerate(boards):
-                sel = (i == self._flash_sel)
-                if sel:
-                    pyxel.rect(dx + 2, y - 1, dw - 4, ROW_H - 1, C_WARNING)
-                c = 0 if sel else C_TEXT
-                pyxel.text(dx + 6, y + 2, f"[{i+1}]", 0 if sel else C_DIM)
-                pyxel.text(dx + 28, y + 2, profile["label"], c)
-                y += ROW_H
-
-            pyxel.text(dx + 4, dy + dh - 14,
-                       "UP/DOWN  ENTER flash  ESC cancel", C_DIM)
+            pyxel.text(dx + 8, dy + 126, "USB power stays on. If automatic fails, try Manual BOOT.", C_DIM)
+        fw_info = "Firmware: " + ("v" + self._fw_version if self._fw_version else "unknown")
+        if self._fw_update_available:
+            fw_info += " -> v" + self._fw_remote_version
+        pyxel.text(dx + 8, dy + 163, fw_info, C_DIM)
+        pyxel.text(dx + 8, dy + 179, "WDG serial is paused while this window is open.", C_DIM)
+        pyxel.text(dx + 8, dy + dh - 16, "UP/DOWN board   ENTER flash   ESC exit / reconnect", C_DIM)
 
     def _draw_captured_data(self):
         """Draw overlay showing captured credentials from portal/evil twin."""

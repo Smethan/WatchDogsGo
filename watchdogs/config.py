@@ -140,7 +140,7 @@ FLASH_BOARDS = {
     "xiao": {
         "label": "XIAO ESP32-C5 (Seeed Studio, USB-JTAG)",
         "baud": 460800,
-        "before": "usb-reset",
+        "before": "default-reset",
         "bin_name": "projectZerobyLOCOSP-xiao.bin",
         "offsets": {
             "bootloader.bin": "0x2000",

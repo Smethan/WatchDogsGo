@@ -32,6 +32,30 @@ def latest_release():
         raise ValueError('Expected a published stable firmware release')
     return data
 
+def firmware_releases():
+    """Published fork releases with the checksummed bundles used by this app."""
+    url = f'https://api.github.com/repos/{FIRMWARE_REPO}/releases?per_page=100'
+    data = json.loads(download(url, 2*1024*1024))
+    if not isinstance(data, list):
+        raise ValueError('Invalid firmware release list')
+    releases = []
+    seen = set()
+    for release in data:
+        try:
+            tag = release['tag_name']
+            release_version(tag)
+            if release.get('draft') or release.get('prerelease') or tag in seen:
+                continue
+            version = tag.removeprefix('v')
+            for name in ('SHA256SUMS', f'projectZerobyLOCOSP-{version}.zip',
+                         f'projectZerobyLOCOSP-xiao-{version}.zip'):
+                asset_url(release, name)
+            releases.append(release)
+            seen.add(tag)
+        except (KeyError, TypeError, ValueError):
+            continue  # Old/unrelated releases are not verified flash bundles.
+    return sorted(releases, key=lambda r:release_version(r['tag_name']), reverse=True)
+
 def asset_url(release, name):
     matches = [a for a in release.get('assets', []) if a.get('name') == name]
     if len(matches) != 1:
@@ -72,6 +96,8 @@ def prepare_firmware(directory, board, release=None):
     if board not in FLASH_BOARDS:
         raise ValueError('Unknown board')
     release = latest_release() if release is None else release
+    if release.get('draft') or release.get('prerelease'):
+        raise ValueError('Expected a published stable firmware release')
     tag = release['tag_name']
     release_version(tag)
     version = tag.removeprefix('v')

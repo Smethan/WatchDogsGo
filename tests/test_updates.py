@@ -72,6 +72,41 @@ def test_download_no_upstream_fallback_or_stale_cache(tmp_path, monkeypatch):
     with pytest.raises(ValueError,match='configured fork'):
         updates.asset_url(release,name)
 
+def release_entry(tag):
+    version = tag.removeprefix('v')
+    names = ('SHA256SUMS',f'projectZerobyLOCOSP-{version}.zip',f'projectZerobyLOCOSP-xiao-{version}.zip')
+    return dict(tag_name=tag,draft=False,prerelease=False,assets=[dict(name=n,
+        browser_download_url=f'https://github.com/Smethan/projectZero/releases/download/{tag}/{n}') for n in names])
+
+def test_firmware_version_list_filters_unpublished_and_unsafe_assets(monkeypatch):
+    old = release_entry('v1.7.3'); current = release_entry('v1.7.4')
+    bad = release_entry('v1.7.0')
+    bad['assets'][0]['browser_download_url'] = 'https://example.invalid/file'
+    values = [old,current,dict(current,draft=True),dict(old,prerelease=True),bad,
+              dict(tag_name='not-a-version'),None,current]
+    get = Mock(return_value=json.dumps(values).encode())
+    monkeypatch.setattr(updates,'download',get)
+    assert [r['tag_name'] for r in updates.firmware_releases()] == ['v1.7.4','v1.7.3']
+    assert get.call_args.args[0].startswith('https://api.github.com/repos/Smethan/projectZero/releases?')
+
+def test_explicit_older_version_never_fetches_latest(tmp_path,monkeypatch):
+    release = release_entry('v1.7.3')
+    name = 'projectZerobyLOCOSP-xiao-1.7.3.zip'
+    blob,_ = bundle(version='1.7.3')
+    urls = []
+    def get(url,limit):
+        urls.append(url)
+        if url.endswith('/SHA256SUMS'):
+            return (hashlib.sha256(blob).hexdigest()+'  '+name+'\n').encode()
+        return blob
+    monkeypatch.setattr(updates,'download',get)
+    monkeypatch.setattr(updates,'latest_release',Mock(side_effect=AssertionError('latest requested')))
+    tag,path = updates.prepare_firmware(tmp_path,'xiao',release=release)
+    assert tag == 'v1.7.3' and json.loads((path/'release.json').read_text())['tag'] == 'v1.7.3'
+    assert all('/v1.7.3/' in url for url in urls)
+    with pytest.raises(ValueError,match='published stable'):
+        updates.prepare_firmware(tmp_path,'xiao',release=dict(release,draft=True))
+
 def repo_pair(tmp_path, monkeypatch):
     real_run = subprocess.run
     def git(path,*args):

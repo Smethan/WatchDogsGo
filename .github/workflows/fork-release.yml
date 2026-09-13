@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: python -m pip install pytest pyxel pyserial 'esptool>=5.0,<6' Pillow requests cryptography PyNaCl scapy bleak netifaces
+        run: python -m pip install pytest pyxel pyserial 'esptool>=5.4,<6' Pillow requests cryptography PyNaCl scapy bleak netifaces
       - name: Test
         run: |
           python -m pytest -q tests

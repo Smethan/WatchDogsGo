@@ -12,13 +12,16 @@ origin is `https://github.com/Smethan/WatchDogsGo.git`. Then run:
 git fetch origin
 git merge --ff-only origin/main
 bash update.sh
-.venv/bin/python -m pip install 'esptool>=5.0,<6'
+.venv/bin/python -m pip install 'esptool>=5.4,<6'
 ./run.sh
 ```
 
 The first merge brings the updater into an older feature checkout; the updater
 then switches that checkout to main. The pip command supplies the flasher
 dependency missing from older installs; new installs get it from requirements.txt.
+With WDG 0.9.20+, this pip step is optional: selecting Flash ESP32 automatically
+prepares a private esptool environment when the running Python's tool is missing
+or too old. That environment is reused; the app updater itself does not install it.
 It refuses dirty tracked files, unexpected
 repositories/branches, and commits that diverge from the published main branch.
 It never resets, stashes, deletes or force-pushes user work. Untracked files are
@@ -54,9 +57,13 @@ the previous serial-wardrive firmware before updating the ESP32. See
 [All Wardrive and diagnostics](HOST_BLE_WARDRIVE.md).
 
 **SYSTEM → Flash ESP32** shows the Smethan source and current/available version.
-Choose XIAO for the XIAO ESP32-C5 USB board. The downloader selects an exact ZIP
-from the latest stable Smethan/projectZero release. It checks SHA256SUMS and the
-ZIP's board/version/file manifest before closing serial or touching the device.
+Choose XIAO for the XIAO ESP32-C5 USB board. **V/B** selects latest stable or an
+explicit older published version. **Left/Right** selects Automatic or Manual
+BOOT; the USB power cycle has been removed. See [flashing and rollback](FIRMWARE_FLASHING.md).
+The downloader selects an exact ZIP from the selected stable Smethan/projectZero
+release. It checks SHA256SUMS and the ZIP's board/version/file manifest before
+invoking esptool. WDG's serial connection is paused throughout the wizard so
+manual BOOT entry and retries are not disturbed by reconnects.
 Each attempt uses a fresh cache directory. Missing assets or failed checks stop
 the update; upstream binaries and stale cached files are never substituted.
 

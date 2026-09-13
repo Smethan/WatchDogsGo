@@ -1,5 +1,32 @@
 # Smethan WatchDogsGo
 
+## 0.9.20 — uConsole flasher repair and firmware rollback selection
+
+- Remove the uConsole-only USB power cycle before flashing. Automatic mode uses
+  the standalone script's `default-reset` / `watchdog-reset` sequence; Manual
+  BOOT mode preserves an already-entered bootloader with `no-reset` at 115200.
+- Pause WDG serial polling and reconnects for the whole flash wizard, including
+  manual BOOT entry and failed attempts. ESC resumes normal use when idle;
+  hiding a running flash keeps its serial reservation until the worker finishes.
+- Follow the selected USB device across port renumbering instead of flashing or
+  reconnecting to the first available tty. Save full output and tool/version/port
+  details in `firmware_cache/flash-<timestamp>.log`.
+- Require esptool 5.4+ (below 6). If the running Python has an older/missing tool,
+  the flasher prepares a private environment on first use and reuses it later.
+  Updating WDG does not rerun the full setup or install system-wide packages.
+- **V/B** selects a published firmware version, including older releases;
+  **Left/Right** selects Automatic or Manual BOOT. Explicit versions never fall
+  back to latest, and board/manifest/SHA256 verification still applies.
+
+Update WDG and restart; no new ESP firmware is required for this flasher update.
+To roll back one release, select **XIAO ESP32-C5**, **v1.7.3**, and the desired
+connection mode. See [flashing and rollback](FIRMWARE_FLASHING.md).
+
+Offline tests, a real private-tool installation, both 1.7.3 bundle downloads and
+UI renders passed. The uConsole transfer and reported HS regression still need
+hardware verification; this release adds rollback but does not claim to repair
+the firmware capture regression.
+
 ## 0.9.19 — Wait for HS Capture file transfer on stop
 
 - Keep the capture finishing indicator and defer pending mode switches when
