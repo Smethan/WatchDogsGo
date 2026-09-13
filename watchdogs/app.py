@@ -210,6 +210,10 @@ _BLE_RE = re.compile(
 )
 # AirTag scanner count line: "X,Y" (airtags, smarttags)
 _AIRTAG_COUNT_RE = re.compile(r'^(\d+),(\d+)$')
+_CAPTURE_KIND_RE = re.compile(r'^CAPTURE_KIND: (VALID|PMKID|PARTIAL)$')
+_HS_ARTIFACT_META_RE = re.compile(
+    r'^SSID:[ \t]*.*?[ \t]+AP:[ \t]*(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
+)
 
 # Lines to suppress in terminal
 _TERM_SKIP_EXACT = {"", ">", "OK"}
@@ -707,6 +711,7 @@ class WatchDogsGame(OtaMixin):
         self._airtag_count = 0         # Apple AirTags detected
         self._smarttag_count = 0       # Samsung SmartTags detected
         self._last_hs_count = 0
+        self._serial_capture_kind = None
 
         # Wardriving auto-repeat (continuous scan loop)
         self._wifi_scan_done_time = 0.0  # time.time() when last WiFi scan finished
@@ -3401,6 +3406,7 @@ class WatchDogsGame(OtaMixin):
             except Exception:
                 pass
             self.serial = None
+            self._serial_capture_kind = None
             self.msg("[ERR] ESP32 disconnected!", C_ERROR)
             self._term_add("[ERR] ESP32 disconnected — plug in & retry", raw=True)
             return
@@ -3430,17 +3436,38 @@ class WatchDogsGame(OtaMixin):
                 threading.Thread(target=self._check_fw_update,
                                  daemon=True).start()
 
+        kind_match = _CAPTURE_KIND_RE.fullmatch(s)
+        if kind_match:
+            self._serial_capture_kind = kind_match.group(1)
+
         # Log to loot (handles PCAP/HCCAPX detection internally)
+        committed_kind = None
         if self.loot:
             try:
-                self.loot.log_serial(s)
+                committed_kind = self.loot.log_serial(s)
             except Exception:
                 pass
 
-        # Detect handshake completion for game event
-        if s.startswith("SSID:") and "AP:" in s:
-            self._trigger_hs_event()
+        # The 1.7.9 serial protocol also commits PMKID-only and partial PCAPs
+        # with this metadata line. Only a validated exchange earns the legacy
+        # handshake event. Untyped older firmware keeps its historical event.
+        if _HS_ARTIFACT_META_RE.fullmatch(s):
+            announced_kind = getattr(self, "_serial_capture_kind", None)
+            self._serial_capture_kind = None
+            if announced_kind is None:
+                self._trigger_hs_event()
+            elif announced_kind == "VALID" and committed_kind == "VALID":
+                self._trigger_hs_event()
+            elif announced_kind == "PMKID" and committed_kind == "PMKID":
+                self.msg("[HS] PMKID capture saved.", C_SUCCESS)
+            elif announced_kind == "PARTIAL" and committed_kind == "PARTIAL":
+                self.msg("[HS] Partial capture saved; exchange is not validated.", C_DIM)
+            elif announced_kind in ("VALID", "PMKID", "PARTIAL"):
+                self.msg("[HS] Incomplete serial artifact rejected.", C_WARNING)
             return
+
+        if "handshake attack cleanup complete" in s.lower():
+            self._serial_capture_kind = None
 
         # --- AirTag scanner count line: "X,Y" ---
         at_m = _AIRTAG_COUNT_RE.match(s)

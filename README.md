@@ -277,7 +277,9 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | WiFi Wardrive | `scan_networks` | Continuous WiFi scan + GPS logging (WiGLE CSV) |
 | BT Wardrive | `scan_bt` | Continuous BLE scan + GPS logging |
 | Pkt Sniffer | `start_sniffer` | Raw 802.11 + BLE packet capture |
-| HS Serial | `start_handshake_serial` | WPA handshake capture via serial |
+| HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
+| HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
+| HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
 
 ### ATTACK
 
@@ -285,7 +287,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 |------|---------|-------------|
 | Deauth | `start_deauth` | Targeted deauth on BSSID + channel |
 | Blackout | `start_blackout` | All-channel deauth broadcast |
-| HS Capture | `start_handshake_serial` | WPA handshake capture |
+| HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
+| HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | Evil Twin | `start_portal` | Fake AP with captive portal (SSID input) |
 | SAE Flood | `sae_overflow` | WPA3 SAE Commit overflow |
 | Dragon Drain | Python-native | WPA3 SAE DoS via scapy **!** |
@@ -294,6 +297,10 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | RACE Attack | Python-native | Airoha BT headphone exploit (CVE-2025-20700) |
 
 > **!** = requires external WiFi adapter with monitor mode
+
+Both active HS Capture screens keep the original all-nearby mode. Press `N` to
+scan, filter and select up to 16 BSSIDs, or `A` to return to all nearby networks.
+Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS_CAPTURE.md).
 
 ### ADDONS
 

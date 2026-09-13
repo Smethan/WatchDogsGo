@@ -10,6 +10,7 @@ class ScanController:
     def reset(self):
         self.supported = None
         self.hs_supported = None
+        self.capture_targets_supported = None
         self.wifi_supported = None
         self.wifi_only = False
         self.diagnostic = False
@@ -48,6 +49,7 @@ class ScanController:
             return False
         self.supported = None
         self.hs_supported = None
+        self.capture_targets_supported = None
         self.wifi_supported = None
         self.probing = True
         self.probe_error = ""
@@ -95,6 +97,7 @@ class ScanController:
         if d["kind"] == "capabilities":
             self.supported = d["wardrive_serial_v1"]
             self.hs_supported = d.get("hs_sniff_serial_v1", False) is True
+            self.capture_targets_supported = d.get("hs_capture_targets_v1", False) is True
             self.wifi_supported = d.get("wardrive_wifi_serial_v1", False) is True
             self.probing = False
             self.probe_error = ""

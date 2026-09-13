@@ -5,9 +5,26 @@ import re
 import time
 
 from .passive_capture import PassiveCapture
-from .wardrive_protocol import integer, TOKEN
+from .wardrive_protocol import integer, MAC, TOKEN
 
 COMMANDS = {"sd": "start_handshake", "serial": "start_handshake_serial"}
+
+
+def capture_storage(command):
+    parts = (command or '').split()
+    if not parts:
+        return None
+    legacy = next((storage for storage, cmd in COMMANDS.items() if command == cmd), None)
+    if legacy:
+        return legacy
+    if parts[0] != 'start_handshake_scope' or len(parts) not in (3, 4) or parts[1] not in COMMANDS:
+        return None
+    if len(parts) == 3:
+        return parts[1] if parts[2] == 'all' else None
+    macs = parts[3].split(',')
+    if not TOKEN.fullmatch(parts[2]) or not 1 <= len(macs) <= 16 or any(not MAC.fullmatch(mac) for mac in macs):
+        return None
+    return parts[1]
 
 
 def parse_progress(line):
@@ -51,6 +68,8 @@ class CaptureRun(PassiveCapture):
         self.seq = self.gaps = self.drops = self.invalid = 0
         self.last_progress = 0
         self.cleanup_pending = False
+        self.scope = "ALL NEARBY"
+        self.started_at = time.monotonic()
         self.note = "Use ESP firmware 1.7.6+ for reliable USB PMKID/M1-M4 progress."
 
     @property
@@ -70,9 +89,14 @@ class HandshakeCapture:
 
     def start(self, command):
         self.finish()
-        self.storage = next(storage for storage, cmd in COMMANDS.items() if cmd == command)
+        self.storage = capture_storage(command)
+        if self.storage is None:
+            raise ValueError("Unknown capture command")
         run = self.runs[self.storage] = CaptureRun()
         run.state = "starting"
+        parts = command.split()
+        if len(parts) == 4 and parts[0] == "start_handshake_scope":
+            run.scope = f"SELECTED: {len(parts[3].split(chr(44)))}"
 
     def stop(self):
         if self.current and self.current.active and self.current.state != "finishing":

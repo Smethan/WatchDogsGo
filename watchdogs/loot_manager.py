@@ -17,11 +17,13 @@ Session directory layout:
 """
 
 import base64
+import binascii
 import csv
 import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -31,6 +33,16 @@ from typing import List, Optional
 from .app_state import AppState, Network, SnifferAP, ProbeEntry
 
 log = logging.getLogger(__name__)
+
+_PCAP_META_RE = re.compile(
+    r"^SSID:[ \t]*(?P<ssid>.*?)[ \t]+AP:[ \t]*"
+    r"(?P<bssid>(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})$"
+)
+_CAPTURE_KINDS = {"VALID", "PMKID", "PARTIAL"}
+_HCCAPX_SIZE = 393
+# Must match projectZero HSX_PCAP_MAX: global header plus four bounded 512-byte
+# frames (each preceded by a 16-byte PCAP record header).
+_TARGET_PCAP_MAX = 24 + 4 * (16 + 512)
 
 
 def _fsync_file(fh) -> None:
@@ -113,6 +125,9 @@ class LootManager:
         self._hccapx_b64_lines: List[str] = []
         self._pcap_meta_ssid = "unknown"
         self._pcap_meta_bssid = "unknown"
+        self._pcap_capture_kind: Optional[str] = None
+        self._pcap_expected_size: Optional[int] = None
+        self._pcap_protocol_error = False
 
         # Aggregate loot database
         self._db_path = self._base / "loot_db.json"
@@ -567,10 +582,10 @@ class LootManager:
     # Full serial log
     # ------------------------------------------------------------------
 
-    def log_serial(self, line: str) -> None:
-        """Append a timestamped serial line to the full log."""
+    def log_serial(self, line: str) -> Optional[str]:
+        """Log one line and return the kind of any committed capture artifact."""
         if not self._serial_fh:
-            return
+            return None
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         try:
             self._serial_fh.write(f"[{ts}] {line}\n")
@@ -581,7 +596,7 @@ class LootManager:
         # Check for handshake metadata in serial stream
         self._detect_handshake(line)
         # Check for pcap base64 data from start_handshake_serial
-        self._detect_pcap_stream(line)
+        return self._detect_pcap_stream(line)
 
     # ------------------------------------------------------------------
     # Handshake detection from serial stream
@@ -676,7 +691,7 @@ class LootManager:
     # PCAP base64 stream parser (start_handshake_serial output)
     # ------------------------------------------------------------------
 
-    def _detect_pcap_stream(self, line: str) -> None:
+    def _detect_pcap_stream(self, line: str) -> Optional[str]:
         """Parse base64-encoded pcap/hccapx blocks from serial stream.
 
         Triggered by start_handshake_serial firmware command which outputs:
@@ -691,14 +706,29 @@ class LootManager:
         """
         stripped = line.strip()
 
+        # Firmware 1.7.9 opens a typed transaction before any binary block.
+        # Reset an incomplete predecessor rather than allowing its bytes or
+        # metadata to leak into this artifact.
+        if stripped.startswith("CAPTURE_KIND:"):
+            kind = stripped.partition(":")[2].strip()
+            self._reset_pcap_stream()
+            self._pcap_capture_kind = kind
+            self._pcap_protocol_error = kind not in _CAPTURE_KINDS
+            return
+
         # PCAP block
-        if "--- PCAP BEGIN ---" in stripped:
+        if stripped == "--- PCAP BEGIN ---":
+            # A legacy transaction has no CAPTURE_KIND. A new typed
+            # transaction keeps the kind established immediately above.
             self._pcap_collecting = True
             self._pcap_b64_lines = []
+            self._hccapx_collecting = False
+            self._hccapx_b64_lines = []
+            self._pcap_expected_size = None
             return
 
         if self._pcap_collecting:
-            if "--- PCAP END ---" in stripped:
+            if stripped == "--- PCAP END ---":
                 self._pcap_collecting = False
             else:
                 # Collect only valid base64 chars
@@ -707,14 +737,27 @@ class LootManager:
                     self._pcap_b64_lines.append(clean)
             return
 
+        if stripped.startswith("PCAP_SIZE:"):
+            value = stripped.partition(":")[2].strip()
+            if not value.isdecimal():
+                self._pcap_protocol_error = True
+            else:
+                size = int(value)
+                self._pcap_expected_size = size
+                if self._pcap_capture_kind is not None and not 24 < size <= _TARGET_PCAP_MAX:
+                    self._pcap_protocol_error = True
+            return
+
         # HCCAPX block
-        if "--- HCCAPX BEGIN ---" in stripped:
+        if stripped == "--- HCCAPX BEGIN ---":
             self._hccapx_collecting = True
             self._hccapx_b64_lines = []
+            if self._pcap_capture_kind in ("PMKID", "PARTIAL"):
+                self._pcap_protocol_error = True
             return
 
         if self._hccapx_collecting:
-            if "--- HCCAPX END ---" in stripped:
+            if stripped == "--- HCCAPX END ---":
                 self._hccapx_collecting = False
             else:
                 clean = stripped.replace(" ", "")
@@ -722,68 +765,105 @@ class LootManager:
                     self._hccapx_b64_lines.append(clean)
             return
 
-        # Metadata line: firmware prints SSID and AP MAC after the blocks
-        if "SSID:" in stripped and "AP:" in stripped:
-            try:
-                parts = stripped.split("SSID:")
-                if len(parts) > 1:
-                    rest = parts[1].strip()
-                    if "AP:" in rest:
-                        ssid_part, ap_part = rest.split("AP:", 1)
-                        self._pcap_meta_ssid = ssid_part.strip()
-                        self._pcap_meta_bssid = ap_part.strip().replace(":", "")[:12]
-                    else:
-                        self._pcap_meta_ssid = rest.strip().split()[0]
-            except Exception:
-                pass
+        # Metadata is the commit record. Match the final canonical MAC at the
+        # end of the line so an SSID containing the text "AP:" cannot replace
+        # the BSSID or introduce path components into the output filename.
+        metadata = _PCAP_META_RE.fullmatch(stripped)
+        if metadata:
+            self._pcap_meta_ssid = metadata.group("ssid").strip()
+            self._pcap_meta_bssid = metadata.group("bssid").replace(":", "").upper()
             # Save when we have both pcap and hccapx (or at least pcap)
             if self._pcap_b64_lines:
-                self._save_pcap_from_b64()
+                kind = self._pcap_capture_kind or "LEGACY"
+                if self._save_pcap_from_b64():
+                    return kind
+            return None
+        if stripped.startswith("SSID:"):
+            # A malformed/split commit record is not a safe reason to name and
+            # save the artifact. A later ordinary line may still invoke the
+            # legacy unknown-metadata fallback and preserve its bytes.
             return
 
         # Fallback: if we got hccapx end and pcap is ready, save after short wait
         # (in case firmware doesn't print SSID/AP line)
-        if self._pcap_b64_lines and self._hccapx_b64_lines and not self._hccapx_collecting:
+        if (self._pcap_capture_kind is None and self._pcap_b64_lines
+                and self._hccapx_b64_lines and not self._hccapx_collecting):
             # Check if this is an unrelated line that signals end of block
             if not any(c in stripped for c in ("BEGIN", "END", "SIZE:", "PCAP", "HCCAPX")):
-                self._save_pcap_from_b64()
+                if self._save_pcap_from_b64():
+                    return "LEGACY"
+        return None
 
-    def _save_pcap_from_b64(self) -> None:
-        """Decode and save accumulated base64 pcap/hccapx data as binary files."""
+    def _save_pcap_from_b64(self) -> bool:
+        """Decode/save a capture transaction and report whether it committed."""
         if not self._handshake_dir or not self._pcap_b64_lines:
-            self._pcap_b64_lines = []
-            self._hccapx_b64_lines = []
-            self._pcap_meta_ssid = "unknown"
-            self._pcap_meta_bssid = "unknown"
-            return
+            self._reset_pcap_stream()
+            return False
+
+
+        # Validate the complete transaction before creating either file. The
+        # strict checks apply to the typed 1.7.9 protocol; legacy captures keep
+        # their historical optional-size/optional-HCCAPX behavior.
+        try:
+            pcap_data = base64.b64decode("".join(self._pcap_b64_lines), validate=True)
+            hccapx_data = (base64.b64decode("".join(self._hccapx_b64_lines), validate=True)
+                            if self._hccapx_b64_lines else None)
+        except (ValueError, TypeError, binascii.Error) as exc:
+            log.error("Cannot decode serial capture: %s", exc)
+            self._reset_pcap_stream()
+            return False
+        if self._pcap_capture_kind is not None:
+            valid = (
+                not self._pcap_protocol_error
+                and self._pcap_expected_size is not None
+                and len(pcap_data) == self._pcap_expected_size
+                and 24 < len(pcap_data) <= _TARGET_PCAP_MAX
+                and ((self._pcap_capture_kind == "VALID" and hccapx_data is not None
+                      and len(hccapx_data) == _HCCAPX_SIZE)
+                     or (self._pcap_capture_kind in ("PMKID", "PARTIAL")
+                         and hccapx_data is None))
+            )
+            if not valid:
+                log.error("Rejected incomplete or inconsistent typed serial capture")
+                self._reset_pcap_stream()
+                return False
+        elif self._pcap_expected_size is not None and len(pcap_data) != self._pcap_expected_size:
+            log.error("Rejected serial PCAP with mismatched declared size")
+            self._reset_pcap_stream()
+            return False
 
         ts = datetime.now().strftime("%H%M%S")
         safe_ssid = "".join(
             c if c.isalnum() or c in "-_" else "_"
             for c in self._pcap_meta_ssid
-        )
-        base_name = f"{safe_ssid}_{self._pcap_meta_bssid}_{ts}"
+        )[:64] or "unknown"
+        safe_bssid = (self._pcap_meta_bssid.upper()
+                       if re.fullmatch(r"[0-9A-Fa-f]{12}", self._pcap_meta_bssid)
+                       else "unknown")
+        base_name = f"{safe_ssid}_{safe_bssid}_{ts}"
 
         # Save .pcap — fsync'd, this is unrecoverable capture data
+        pcap_saved = False
         try:
-            pcap_data = base64.b64decode("".join(self._pcap_b64_lines))
             pcap_path = self._handshake_dir / f"{base_name}.pcap"
             with open(pcap_path, "wb") as fh:
                 fh.write(pcap_data)
                 _fsync_file(fh)
+            pcap_saved = True
             log.info("PCAP saved: %s (%d bytes)", pcap_path, len(pcap_data))
             self._save_gps_sidecar(pcap_path)
         except Exception as exc:
             log.error("Cannot save PCAP: %s", exc)
 
         # Save .hccapx (if present) — fsync'd
-        if self._hccapx_b64_lines:
+        hccapx_saved = hccapx_data is None
+        if hccapx_data is not None:
             try:
-                hccapx_data = base64.b64decode("".join(self._hccapx_b64_lines))
                 hccapx_path = self._handshake_dir / f"{base_name}.hccapx"
                 with open(hccapx_path, "wb") as fh:
                     fh.write(hccapx_data)
                     _fsync_file(fh)
+                hccapx_saved = True
                 log.info("HCCAPX saved: %s (%d bytes)",
                          hccapx_path, len(hccapx_data))
                 self._save_gps_sidecar(hccapx_path)
@@ -793,11 +873,20 @@ class LootManager:
                 log.error("Cannot save HCCAPX: %s", exc)
 
         # Reset state and update DB
+        self._reset_pcap_stream()
+        self.update_session_loot()
+        return pcap_saved and hccapx_saved
+
+    def _reset_pcap_stream(self) -> None:
+        self._pcap_collecting = False
         self._pcap_b64_lines = []
+        self._hccapx_collecting = False
         self._hccapx_b64_lines = []
         self._pcap_meta_ssid = "unknown"
         self._pcap_meta_bssid = "unknown"
-        self.update_session_loot()
+        self._pcap_capture_kind = None
+        self._pcap_expected_size = None
+        self._pcap_protocol_error = False
 
     # ------------------------------------------------------------------
     # GPS sidecar (Pwnagotchi-compatible .gps.json)

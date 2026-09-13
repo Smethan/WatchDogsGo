@@ -1,5 +1,35 @@
 # Smethan WatchDogsGo
 
+## 0.9.25 — Optional targets for both active HS Capture modes
+
+- Add the same network picker to **HS Capture** (ESP32 SD) and **HS Capture no
+  SD** (serial/uConsole). Press **N**, **R** to scan, **F** or **/** to filter by
+  SSID, **G** to set a minimum RSSI, **O** to sort, and **Space** to select up to
+  16 BSSIDs. **Enter** applies the selection; **A** keeps the original
+  all-nearby behavior.
+- Keep both captures active and background-friendly, including their existing
+  deauthentication behavior and PMKID/M1/M2/M3/M4 progress screens. The SD
+  variant still requires an ESP32 SD card. The no-SD variant still transfers
+  its results to the uConsole after stop. Neither mode requires GPS.
+- Bind selected starts to one complete five-minute firmware scan snapshot.
+  Disconnects, incomplete scans, expired or changed tokens, missing BSSIDs,
+  open/WEP networks, unsupported channels and current WDG whitelist entries are
+  rejected instead of falling back to all-nearby capture.
+- Require Smethan projectZero **1.7.9+** only for network selection. All-nearby
+  capture continues to use the compatible legacy command on older firmware.
+  PMKID and M1-M4 values remain packet sightings; they do not claim a matched
+  exchange even when every column is populated.
+- Treat the final canonical `SSID: ... AP: ...` line as the commit for each
+  no-SD artifact. `CAPTURE_KIND` precedes its blocks without triggering the
+  legacy fallback; sequential valid/partial artifacts cannot share buffered
+  data. Bound and sanitize SSID/BSSID filename components from older or
+  malformed firmware output.
+
+The full 220-test host suite, bytecode compilation, source diff checks,
+sequential valid/partial serial-artifact coverage and a 640x360 picker render passed.
+Firmware protocol/build tests cover the companion changes. Targeted capture and
+RF completeness were not physically validated for this release.
+
 ## 0.9.24 — Faster USB OTA
 
 Measured on the uConsole: **53.33 seconds** for a complete published-release

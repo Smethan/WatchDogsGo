@@ -11,7 +11,8 @@ from .notable_detector import NotableDetector, ble_name
 from .wardrive_trail import FixHistory, WardriveTrail
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
-from .handshake_capture import HandshakeCapture, COMMANDS
+from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
+from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
 
@@ -27,6 +28,7 @@ class WardriveUI:
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
         self.capture = HandshakeCapture()
+        self.targets = HandshakeTargets(time.monotonic)
         self.capture_screen = HandshakeScreen(app, self)
         self.capture_stop_ack = False
         self.detector = NotableDetector()
@@ -61,6 +63,9 @@ class WardriveUI:
         self.reported_false_timeouts = 0
 
     def on_stop(self):
+        self.targets.cancel()
+        if self.app._pending_cmd and self.app._pending_cmd.startswith("hs_scan "):
+            self.app._pending_cmd = None
         self.capture.stop()
         self.host_ble.stop()
         self.scan.stop()
@@ -86,6 +91,7 @@ class WardriveUI:
             self.capture_stop_ack = False
             app.capturing_hs = False
             self.scan.reset()
+            self.targets.disconnect()
             app._clear_scan_state()
             self.detector.clear()
             self.trail.break_segment()
@@ -99,6 +105,16 @@ class WardriveUI:
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
+        if self.targets.tick():
+            if app._pending_cmd and app._pending_cmd.startswith("hs_scan "):
+                app._pending_cmd = None
+            app._send("stop")
+        run = self.capture.current
+        if run and run.state == "starting" and time.monotonic()-run.started_at > 15:
+            run.note = "No capture acknowledgement; stopped. Check firmware and retry."
+            self.capture.finish("error")
+            app.capturing_hs = False
+            app._send("stop")
         self.poll_host_ble(now)
         self.write_diagnostics(now)
         if self.scan.false_timeouts > self.reported_false_timeouts:
@@ -148,6 +164,20 @@ class WardriveUI:
 
     def handle_line(self, line):
         s = line.strip()
+        if s.startswith("HST:"):
+            d = parse_target_record(s)
+            if d is None:
+                self.targets.cancel("Malformed scan result. Press R to rescan.")
+            elif d["kind"] == "capture_error":
+                run = self.capture.current
+                if run and run.state == "starting" and d["storage"] == self.capture.storage:
+                    run.note = ERRORS[d["error"]]
+                    self.capture.finish("error")
+                    self.app.capturing_hs = False
+                    self.app.msg(run.note, 8)
+            else:
+                self.targets.accept(d)
+            return True
         if self.capture.handle(s):
             return True
         if self.capture.current and self.capture.current.state in ("stopped", "error", "disconnected"):
@@ -221,8 +251,10 @@ class WardriveUI:
                         if app.loot and app.loot.active:
                             app._term_add("[TEST] Timing log: " + str(Path(app.loot.session_path) / "wardrive_diagnostics.jsonl"), raw=True)
                 else:
-                    if cmd in COMMANDS.values():
+                    if capture_storage(cmd):
                         self.capture.start(cmd)
+                    elif state == "hs_target_scan" and not self.targets.dispatched(cmd):
+                        return True
                     app._send(cmd)
                     app._set_running(state, True)
                     if state in ("bt_scanning", "ble_scan"):

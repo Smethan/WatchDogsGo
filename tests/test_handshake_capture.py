@@ -175,6 +175,217 @@ def test_legacy_file_output_not_swallowed_and_end_flag_cleared(game, tmp_path):
     game.loot.close()
 
 
+def test_serial_artifact_kind_precedes_blocks_and_sequential_artifacts_keep_metadata(tmp_path, monkeypatch):
+    """Firmware 1.7.9 classifies each artifact before its binary blocks.
+
+    The classification line must not trigger the legacy missing-metadata
+    fallback or carry data from one AP into the next artifact.
+    """
+    from watchdogs.loot_manager import LootManager
+
+    loot = LootManager(str(tmp_path))
+    monkeypatch.setattr(loot, "_try_generate_22000", lambda _: None)
+    valid_pcap = b"P" * 64
+    valid_hccapx = b"H" * 393
+    partial_pcap = b"Q" * 48
+
+    streams = (
+        (
+            "VALID",
+            valid_pcap,
+            valid_hccapx,
+            "OwnedLab",
+            "02:00:00:00:00:11",
+        ),
+        (
+            "PARTIAL",
+            partial_pcap,
+            None,
+            "GuestLab",
+            "02:00:00:00:00:22",
+        ),
+    )
+    for kind, pcap, hccapx, ssid, bssid in streams:
+        lines = [
+            f"CAPTURE_KIND: {kind}",
+            "--- PCAP BEGIN ---",
+            base64.b64encode(pcap).decode(),
+            "--- PCAP END ---",
+            f"PCAP_SIZE: {len(pcap)}",
+        ]
+        if hccapx is not None:
+            lines.extend((
+                "--- HCCAPX BEGIN ---",
+                base64.b64encode(hccapx).decode(),
+                "--- HCCAPX END ---",
+            ))
+        lines.append(f"SSID: {ssid}  AP: {bssid}")
+        for line in lines:
+            loot._detect_pcap_stream(line)
+
+    pcaps = {path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.pcap")}
+    hccapx = {path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.hccapx")}
+    assert len(pcaps) == 2
+    assert next(data for name, data in pcaps.items() if name.startswith("OwnedLab_020000000011_")) == valid_pcap
+    assert next(data for name, data in pcaps.items() if name.startswith("GuestLab_020000000022_")) == partial_pcap
+    assert len(hccapx) == 1
+    assert next(data for name, data in hccapx.items() if name.startswith("OwnedLab_020000000011_")) == valid_hccapx
+    assert not any("unknown" in name for name in (*pcaps, *hccapx))
+    loot.close()
+
+
+def test_serial_artifact_metadata_cannot_inject_bssid_or_path(tmp_path, monkeypatch):
+    from watchdogs.loot_manager import LootManager
+
+    loot = LootManager(str(tmp_path))
+    monkeypatch.setattr(loot, "_try_generate_22000", lambda _: None)
+    payload = base64.b64encode(b"P" * 40).decode()
+    hccapx = base64.b64encode(b"H" * 393).decode()
+    for line in (
+        "--- PCAP BEGIN ---", payload, "--- PCAP END ---", "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
+        "SSID: Trap AP: ../../outside  AP: 02:00:00:00:00:33",
+    ):
+        loot._detect_pcap_stream(line)
+
+    paths = list(loot._handshake_dir.glob("*"))
+    assert len(paths) == 2
+    assert all(path.parent == loot._handshake_dir for path in paths)
+    assert all("_020000000033_" in path.name for path in paths)
+    assert not any(".." in path.name or "/" in path.name for path in paths)
+
+    # A line-split or otherwise malformed legacy commit cannot supply path
+    # characters as a BSSID. The fallback may preserve it under "unknown".
+    for line in (
+        "--- PCAP BEGIN ---", payload, "--- PCAP END ---", "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
+        "SSID: split", "AP: ../../outside", "capture cleanup",
+    ):
+        loot._detect_pcap_stream(line)
+    new_paths = [path for path in loot._handshake_dir.glob("*") if path not in paths]
+    assert new_paths and all(path.parent == loot._handshake_dir for path in new_paths)
+    assert all("_unknown_" in path.name for path in new_paths)
+    loot.close()
+
+
+def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, monkeypatch):
+    from watchdogs.loot_manager import LootManager, _TARGET_PCAP_MAX
+
+    loot = LootManager(str(tmp_path))
+    assert _TARGET_PCAP_MAX == 2136
+    monkeypatch.setattr(loot, "_try_generate_22000", lambda _: None)
+    pcap = base64.b64encode(b"P" * 40).decode()
+    hccapx = base64.b64encode(b"H" * 393).decode()
+
+    loot._detect_pcap_stream("CAPTURE_KIND: PARTIAL")
+    loot._detect_pcap_stream("--- PCAP BEGIN ---")
+    loot._detect_pcap_stream("SSID payload --- PCAP END ---")
+    assert loot._pcap_collecting  # marker text inside an untrusted line is data
+    loot._reset_pcap_stream()
+
+    # Without the sole metadata commit, an ordinary cleanup/log line must not
+    # invoke the legacy unknown-name fallback for a typed transaction.
+    for line in (
+        "CAPTURE_KIND: VALID",
+        "--- PCAP BEGIN ---", pcap, "--- PCAP END ---", "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
+        "Handshake attack cleanup complete.",
+    ):
+        loot._detect_pcap_stream(line)
+    assert not list(loot._handshake_dir.glob("*"))
+
+    # A new transaction discards that incomplete predecessor. Wrong declared
+    # length and malformed base64 are rejected before either file is created.
+    for stream in (
+        (
+            "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---", pcap,
+            "--- PCAP END ---", "PCAP_SIZE: 41",
+            "SSID: BadSize  AP: 02:00:00:00:00:44",
+        ),
+        (
+            "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---", "not_base64!",
+            "--- PCAP END ---", "PCAP_SIZE: 40",
+            "SSID: BadBase64  AP: 02:00:00:00:00:55",
+        ),
+        (
+            "CAPTURE_KIND: VALID", "--- PCAP BEGIN ---", pcap,
+            "--- PCAP END ---", "PCAP_SIZE: 40",
+            "--- HCCAPX BEGIN ---", base64.b64encode(b"short").decode(),
+            "--- HCCAPX END ---", "SSID: BadHccapx  AP: 02:00:00:00:00:66",
+        ),
+    ):
+        for line in stream:
+            loot._detect_pcap_stream(line)
+        assert not list(loot._handshake_dir.glob("*"))
+
+    at_limit = b"L" * _TARGET_PCAP_MAX
+    for line in (
+        "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---",
+        base64.b64encode(at_limit).decode(), "--- PCAP END ---",
+        f"PCAP_SIZE: {_TARGET_PCAP_MAX}",
+        "SSID: AtLimit  AP: 02:00:00:00:00:77",
+    ):
+        loot._detect_pcap_stream(line)
+    saved = list(loot._handshake_dir.glob("*.pcap"))
+    assert len(saved) == 1 and saved[0].read_bytes() == at_limit
+
+    too_large = b"X" * (_TARGET_PCAP_MAX + 1)
+    for line in (
+        "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---",
+        base64.b64encode(too_large).decode(), "--- PCAP END ---",
+        f"PCAP_SIZE: {_TARGET_PCAP_MAX + 1}",
+        "SSID: TooLarge  AP: 02:00:00:00:00:88",
+    ):
+        loot._detect_pcap_stream(line)
+    assert list(loot._handshake_dir.glob("*.pcap")) == saved
+    loot.close()
+
+
+def test_typed_artifact_events_distinguish_valid_pmkid_and_partial(game, tmp_path, monkeypatch):
+    from watchdogs.loot_manager import LootManager
+
+    game.loot = LootManager(str(tmp_path))
+    monkeypatch.setattr(game.loot, "_try_generate_22000", lambda _: None)
+    game._trigger_hs_event = Mock()
+    game.msg = Mock()
+    game._fw_version = "1.7.9"
+    game.net_mgr = NS(parse_network_line=lambda _: None)
+    game._bt_airtag = False
+
+    def feed(kind, ssid, suffix, include_hccapx=False, declared=40):
+        lines = [
+            f"CAPTURE_KIND: {kind}",
+            "--- PCAP BEGIN ---", base64.b64encode(b"P" * 40).decode(),
+            "--- PCAP END ---", f"PCAP_SIZE: {declared}",
+        ]
+        if include_hccapx:
+            lines.extend((
+                "--- HCCAPX BEGIN ---", base64.b64encode(b"H" * 393).decode(),
+                "--- HCCAPX END ---",
+            ))
+        lines.append(f"SSID: {ssid}  AP: 02:00:00:00:00:{suffix}")
+        for line in lines:
+            game._handle_serial_line(line)
+
+    feed("VALID", "ValidLab", "11", include_hccapx=True)
+    feed("PMKID", "PmkidLab", "22")
+    feed("PARTIAL", "PartialLab", "33")
+    feed("VALID", "RejectedLab", "44", include_hccapx=True, declared=41)
+
+    game._trigger_hs_event.assert_called_once_with()
+    messages = [call.args[0] for call in game.msg.call_args_list]
+    assert any("PMKID capture saved" in message for message in messages)
+    assert any("Partial capture saved" in message for message in messages)
+    assert any("artifact rejected" in message for message in messages)
+    assert len(list(game.loot._handshake_dir.glob("*.pcap"))) == 3
+    assert len(list(game.loot._handshake_dir.glob("*.hccapx"))) == 1
+
+    # Untyped metadata retains the historical game event for old firmware.
+    game._handle_serial_line("SSID: LegacyLab  AP: 02:00:00:00:00:55")
+    assert game._trigger_hs_event.call_count == 2
+    game.loot.close()
+
+
 def test_capture_draw_unknown_values_and_progress_late(game, monkeypatch):
     w = game.wardrive; w.capture.start(COMMANDS["sd"])
     w.capture.handle("[HS-SNIFF] EAPOL M2 captured for 'lab' (02:00:00:00:00:02)")
