@@ -78,6 +78,19 @@ two reported drops. No EAPOL/PMKID exchange happened during that sample; it
 verifies the repaired packet delivery path, not a live active-capture exchange.
 Both active capture variants use the same repaired output helper.
 
+The complete USB OTA hardware test then ran on firmware **1.7.7**. The host
+closed its serial connection after the ESP32 wrote **65,536 bytes**, discarded
+the acknowledgment, reconnected by the same USB identity, and resumed at the
+board's saved offset. The **2,252,256-byte** image completed its whole-image
+checksum and firmware validation, rebooted, and passed the expected-slot and
+valid-state checks. Total elapsed time was **457 seconds** (7m37s), including
+download, interruption recovery, hashing and reboot. This was a serial-close
+interruption; reboot/power-loss checkpoint recovery is covered by simulated
+host/firmware tests, not a physical power-cut test.
+
+Automatic hotspot support was removed. The uConsole remains on its existing
+network; neither updater method reconfigures its Wi-Fi or cellular connection.
+
 ## Resumable USB OTA
 
 Select **METHOD → USB (resumable, no ESP32 Wi-Fi)**. Install firmware **1.7.7+**
@@ -96,6 +109,6 @@ before START; this clears only the unfinished inactive-slot transfer.
 Whole-image SHA256, project/image validation and post-reboot version/slot checks
 must all pass before success is shown. A missing final acknowledgment is treated
 as uncertain until reboot verification succeeds. USB OTA can also install an
-older compatible app, but downgrading below 1.7.7 removes its USB OTA receiver;
+older compatible app, but downgrading below 1.7.7 loses the supported USB OTA path;
 use Wi-Fi OTA to upgrade again. Full USB flashing remains available for initial
 installation, bootloader/partition changes, or recovery.

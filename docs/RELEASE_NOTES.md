@@ -17,6 +17,12 @@
   **1.7.6** fixes the root cause: packet lines were larger than the console's
   256-byte USB TX ring. The fix also covers HS Sniff and serial wardrive output.
 
+Hardware validation on the uConsole/XIAO C5 completed a 2.25 MB USB update,
+resumed after a deliberate disconnect at 64 KiB, and verified the new valid boot
+slot (7m37s total). The passive packet-delivery check received 394 complete
+frames with no malformed or incomplete records. WDG's 181 tests and firmware
+build/transport checks pass.
+
 The capture packet-copy fix requires the firmware update, not just WDG.
 See [OTA methods](FIRMWARE_OTA.md) for requirements and recovery behavior.
 
