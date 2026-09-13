@@ -1,5 +1,20 @@
 # Smethan WatchDogsGo
 
+## 0.9.24 — Faster USB OTA
+
+- Automatically negotiate 4 KiB base64 blocks with XIAO firmware 1.7.8+.
+  Supported receivers get a whole block without the old 64-byte write pauses;
+  progress updates once per percentage point instead of once per 256 bytes.
+- Retain the existing 1.7.7 receiver path and WROOM compatibility. Reconnects
+  remain bound to the original USB identity, verify the receiver offset and
+  renegotiate its transfer capabilities. Two consecutive large-block failures
+  fall back to the smaller format without discarding completed progress.
+- Keep release verification, CRCs, durable resume, full-image verification and
+  post-reboot slot/version checks. No network configuration changes.
+- Update WDG, then install firmware 1.7.8 using USB OTA. That first transfer
+  uses the old receiver speed; later transfers use fast mode automatically.
+- Targeted HS Capture was deferred; existing capture modes are unchanged.
+
 ## 0.9.23 — Resumable USB OTA and handshake display guidance
 
 - **SYSTEM → OTA Update** now offers ordinary Wi-Fi OTA and resumable

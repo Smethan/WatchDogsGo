@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import zlib
@@ -24,9 +25,11 @@ class Device:
         self.fail_finish = False
         self.crc_seen = []
         self.version = '1.7.7'
+        self.fast = False
+        self.features = dict(block_size=4096, encoding='base64', line_size=8192)
 
     def send(self, cmd):
-        if cmd == '\b' * 1024:
+        if cmd and set(cmd) == {'\b'}:
             self.queue = []
             return
         cmd = cmd.removeprefix('\x15')
@@ -46,8 +49,12 @@ class Device:
             assert args[1:] == [str(len(self.image)), self.sha]
             self.active = True
             kind = 'ready'
-        elif args[0] == 'uota_chunk':
-            at = int(args[2]); data = bytes.fromhex(args[4])
+        elif args[0] in ('uota_chunk', 'uota_block'):
+            at = int(args[2])
+            data = base64.b64decode(args[4], validate=True) if args[0] == 'uota_block' else bytes.fromhex(args[4])
+            if args[0] == 'uota_block':
+                assert self.fast
+                assert len(data) == min(4096-at%4096, len(self.image)-at)
             assert args[1] == self.sha and int(args[3]) == zlib.crc32(data)
             assert data == self.image[at:at+len(data)]
             self.crc_seen.append(at)
@@ -69,7 +76,7 @@ class Device:
                 self.active = False
                 kind = 'applied'
         self.queue = ['UOTA:' + json.dumps(dict(v=1, kind=kind, board='xiao', sha256=self.sha,
-                      size=len(self.image), offset=self.offset, active=self.active, slot='ota_1', error='sha256'))]
+                      size=len(self.image), offset=self.offset, active=self.active, slot='ota_1', error='sha256', **(self.features if self.fast else {})))]
 
     def read(self):
         result, self.queue = self.queue, []
@@ -159,3 +166,83 @@ def test_preexisting_active_transfer_resumes_without_stopping_or_rewriting_it(se
     assert result.state == 'success'
     assert dev.commands[:2] == ['stop', 'version']
     assert min(dev.crc_seen) == 4096
+
+
+@pytest.mark.parametrize('reboot', [False, True])
+def test_fast_blocks_resume_after_lost_ack_and_keep_final_partial_bytes(setup, reboot):
+    dev, runner, _ = setup
+    dev.fast = True
+    dev.drop_at = 4096
+    dev.reboot_on_drop = reboot
+    result = runner.run(release('v1.7.7'))
+    assert result.state == 'success' and dev.applied
+    assert runner.fast and dev.crc_seen == [0, 4096, 8192]
+    assert not any(c.startswith('uota_chunk') for c in dev.commands)
+
+
+def test_fast_upgrade_of_live_legacy_transfer_finishes_sector_first(setup):
+    dev, runner, _ = setup
+    dev.fast = dev.active = True
+    dev.offset = 256
+    assert runner.run(release('v1.7.7')).state == 'success'
+    commands = [c.split() for c in dev.commands if c.startswith('uota_block')]
+    assert [len(base64.b64decode(c[4])) for c in commands] == [3840,4096,19]
+    assert len(commands) == 3  # legacy uses 32 further full chunks + tail
+
+
+@pytest.mark.parametrize('feature', [dict(block_size=8192), dict(encoding='hex'), dict(line_size=1024)])
+def test_unknown_fast_parameters_fall_back_to_legacy(setup, feature):
+    dev, runner, _ = setup
+    dev.fast = True
+    dev.features.update(feature)
+    assert runner.run(release('v1.7.7')).state == 'success'
+    assert not runner.fast
+    assert all(not c.startswith('uota_block') for c in dev.commands)
+
+
+def test_fast_large_wire_write_uses_one_bounded_write_without_flush():
+    from watchdogs.firmware_ota import SerialOtaTransport
+    from types import SimpleNamespace
+    conn = Mock()
+    conn.write.side_effect = len
+    transport = SerialOtaTransport(SimpleNamespace(serial_conn=conn), None)
+    command = 'uota_block ' + 'a'*64 + ' 0 123 ' + base64.b64encode(bytes(4096)).decode()
+    transport.send_fast(command)
+    conn.write.assert_called_once_with((command+'\r').encode())
+    conn.flush.assert_not_called()
+    assert conn.write_timeout == 2
+    conn.write.return_value = 0; conn.write.side_effect = None
+    with pytest.raises(OSError, match='Incomplete'):
+        transport.send_fast(command)
+
+
+def test_repeated_large_block_failure_falls_back_without_discard_or_restart(setup):
+    dev, runner, _ = setup
+    dev.fast = True
+    original = dev.send
+    failures = []
+    def send(command):
+        if command.startswith('uota_block') and int(command.split()[2]) >= 4096:
+            failures.append(command)
+            raise OSError('large USB block interrupted')
+        original(command)
+    dev.send = send
+    assert runner.run(release('v1.7.7')).state == 'success'
+    assert len(failures) == 2 and runner.fast_disabled
+    assert dev.crc_seen.count(0) == 1
+    assert min(int(c.split()[2]) for c in dev.commands if c.startswith('uota_chunk')) == 4096
+    assert not any(c.startswith('uota_abort') for c in dev.commands)
+
+
+@pytest.mark.parametrize('offset,active', [(1,True),(99999,True),(0,False)])
+def test_invalid_ready_state_cannot_send_data_or_finish(setup, offset, active):
+    dev, runner, _ = setup
+    original = dev.send
+    def send(cmd):
+        original(cmd)
+        if cmd.startswith('uota_begin'):
+            data = json.loads(dev.queue[0][5:]); data.update(offset=offset,active=active)
+            dev.queue = ['UOTA:' + json.dumps(data)]
+    dev.send = send
+    assert runner.run(release('v1.7.7')).state == 'unconfirmed'
+    assert not dev.crc_seen and not dev.applied

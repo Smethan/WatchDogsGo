@@ -77,6 +77,14 @@ class SerialOtaTransport:
                 raise OSError('Incomplete command write')
             time.sleep(0.002)
 
+    def send_fast(self, command):
+        """Only after the receiver advertises a full-block RX buffer."""
+        payload = (command + "\r").encode("ascii")
+        conn = self.manager.serial_conn
+        conn.write_timeout = 2
+        if conn.write(payload) != len(payload):
+            raise OSError("Incomplete block write")
+
     def read(self):
         return self.manager.read_available()
 

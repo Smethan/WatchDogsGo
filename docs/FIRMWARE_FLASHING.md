@@ -109,3 +109,18 @@ failure cleanup, exact release selection, output logging, command construction,
 and dependency reuse. Both 1.7.3 board bundles were downloaded and verified
 through WDG, and private esptool installation/reuse and screen rendering were
 checked. No connected hardware was flashed during this change.
+
+
+### Faster USB OTA (WDG 0.9.24 / XIAO firmware 1.7.8)
+
+Update WDG first, then use SYSTEM > OTA Update > METHOD USB to install 1.7.8.
+That first upgrade uses the running 1.7.7 receiver's original speed. Later
+transfers automatically show **Fast USB** and send 4 KiB blocks. Reinstalling
+the same published version is supported for testing. BOOT stays released.
+
+Large-block transfer is negotiated from the receiver, not guessed from the
+selected release. Firmware 1.7.7 and WROOM retain the paced compatibility path.
+Two consecutive large-block failures switch the current run to smaller chunks
+without discarding progress. The updater still verifies the downloaded release,
+each block and the entire installed image, then checks the rebooted version and
+OTA slot. Existing Wi-Fi OTA remains available. No hotspot is created.

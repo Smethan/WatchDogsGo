@@ -185,7 +185,7 @@ class OtaMixin:
         pyxel.text(x + 10, y + 9, 'ESP32 OTA UPDATE / Smethan projectZero', 12)
         methods = ('Wi-Fi (enter network)', 'USB (resumable, no ESP32 Wi-Fi)')
         details = ('ESP32 downloads from GitHub over Wi-Fi. Requires fork firmware 1.7.2+.',
-                   'uConsole downloads, verifies and sends the app over USB. Requires firmware 1.7.7+.')
+                   'USB: firmware 1.7.7+; fast blocks on XIAO 1.7.8+. First upgrade uses the old speed.')
         pyxel.text(x + 10, y + 26, details[self._ota_method], 10)
         pyxel.text(x + 10, y + 39, 'Boot the firmware normally: BOOT released. Two OTA slots required; no SD needed.', 13)
         values = [self._ota_fields[0] or '(blank: use ESP32 current Wi-Fi)',

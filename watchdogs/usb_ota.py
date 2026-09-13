@@ -1,4 +1,5 @@
 """Verified app-only USB OTA with acknowledged chunks and durable resume."""
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,8 @@ class UsbOtaRunner(OtaRunner):
         self.directory = directory
         self.identity = None
         self.poll_interval = 0.005
+        self.fast = False
+        self.fast_disabled = False
         self._resync = True
 
     def send(self, command):
@@ -23,9 +26,12 @@ class UsbOtaRunner(OtaRunner):
         if self._resync:
             # IDF dumb mode ignores Ctrl+U. Backspace works in both console
             # modes and clears the full maximum line without executing it.
-            paced('\b' * 1024)
+            paced('\b' * 8192)
             self._resync = False
-        paced(command)
+        if self.fast and command.startswith("uota_block "):
+            getattr(self.transport, "send_fast", self.transport.send)(command)
+        else:
+            paced(command)
 
     def version(self):
         self._resync = True
@@ -70,6 +76,16 @@ class UsbOtaRunner(OtaRunner):
             raise OtaError('Unexpected USB OTA response')
         return record
 
+    def ready_offset(self, record, image_size, board):
+        self.check(record, 'ready')
+        position = record['offset']
+        if not record['active'] or position > image_size or (position != image_size and position % 256):
+            raise OtaError('Invalid USB OTA resume offset/state')
+        self.fast = (not self.fast_disabled and type(record.get('block_size')) is int and record['block_size'] == 4096
+                     and record.get('encoding') == 'base64' and record.get('line_size') == 8192
+                     and board == 'xiao')
+        return position
+
     def run(self, release, ssid='', password='', *, discard=False):
         try:
             tag = validate_release(release)
@@ -100,19 +116,27 @@ class UsbOtaRunner(OtaRunner):
             self.identity = digest, len(image), board
             self.requested = True
             ready = self.check(self.exchange(f'uota_begin {len(image)} {digest}', 60), 'ready')
-            position = ready['offset']
+            position = self.ready_offset(ready, len(image), board)
             retries = 0
             deadline = self.clock() + 1800
+            last_report = -1
             while position < len(image):
                 if self.clock() >= deadline:
                     raise OtaError("USB transfer paused after 30 minutes. Select this version again to resume.")
-                if position % 256:
+                if type(position) is not int or not 0 <= position <= len(image) or position % 256:
                     raise OtaError('Invalid USB OTA resume offset')
-                data = image[position:position+256]
-                self.report(f'USB firmware transfer: {position*100//len(image)}% (resumes after disconnects)', position*100//len(image))
+                block_size = (4096-position%4096) if self.fast else 256
+                data = image[position:position+block_size]
+                percent = position*100//len(image)
+                if percent != last_report:
+                    mode = "Fast USB" if self.fast else "USB (legacy)"
+                    self.report(f"{mode} firmware transfer: {percent}% (resumable)", percent)
+                    last_report = percent
                 try:
-                    reply = self.exchange(f'uota_chunk {digest} {position} {zlib.crc32(data)} {data.hex()}')
-                    if reply['kind'] == 'error' and reply.get('error') in ('chunk_crc', 'chunk_arguments', 'offset'):
+                    payload = base64.b64encode(data).decode('ascii') if self.fast else data.hex()
+                    command = 'uota_block' if self.fast else 'uota_chunk'
+                    reply = self.exchange(f'{command} {digest} {position} {zlib.crc32(data)} {payload}')
+                    if reply['kind'] == 'error' and reply.get('error') in ('chunk_crc', 'chunk_arguments', 'chunk_base64', 'offset'):
                         raise OSError('Retry block')
                     reply = self.check(reply, 'ack')
                     if reply['offset'] != position+len(data):
@@ -123,13 +147,17 @@ class UsbOtaRunner(OtaRunner):
                     retries += 1
                     if retries > 8:
                         raise OtaError('USB interrupted. Transfer is saved; reopen USB OTA with this same version to resume.')
+                    if self.fast and retries >= 2:
+                        self.fast_disabled = True
+                        self.fast = False
+                        self.report('Large USB blocks interrupted twice; continuing with compatibility transfer.', None)
                     self.report('USB interrupted; reconnecting to the same ESP32 and checking saved progress...', None)
                     self.sleep(1)
                     try:
                         self.transport.reconnect()
                         self._resync = True
                         ready = self.check(self.exchange(f'uota_begin {len(image)} {digest}', 60), 'ready')
-                        position = ready['offset']
+                        position = self.ready_offset(ready, len(image), board)
                     except (OSError, OtaError, RuntimeError):
                         continue
             if position != len(image):
