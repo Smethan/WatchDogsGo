@@ -1,11 +1,12 @@
-"""Wi-Fi OTA menu. Serial ownership is transferred only on explicit start."""
+"""Wi-Fi and USB OTA menu. Serial ownership is transferred only on explicit start."""
 from queue import Queue, Empty
 import threading
 import os
+from pathlib import Path
 
 import pyxel
 
-from .firmware_ota import OtaRunner, SerialOtaTransport, validate_release, wifi_command
+from .firmware_ota import OtaRunner, OtaResult, SerialOtaTransport, validate_release, wifi_command
 from .updates import release_version
 
 
@@ -21,7 +22,9 @@ class OtaMixin:
         self._ota_running = False
         self._ota_reserved = False
         self._ota_fields = ['', '']
-        self._ota_field = 0
+        self._ota_method = getattr(self, "_ota_method", 0)
+        self._ota_discard = False
+        self._ota_field = 3
         self._ota_selection = 0
         self._ota_releases = []
         self._ota_loading = True
@@ -49,7 +52,8 @@ class OtaMixin:
         if self._ota_running or self._ota_result or not self._ota_releases:
             return
         try:
-            wifi_command(*self._ota_fields)
+            if self._ota_method == 0:
+                wifi_command(*self._ota_fields)
         except ValueError as exc:
             self._ota_status = str(exc)
             return
@@ -82,10 +86,19 @@ class OtaMixin:
         self._ota_fields[1] = ''
         release = self._ota_releases[self._ota_selection]
         events = self._ota_events
+        method, discard = self._ota_method, self._ota_discard
+        cache = str(Path(self._app_dir) / 'firmware_cache')
         def worker():
+            report = lambda text, pct: events.put(('status', (text, pct)))
+            result = OtaResult('unconfirmed', 'Update did not complete; check ESP32 before retrying.')
             try:
-                runner = OtaRunner(transport, lambda text, pct: events.put(('status', (text, pct))))
-                result = runner.run(release, ssid, password)
+                if method == 1:
+                    from .usb_ota import UsbOtaRunner
+                    result = UsbOtaRunner(transport, report, cache).run(release, discard=discard)
+                else:
+                    result = OtaRunner(transport, report).run(release, ssid, password)
+            except Exception:
+                result = OtaResult('failed', 'Could not start the updater. Check device/network availability.')
             finally:
                 # Discard firmware command echoes before normal logging resumes.
                 try:
@@ -93,6 +106,7 @@ class OtaMixin:
                 except Exception:
                     pass
             events.put(('done', result))
+
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_ota_screen(self):
@@ -104,7 +118,7 @@ class OtaMixin:
             if kind == 'releases':
                 self._ota_releases = value
                 self._ota_loading = False
-                self._ota_status = ('Enter ESP32 Wi-Fi details, select a release, then start.' if value
+                self._ota_status = ('Choose Wi-Fi or USB, select a release, then start.' if value
                                     else 'No compatible OTA releases found. ESC closes; reopen to retry.')
             elif kind == 'load_error':
                 self._ota_loading = False
@@ -133,21 +147,29 @@ class OtaMixin:
             return
         if self._ota_running or self._ota_result:
             return
-        if pyxel.btnp(pyxel.KEY_TAB) or pyxel.btnp(pyxel.KEY_DOWN):
-            self._ota_field = (self._ota_field + 1) % 4
+        if (self._ota_method == 1 and (pyxel.btn(pyxel.KEY_LCTRL) or pyxel.btn(pyxel.KEY_RCTRL))
+                and pyxel.btnp(pyxel.KEY_D)):
+            self._ota_discard = not self._ota_discard
+            self._ota_status = ('Next START discards the unfinished USB image.' if self._ota_discard
+                                else 'Resume the same USB image on next START.')
+        elif pyxel.btnp(pyxel.KEY_TAB) or pyxel.btnp(pyxel.KEY_DOWN):
+            self._ota_field = (self._ota_field + 1) % 5
         elif pyxel.btnp(pyxel.KEY_UP):
-            self._ota_field = (self._ota_field - 1) % 4
+            self._ota_field = (self._ota_field - 1) % 5
         elif pyxel.btnp(pyxel.KEY_RETURN):
-            if self._ota_field == 3:
+            if self._ota_field == 4:
                 self._start_ota()
             else:
                 self._ota_field += 1
-        elif self._ota_field == 2 and self._ota_releases:
-            if pyxel.btnp(pyxel.KEY_LEFT):
-                self._ota_selection = (self._ota_selection - 1) % len(self._ota_releases)
-            elif pyxel.btnp(pyxel.KEY_RIGHT):
-                self._ota_selection = (self._ota_selection + 1) % len(self._ota_releases)
-        elif self._ota_field < 2:
+        elif self._ota_field in (2, 3):
+            direction = -1 if pyxel.btnp(pyxel.KEY_LEFT) else 1 if pyxel.btnp(pyxel.KEY_RIGHT) else 0
+            if direction and self._ota_field == 2 and self._ota_releases:
+                self._ota_selection = (self._ota_selection + direction) % len(self._ota_releases)
+            elif direction and self._ota_field == 3:
+                self._ota_method = (self._ota_method + direction) % 2
+                self._ota_fields[1] = ''
+                self._ota_discard = False
+        elif self._ota_field < 2 and self._ota_method == 0:
             if pyxel.btnp(pyxel.KEY_BACKSPACE, 10, 2):
                 self._ota_fields[self._ota_field] = self._ota_fields[self._ota_field][:-1]
             else:
@@ -160,15 +182,21 @@ class OtaMixin:
         x, y, width, height = 36, 36, 568, 288
         pyxel.rect(x, y, width, height, 0)
         pyxel.rectb(x, y, width, height, 12)
-        pyxel.text(x + 10, y + 9, 'ESP32 WI-FI OTA / Smethan projectZero', 12)
-        pyxel.text(x + 10, y + 26, 'Firmware downloads through ESP32 Wi-Fi. USB carries setup/status only.', 13)
-        pyxel.text(x + 10, y + 39, 'Requires the running Smethan fork v1.7.2+ with two OTA slots; BOOT must be released.', 10)
+        pyxel.text(x + 10, y + 9, 'ESP32 OTA UPDATE / Smethan projectZero', 12)
+        methods = ('Wi-Fi (enter network)', 'USB (resumable, no ESP32 Wi-Fi)')
+        details = ('ESP32 downloads from GitHub over Wi-Fi. Requires fork firmware 1.7.2+.',
+                   'uConsole downloads, verifies and sends the app over USB. Requires firmware 1.7.7+.')
+        pyxel.text(x + 10, y + 26, details[self._ota_method], 10)
+        pyxel.text(x + 10, y + 39, 'Boot the firmware normally: BOOT released. Two OTA slots required; no SD needed.', 13)
         values = [self._ota_fields[0] or '(blank: use ESP32 current Wi-Fi)',
                   '*' * len(self._ota_fields[1]) or '(blank: open network)',
                   self._ota_releases[self._ota_selection]['tag_name'] if self._ota_releases else '(loading/unavailable)',
-                  'START WI-FI UPDATE']
-        for i, label in enumerate(('SSID', 'PASSWORD', 'VERSION', '')):
-            yy = y + 65 + i * 25
+                  methods[self._ota_method],
+                  'START UPDATE' + (' / DISCARD PREVIOUS USB TRANSFER' if self._ota_discard else '')]
+        if self._ota_method != 0:
+            values[:2] = ['(not needed)'] * 2
+        for i, label in enumerate(('SSID', 'PASSWORD', 'VERSION', 'METHOD', '')):
+            yy = y + 63 + i * 22
             selected = self._ota_field == i and not self._ota_running and not self._ota_result
             if selected:
                 pyxel.rect(x + 8, yy - 4, width - 16, 18, 1)
@@ -176,15 +204,18 @@ class OtaMixin:
             pyxel.text(x + 76, yy, values[i][:115], 7)
         if self._ota_running:
             pct = self._ota_percent
-            pyxel.rectb(x + 12, y + 168, width - 24, 9, 5)
+            pyxel.rectb(x + 12, y + 177, width - 24, 9, 5)
             if pct is not None:
-                pyxel.rect(x + 14, y + 170, int((width - 28) * pct / 100), 5, 12)
+                pyxel.rect(x + 14, y + 179, int((width - 28) * pct / 100), 5, 12)
         color = 11 if self._ota_result and self._ota_result.state in ('success', 'current') else 10
         for i, line in enumerate(textwrap.wrap(self._ota_status, 132)[:3]):
-            pyxel.text(x + 12, y + 185 + i * 11, line, color)
-        pyxel.text(x + 12, y + 225, 'Password is masked and not logged by WDG; firmware may save it on its SD card.', 13)
-        pyxel.text(x + 12, y + 238, 'Keep power connected. Scans stop for the update; no SD card is required.', 13)
+            pyxel.text(x + 12, y + 195 + i * 10, line, color)
+        note = ('Password is masked and not logged by WDG; firmware may save it on its SD card.'
+                if self._ota_method == 0 else
+                'ESP32 uses USB only. The uConsole can download over Wi-Fi or cellular.')
+        pyxel.text(x + 12, y + 225, note, 13)
+        pyxel.text(x + 12, y + 238, 'Keep power on. USB resume: same version; Ctrl+D toggles discard of a previous transfer.', 13)
         hint = ('Updating / verifying - please wait' if self._ota_running else
                 'ESC returns (check ESP32 before retrying if result is unconfirmed)' if self._ota_result else
-                'TAB/UP/DOWN field   LEFT/RIGHT version   ENTER on START   ESC cancel')
+                'TAB/UP/DOWN field   LEFT/RIGHT version/method   ENTER on START   ESC cancel')
         pyxel.text(x + 12, y + 265, hint, 7)

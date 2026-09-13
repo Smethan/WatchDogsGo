@@ -1,5 +1,25 @@
 # Smethan WatchDogsGo
 
+## 0.9.23 — Resumable USB OTA and handshake display guidance
+
+- **SYSTEM → OTA Update** now offers ordinary Wi-Fi OTA and resumable
+  application-mode USB transfer. Select METHOD with Left/Right, then START.
+  USB uses the uConsole's available internet connection, including cellular;
+  the ESP32 needs no Wi-Fi connection and WDG does not change host networks.
+
+- USB mode downloads/verifies the board-specific fork bundle on the uConsole,
+  sends CRC-checked blocks, and resumes at the ESP32's acknowledged/checkpointed
+  offset after disconnects or reboot. Full-image SHA256 and firmware validation
+  precede boot selection. Install firmware **1.7.7+ once via Wi-Fi OTA** first.
+  Ctrl+D explicitly toggles discard of an unfinished different image; normal
+  START resumes the same image. Bootloader and partition table are not rewritten.
+- Explain empty HS Capture counters caused by dropped progress copies. Firmware
+  **1.7.6** fixes the root cause: packet lines were larger than the console's
+  256-byte USB TX ring. The fix also covers HS Sniff and serial wardrive output.
+
+The capture packet-copy fix requires the firmware update, not just WDG.
+See [OTA methods](FIRMWARE_OTA.md) for requirements and recovery behavior.
+
 ## 0.9.22 — Update ESP32 firmware over Wi-Fi
 
 - Add **SYSTEM → Wi-Fi OTA** with masked network details, published version

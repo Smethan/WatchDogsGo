@@ -219,7 +219,8 @@ def test_ota_reservation_blocks_flash_power_and_other_commands():
     assert app.msg.call_count == 3
 
 
-def test_ui_transfers_serial_ownership_clears_password_and_retains_reservation(monkeypatch):
+@pytest.mark.parametrize('method', [0, 1])
+def test_ui_transfers_serial_ownership_clears_password_and_retains_reservation(monkeypatch, method):
     from watchdogs import firmware_flash, ota_ui
     from queue import Queue
     device = NS(device='/dev/ttyACM0', vid=0x303a, pid=0x1001,
@@ -229,12 +230,19 @@ def test_ui_transfers_serial_ownership_clears_password_and_retains_reservation(m
     monkeypatch.setattr(ota_ui.threading, 'Thread', lambda target, **kw: NS(start=lambda: scheduled.append(target)))
     runner = Mock()
     runner.run.return_value = OtaResult('success', 'Verified v1.7.5', '1.7.5')
-    monkeypatch.setattr(ota_ui, 'OtaRunner', Mock(return_value=runner))
+    from watchdogs import usb_ota
+    wifi_factory = Mock(return_value=runner)
+    usb_factory = Mock(return_value=runner)
+    monkeypatch.setattr(ota_ui, 'OtaRunner', wifi_factory)
+    monkeypatch.setattr(usb_ota, 'UsbOtaRunner', usb_factory)
     app = WatchDogsGame.__new__(WatchDogsGame)
     app._ota_running = False
     app._ota_result = None
     app._ota_releases = [release()]
     app._ota_selection = 0
+    app._ota_method = method
+    app._ota_discard = False
+    app._app_dir = '/tmp'
     app._ota_fields = ['home', 'secret123']
     app._ota_events = Queue()
     app.wardrive = Mock()
@@ -248,6 +256,11 @@ def test_ui_transfers_serial_ownership_clears_password_and_retains_reservation(m
     app._term_add.assert_not_called()
     assert len(scheduled) == 1
     scheduled[0]()
+    (usb_factory if method else wifi_factory).assert_called_once()
+    (wifi_factory if method else usb_factory).assert_not_called()
+    if method:
+        assert runner.run.call_args.kwargs == {'discard': False}
+        assert 'secret123' not in str(runner.run.call_args)
     manager.close.assert_called_once()
     monkeypatch.setattr(ota_ui.pyxel, 'btnp', lambda *args: False)
     app._update_ota_screen()
@@ -293,3 +306,20 @@ def test_firmware_171_project_name_bug_requires_usb_upgrade():
     assert fake.commands == ['stop', 'version']
     with pytest.raises(ValueError):
         validate_release(release('v1.7.1'))
+
+
+def test_paced_usb_commands_preserve_bytes_and_bound_each_write(monkeypatch):
+    from watchdogs import firmware_ota
+    monkeypatch.setattr(firmware_ota.time, 'sleep', Mock())
+    manager = Mock()
+    manager.serial_conn.write.side_effect = len
+    transport = SerialOtaTransport(manager, Mock())
+    command = 'uota_chunk ' + 'a' * 620
+    transport.send_paced(command)
+    writes = [c.args[0] for c in manager.serial_conn.write.call_args_list]
+    assert b''.join(writes) == command.encode() + b'\r'
+    assert all(0 < len(part) <= 64 for part in writes)
+    manager.serial_conn.flush.assert_not_called()
+    manager.serial_conn.write.side_effect = lambda data: len(data) - 1
+    with pytest.raises(OSError, match='Incomplete command'):
+        transport.send_paced(command)

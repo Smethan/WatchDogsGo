@@ -197,7 +197,7 @@ MENU_CATS = [
         ("u", "Upload WPA-SEC",  "_wpasec_upload",         "_wpasec_up",   None),
         ("p", "Download WPA-SEC","_wpasec_download",       "_wpasec_dl",   None),
         ("f", "Flash ESP32",    "_flash_esp32",           "_flash_esp",   None),
-        ("o", "Wi-Fi OTA",       "_ota_esp32",             "_ota_esp",     None),
+        ("o", "OTA Update",       "_ota_esp32",             "_ota_esp",     None),
         ("a", "Update WDG",      "_update_app",            "_update_app",  None),
     ]),
 ]

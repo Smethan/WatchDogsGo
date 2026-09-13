@@ -70,7 +70,7 @@ the update; upstream binaries and stale cached files are never substituted.
 The firmware ZIP includes the bootloader, partition table, initial OTA data and
 application for the existing 8 MB layout. Flashing still requires working serial
 access and may need the physical BOOT/RESET buttons depending on the hardware.
-WDG 0.9.22 adds [SYSTEM → Wi-Fi OTA](FIRMWARE_OTA.md). Onboard firmware OTA is
+WDG 0.9.23 adds cellular-hotspot and resumable USB methods under [SYSTEM → OTA Update](FIRMWARE_OTA.md). Onboard firmware OTA is
 fully configured after installing firmware 1.7.2 or later; 1.7.1 has an OTA
 project-name validation mismatch, and older upstream firmware may still have
 the LOCOSP OTA URL compiled into it. Stable/tagged

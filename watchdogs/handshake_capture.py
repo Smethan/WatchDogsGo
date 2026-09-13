@@ -51,7 +51,7 @@ class CaptureRun(PassiveCapture):
         self.seq = self.gaps = self.drops = self.invalid = 0
         self.last_progress = 0
         self.cleanup_pending = False
-        self.note = "Live PMKID/M1-M4 progress requires ESP firmware 1.7.4+."
+        self.note = "Use ESP firmware 1.7.6+ for reliable USB PMKID/M1-M4 progress."
 
     @property
     def active(self):

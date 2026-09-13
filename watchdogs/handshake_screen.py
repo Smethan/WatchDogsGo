@@ -57,6 +57,14 @@ class HandshakeScreen(PassiveScreen):
             note = messages[-1][0]
         if run.session and run.state == "running" and time.monotonic()-run.last_progress > 7:
             note = "Live progress is late; capture has not been stopped. Check the console."
+        if run.session and run.state == "running" and run.drops and not run.frames:
+            from .updates import release_version
+            try:
+                old = release_version(getattr(self.app, '_fw_version', '')) < (1, 7, 6)
+            except ValueError:
+                old = True
+            note = ("ESP progress packets dropped: firmware 1.7.6 fixes the USB buffer limit." if old
+                    else "Progress copies are dropping; check USB. Capture files may still be recording.")
         if run.invalid:
             note += f" Bad records:{run.invalid}"
         px.text(8,309,note[:120],9)

@@ -221,3 +221,18 @@ def test_old_firmware_cleanup_and_forced_stop():
     assert c.current.state == "error" and not c.current.active
     c.handle(wire(status("stopped", seq=5)))
     assert c.current.state == "error"
+
+
+def test_empty_capture_with_drops_explains_usb_ring_fix(game, monkeypatch):
+    w = game.wardrive
+    w.capture.start(COMMANDS['serial'])
+    w.capture.handle(wire(status()))
+    w.capture.handle(wire(status('stats', seq=10, storage='serial')).replace('"drops":0', '"drops":9'))
+    w.capture_screen.show('serial')
+    game._fw_version = '1.7.5'
+    px = sys.modules['pyxel']; text = Mock()
+    for name in ('cls', 'rect', 'line'):
+        monkeypatch.setattr(px, name, Mock())
+    monkeypatch.setattr(px, 'text', text)
+    w.capture_screen.draw()
+    assert any('1.7.6 fixes the USB buffer' in c.args[2] for c in text.call_args_list)

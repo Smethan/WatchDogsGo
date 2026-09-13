@@ -1,6 +1,6 @@
-# Updating ESP32 firmware over Wi-Fi
+# ESP32 OTA update methods
 
-**WDG 0.9.22+ → SYSTEM → Wi-Fi OTA** uses the OTA updater already in
+**WDG 0.9.23+ → SYSTEM → OTA Update → Wi-Fi (enter network)** uses the OTA updater already in
 **Smethan/projectZero 1.7.2+**. The ESP32 downloads the selected firmware from
 GitHub through its own Wi-Fi connection. USB carries only small setup commands,
 progress and version checks. It does not use esptool, erase the whole chip, or
@@ -9,14 +9,14 @@ transfer the firmware image through USB. No SD card or paid API is required.
 1. Update WDG and restart it. Boot the ESP32 normally: **release BOOT and tap
    RESET** if it was left in download/bootloader mode. WDG needs a responsive
    connection to the running firmware, not the ROM downloader.
-2. Open **SYSTEM → Wi-Fi OTA**. Enter the Wi-Fi network the ESP32 should join and
+2. Open **SYSTEM → OTA Update** and select the Wi-Fi method. Enter the Wi-Fi network the ESP32 should join and
    its password. A phone hotspot with internet access also works. A blank password
    means an open network; blank SSID and password use an already-connected ESP32
    network. WDG does not copy the uConsole's saved network credentials.
 3. Use **Tab / Up / Down** to select a field. On **VERSION**, use **Left / Right**
    to choose a release. The newest compatible stable release is selected initially;
    older compatible tags remain selectable. No fallback to another version occurs.
-4. Select **START WI-FI UPDATE** and press **Enter**. WDG stops scans, verifies the
+4. Select **START UPDATE** and press **Enter**. WDG stops scans, verifies the
    firmware and OTA layout, connects Wi-Fi, and requests the exact selected tag.
    An already-running selected version is reported without downloading or writing.
 5. Leave power connected while progress and verification run. The screen remains
@@ -65,9 +65,37 @@ Wi-Fi errors before the update request are reported without requesting a write.
 
 ## Validation
 
-Offline tests cover credential quoting/nonlogging, rejected credentials, missing
-capabilities/partitions, old firmware, successful updates, explicit OTA failures,
-missing final messages, wrong versions/slots, pending validation, USB errors,
-serial ownership, and refusal to reconnect to another device. The version list
-was checked against published 1.7.2-1.7.5 assets; setup/progress/result screens were
-rendered. The affected uConsole still needs an end-to-end hardware OTA test.
+Tests cover credential quoting/nonlogging, capabilities and partition checks,
+release validation, interruption recovery, resume offsets, checksum rejection,
+wrong versions/slots, pending validation, serial ownership, and refusal to
+reconnect to another device. Both updater menu screens were rendered.
+
+On the user's uConsole/XIAO ESP32-C5, ordinary Wi-Fi OTA installed 1.7.6 and
+confirmed its new valid boot slot. A 25-second passive transport test then
+received **767 packet records longer than 256 bytes**, reconstructing **394
+complete frames**, with **zero malformed records or incomplete frames** and
+two reported drops. No EAPOL/PMKID exchange happened during that sample; it
+verifies the repaired packet delivery path, not a live active-capture exchange.
+Both active capture variants use the same repaired output helper.
+
+## Resumable USB OTA
+
+Select **METHOD → USB (resumable, no ESP32 Wi-Fi)**. Install firmware **1.7.7+**
+once using Wi-Fi OTA to enable its USB receiver. WDG uses the uConsole's
+internet connection (Wi-Fi, cellular, or another working host connection) to download the verified release bundle, asks the ESP32 for
+its board profile, and sends only the matching application in small, acknowledged
+blocks. Normal firmware runs the receiver; BOOT stays released. No SD is needed.
+
+On a brief USB drop, WDG reconnects only to the same USB identity and resumes.
+If it cannot reconnect after bounded attempts, close the result, reconnect the
+board and select **the same firmware version** to resume. If the ESP32 lost
+power, up to the last 4 KiB is resent from a durable checkpoint. An intentional
+version change with another image pending requires **Ctrl+D** to enable discard
+before START; this clears only the unfinished inactive-slot transfer.
+
+Whole-image SHA256, project/image validation and post-reboot version/slot checks
+must all pass before success is shown. A missing final acknowledgment is treated
+as uncertain until reboot verification succeeds. USB OTA can also install an
+older compatible app, but downgrading below 1.7.7 removes its USB OTA receiver;
+use Wi-Fi OTA to upgrade again. Full USB flashing remains available for initial
+installation, bootloader/partition changes, or recovery.

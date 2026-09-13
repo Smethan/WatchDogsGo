@@ -1,7 +1,7 @@
 # Flashing or rolling back ESP32-C5 firmware
 
 For a Wi-Fi update that avoids sending the image through USB, use
-[SYSTEM → Wi-Fi OTA](FIRMWARE_OTA.md) in **WDG 0.9.22+**.
+[SYSTEM → OTA Update](FIRMWARE_OTA.md) in **WDG 0.9.23+**.
 
 For a full USB installation, update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
 

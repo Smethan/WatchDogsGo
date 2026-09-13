@@ -67,6 +67,16 @@ class SerialOtaTransport:
         if conn.write(payload) != len(payload):
             raise OSError('Incomplete command write')
 
+    def send_paced(self, command):
+        payload = (command + '\r').encode('utf-8')
+        conn = self.manager.serial_conn
+        conn.write_timeout = 2
+        for offset in range(0, len(payload), 64):
+            part = payload[offset:offset+64]
+            if conn.write(part) != len(part):
+                raise OSError('Incomplete command write')
+            time.sleep(0.002)
+
     def read(self):
         return self.manager.read_available()
 
@@ -102,7 +112,7 @@ class OtaRunner:
         if not self.pending:
             self.pending.extend(self.transport.read())
         if not self.pending:
-            self.sleep(0.05)
+            self.sleep(getattr(self, "poll_interval", 0.05))
             return ''
         return ANSI.sub('', self.pending.popleft()).strip()
 
