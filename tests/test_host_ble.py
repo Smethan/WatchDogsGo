@@ -114,3 +114,18 @@ def test_wifi_only_requires_explicit_firmware_capability():
     scan.handle(dict(kind="capabilities", wardrive_serial_v1=True, wardrive_wifi_serial_v1=True))
     assert scan.start(wifi_only=True)
     assert sent[-1].startswith("start_wardrive_wifi_serial ")
+
+
+def test_gap_percentage_counts_missing_sequence_positions_not_repeats():
+    scan = ScanController(lambda _:None, lambda:0)
+    assert scan.gap_percent == 0
+    scan.supported = True
+    scan.start()
+    scan.handle(dict(kind="started", session=scan.session, seq=1))
+    scan.handle(dict(kind="wifi", session=scan.session, seq=5))
+    assert scan.seq_gaps == 3 and scan.gap_percent == 60
+    scan.handle(dict(kind="wifi", session=scan.session, seq=5))
+    scan.handle(dict(kind="wifi", session="old", seq=100))
+    assert scan.gap_percent == 60
+    scan.reset()
+    assert scan.gap_percent == 0

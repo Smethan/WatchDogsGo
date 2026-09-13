@@ -47,8 +47,9 @@ it is not retried automatically at the next WDG launch.
 
 ## Firmware
 
-WDG 0.9.16 uses host Bluetooth for All Wardrive and requires firmware 1.7.3+ for
-Wi-Fi-only serial capture. ESP Dual Test can diagnose heartbeat behavior on
+WDG 0.9.17 defaults All Wardrive to ESP32 Wi-Fi + BLE. The separate
+All Wardrive (host BLE) option requires firmware 1.7.3+ for Wi-Fi-only serial
+capture. ESP Dual Test can diagnose heartbeat behavior on
 the previous serial-wardrive firmware before updating the ESP32. See
 [All Wardrive and diagnostics](HOST_BLE_WARDRIVE.md).
 

@@ -1,5 +1,19 @@
 # Smethan WatchDogsGo
 
+## 0.9.17 — ESP32 default and explicit host BLE option
+
+- **All Wardrive (6)** uses the ESP32 for both Wi-Fi and BLE again, with the
+  corrected heartbeat handling from 0.9.16.
+- **All Wardrive (host BLE) (9)** is a separate option using ESP32 Wi-Fi and
+  uConsole BLE. Only this option requires the firmware 1.7.3 Wi-Fi-only capability.
+- **ESP Dual Test (8)** remains available. Its gap counter now includes a
+  cumulative percentage of serial sequence positions missing; timing logs also
+  include the percentage. Gaps measure unaccepted serial records, not missing
+  unique devices or all RF packet loss.
+
+Update WDG and restart; this release does not require a new firmware flash.
+Firmware 1.7.3 is still required if selecting the host BLE option.
+
 ## 0.9.16 — uConsole BLE and heartbeat diagnostics
 
 - **All Wardrive (6)** now captures Wi-Fi on the ESP32 and BLE on the uConsole.

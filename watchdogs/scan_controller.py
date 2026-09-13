@@ -38,6 +38,11 @@ class ScanController:
     def active(self):
         return self.state in ("starting", "running", "stopping")
 
+    @property
+    def gap_percent(self):
+        """Missing serial sequence positions, not over-the-air loss or devices."""
+        return 100 * self.seq_gaps / self.seq if self.seq else 0.0
+
     def probe(self):
         if self.active or self.probing:
             return False

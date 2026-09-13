@@ -438,7 +438,7 @@ def test_passive_ui_capture_and_switch_back_to_wardrive(game):
     assert w.passive.file is None
     w.handle_line("All operations stopped.")
     assert w.scan.mode=="wardrive" and w.scan.state=="starting"
-    assert w.scan.wifi_only
+    assert not w.scan.wifi_only
 
 
 @pytest.mark.parametrize("message,key_info,nonce", [(1,0x008a,True),(2,0x010a,True),(3,0x13ca,True),(4,0x030a,False),(0,0x0382,False)])
@@ -485,7 +485,7 @@ def test_split_wardrive_host_ble_detection_and_stop(game):
     w.host_ble.start.return_value = True
     w.host_ble.poll.return_value = []
     w.handle_line(wire(dict(v=1,kind="capabilities",wardrive_serial_v1=True,wardrive_wifi_serial_v1=True)))
-    game._start_scan_cmd("start_wardrive_wifi_serial", "all_wardrive", "All Wardrive")
+    game._start_scan_cmd("start_wardrive_wifi_serial", "all_wardrive_host", "All Wardrive (host BLE)")
     w.handle_line("All operations stopped.")
     token = w.scan.session
     assert w.scan.wifi_only
@@ -551,3 +551,34 @@ def test_dual_diagnostic_works_on_previous_firmware_and_saves_timing(game, monke
     assert w.scan.state == "stopping"
     last = json.loads(path.read_text().splitlines()[-1])
     assert "No firmware records" in last["error"]
+
+
+@pytest.mark.parametrize("label,command,wifi_only,diagnostic", [
+    ("All Wardrive", "start_wardrive_serial", False, False),
+    ("All Wardrive (host BLE)", "start_wardrive_wifi_serial", True, False),
+    ("ESP Dual Test", "start_wardrive_serial", False, True),
+])
+def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_only, diagnostic):
+    from watchdogs.app import MENU_CATS
+    game._is_running = Mock(return_value=False)
+    w = game.wardrive
+    w.scan.supported = True
+    w.scan.wifi_supported = wifi_only  # ESP modes must work without the new capability
+    entry = next(item for category,items in MENU_CATS if category=="SNIFF"
+                 for item in items if item[1]==label)
+    game._execute_item(entry[2],entry[3],entry[1],[])
+    assert game._pending_state == entry[3]
+    w.handle_line("All operations stopped.")
+    assert w.scan.state == "starting"
+    assert w.scan.wifi_only is wifi_only and w.scan.diagnostic is diagnostic
+    assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
+
+
+def test_host_ble_menu_requires_new_firmware_without_stopping_current_scan(game):
+    game._is_running = Mock(return_value=False)
+    game.wardrive.scan.supported = True
+    game.wardrive.scan.wifi_supported = False
+    game.serial.send_command.reset_mock()
+    game._execute_item("start_wardrive_wifi_serial", "all_wardrive_host", "All Wardrive (host BLE)", [])
+    game.serial.send_command.assert_not_called()
+    assert "1.7.3" in game.msg.call_args.args[0]

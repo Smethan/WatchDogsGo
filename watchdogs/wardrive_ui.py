@@ -176,7 +176,7 @@ class WardriveUI:
             if app._pending_cmd:
                 cmd, state, name = app._pending_cmd, app._pending_state, app._pending_cmd_name
                 app._pending_cmd = None
-                if state in ("all_wardrive", "all_wardrive_test", "hs_sniff"):
+                if state in ("all_wardrive", "all_wardrive_host", "all_wardrive_test", "hs_sniff"):
                     self.detector.clear()
                     if state == "hs_sniff":
                         if not self.app.loot or not self.app.loot.active:
@@ -187,7 +187,7 @@ class WardriveUI:
                         except OSError as exc:
                             app.msg("[HS SNIFF] Cannot save capture: " + str(exc)[:60], 8)
                             return True
-                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive", wifi_only=state == "all_wardrive", diagnostic=state == "all_wardrive_test"):
+                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive", wifi_only=state == "all_wardrive_host", diagnostic=state == "all_wardrive_test"):
                         self.close_passive()
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
@@ -229,6 +229,7 @@ class WardriveUI:
                      stats_age=round(now-scan.last_stats, 3),
                      record_age=round(now-scan.last_heartbeat, 3),
                      received=dict(scan.record_counts), sequence_gaps=scan.seq_gaps,
+                     sequence_gap_percent=round(scan.gap_percent, 3),
                      false_timeouts=scan.false_timeouts, firmware_stats=scan.stats,
                      invalid_records=self.invalid_records, error=scan.error)
         try:
@@ -545,7 +546,7 @@ class WardriveUI:
                 if self.scan.wifi_only:
                     text = "ESP WiFi / host BLE:"+self.host_ble.state+" "+ages+" drops:"+str(self.scan.stats.get("drops",0))+"/"+str(self.host_ble.drops)
                 elif self.scan.diagnostic:
-                    text = f"TEST stats:{now-self.scan.last_stats:.1f}s data:{now-self.scan.last_heartbeat:.1f}s false stops:{self.scan.false_timeouts} gaps:{self.scan.seq_gaps}"
+                    text = f"TEST stats:{now-self.scan.last_stats:.1f}s data:{now-self.scan.last_heartbeat:.1f}s false stops:{self.scan.false_timeouts} gaps:{self.scan.seq_gaps} ({self.scan.gap_percent:.1f}%)"
                 if not self.app.gps_fix: text += " GPS unavailable"
             px.rect(4,218,520,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)

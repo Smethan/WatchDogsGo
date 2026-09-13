@@ -1,10 +1,12 @@
 # All Wardrive and ESP Dual Test
 
-WDG 0.9.16 has two distinct modes under SNIFF:
+WDG 0.9.17 has three distinct modes under SNIFF. All Wardrive defaults to the
+ESP32 for both radios; host Bluetooth is an explicit separate option.
 
 | Mode | Wi-Fi radio | BLE radio | Firmware required |
 | --- | --- | --- | --- |
-| All Wardrive (6) | ESP32, continuous management capture | uConsole/BlueZ | 1.7.3 or newer |
+| All Wardrive (6) | ESP32 | ESP32 | Existing `wardrive_serial_v1` firmware |
+| All Wardrive (host BLE) (9) | ESP32, continuous management capture | uConsole/BlueZ | 1.7.3 or newer |
 | ESP Dual Test (8) | ESP32 | ESP32 | Existing `wardrive_serial_v1` firmware |
 
 ## Why change it?
@@ -29,7 +31,9 @@ Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-gui
    `data` is the age of the last accepted firmware record (including status).
    `false stops` counts episodes where the old stats-only watchdog would have
    fired while the new watchdog still had recent valid records. `gaps` counts
-   missing record sequence numbers, not all over-the-air packet loss.
+   missing record sequence numbers, not all over-the-air packet loss. Its
+   percentage is missing sequence positions divided by the latest accepted
+   sequence number, over the whole session so far.
 4. A false-stop warning with continuing discoveries demonstrates the old WDG
    watchdog could be mistaken. If all records stop for seven seconds, the scan
    stops normally; that indicates a stream interruption, which may be firmware,
@@ -43,10 +47,28 @@ Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-gui
 The test leaves the normal keepalive active and retains the real-silence
 watchdog. It does not deliberately run an uncontrolled or disconnected scan.
 
+## What gaps mean
+
+A jump from sequence 100 to 104 adds three gaps: records 101–103 were not
+accepted. This can include serial output loss/partial writes, framing problems,
+or records rejected by WDG's validator. A gap does not identify a unique missed
+network or device; repeated advertisements and Wi-Fi management/summary records
+also have sequence numbers. Firmware queue overflow or stale observations
+discarded before numbering contribute to firmware `drops` instead and may not
+create sequence gaps. Intentional repeat suppression is not counted as a gap.
+
+Gaps are a capture-completeness signal, not a crash indicator. A cumulative
+count needs a denominator: 1,000 gaps in 100,000 positions is 1%, whereas 1,000
+in 2,000 is 50%. These are examples, not safe/unsafe thresholds. Repeated
+sightings can still discover devices despite some loss, but brief sightings or
+signature evidence can be missed. Neither gaps nor drops measure all RF loss.
+Compare timing logs, gap percentage, `invalid_records`, firmware drops and
+discovery continuity when diagnosing sustained high loss.
+
 ## Switch to host Bluetooth
 
 Flash firmware 1.7.3+ for the correct board, enable Bluetooth in the uConsole's
-OS, and choose All Wardrive (6). The capability check prevents old firmware from
+OS, and choose All Wardrive (host BLE) (9). The capability check prevents old firmware from
 accidentally running ESP32 BLE as well. Firmware receives
 `start_wardrive_wifi_serial <session>`; Wi-Fi keeps the 2.4/5 GHz hopping and raw
 management observations used for probe/OUI/SSID matches, without ESP32 BLE scanning.
