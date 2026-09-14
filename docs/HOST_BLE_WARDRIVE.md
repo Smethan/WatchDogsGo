@@ -1,13 +1,15 @@
 # All Wardrive and ESP Dual Test
 
-WDG 0.9.17 has three distinct modes under SNIFF. All Wardrive defaults to the
-ESP32 for both radios; host Bluetooth is an explicit separate option.
+WDG 0.9.27 has three distinct modes under SNIFF. All Wardrive defaults to the
+ESP32 for both radios; host Bluetooth is an explicit separate option. Firmware
+1.7.10 adds the preferred ten-second batch transport; older firmware keeps the
+streaming fallback.
 
 | Mode | Wi-Fi radio | BLE radio | Firmware required |
 | --- | --- | --- | --- |
-| All Wardrive (6) | ESP32 | ESP32 | Existing `wardrive_serial_v1` firmware |
-| All Wardrive (host BLE) (9) | ESP32, continuous management capture | uConsole/BlueZ | 1.7.3 or newer |
-| ESP Dual Test (8) | ESP32 | ESP32 | Existing `wardrive_serial_v1` firmware |
+| All Wardrive (6) | ESP32, ten-second batch | ESP32, same batch | 1.7.10 preferred; v1 fallback |
+| All Wardrive (host BLE) (9) | ESP32, ten-second batch | uConsole/BlueZ, continuous | 1.7.10 preferred; 1.7.3 fallback |
+| ESP Dual Test (8) | ESP32, ten-second batch | ESP32, same batch | 1.7.10 preferred; v1 fallback |
 
 ## Why change it?
 
@@ -15,10 +17,12 @@ Espressif marks C5 Wi-Fi sniffer plus BLE coexistence as supported with unstable
 performance. That does not prove a given timeout was a firmware crash. WDG also
 had a separate false-timeout path: only started/stats messages renewed its
 seven-second watchdog, even while valid discovery records were arriving.
-Now every validated record with the current session and a new sequence number
-renews it. Stale sessions, duplicate sequences, malformed records and host BLE
-observations cannot keep an unresponsive ESP32 session alive. The firmware's
-15-second host lease and five-second WDG keepalives remain in effect.
+Version 0.9.27 tracks control heartbeats and ESP observations independently.
+After six seconds without control it asks `wardrive_status` for the current
+phase. It stops after 15 seconds only if both control and ESP records are absent.
+Stale sessions, duplicate sequences, malformed records, host BLE observations
+and cell measurements cannot keep an unresponsive ESP32 session alive. The
+firmware's 15-second host lease and five-second WDG keepalives remain in effect.
 
 Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html
 
@@ -27,17 +31,16 @@ Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-gui
 1. Update WDG with SYSTEM → Update WDG or `bash update.sh`, then restart.
 2. Select SNIFF → ESP Dual Test (8). Both scans stay on the ESP32; no host
    Bluetooth is started. Use the same area and conditions that caused timeouts.
-3. Watch the overlay: `stats` is the age of the last firmware status message;
-   `data` is the age of the last accepted firmware record (including status).
-   `false stops` counts episodes where the old stats-only watchdog would have
-   fired while the new watchdog still had recent valid records. `gaps` counts
+3. Watch the overlay: `ctl` is the age of the last firmware control frame;
+   `data` is the age of the last ESP32 observation, and `probes` counts explicit
+   state queries. `gaps` counts
    missing record sequence numbers, not all over-the-air packet loss. Its
    percentage is missing sequence positions divided by the latest accepted
    sequence number, over the whole session so far.
-4. A false-stop warning with continuing discoveries demonstrates the old WDG
-   watchdog could be mistaken. If all records stop for seven seconds, the scan
-   stops normally; that indicates a stream interruption, which may be firmware,
-   USB, host processing, or power. It does not alone prove a coexistence crash.
+4. A late heartbeat produces a status query rather than an immediate stop. If
+   both control and ESP observations stop for 15 seconds, WDG stops the scan.
+   That indicates a stream interruption, which may be firmware, USB, host
+   processing, or power. It does not alone prove a coexistence crash.
 5. Stop with the normal STOP action. Timing snapshots are appended once per
    second and on state changes to `wardrive_diagnostics.jsonl` in the current
    loot session. The console prints its location. It includes counts, firmware
@@ -70,7 +73,8 @@ discovery continuity when diagnosing sustained high loss.
 Flash firmware 1.7.3+ for the correct board, enable Bluetooth in the uConsole's
 OS, and choose All Wardrive (host BLE) (9). The capability check prevents old firmware from
 accidentally running ESP32 BLE as well. Firmware receives
-`start_wardrive_wifi_serial <session>`; Wi-Fi keeps the 2.4/5 GHz hopping and raw
+`start_wardrive_wifi_batch_serial <session>` on 1.7.10, or the v1
+`start_wardrive_wifi_serial <session>` fallback; Wi-Fi keeps the 2.4/5 GHz hopping and raw
 management observations used for probe/OUI/SSID matches, without ESP32 BLE scanning.
 
 Bleak (already in requirements.txt) runs BlueZ discovery in a background thread

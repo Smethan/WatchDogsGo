@@ -31,6 +31,20 @@ def ad(t, data):
 def wire(d):
     return "WDG:"+json.dumps(d,separators=(",", ":"))
 
+def batch_control(kind="heartbeat", **changes):
+    d = dict(v=2, kind=kind, session="test", seq=1, batch=1,
+             state="running", uptime_ms=1000, wifi_count=1, ble_count=1, drops=0)
+    if kind == "batch_start": d["window_ms"] = 10000
+    if kind in ("batch_results", "batch_done"):
+        d.update(batch_wifi=1, batch_ble=1)
+    d.update(changes)
+    return d
+
+def batch_record(kind="wifi", **changes):
+    d = record(kind, v=2, seq=2, batch=1, age_ms=10000)
+    d.update(changes)
+    return d
+
 @pytest.mark.parametrize("chunk", [1,2,7,1024])
 def test_framing(chunk):
     text = (wire(record())+"\r\n"+wire(record("ble"))+"\n").encode()
@@ -47,6 +61,49 @@ def test_oversize_recovery():
 @pytest.mark.parametrize("change", [dict(v=2),dict(v=True),dict(seq=-1),dict(age_ms=2001),dict(rssi="-50"),dict(mac="??"),dict(ssid_hex="aa " ),dict(ssid_hex="aa"*33),dict(session="bad\n"),dict(channel=0)])
 def test_bad_records(change):
     assert parse_record(wire(record(**change))) is None
+
+def test_v2_protocol_boundaries_and_batches():
+    assert parse_record(wire(batch_control()))["kind"] == "heartbeat"
+    assert parse_record(wire(batch_control("batch_start")))["window_ms"] == 10000
+    assert parse_record(wire(batch_control("batch_results")))["batch_wifi"] == 1
+    assert parse_record(wire(batch_record(age_ms=20000)))["batch"] == 1
+    assert parse_record(wire(batch_record(age_ms=20001))) is None
+    assert parse_record(wire(batch_control("batch_start", batch=0))) is None
+    assert parse_record(wire(batch_control("status", state="unknown"))) is None
+
+def test_v2_is_default_with_legacy_fallback_and_independent_liveness():
+    now=[0];sent=[];c=ScanController(sent.append,lambda:now[0])
+    c.handle(dict(kind="capabilities",wardrive_serial_v1=True,wardrive_wifi_serial_v1=True,
+                  wardrive_batch_serial_v2=True,wardrive_wifi_batch_serial_v2=True))
+    assert c.start() and sent[-1].startswith("start_wardrive_batch_serial ")
+    token=c.session
+    c.handle(batch_control("started",session=token,seq=1,batch=0))
+    c.handle(batch_control("batch_start",session=token,seq=2))
+    assert c.state=="running" and c.batch_phase=="scanning"
+    now[0]=7;c.tick()
+    assert c.state=="running" and "wardrive_status " in sent[-2]
+    # A data record proves observations are flowing, but does not forge a
+    # control heartbeat or hide the warning/probe path.
+    now[0]=14;c.handle(batch_record(session=token,seq=3));c.tick()
+    assert c.state=="running" and c.last_control==0 and c.last_data==14
+    now[0]=16;c.tick();assert c.state=="running"
+    c.handle(batch_control("heartbeat",session=token,seq=4,batch=2))
+    assert c.last_control==16
+    c.stop();assert c.accept_plain_stop() and c.state=="idle"
+
+    legacy=ScanController(sent.append,lambda:0)
+    legacy.handle(dict(kind="capabilities",wardrive_serial_v1=True))
+    assert legacy.start() and legacy.legacy and sent[-1].startswith("start_wardrive_serial ")
+    legacy.stop();assert not legacy.accept_plain_stop()
+
+def test_v2_status_recovers_missed_start_and_stop():
+    now=[0];sent=[];c=ScanController(sent.append,lambda:now[0])
+    c.supported=True;c.batch_supported=True;c.start();token=c.session
+    now[0]=4;c.tick();assert sent[-1]=="wardrive_status "+token
+    c.handle(batch_control("status",session=token,seq=1,state="running",batch=1))
+    assert c.state=="running"
+    c.stop();c.handle(batch_control("status",session=token,seq=2,state="stopped",batch=1))
+    assert c.state=="idle"
 
 def test_malformed_json():
     for s in ('WDG:[]','WDG:null','WDG:{','WDG:'+ '['*1100):
@@ -111,6 +168,15 @@ def test_fix_history_and_stale():
     assert h.at(11)["latitude"]==0 and h.at(12)["latitude"]==2
     assert h.at(16) is None
     f.valid=False;f.received_at=13;h.update(f,13);assert h.at(13) is None
+
+def test_fix_history_keeps_batch_window_and_uses_nearest_fix():
+    h=FixHistory()
+    for stamp in range(1,31):
+        h.update(GpsFix(latitude=stamp,longitude=0,valid=True,received_at=stamp),stamp)
+    assert h.at(20.4)["latitude"]==20
+    assert h.at(9)["latitude"]==9
+    h.update(GpsFix(latitude=32,longitude=0,valid=True,received_at=32),32)
+    assert h.at(-2) is None and len(h.fixes)<=600
 
 def test_frozen_nmea_does_not_refresh(monkeypatch):
     import watchdogs.gps_manager as g
@@ -579,6 +645,50 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert w.scan.wifi_only is wifi_only and w.scan.diagnostic is diagnostic
     assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
     w.cell.start.assert_called_once_with(w.scan.session)
+
+def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
+    w=game.wardrive
+    w.cell=Mock(state="idle",session="",provider="",error="",drops=0)
+    w.cell.poll.return_value=[];w.cell.start.return_value=True
+    caps=dict(v=1,kind="capabilities",wardrive_serial_v1=True,
+              wardrive_wifi_serial_v1=True,wardrive_batch_serial_v2=True,
+              wardrive_wifi_batch_serial_v2=True)
+    w.handle_line(wire(caps))
+    game._start_scan_cmd("start_wardrive_serial","all_wardrive","All Wardrive")
+    w.handle_line("All operations stopped.")
+    token=w.scan.session
+    assert game.serial.send_command.call_args.args[0]=="start_wardrive_batch_serial "+token
+    w.handle_line(wire(batch_control("started",session=token,seq=1,batch=0)))
+    w.handle_line(wire(batch_control("batch_start",session=token,seq=2)))
+    w.handle_line(wire(batch_control("batch_results",session=token,seq=3,
+                                     batch_wifi=2,batch_ble=3)))
+    w.handle_line(wire(batch_record(session=token,seq=4)))
+    w.handle_line(wire(batch_control("batch_done",session=token,seq=5,
+                                     batch_wifi=1,batch_ble=0)))
+    lines=[call.args[0] for call in game._term_add.call_args_list]
+    assert any("Background scan #1 started" in line for line in lines)
+    assert any("Results #1: WiFi 2 | BLE 3" in line for line in lines)
+    assert any("Batch #1 complete" in line for line in lines)
+    assert len(game.wifi_networks)==1
+
+def test_host_ble_batch_updates_map_immediately_but_groups_terminal(game):
+    from watchdogs.host_ble import advertisement_record
+    w=game.wardrive;w.scan.supported=True;w.scan.wifi_supported=True
+    w.scan.wifi_batch_supported=True;w.scan.start(wifi_only=True);w.scan.state="running"
+    w.scan.batch_number=1;w.scan.batch_phase="scanning"
+    w.host_ble=Mock(state="running",drops=0)
+    device=NS(address="C2:00:00:00:00:01",details={"props":{"AddressType":"random"}})
+    adv=NS(local_name="Penguin-123",rssi=-52,manufacturer_data={},service_data={},service_uuids=[])
+    d=advertisement_record(device,adv)
+    w.host_ble.poll.return_value=[(w.scan.session,"ble",(10,d))]
+    game._term_add.reset_mock();w.poll_host_ble(10)
+    assert len(game.ble_devices)==1 and len(w.host_ble_batch_lines)==1
+    assert not any("[BLE]" in call.args[0] for call in game._term_add.call_args_list)
+    token=w.scan.session
+    w.handle_line(wire(batch_control("batch_results",session=token,seq=1,
+                                     batch_wifi=0,batch_ble=0)))
+    assert not w.host_ble_batch_lines
+    assert any("[BLE]" in call.args[0] for call in game._term_add.call_args_list)
 
 
 def test_host_ble_menu_requires_new_firmware_without_stopping_current_scan(game):

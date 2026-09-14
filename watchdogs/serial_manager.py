@@ -266,8 +266,9 @@ class SerialManager:
         try:
             self.serial_conn.write((command + "\r\n").encode("utf-8"))
             self.serial_conn.flush()
-            time.sleep(0.1)
-            if not command.startswith("wardrive_keepalive "):
+            if not (command.startswith("wardrive_keepalive ") or
+                    command.startswith("wardrive_status ")):
+                time.sleep(0.1)
                 log.debug("TX: %s", command)
         except Exception as exc:
             log.error("Send error: %s", exc)

@@ -12,7 +12,7 @@ def distance(a, b):
 
 class FixHistory:
     def __init__(self):
-        self.fixes = deque(maxlen=64)
+        self.fixes = deque(maxlen=600)
         self.stamp = None
 
     def update(self, fix, now):
@@ -21,12 +21,14 @@ class FixHistory:
             self.stamp = stamp
             valid = fix.valid and -90 <= fix.latitude <= 90 and -180 <= fix.longitude <= 180
             self.fixes.append((stamp, asdict(fix) if valid else None))
+            while self.fixes and stamp-self.fixes[0][0] > 30:
+                self.fixes.popleft()
 
     def at(self, when):
-        for stamp, fix in reversed(self.fixes):
-            if stamp <= when:
-                return fix if when-stamp <= 3 else None
-        return None
+        if not self.fixes:
+            return None
+        stamp, fix = min(self.fixes, key=lambda item: abs(item[0]-when))
+        return fix if abs(when-stamp) <= 3 else None
 
 class WardriveTrail:
     def __init__(self):

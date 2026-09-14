@@ -1,9 +1,11 @@
-"""Strict, bounded WDG v1 records. Firmware uptime is not a GPS clock."""
+"""Strict, bounded WDG records. Firmware uptime is not a GPS clock."""
 import json
 import re
 MAC = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 KINDS = {"started", "stopped", "error", "stats", "wifi", "wifi_mgmt", "ble", "hs_packet"}
+V2_KINDS = {"started", "stopped", "error", "heartbeat", "status", "batch_start",
+            "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble"}
 
 def integer(d, key, low, high):
     v = d.get(key)
@@ -17,16 +19,31 @@ def parse_record(line):
         if len(line.encode("utf-8")) > 1024:
             raise ValueError("line")
         d = json.loads(line[4:])
-        if not isinstance(d, dict) or type(d.get("v")) is not int or d["v"] != 1:
+        if not isinstance(d, dict) or type(d.get("v")) is not int or d["v"] not in (1, 2):
             raise ValueError("version")
         kind = d.get("kind")
         if kind == "capabilities":
+            if d["v"] != 1:
+                raise ValueError("capabilities")
             if type(d.get("wardrive_serial_v1")) is not bool:
                 raise ValueError("capabilities")
             return d
-        if kind not in KINDS or not isinstance(d.get("session"), str) or not TOKEN.fullmatch(d["session"]):
+        allowed = V2_KINDS if d["v"] == 2 else KINDS
+        if kind not in allowed or not isinstance(d.get("session"), str) or not TOKEN.fullmatch(d["session"]):
             raise ValueError("session")
         integer(d, "seq", 1, 2**32-1)
+        if d["v"] == 2:
+            integer(d, "batch", 0, 2**32-1)
+            state = d.get("state")
+            if kind in V2_KINDS-{"wifi", "wifi_mgmt", "ble"} and state not in ("running", "reporting", "stopped", "error"):
+                raise ValueError("state")
+            if kind in ("batch_start", "batch_results", "batch_done") and d["batch"] < 1:
+                raise ValueError("batch")
+            if kind == "batch_start":
+                integer(d, "window_ms", 1000, 60000)
+            if kind in ("batch_results", "batch_done"):
+                integer(d, "batch_wifi", 0, 2**32-1)
+                integer(d, "batch_ble", 0, 2**32-1)
         if kind == "hs_packet":
             for key, low, high in (("packet",1,2**32-1), ("offset",0,2303),
                                    ("total",24,2304), ("capture_ms",0,2**63-1),
@@ -40,7 +57,7 @@ def parse_record(line):
             return d
         if kind in {"wifi", "wifi_mgmt", "ble"}:
             integer(d, "capture_ms", 0, 2**63-1)
-            integer(d, "age_ms", 0, 2000)
+            integer(d, "age_ms", 0, 20000 if d["v"] == 2 else 2000)
             integer(d, "rssi", -127, 20)
             if not isinstance(d.get("mac"), str) or not MAC.fullmatch(d["mac"]):
                 raise ValueError("mac")
@@ -63,7 +80,7 @@ def parse_record(line):
                         raise ValueError("management")
                     if not MAC.fullmatch(d.get("receiver", "")):
                         raise ValueError("receiver")
-        if kind in {"stats", "started", "stopped"}:
+        if kind in {"stats", "started", "stopped", "heartbeat", "status", "batch_start", "batch_results", "batch_done"}:
             for key in ("wifi_count", "ble_count", "drops"):
                 integer(d, key, 0, 2**32-1)
         return d

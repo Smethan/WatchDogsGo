@@ -1,5 +1,34 @@
 # Smethan WatchDogsGo
 
+## 0.9.27 — Batched All Wardrive and recoverable liveness
+
+- Prefer projectZero firmware 1.7.10's ten-second batch transport for **All
+  Wardrive**, **All Wardrive (host BLE)** and **ESP Dual Test**. The overlay now
+  shows `Background scan #N x/10s`, result counts and the transition to the next
+  scan. The terminal prints one scan banner, grouped result rows and a completion
+  banner instead of receiving an unbounded live firmware stream. Firmware with
+  only v1 remains available and is labeled `LEGACY STREAM`.
+- Track firmware control and ESP observation time separately. A late heartbeat
+  first triggers `wardrive_status`; WDG retries the state query and only stops
+  after 15 seconds when both control and ESP data are absent. Host BLE and cell
+  observations never renew the ESP32 clocks. Missed start/stop records can be
+  recovered from a status response, and the firmware's final global cleanup
+  line is accepted as a v2 stop fallback.
+- Keep BlueZ BLE collection, saving, map updates and Flock/Axon matching live in
+  host-BLE mode while buffering only its terminal rows until the ESP batch
+  result boundary. Cellular serving/neighbor collection continues throughout
+  both All Wardrive modes.
+- Extend GPS history to a bounded 30-second/600-fix window and select the nearest
+  fix within three seconds of each delayed observation. This preserves the
+  capture-time position of records delivered after a ten-second batch.
+- Remove the artificial 100 ms delay from keepalive/status commands. Other
+  console commands retain their existing pacing.
+
+The full 231-test host suite, bytecode compilation and shell syntax checks pass.
+Both companion firmware variants compile with ESP-IDF 6.0.1 and pass native
+transport and stack tests. A prolonged XIAO/uConsole field test is still needed
+to establish whether the original timeout is eliminated under dense RF load.
+
 ## 0.9.25 — Optional targets for both active HS Capture modes
 
 - Add the same network picker to **HS Capture** (ESP32 SD) and **HS Capture no

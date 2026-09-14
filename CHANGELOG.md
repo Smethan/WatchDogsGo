@@ -8,6 +8,25 @@ minor versions.
 
 ---
 
+## [0.9.27] — 2026-09-14
+
+### Added
+
+- Protocol-v2 parsing and state recovery for projectZero 1.7.10's ten-second
+  All Wardrive batches.
+- Background-scan phase, batch result counts, separate control/data ages and
+  status-probe counts in the All Wardrive and diagnostic overlays.
+
+### Changed
+
+- Prefer batched Wi-Fi/BLE or batched Wi-Fi-only commands when firmware
+  advertises them, with labeled v1 streaming fallback.
+- Require 15 seconds of both control and ESP-data silence before stopping a v2
+  scan; query firmware state first and accept its global cleanup as a stop
+  fallback.
+- Retain 30 seconds of host GPS history so delayed batch records use the nearest
+  capture-time fix within three seconds.
+
 ## [0.9.26] — 2026-09-14
 
 ### Added

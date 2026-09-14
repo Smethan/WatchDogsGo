@@ -3612,7 +3612,7 @@ class WatchDogsGame(OtaMixin):
     # GPS polling
     # ------------------------------------------------------------------
 
-    def _ingest_ble(self, mac, rssi, name, tag_type="", observation=None):
+    def _ingest_ble(self, mac, rssi, name, tag_type="", observation=None, terminal=True):
         if self._whitelist.is_blocked(mac):
             return  # silently skip whitelisted BLE device
         self.wardrive.observe_legacy("ble", mac, name, rssi, observation)
@@ -3646,13 +3646,14 @@ class WatchDogsGame(OtaMixin):
         # Pretty terminal line instead of raw
         new_mark = "*" if is_new else " "
         suffix = f" {tag_type}" if tag_type else ""
-        self._term_add(
-            f"[BLE]{new_mark} {name[:16]:<16} {mac} {rssi}dBm{suffix}",
-            raw=True)
+        if terminal:
+            self._term_add(
+                f"[BLE]{new_mark} {name[:16]:<16} {mac} {rssi}dBm{suffix}",
+                raw=True)
         return
 
 
-    def _ingest_wifi(self, net, observation=None):
+    def _ingest_wifi(self, net, observation=None, terminal=True):
         bssid = net.bssid
         if bssid:
             if self._whitelist.is_blocked(bssid):
@@ -3706,10 +3707,11 @@ class WatchDogsGame(OtaMixin):
             # Pretty terminal line instead of raw CSV
             tag = "*" if is_new else " "
             ssid = net.ssid[:20] if net.ssid else "<hidden>"
-            self._term_add(
-                f"[WiFi]{tag} {ssid:<20} Ch:{net.channel:>2} "
-                f"{net.rssi:>4}dBm {net.auth[:8]:<8} {bssid}",
-                raw=True)
+            if terminal:
+                self._term_add(
+                    f"[WiFi]{tag} {ssid:<20} Ch:{net.channel:>2} "
+                    f"{net.rssi:>4}dBm {net.auth[:8]:<8} {bssid}",
+                    raw=True)
             return
 
 

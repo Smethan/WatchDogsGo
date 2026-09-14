@@ -69,6 +69,7 @@ class WardriveUI:
         self.diagnostic_next = 0
         self.diagnostic_state = ""
         self.reported_false_timeouts = 0
+        self.host_ble_batch_lines = deque(maxlen=256)
 
     def on_stop(self):
         self.targets.cancel()
@@ -76,6 +77,7 @@ class WardriveUI:
             self.app._pending_cmd = None
         self.capture.stop()
         self.host_ble.stop()
+        self.host_ble_batch_lines.clear()
         self.cell.stop()
         self.scan.stop()
         self.app._clear_scan_state()
@@ -94,6 +96,7 @@ class WardriveUI:
                 self.scan.error = "Serial connection lost or changed"
                 self.write_diagnostics(time.monotonic())
             self.host_ble.stop()
+            self.host_ble_batch_lines.clear()
             self.cell.stop()
             self.connection = connection
             self.close_passive()
@@ -203,6 +206,8 @@ class WardriveUI:
             if d["kind"] == "capabilities":
                 support = "supported" if d.get("wardrive_wifi_serial_v1") is True else "needs firmware 1.7.3+"
                 self.app._term_add("[WDG] WiFi-only serial for host BLE: " + support, raw=True)
+                protocol = "batched v2" if d.get("wardrive_batch_serial_v2") is True else "legacy stream"
+                self.app._term_add("[WDG] All Wardrive transport: " + protocol, raw=True)
             previous = self.scan.state
             if self.scan.handle(d):
                 if d["kind"] == "hs_packet":
@@ -214,6 +219,15 @@ class WardriveUI:
                         self.close_passive()
                 else:
                     self.observation(d)
+            if d["kind"] == "batch_start":
+                self.app._term_add(f"[ALL] Background scan #{d['batch']} started (10s)", raw=True)
+            elif d["kind"] == "batch_results":
+                self.app._term_add(
+                    f"[ALL] Results #{d['batch']}: WiFi {d['batch_wifi']} | BLE {d['batch_ble']}", raw=True)
+                while self.host_ble_batch_lines:
+                    self.app._term_add(self.host_ble_batch_lines.popleft(), raw=True)
+            elif d["kind"] == "batch_done":
+                self.app._term_add(f"[ALL] Batch #{d['batch']} complete; starting next scan", raw=True)
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
                 if not self.host_ble.start(self.scan.session):
                     self.host_ble_error("Previous Bluetooth scan is still closing; retry shortly")
@@ -231,6 +245,9 @@ class WardriveUI:
                 self.capture_stop_ack = True
                 return True
             self.capture.finish()
+            # v2 emits a structured stop first, but this global cleanup line is
+            # an independent acknowledgement if USB congestion lost that frame.
+            self.scan.accept_plain_stop()
             if self.scan.state != "running":
                 app.sniffing = app.capturing_hs = False
                 app._bt_tracking = app._bt_airtag = False
@@ -256,6 +273,7 @@ class WardriveUI:
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
                     if state != "hs_sniff":
+                        self.host_ble_batch_lines.clear()
                         self.cell_unique.clear()
                         self.cell_observations = self.cell_serving = self.cell_neighbors = 0
                         self.cell_latest = None
@@ -301,6 +319,10 @@ class WardriveUI:
         entry = dict(time=time.time(), session=scan.session, state=scan.state,
                      stats_age=round(now-scan.last_stats, 3),
                      record_age=round(now-scan.last_heartbeat, 3),
+                     control_age=round(now-scan.last_control, 3),
+                     data_age=round(now-scan.last_data, 3),
+                     status_probes=scan.status_attempts,
+                     batch=scan.batch_number, batch_phase=scan.batch_phase,
                      received=dict(scan.record_counts), sequence_gaps=scan.seq_gaps,
                      sequence_gap_percent=round(scan.gap_percent, 3),
                      false_timeouts=scan.false_timeouts, firmware_stats=scan.stats,
@@ -334,7 +356,11 @@ class WardriveUI:
                 record["age_ms"] = int(age * 1000)
                 self.scan.last_seen["ble"] = received
                 # Host BLE must never renew the ESP32 heartbeat.
-                self.observation(record)
+                if self.scan.batch:
+                    name = ble_name(bytes.fromhex(record["data_hex"])) or "?"
+                    self.host_ble_batch_lines.append(
+                        f"[BLE]  {name[:16]:<16} {record['mac']} {record['rssi']}dBm [host]")
+                self.observation(record, terminal=not self.scan.batch)
 
     def poll_cell(self, now):
         active = self.scan.state in ("starting", "running") and self.scan.mode == "wardrive"
@@ -390,7 +416,7 @@ class WardriveUI:
             self.app._term_add("[HS SNIFF] Capture file: " + str(self.passive.path), raw=True)
             self.app.msg(f"[HS SNIFF] EAPOL:{self.passive.eapol} PMKID:{self.passive.pmkids}", CYAN)
 
-    def observation(self, d):
+    def observation(self, d, terminal=True):
         now = time.monotonic()
         d = dict(d)
         d["fix"] = self.fixes.at(now - d["age_ms"] / 1000) if self.app.gps.available else None
@@ -399,10 +425,10 @@ class WardriveUI:
             net = Network(index="0", bssid=d["mac"], ssid=display_bytes(d["ssid_hex"]),
                           channel=str(d["channel"]), rssi=str(d["rssi"]),
                           auth=d.get("auth", "UNKNOWN"), band="5G" if d["channel"] > 14 else "2.4G")
-            self.app._ingest_wifi(net, observation=d)
+            self.app._ingest_wifi(net, observation=d, terminal=terminal)
         elif d["kind"] == "ble":
             name = ble_name(bytes.fromhex(d["data_hex"]))
-            self.app._ingest_ble(d["mac"], d["rssi"], name or "?", observation=d)
+            self.app._ingest_ble(d["mac"], d["rssi"], name or "?", observation=d, terminal=terminal)
         else:
             self.detect(d)
 
@@ -663,7 +689,18 @@ class WardriveUI:
                 if self.scan.wifi_only:
                     text = "ESP WiFi / host BLE:"+self.host_ble.state+" "+ages+" drops:"+str(self.scan.stats.get("drops",0))+"/"+str(self.host_ble.drops)
                 elif self.scan.diagnostic:
-                    text = f"TEST stats:{now-self.scan.last_stats:.1f}s data:{now-self.scan.last_heartbeat:.1f}s false stops:{self.scan.false_timeouts} gaps:{self.scan.seq_gaps} ({self.scan.gap_percent:.1f}%)"
+                    text = f"TEST ctl:{now-self.scan.last_control:.1f}s data:{now-self.scan.last_data:.1f}s probes:{self.scan.status_attempts} gaps:{self.scan.seq_gaps} ({self.scan.gap_percent:.1f}%)"
+                if self.scan.batch:
+                    if self.scan.batch_phase == "scanning":
+                        elapsed = min(10, max(0, now-self.scan.batch_started))
+                        text = f"Background scan #{self.scan.batch_number} {elapsed:.0f}/10s | " + text
+                    elif self.scan.batch_phase == "results":
+                        counts = self.scan.batch_counts
+                        text = f"Results #{self.scan.batch_number} WiFi:{counts['wifi']} BLE:{counts['ble']} | " + text
+                    elif self.scan.batch_phase == "next":
+                        text = f"Batch #{self.scan.batch_number} complete; next scan | " + text
+                elif self.scan.legacy:
+                    text = "LEGACY STREAM | " + text
                 if not self.app.gps_fix: text += " GPS unavailable"
                 cell = " CELL:" + self.cell.state.upper()
                 cell += f" {len(self.cell_unique)}/{self.cell_observations}"
