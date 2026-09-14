@@ -510,7 +510,8 @@ Saved to `loot/<session>/`:
 | File | Content |
 |------|---------|
 | `serial_full.log` | Complete ESP32 serial output |
-| `wardriving.csv` | WiGLE-format WiFi/BLE data + GPS |
+| `wardriving.csv` | WiGLE 1.6 WiFi/BLE/cellular observations + GPS |
+| `cell_diagnostics.jsonl` | Full serving/neighbor radio measurements and provider status |
 | `bt_devices.csv` | BLE devices with GPS coordinates |
 | `handshakes/` | PCAP, HCCAPX, .22000 (hashcat-ready) |
 | `mitm/` | MITM pcap captures |

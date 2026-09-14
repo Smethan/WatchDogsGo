@@ -8,6 +8,23 @@ minor versions.
 
 ---
 
+## [0.9.26] — 2026-09-14
+
+### Added
+
+- All Wardrive now runs a host cellular collector in both ESP BLE and host
+  BlueZ BLE modes. ModemManager supplies serving and neighboring cells when
+  supported; SIM7600 `AT+CPSI?` remains a serving-cell fallback.
+- Cellular observations use WiGLE cell identities, preserve repeated GPS
+  samples, expose unique/observation counts, and appear as green map points.
+
+### Changed
+
+- New wardrive files use the WiGLE 1.6, 14-column layout. Readers and WDGoWars
+  sync now parse columns by name and remain compatible with WiGLE 1.4 files.
+- WDGoWars sync preserves cellular technology, channel, frequency, GPS
+  accuracy, and signal fields instead of applying Wi-Fi authentication rules.
+
 ## [0.9.13] — 2026-06-04
 
 Companion to 0.9.12 — handles the transient HTTP 413 the same user

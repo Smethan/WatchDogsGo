@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -219,7 +219,8 @@ class LootManager:
             try:
                 with open(self._db_path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                if isinstance(data, dict) and "version" in data and "sessions" in data:
+                if (isinstance(data, dict) and data.get("version", 0) >= 2
+                        and "sessions" in data):
                     log.info("Loot DB loaded: %d sessions", len(data.get("sessions", {})))
                     return data
             except (json.JSONDecodeError, OSError) as exc:
@@ -232,7 +233,7 @@ class LootManager:
         Also generates .22000 files retroactively for any .hccapx that
         doesn't already have a corresponding .22000 file.
         """
-        db: dict = {"version": 1, "sessions": {}, "totals": {}}
+        db: dict = {"version": 2, "sessions": {}, "totals": {}}
         if not self._base.is_dir():
             return db
         for entry in sorted(self._base.iterdir()):
@@ -264,7 +265,8 @@ class LootManager:
         counts = {"pcap": 0, "hccapx": 0, "hc22000": 0, "passwords": 0, "et_captures": 0,
                   "mc_nodes": 0, "mc_messages": 0, "bt_devices": 0, "bt_airtags": 0,
                   "bt_smarttags": 0, "bt_devices_gps": 0, "wardriving": 0, "adsb": 0,
-                  "mitm_pcaps": 0}
+                  "wardriving_wifi": 0, "wardriving_ble": 0,
+                  "cell_observations": 0, "cell_cells": 0, "mitm_pcaps": 0}
         hs_dir = session_path / "handshakes"
         if hs_dir.is_dir():
             try:
@@ -365,8 +367,14 @@ class LootManager:
             try:
                 with open(wd_file, newline="", encoding="utf-8") as f:
                     next(f, None)
-                    lines = sum(1 for _ in csv.reader(f))
-                counts["wardriving"] = max(0, lines - 1)  # minus pre-header + header
+                    rows = list(csv.DictReader(f))
+                cell_types = {"GSM", "WCDMA", "LTE", "NR"}
+                cells = [row for row in rows if row.get("Type", "").upper() in cell_types]
+                counts["wardriving"] = len(rows)
+                counts["wardriving_wifi"] = sum(1 for row in rows if row.get("Type", "WIFI").upper() == "WIFI")
+                counts["wardriving_ble"] = sum(1 for row in rows if row.get("Type", "").upper() in ("BT", "BLE"))
+                counts["cell_observations"] = len(cells)
+                counts["cell_cells"] = len({row.get("MAC", "") for row in cells if row.get("MAC")})
             except OSError:
                 pass
         adsb_file = session_path / "adsb_aircraft.csv"
@@ -389,7 +397,8 @@ class LootManager:
         """Recalculate totals from all session entries."""
         keys = ("pcap", "hccapx", "hc22000", "passwords", "et_captures",
                 "mc_nodes", "mc_messages", "bt_devices", "bt_airtags", "bt_smarttags",
-                "bt_devices_gps", "wardriving", "adsb")
+                "bt_devices_gps", "wardriving", "wardriving_wifi", "wardriving_ble",
+                "cell_observations", "cell_cells", "adsb")
         totals: dict = {k: 0 for k in keys}
         totals["sessions"] = len(db["sessions"])
         for session_counts in db["sessions"].values():
@@ -960,22 +969,22 @@ class LootManager:
     }
 
     _WIGLE_PRE_HEADER = (
-        "WigleWifi-1.4,appRelease=WatchDogsGo,model=uConsole,"
+        "WigleWifi-1.6,appRelease=WatchDogsGo,model=uConsole,"
         "release=1.0,device=WatchDogsGo,display=Pyxel,board=ESP32,"
         "brand=LOCOSP,star=Sol,body=3,subBody=0\n"
     )
-    _WIGLE_HEADER = (
-        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,"
-        "CurrentLatitude,CurrentLongitude,AltitudeMeters,"
-        "AccuracyMeters,Type\n"
-    )
+    _WIGLE_FIELDS = ("MAC", "SSID", "AuthMode", "FirstSeen", "Channel", "Frequency",
+                     "RSSI", "CurrentLatitude", "CurrentLongitude", "AltitudeMeters",
+                     "AccuracyMeters", "RCOIs", "MfgrId", "Type")
+    _WIGLE_HEADER = ",".join(_WIGLE_FIELDS) + "\n"
 
     def _wigle_auth(self, auth: str) -> str:
         """Convert ESP32 auth string to WiGLE AuthMode format."""
         return self._AUTH_MAP.get(auth.strip(), f"[{auth}][ESS]")
 
     def _save_wardrive_row(self, mac, name, auth, channel, rssi, kind,
-                           observation_fix="current", observed_at=None):
+                           observation_fix="current", observed_at=None,
+                           frequency="", append=False):
         if not self._session_active or not mac:
             return False
         if observation_fix == "current":
@@ -990,25 +999,28 @@ class LootManager:
             lat, lon = round(fix.latitude, 7), round(fix.longitude, 7)
             alt = round(fix.altitude, 1)
             accuracy = round(fix.hdop * 5, 1) if fix.hdop < 99 else 0.0
-        ts = datetime.fromtimestamp(observed_at).strftime("%Y-%m-%d %H:%M:%S") if observed_at is not None else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        instant = datetime.fromtimestamp(observed_at, timezone.utc) if observed_at is not None else datetime.now(timezone.utc)
+        ts = instant.strftime("%Y-%m-%d %H:%M:%S")
         path = self._session / "wardriving.csv"
         try:
             rows = []
             if path.is_file():
                 with path.open(newline="", encoding="utf-8") as f:
                     next(f, None)  # WiGLE pre-header
-                    rows = list(csv.reader(f))
-                rows = rows[1:]  # column names
+                    reader = csv.DictReader(f)
+                    rows = [dict(row) for row in reader]
             rssi = int(rssi)
-            row = [mac, name, auth, ts, channel, rssi, lat, lon, alt, accuracy, kind]
-            for i, old in enumerate(rows):
-                if len(old) == 11 and old[0].upper() == mac.upper() and old[10] == kind:
+            row = dict(zip(self._WIGLE_FIELDS,
+                (mac, name, auth, ts, channel, frequency, rssi, lat, lon, alt,
+                 accuracy, "", "", kind)))
+            for i, old in enumerate(rows if not append else ()):
+                if old.get("MAC", "").upper() == mac.upper() and old.get("Type") == kind:
                     try:
-                        if rssi <= int(old[5]):
+                        if rssi <= int(old.get("RSSI", -1000)):
                             return False
                     except ValueError:
                         pass
-                    row[3] = old[3]  # preserve FirstSeen
+                    row["FirstSeen"] = old.get("FirstSeen", ts)
                     rows[i] = row
                     break
             else:
@@ -1016,8 +1028,10 @@ class LootManager:
             temp = path.with_suffix(".csv.tmp")
             with temp.open("w", newline="", encoding="utf-8") as f:
                 f.write(self._WIGLE_PRE_HEADER)
-                f.write(self._WIGLE_HEADER)
-                csv.writer(f).writerows(rows)
+                writer = csv.DictWriter(f, fieldnames=self._WIGLE_FIELDS,
+                                        extrasaction="ignore", lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(rows)
                 _fsync_file(f)
             temp.replace(path)
             return True
@@ -1035,6 +1049,30 @@ class LootManager:
                          observation_fix="current", observed_at=None) -> bool:
         return self._save_wardrive_row(mac, name, "[BLE]", "", rssi, "BLE",
                                       observation_fix, observed_at)
+
+    def save_wardriving_cell(self, cell, *, observation_fix="current", observed_at=None) -> bool:
+        """Append one WiGLE-compatible cellular location observation."""
+        kind = str(cell.get("technology", "")).upper()
+        if kind not in ("GSM", "WCDMA", "LTE", "NR"):
+            return False
+        signal = cell.get("signal_dbm")
+        if signal is None:
+            return False
+        saved = self._save_wardrive_row(
+            cell.get("identity"), cell.get("operator_id", ""), kind,
+            cell.get("channel") if cell.get("channel") is not None else "",
+            round(float(signal)), kind, observation_fix, observed_at,
+            frequency=cell.get("frequency") or "", append=True)
+        if saved:
+            try:
+                path = self._session / "cell_diagnostics.jsonl"
+                entry = dict(cell, observed_at=observed_at, fix=observation_fix)
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                    _fsync_file(stream)
+            except OSError as exc:
+                log.error("Cannot save cell diagnostics: %s", exc)
+        return saved
 
     def save_scan_results(self, networks: List[Network]) -> None:
         """Save scan results as CSV. fsync'd."""
@@ -1271,31 +1309,22 @@ class LootManager:
             wd_file = session_dir / "wardriving.csv"
             if wd_file.is_file():
                 try:
-                    with open(wd_file, "r", encoding="utf-8") as fh:
-                        for i, line in enumerate(fh):
-                            if i <= 1:
-                                continue  # skip pre-header + header
-                            parts = line.strip().split(",")
-                            if len(parts) >= 8:
-                                try:
-                                    lat = float(parts[6])
-                                    lon = float(parts[7])
-                                    if lat != 0.0 or lon != 0.0:
-                                        # Detect Type column (11th col = index 10)
-                                        ptype = "wifi"
-                                        if len(parts) >= 11 and parts[10].strip().upper() == "BLE":
-                                            ptype = "bt"
-                                        points.append({
-                                            "lat": lat, "lon": lon,
-                                            "type": ptype,
-                                            "label": parts[1],  # SSID/Name
-                                            "bssid": parts[0],
-                                            "auth": parts[2] if len(parts) > 2 else "",
-                                            "rssi": parts[5] if len(parts) > 5 else "",
-                                            "channel": parts[4] if len(parts) > 4 else "",
-                                        })
-                                except (ValueError, IndexError):
-                                    pass
+                    with open(wd_file, "r", encoding="utf-8", newline="") as fh:
+                        next(fh, None)
+                        for row in csv.DictReader(fh):
+                            try:
+                                lat = float(row.get("CurrentLatitude", 0))
+                                lon = float(row.get("CurrentLongitude", 0))
+                                if lat == 0.0 and lon == 0.0:
+                                    continue
+                                raw_type = row.get("Type", "WIFI").upper()
+                                ptype = "bt" if raw_type in ("BT", "BLE") else "cell" if raw_type in ("GSM", "WCDMA", "LTE", "NR") else "wifi"
+                                points.append({"lat":lat, "lon":lon, "type":ptype,
+                                    "label":row.get("SSID") or row.get("MAC", "?"),
+                                    "bssid":row.get("MAC", ""), "auth":row.get("AuthMode", ""),
+                                    "rssi":row.get("RSSI", ""), "channel":row.get("Channel", "")})
+                            except (ValueError, TypeError):
+                                pass
                 except OSError:
                     pass
 

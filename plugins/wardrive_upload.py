@@ -432,7 +432,7 @@ class WardriveUpload(PluginBase):
         return True
 
     def _parse_csv(self, csv_path: Path) -> list[dict]:
-        """Parse WiGLE CSV to list of network dicts."""
+        """Parse WiGLE 1.4 or 1.6 CSV by column name."""
         if not csv_path.is_file():
             return []
         networks = []
@@ -443,33 +443,38 @@ class WardriveUpload(PluginBase):
                 first = f.readline()
                 if not first:
                     return []
-                reader = _csv.reader(f)
-                header = next(reader, None)
-                if not header:
+                reader = _csv.DictReader(f)
+                if not reader.fieldnames:
                     return []
-                for parts in reader:
-                    if len(parts) < 11:
-                        continue
+                for row in reader:
                     try:
-                        lat = float(parts[6]) if parts[6] else 0.0
-                        lon = float(parts[7]) if parts[7] else 0.0
+                        lat = float(row.get("CurrentLatitude") or 0.0)
+                        lon = float(row.get("CurrentLongitude") or 0.0)
                     except ValueError:
                         continue
                     if lat == 0.0 and lon == 0.0:
                         continue
                     if lat < -90 or lat > 90 or lon < -180 or lon > 180:
                         continue
+                    kind = (row.get("Type") or "WIFI").upper()
+                    auth = row.get("AuthMode") or ""
+                    if kind == "WIFI":
+                        auth = _map_auth(auth)
+                    elif kind in ("BT", "BLE"):
+                        auth = "BLE"
                     networks.append({
-                        "bssid": parts[0],
-                        "ssid": parts[1],
-                        "auth": _map_auth(parts[2]),
-                        "first_seen": parts[3],
-                        "channel": int(parts[4]) if parts[4].isdigit() else 0,
-                        "rssi": int(parts[5]) if parts[5].lstrip("-").isdigit() else -100,
+                        "bssid": row.get("MAC", ""),
+                        "ssid": row.get("SSID", ""),
+                        "auth": auth,
+                        "first_seen": row.get("FirstSeen", ""),
+                        "channel": int(row["Channel"]) if (row.get("Channel") or "").isdigit() else 0,
+                        "frequency": int(row["Frequency"]) if (row.get("Frequency") or "").isdigit() else 0,
+                        "rssi": int(row["RSSI"]) if (row.get("RSSI") or "").lstrip("-").isdigit() else -100,
                         "lat": lat,
                         "lon": lon,
-                        "alt": float(parts[8]) if parts[8] else 0.0,
-                        "type": parts[10] if len(parts) > 10 else "WIFI",
+                        "alt": float(row.get("AltitudeMeters") or 0.0),
+                        "accuracy": float(row.get("AccuracyMeters") or 0.0),
+                        "type": kind,
                     })
         except Exception as e:
             self._log_add(f"CSV parse error: {e}", 8)

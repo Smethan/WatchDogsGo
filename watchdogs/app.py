@@ -3932,8 +3932,9 @@ class WatchDogsGame(OtaMixin):
             t = self.loot.loot_totals
             self._loot_totals = {
                 "sessions":    t.get("sessions", 0),
-                "wifi":        t.get("wardriving", 0),
+                "wifi":        t.get("wardriving_wifi", t.get("wardriving", 0)),
                 "bt":          t.get("bt_devices", 0),
+                "cell":        t.get("cell_cells", 0),
                 "hs":          t.get("hc22000", 0),
                 "pcap":        t.get("pcap", 0),
                 "passwords":   t.get("passwords", 0),
@@ -3955,23 +3956,20 @@ class WatchDogsGame(OtaMixin):
             wd = session_dir / "wardriving.csv"
             if wd.is_file():
                 try:
-                    with open(wd, encoding="utf-8") as fh:
+                    with open(wd, encoding="utf-8", newline="") as fh:
                         next(fh, None)
-                        for i, p in enumerate(_csv.reader(fh)):
-                            if i == 0:
-                                continue
-                            if len(p) < 8:
-                                continue
+                        for row in _csv.DictReader(fh):
                             try:
-                                lat, lon = float(p[6]), float(p[7])
+                                lat = float(row.get("CurrentLatitude", 0))
+                                lon = float(row.get("CurrentLongitude", 0))
                                 if lat == 0.0 and lon == 0.0:
                                     continue
-                                ptype = "wifi"
-                                if len(p) >= 11 and p[10].strip().upper() == "BLE":
-                                    ptype = "bt"
+                                raw_type = row.get("Type", "WIFI").upper()
+                                ptype = "bt" if raw_type in ("BT", "BLE") else "cell" if raw_type in ("GSM", "WCDMA", "LTE", "NR") else "wifi"
                                 points.append({"lat": lat, "lon": lon,
-                                               "type": ptype, "label": p[1]})
-                            except (ValueError, IndexError):
+                                               "type": ptype,
+                                               "label": row.get("SSID") or row.get("MAC", "?")})
+                            except (ValueError, TypeError):
                                 pass
                 except OSError:
                     pass
@@ -4315,23 +4313,22 @@ class WatchDogsGame(OtaMixin):
         for cl in clusters:
             pts = cl["points"]
             if cl["count"] == 1:
-                cl["color"] = (C_HACK_CYAN
-                               if pts[0].get("type") == "bt" else C_SUCCESS)
+                point_type = pts[0].get("type")
+                cl["color"] = 11 if point_type == "cell" else C_HACK_CYAN if point_type == "bt" else C_SUCCESS
                 cl["radius"] = 0
             else:
-                wifi = sum(1 for p in pts if p.get("type") == "wifi")
-                bt = sum(1 for p in pts if p.get("type") == "bt")
-                cl["color"] = C_HACK_CYAN if bt > wifi else C_SUCCESS
+                cl["color"] = self._cluster_color(pts)
                 cl["radius"] = min(5 + cl["count"] // 3, 12)
 
         self._clusters = clusters
 
     @staticmethod
     def _cluster_color(points: list[dict]) -> int:
-        """Dominant color for a cluster: wifi=green, bt=cyan."""
+        """Dominant color for a cluster: wifi=green, bt=cyan, cell=lime."""
         wifi = sum(1 for p in points if p.get("type") == "wifi")
         bt = sum(1 for p in points if p.get("type") == "bt")
-        return C_HACK_CYAN if bt > wifi else C_SUCCESS
+        cell = sum(1 for p in points if p.get("type") == "cell")
+        return 11 if cell >= max(wifi, bt) else C_HACK_CYAN if bt > wifi else C_SUCCESS
 
     def _draw_loot_points(self):
         self._update_clusters()
@@ -4383,6 +4380,8 @@ class WatchDogsGame(OtaMixin):
             return "Open", C_WARNING
         if auth == "[BLE]":
             return "BLE", C_HACK_CYAN
+        if auth.upper() in ("GSM", "WCDMA", "LTE", "NR"):
+            return auth.upper(), 11
         return "Secured", C_ERROR
 
     def _find_nearest_cluster(self, dx: int, dy: int) -> int:
@@ -4992,6 +4991,7 @@ class WatchDogsGame(OtaMixin):
         t_wifi = self._loot_totals.get("wifi", 0) + len(self.wifi_networks)
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         t_hs   = self._loot_totals.get("hs",   0) + n_hs_ses
+        t_cell = self._loot_totals.get("cell", 0) + len(self.wardrive.cell_unique)
         n_pwn  = (sum(1 for d in self.ble_devices if d.hacked)
                   + sum(1 for n in self.wifi_networks if n.hacked))
         t_pwd  = (self._loot_totals.get("passwords", 0)
@@ -5004,6 +5004,7 @@ class WatchDogsGame(OtaMixin):
         pyxel.text(125, y, f"HS:{t_hs}",    C_ERROR)
         pyxel.text(170, y, f"PWD:{t_pwd}",  12)  # blue
         pyxel.text(220, y, f"PWN:{n_pwn}",  C_SUCCESS)
+        pyxel.text(275, y, f"CELL:{t_cell}", 11)
 
         tools = []
         if self.wardrive.scan.active:
@@ -5087,7 +5088,7 @@ class WatchDogsGame(OtaMixin):
             dy = (self.player_lat - m.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
                 pyxel.pset(rx+int(dx), ry+int(dy), C_ERROR)
-        loot_colors = {"wifi": C_SUCCESS, "bt": C_HACK_CYAN,
+        loot_colors = {"wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
                        "handshake": C_ERROR, "meshcore": C_WARNING}
         step = max(1, len(self.loot_points) // 100)
         for i in range(0, len(self.loot_points), step):

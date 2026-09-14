@@ -480,6 +480,9 @@ def test_passive_menu_back_and_reopen_keeps_capture(game,monkeypatch):
 def test_split_wardrive_host_ble_detection_and_stop(game):
     from watchdogs.host_ble import advertisement_record
     w = game.wardrive
+    w.cell = Mock(state="idle", session="", provider="", error="", drops=0)
+    w.cell.poll.return_value = []
+    w.cell.start.return_value = True
     w.scan.clock = lambda:10
     w.host_ble = Mock(state="idle", drops=0)
     w.host_ble.start.return_value = True
@@ -562,6 +565,9 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     from watchdogs.app import MENU_CATS
     game._is_running = Mock(return_value=False)
     w = game.wardrive
+    w.cell = Mock(state="idle", session="", provider="", error="", drops=0)
+    w.cell.poll.return_value = []
+    w.cell.start.return_value = True
     w.scan.supported = True
     w.scan.wifi_supported = wifi_only  # ESP modes must work without the new capability
     entry = next(item for category,items in MENU_CATS if category=="SNIFF"
@@ -572,6 +578,7 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert w.scan.state == "starting"
     assert w.scan.wifi_only is wifi_only and w.scan.diagnostic is diagnostic
     assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
+    w.cell.start.assert_called_once_with(w.scan.session)
 
 
 def test_host_ble_menu_requires_new_firmware_without_stopping_current_scan(game):

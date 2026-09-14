@@ -15,6 +15,7 @@ from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
 from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
+from .cell_monitor import HostCellScanner
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
 DEFAULTS = {"flock": True, "axon": True, "precise": True, "trail": False,
@@ -25,6 +26,13 @@ class WardriveUI:
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
         self.host_ble = HostBleScanner()
+        self.cell = HostCellScanner()
+        self.cell_unique = set()
+        self.cell_observations = 0
+        self.cell_serving = 0
+        self.cell_neighbors = 0
+        self.cell_latest = None
+        self.cell_retry_at = 0
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
         self.capture = HandshakeCapture()
@@ -68,6 +76,7 @@ class WardriveUI:
             self.app._pending_cmd = None
         self.capture.stop()
         self.host_ble.stop()
+        self.cell.stop()
         self.scan.stop()
         self.app._clear_scan_state()
         self.app._gps_wait = False
@@ -85,6 +94,7 @@ class WardriveUI:
                 self.scan.error = "Serial connection lost or changed"
                 self.write_diagnostics(time.monotonic())
             self.host_ble.stop()
+            self.cell.stop()
             self.connection = connection
             self.close_passive()
             self.capture.finish("disconnected")
@@ -116,6 +126,7 @@ class WardriveUI:
             app.capturing_hs = False
             app._send("stop")
         self.poll_host_ble(now)
+        self.poll_cell(now)
         self.write_diagnostics(now)
         if self.scan.false_timeouts > self.reported_false_timeouts:
             self.reported_false_timeouts = self.scan.false_timeouts
@@ -210,6 +221,7 @@ class WardriveUI:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
             if d["kind"] == "stopped" and not self.scan.active:
                 self.host_ble.stop()
+                self.cell.stop()
                 self.close_passive()
             return True
         # Completion, not the early 'stop command received' message.
@@ -243,6 +255,11 @@ class WardriveUI:
                         self.close_passive()
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
+                    if state != "hs_sniff":
+                        self.cell_unique.clear()
+                        self.cell_observations = self.cell_serving = self.cell_neighbors = 0
+                        self.cell_latest = None
+                        self.cell.start(self.scan.session)
                     self.last_error = ""
                     self.reported_false_timeouts = 0
                     self.diagnostic_next = 0
@@ -318,6 +335,50 @@ class WardriveUI:
                 self.scan.last_seen["ble"] = received
                 # Host BLE must never renew the ESP32 heartbeat.
                 self.observation(record)
+
+    def poll_cell(self, now):
+        active = self.scan.state in ("starting", "running") and self.scan.mode == "wardrive"
+        if not active:
+            self.cell.stop()
+        elif (self.cell.session != self.scan.session or self.cell.state == "idle"
+              or self.cell.state == "error" and now >= self.cell_retry_at):
+            if self.cell.state == "error":
+                self.cell.stop()
+            self.cell.start(self.scan.session)
+        for session, kind, data in self.cell.poll():
+            if session != self.scan.session or not active:
+                continue
+            if kind == "started":
+                self.cell.state = "starting"
+                self.app._term_add("[CELL] Provider starting: " + str(data), raw=True)
+                continue
+            if kind == "error":
+                self.cell.state = "error"
+                self.cell.error = str(data)
+                self.cell_retry_at = now + 15
+                self.app._term_add("[CELL] " + self.cell.error, raw=True)
+                self.app.msg("[CELL] Unavailable; WiFi/BLE still running", 8)
+                continue
+            measured, cells = data
+            serving = [cell for cell in cells if cell.serving]
+            neighbors = [cell for cell in cells if not cell.serving]
+            self.cell_serving, self.cell_neighbors = len(serving), len(neighbors)
+            self.cell.state = "full" if neighbors else "serving_only"
+            fix = self.fixes.at(now)
+            if fix is None:
+                self.cell.state = "no_gps"
+                continue
+            for cell in cells:
+                record = cell.record()
+                self.cell_unique.add(cell.identity)
+                self.cell_latest = record if cell.serving or self.cell_latest is None else self.cell_latest
+                if self.app.loot and self.app.loot.active:
+                    try:
+                        if self.app.loot.save_wardriving_cell(
+                                record, observation_fix=fix, observed_at=measured):
+                            self.cell_observations += 1
+                    except Exception as exc:
+                        self.app._term_add("[CELL] Save failed: " + str(exc), raw=True)
 
     def close_passive(self):
         had_file = self.passive.file is not None
@@ -604,7 +665,14 @@ class WardriveUI:
                 elif self.scan.diagnostic:
                     text = f"TEST stats:{now-self.scan.last_stats:.1f}s data:{now-self.scan.last_heartbeat:.1f}s false stops:{self.scan.false_timeouts} gaps:{self.scan.seq_gaps} ({self.scan.gap_percent:.1f}%)"
                 if not self.app.gps_fix: text += " GPS unavailable"
-            px.rect(4,218,520,12,0)
+                cell = " CELL:" + self.cell.state.upper()
+                cell += f" {len(self.cell_unique)}/{self.cell_observations}"
+                if self.cell.provider:
+                    cell += " " + self.cell.provider.replace("modemmanager", "MM").replace("sim7600_at", "AT")
+                if self.cell_latest:
+                    cell += " " + self.cell_latest["technology"] + " " + str(round(self.cell_latest.get("signal_dbm") or 0)) + "dBm"
+                text += cell
+            px.rect(4,218,632,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)
         if self.alerts:
             item = self.alerts[0]
