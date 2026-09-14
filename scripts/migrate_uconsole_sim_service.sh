@@ -51,7 +51,9 @@ apply_service() {
     if [ -f "$GPS_SCRIPT" ]; then
         cp -a "$GPS_SCRIPT" "$backup/setup-sim-gps"
     fi
-    temp=$(mktemp)
+    # systemd-analyze uses the candidate's basename as the unit name and older
+    # releases reject files without a recognized unit suffix.
+    temp=$(mktemp --suffix=.service)
     trap 'rm -f "$temp"' EXIT HUP INT TERM
     cat >"$temp" <<'EOF'
 [Unit]
