@@ -8,6 +8,18 @@ minor versions.
 
 ---
 
+## [0.9.28] — 2026-09-14
+
+### Fixed
+
+- Recover SIM7600 serving-cell collection when ModemManager exposes
+  `GetCellInfo` but returns `Core.Unsupported` and omits the modem's AT ports
+  from `Modem.Ports`. WDG now discovers the secondary command interface from
+  ModemManager's udev role tag and verifies that it belongs to the same physical
+  modem before using the existing `AT+CPSI?` fallback.
+- Avoid selecting the SIM7600 GPS, diagnostic, audio, primary AT, or another
+  modem's serial interface during cellular fallback discovery.
+
 ## [0.9.27] — 2026-09-14
 
 ### Added

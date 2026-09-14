@@ -1,11 +1,14 @@
 """Cell identity, WiGLE storage, and background-provider tests."""
 import csv
+import sys
 import time
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import watchdogs.cell_monitor as cell_monitor
 from watchdogs.cell_monitor import (CellObservation, HostCellScanner,
-    modemmanager_cell, parse_cpsi)
+    discover_secondary_at, discover_udev_secondary_at, modemmanager_cell, parse_cpsi)
 from watchdogs.gps_manager import GpsFix
 from watchdogs.loot_manager import LootManager
 from plugins.wardrive_upload import WardriveUpload
@@ -30,6 +33,42 @@ def test_sim7600_lte_and_no_service():
     assert cell.channel == 66486 and cell.pci == 42
     assert cell.rsrp == -91.5 and cell.serving
     assert parse_cpsi("+CPSI: NO SERVICE, Online\r\nOK\r\n") is None
+
+
+def test_udev_secondary_at_requires_role_and_same_physical_modem(tmp_path):
+    for name in ("ttyUSB1", "ttyUSB3", "ttyUSB8"):
+        (tmp_path / name).touch()
+    properties = {
+        "ttyUSB1": {"DEVPATH": "/devices/usb1/1-3/1-3:1.1",
+                    "ID_MM_PORT_TYPE_GPS": "1"},
+        "ttyUSB3": {"DEVPATH": "/devices/usb1/1-3/1-3:1.3",
+                    "ID_MM_PORT_TYPE_AT_SECONDARY": "1"},
+        "ttyUSB8": {"DEVPATH": "/devices/usb1/1-30/1-30:1.3",
+                    "ID_MM_PORT_TYPE_AT_SECONDARY": "1"},
+    }
+    selected = discover_udev_secondary_at(
+        "/sys/devices/usb1/1-3", port_names=properties,
+        property_reader=lambda port: properties[port.name], device_root=tmp_path)
+    assert selected == str(tmp_path / "ttyUSB3")
+
+
+def test_dbus_port_omission_uses_same_modems_udev_secondary(monkeypatch):
+    modem_path = "/org/freedesktop/ModemManager1/Modem/0"
+    interface = "org.freedesktop.ModemManager1.Modem"
+    root = Mock()
+    root.GetManagedObjects.return_value = {modem_path: {interface: {
+        "Model": "SIMCOM_SIM7600G-H", "Manufacturer": "QUALCOMM INCORPORATED",
+        "PrimaryPort": "cdc-wdm0", "Device": "/sys/devices/usb1/1-3",
+        "Ports": (("cdc-wdm0", 6), ("ttyUSB1", 4), ("wwan0", 8)),
+    }}}
+    bus = Mock()
+    bus.get_object.side_effect = [root, Mock()]
+    monkeypatch.setitem(sys.modules, "dbus", SimpleNamespace(Interface=lambda obj, _name: obj))
+    fallback = Mock(return_value="/dev/ttyUSB3")
+    monkeypatch.setattr(cell_monitor, "discover_udev_secondary_at", fallback)
+
+    assert discover_secondary_at(bus) == "/dev/ttyUSB3"
+    fallback.assert_called_once_with("/sys/devices/usb1/1-3")
 
 
 def test_cell_wigle_rows_repeat_and_keep_mnc_width(tmp_path):

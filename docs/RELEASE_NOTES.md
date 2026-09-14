@@ -1,5 +1,22 @@
 # Smethan WatchDogsGo
 
+## 0.9.28 — SIM7600 cellular fallback discovery
+
+- Fix **All Wardrive** cellular detection on QMI-controlled SIM7600 modems where
+  ModemManager 1.20 exposes `GetCellInfo` but answers `Core.Unsupported` and
+  omits both AT command ports from its D-Bus `Modem.Ports` list.
+- When that happens, WDG now reads the existing ModemManager udev role tags,
+  accepts only `AT_SECONDARY`, and verifies the candidate belongs to the same
+  physical modem. GPS, QCDM diagnostic, audio, primary AT, and other modems are
+  excluded.
+- The fallback remains serving-cell-only through `AT+CPSI?`; neighboring cells
+  still require modem/ModemManager `GetCellInfo` support.
+
+Diagnosis on the affected uConsole confirmed that `/dev/ttyUSB3` is tagged as
+the SIM7600's secondary AT interface and answers `AT+CPSI?` while WDG and the
+QMI data bearer remain active. No application changes were installed on the
+uConsole during validation. The complete 233-test suite passed on the host.
+
 ## 0.9.27 — Batched All Wardrive and recoverable liveness
 
 - Prefer projectZero firmware 1.7.10's ten-second batch transport for **All

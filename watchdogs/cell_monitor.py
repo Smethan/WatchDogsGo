@@ -4,8 +4,10 @@ The preferred path mirrors Android's CellInfo API through ModemManager's
 GetCellInfo method.  SIM7600 AT+CPSI is a serving-cell-only fallback.
 """
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from queue import Empty, Full, Queue
 import re
+import subprocess
 import threading
 import time
 
@@ -224,8 +226,52 @@ class Sim7600AtProvider:
         self.serial.close()
 
 
+def _udev_properties(port):
+    """Read the port-role tags installed for ModemManager."""
+    try:
+        result = subprocess.run(
+            ["udevadm", "info", "--query=property", "--name", str(port)],
+            capture_output=True, text=True, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode:
+        return {}
+    return dict(line.split("=", 1) for line in result.stdout.splitlines()
+                if "=" in line)
+
+
+def discover_udev_secondary_at(modem_device, *, port_names=None,
+                               property_reader=None, device_root=Path("/dev")):
+    """Find a udev-tagged secondary AT port on the same physical modem.
+
+    QMI-controlled SIM7600s may omit their AT ports from Modem.Ports even
+    though ModemManager's udev rules identify those interfaces precisely.
+    """
+    property_reader = property_reader or _udev_properties
+    if port_names is None:
+        port_names = sorted(path.name for path in Path("/sys/class/tty").glob("ttyUSB*"))
+    modem_path = Path(str(modem_device))
+    candidates = []
+    for name in port_names:
+        port = Path(device_root) / str(name)
+        if not port.exists():
+            continue
+        props = property_reader(port)
+        if props.get("ID_MM_PORT_TYPE_AT_SECONDARY") != "1":
+            continue
+        devpath = props.get("DEVPATH", "")
+        try:
+            Path("/sys" + devpath).relative_to(modem_path)
+        except (TypeError, ValueError):
+            continue
+        candidates.append(str(port))
+    if candidates:
+        return sorted(candidates)[0]
+    raise RuntimeError("No udev-tagged SIM7600 secondary AT port")
+
+
 def discover_secondary_at(bus=None):
-    """Return a non-primary AT port advertised by ModemManager."""
+    """Return a secondary AT port from ModemManager or its udev tags."""
     if bus is None:
         import dbus
         bus = dbus.SystemBus()
@@ -246,6 +292,9 @@ def discover_secondary_at(bus=None):
                       if int(kind) == 2 and str(name) != primary]
         if candidates:
             return "/dev/" + sorted(candidates)[0]
+        device = str(modem.get("Device", ""))
+        if device:
+            return discover_udev_secondary_at(device)
     raise RuntimeError("No free SIM7600 secondary AT port")
 
 
