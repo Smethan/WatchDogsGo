@@ -5,11 +5,13 @@ import glob
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import serial
 
 from .config import GPS_DEVICE, GPS_BAUD_RATE
+from .modem_location import ModemLocationBroker, managed_port_names
 
 log = logging.getLogger(__name__)
 
@@ -51,23 +53,24 @@ class _LineBuffer:
 
 
 class GpsManager:
-    """Manage a UART GPS receiver via pyserial + urwid watch_file."""
-
-    # True when user explicitly set the GPS device via env var
-    _user_configured = bool(
-        os.environ.get("WDG_GPS_DEVICE")
-        or os.environ.get("JANOS_GPS_DEVICE")
-    )
+    """Manage an external serial GPS or ModemManager's cached GNSS feed."""
 
     def __init__(self, device: str = GPS_DEVICE,
-                 baud: int = GPS_BAUD_RATE) -> None:
+                 baud: int = GPS_BAUD_RATE,
+                 modem_broker: Optional[ModemLocationBroker] = None) -> None:
         self.device = device
         self._baud = baud
+        self._user_configured = bool(
+            os.environ.get("WDG_GPS_DEVICE")
+            or os.environ.get("JANOS_GPS_DEVICE"))
         self._conn: Optional[serial.Serial] = None
         self._buf = _LineBuffer()
         self.fix = GpsFix()
         self._available = False
         self._gsv_visible: dict = {}  # constellation prefix → satellite count
+        self.modem_broker = modem_broker or ModemLocationBroker()
+        self.provider = ""
+        self.status_reason = ""
 
     @property
     def available(self) -> bool:
@@ -79,21 +82,43 @@ class GpsManager:
 
     def setup(self) -> bool:
         """Try to open GPS serial port. Returns True on success.
-        If user set WDG_GPS_DEVICE (or legacy JANOS_GPS_DEVICE), use that directly.
-        Otherwise probe default path for NMEA, then auto-detect USB GPS.
+        Explicit external devices take priority.  Otherwise use ModemManager's
+        GNSS feed, then probe only serial ports that ModemManager does not own.
         Never raises — GPS is optional."""
         device = self.device
+        self.status_reason = ""
 
         if self._user_configured:
-            # User explicitly set env var — trust it
+            if self._is_managed_port(device):
+                self.status_reason = (
+                    f"{device} is owned by ModemManager; configure an external GPS")
+                log.warning(self.status_reason)
+                return False
             if self._try_open(device):
                 return True
             log.info("GPS device %s (from env) not available — GPS disabled",
                      device)
             return False
 
-        # No env var — probe default path, then auto-detect
-        if os.path.exists(device) and self._probe_nmea(device, self._baud):
+        # The internal SIM7600 is accessed only through ModemManager.  Starting
+        # this broker does not open its GPS/AT/QMI device nodes.
+        if self.modem_broker.acquire("gps", gps=True):
+            if self.modem_broker.wait_ready(5):
+                self.device = "ModemManager GNSS"
+                self.provider = "modemmanager"
+                self._available = True
+                log.info("GPS provided by ModemManager")
+                return True
+            self.status_reason = self.modem_broker.error
+            self.modem_broker.release("gps")
+            self.modem_broker.close()
+        else:
+            self.status_reason = self.modem_broker.error
+
+        # No usable internal GNSS — probe the configured default and external
+        # ports only after excluding every device node managed by MM.
+        if (not self._is_managed_port(device) and os.path.exists(device)
+                and self._probe_nmea(device, self._baud)):
             if self._try_open(device):
                 return True
 
@@ -132,6 +157,7 @@ class GpsManager:
             )
             self._conn.reset_input_buffer()
             self._available = True
+            self.provider = "serial"
             log.info("GPS opened: %s @ %d baud", device, self._baud)
             return True
         except Exception as exc:
@@ -139,9 +165,37 @@ class GpsManager:
             return False
 
     @staticmethod
-    def _auto_detect(exclude: Optional[set] = None) -> Optional[str]:
-        """Scan common serial paths for a GPS device (NMEA probe)."""
+    def _is_managed_port(device: str) -> bool:
+        names = managed_port_names()
+        name = Path(device).name
+        # A missing inventory must fail closed for ttyUSB because that class is
+        # commonly an AT/GPS interface of a composite modem.
+        return name in names if names is not None else name.startswith("ttyUSB")
+
+    @staticmethod
+    def _unsafe_acm(path: str) -> bool:
+        """Exclude known control devices whose open can reset hardware."""
+        name = Path(path).name
+        if not name.startswith("ttyACM"):
+            return False
+        try:
+            node = (Path("/sys/class/tty") / name / "device").resolve()
+            for parent in (node, *node.parents):
+                vendor_path = parent / "idVendor"
+                if vendor_path.is_file():
+                    vendor = vendor_path.read_text().strip().lower()
+                    product = ((parent / "product").read_text(errors="replace").lower()
+                               if (parent / "product").is_file() else "")
+                    return vendor == "303a" or "uconsole" in product or "clockwork" in product
+        except OSError:
+            return True
+        return False
+
+    @classmethod
+    def _auto_detect(cls, exclude: Optional[set] = None) -> Optional[str]:
+        """Probe serial ports outside ModemManager's physical device."""
         skip = exclude or set()
+        managed = managed_port_names()
         candidates = sorted(
             glob.glob("/dev/ttyUSB*")
             + glob.glob("/dev/ttyACM*")
@@ -149,6 +203,10 @@ class GpsManager:
         )
         for path in candidates:
             if path in skip:
+                continue
+            name = Path(path).name
+            if (managed is None and name.startswith("ttyUSB")) or (
+                    managed is not None and name in managed) or cls._unsafe_acm(path):
                 continue
             if not os.access(path, os.R_OK):
                 continue
@@ -171,7 +229,14 @@ class GpsManager:
             except Exception:
                 pass
             self._conn = None
+        if self.provider == "modemmanager":
+            self.modem_broker.release("gps")
+        # The same broker may have been used for cell tracking while an
+        # external serial GPS supplied fixes. Always stop it on application
+        # cleanup after WardriveUI has released its cell owner.
+        self.modem_broker.close()
         self._available = False
+        self.provider = ""
 
     @property
     def fd(self) -> int:
@@ -186,6 +251,8 @@ class GpsManager:
 
     def read_available(self) -> List[str]:
         """Non-blocking read — return complete NMEA sentences."""
+        if self.provider == "modemmanager":
+            return self.modem_broker.drain_nmea()
         if not self._conn:
             return []
         try:

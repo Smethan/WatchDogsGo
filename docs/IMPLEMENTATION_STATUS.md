@@ -1,6 +1,20 @@
 # Implementation and verification — 2026-09-12
 
-Implemented in the user's LOCOSP-derived forks on `feature/all-wardrive`. No upstream PR, merge or push. No device connection or flashing.
+## ModemManager cell and GNSS ownership — 2026-09-14
+
+WDG 0.9.31 restores serving-cell tracking through ModemManager's cached 3GPP
+location and GPS-NMEA sources. Both All Wardrive modes sample the serving cell
+at completed firmware batches. ESP Dual Test and handshake modes remain
+excluded. The default path performs no `GetCellInfo`, qmicli, direct AT, or
+modem-device open. Experimental QMI neighbors are opt-in, rate-limited,
+provisional, local-only, and circuit-broken after one session failure.
+
+The host test suite covers the measured SIM7600 location, leading-zero MNCs,
+source-mask restoration, managed-port exclusion, batch persistence, QMI PLMN
+mismatch, neighbor identity boundaries, child timeout cleanup, crash sentinels,
+and both ESP/host BLE modes. Hardware rollout additionally requires the
+reversible power-service migration and one announced manual reboot. See
+[CELLULAR_STABILITY.md](CELLULAR_STABILITY.md).
 
 ## Passive HS Sniff update — 2026-09-12
 

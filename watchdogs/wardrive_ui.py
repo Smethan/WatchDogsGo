@@ -15,9 +15,11 @@ from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
 from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
+from .cell_monitor import HostCellScanner, find_unclean_cell_session
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
 DEFAULTS = {"flock": True, "axon": True, "precise": True, "trail": False,
+            "cell_tracking": True, "cell_neighbors": False,
             "realert_seconds": 60, "suppressed_rules": [], "suppressed_devices": []}
 
 class WardriveUI:
@@ -25,6 +27,11 @@ class WardriveUI:
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
         self.host_ble = HostBleScanner()
+        self.cell = HostCellScanner(getattr(app.gps, "modem_broker", None))
+        self.cell_candidates = deque(maxlen=512)
+        self.cell_legacy_next = 0
+        self.cell_unclean = find_unclean_cell_session(app._app_dir)
+        self.cell_unclean_reported = False
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
         self.capture = HandshakeCapture()
@@ -70,6 +77,7 @@ class WardriveUI:
         self.capture.stop()
         self.host_ble.stop()
         self.host_ble_batch_lines.clear()
+        self.cell.stop()
         self.scan.stop()
         self.app._clear_scan_state()
         self.app._gps_wait = False
@@ -88,6 +96,7 @@ class WardriveUI:
                 self.write_diagnostics(time.monotonic())
             self.host_ble.stop()
             self.host_ble_batch_lines.clear()
+            self.cell.stop()
             self.connection = connection
             self.close_passive()
             self.capture.finish("disconnected")
@@ -119,6 +128,7 @@ class WardriveUI:
             app.capturing_hs = False
             app._send("stop")
         self.poll_host_ble(now)
+        self.poll_cell(now)
         self.write_diagnostics(now)
         if self.scan.false_timeouts > self.reported_false_timeouts:
             self.reported_false_timeouts = self.scan.false_timeouts
@@ -126,6 +136,10 @@ class WardriveUI:
             app.msg("[TEST] Stats late; ESP32 data still arriving. Old timeout avoided.", ORANGE)
         if not self.scan.active and self.passive.file:
             self.close_passive()
+        if self.cell_unclean and not self.cell_unclean_reported:
+            self.cell_unclean_reported = True
+            app._term_add("[CELL] Previous cell session ended uncleanly: "
+                          + str(self.cell_unclean), raw=True)
         if self.scan.probe_error != self.last_probe_error:
             self.last_probe_error = self.scan.probe_error
             if self.last_probe_error:
@@ -217,13 +231,18 @@ class WardriveUI:
                     self.app._term_add(self.host_ble_batch_lines.popleft(), raw=True)
             elif d["kind"] == "batch_done":
                 self.app._term_add(f"[ALL] Batch #{d['batch']} complete; starting next scan", raw=True)
+                if self.cell.active:
+                    self.cell.observe_batch(self.fixes.at(time.monotonic()), d["batch"])
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
                 if not self.host_ble.start(self.scan.session):
                     self.host_ble_error("Previous Bluetooth scan is still closing; retry shortly")
                 else:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
+            if previous == "starting" and self.scan.state == "running":
+                self.start_cell()
             if d["kind"] == "stopped" and not self.scan.active:
                 self.host_ble.stop()
+                self.cell.stop()
                 self.close_passive()
             return True
         # Completion, not the early 'stop command received' message.
@@ -262,6 +281,7 @@ class WardriveUI:
                         return True
                     if state != "hs_sniff":
                         self.host_ble_batch_lines.clear()
+                        self.cell_candidates.clear()
                     self.last_error = ""
                     self.reported_false_timeouts = 0
                     self.diagnostic_next = 0
@@ -345,6 +365,78 @@ class WardriveUI:
                     self.host_ble_batch_lines.append(
                         f"[BLE]  {name[:16]:<16} {record['mac']} {record['rssi']}dBm [host]")
                 self.observation(record, terminal=not self.scan.batch)
+
+    def start_cell(self):
+        """Start cell collection only after the ESP wardrive is acknowledged."""
+        if (not self.settings["cell_tracking"] or self.scan.mode != "wardrive"
+                or self.scan.diagnostic or self.scan.state != "running"
+                or not self.app.gps.available
+                or self.cell.active or not self.app.loot or not self.app.loot.active):
+            return False
+        started = self.cell.start(
+            self.scan.session, Path(self.app.loot.session_path),
+            experimental_neighbors=self.settings["cell_neighbors"])
+        if started:
+            self.app._term_add("[CELL] ModemManager serving-cell tracking starting", raw=True)
+            if self.settings["cell_neighbors"]:
+                self.app._term_add("[CELL] Experimental QMI neighbors enabled (60s minimum)", raw=True)
+        else:
+            self.app._term_add("[CELL] " + (self.cell.error or "Cell tracking unavailable"), raw=True)
+            self.app.msg("[CELL] Unavailable; WiFi/BLE still running", 8)
+        return started
+
+    def poll_cell(self, now):
+        active = (self.scan.state == "running" and self.scan.mode == "wardrive"
+                  and not self.scan.diagnostic and self.settings["cell_tracking"]
+                  and self.app.gps.available)
+        if not active:
+            self.cell.stop()
+        elif not self.cell.active:
+            self.start_cell()
+        if active and self.scan.legacy and now >= self.cell_legacy_next:
+            self.cell_legacy_next = now + 10
+            self.cell.observe_batch(self.fixes.at(now), ("legacy", int(now // 10)))
+        for session, kind, data in self.cell.poll():
+            if session != self.scan.session or not active:
+                continue
+            if kind == "status":
+                if data.get("error"):
+                    self.app._term_add("[CELL] " + data["error"], raw=True)
+                continue
+            if kind == "neighbor_error":
+                self.app._term_add("[CELL] Neighbors paused: " + str(data), raw=True)
+                self.app.msg("[CELL] Neighbor probe paused; serving cells continue", ORANGE)
+                continue
+            if kind == "neighbors":
+                path = Path(self.app.loot.session_path) / "cell_neighbor_candidates.jsonl"
+                if data.candidates:
+                    try:
+                        with path.open("a", encoding="utf-8") as stream:
+                            for candidate in data.candidates:
+                                record = candidate.record()
+                                stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+                                self.cell_candidates.append(record)
+                            stream.flush()
+                            import os
+                            os.fsync(stream.fileno())
+                    except OSError as exc:
+                        self.app._term_add("[CELL] Cannot save neighbor candidates: "
+                                           + str(exc)[:100], raw=True)
+                    self.cell.candidates += len(data.candidates)
+                continue
+            if kind != "cell":
+                continue
+            measured, cell, fix = data
+            try:
+                if self.app.loot.save_wardriving_cell(
+                        cell.record(), observation_fix=fix, observed_at=measured):
+                    self.cell.note_saved(cell)
+                    self.app.loot_points.append({
+                        "lat": fix["latitude"], "lon": fix["longitude"],
+                        "type": "cell", "label": cell.identity})
+                    self.app._cluster_zoom = -1
+            except Exception as exc:
+                self.app._term_add("[CELL] Save failed: " + str(exc)[:120], raw=True)
 
     def close_passive(self):
         had_file = self.passive.file is not None
@@ -464,6 +556,11 @@ class WardriveUI:
     def draw_markers(self):
         import pyxel as px
         now = time.monotonic()
+        for item in self.cell_candidates:
+            x, y = self.app.proj.geo_to_screen(item["latitude"], item["longitude"])
+            if self.app.proj.screen_visible(x, y):
+                px.circb(x, y, 3, 10)
+                px.pset(x, y, 10)
         for item, pos in self.visible_notables():
             x, y = self.app.proj.geo_to_screen(*pos)
             if self.app.proj.screen_visible(x,y):
@@ -513,6 +610,10 @@ class WardriveUI:
                 px.circb(x,y,3,PURPLE)  # ring stays visible under the observer dot
                 if time.monotonic()-item.get("fix_seen",0) < 60:
                     px.pset(x,y,PURPLE)
+        for item in self.cell_candidates:
+            x, y = xy(item["latitude"], item["longitude"])
+            if (x-rx)**2+(y-ry)**2 < (rr-3)**2:
+                px.circb(x, y, 2, 10)
 
     def cycle_history(self):
         if not self.app.loot:
@@ -575,12 +676,17 @@ class WardriveUI:
                 self.settings["suppressed_devices"] = []
                 self.persist_settings()
             return
+        keys = ("flock", "axon", "precise", "trail", "cell_tracking", "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
-        if px.btnp(px.KEY_DOWN): self.selection = min(3,self.selection+1)
+        if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
-            key = ("flock","axon","precise","trail")[self.selection]
+            key = keys[self.selection]
             self.settings[key] = not self.settings[key]
             if key == "trail": self.trail.break_segment()
+            if key == "cell_tracking" and not self.settings[key]:
+                self.cell.stop()
+            if key == "cell_neighbors" and self.cell.active:
+                self.app.msg("[CELL] Neighbor setting applies to the next wardrive session", 13)
             self.persist_settings()
 
     def persist_settings(self):
@@ -598,20 +704,24 @@ class WardriveUI:
             px.rect(40,35,560,285,0)
             px.rectb(40,35,560,285,PURPLE)
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
-            labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers", "Wardrive trail")
-            for i,(key,label) in enumerate(zip(("flock","axon","precise","trail"),labels)):
-                px.text(55,70+i*15,("> " if i==self.selection else "  ")+label+": "+("ON" if self.settings[key] else "OFF"),11 if i==self.selection else 7)
-            px.text(55,137,"Precise = where YOU heard it, not the camera location.",13)
+            keys = ("flock", "axon", "precise", "trail", "cell_tracking", "cell_neighbors")
+            labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
+                      "Wardrive trail", "Cell mast tracking",
+                      "Experimental QMI neighbors")
+            for i,(key,label) in enumerate(zip(keys,labels)):
+                px.text(55,68+i*14,("> " if i==self.selection else "  ")+label+": "+("ON" if self.settings[key] else "OFF"),11 if i==self.selection else 7)
+            px.text(55,155,"Precise = where YOU heard it, not the camera location.",13)
+            px.text(55,166,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
             route = self.history_trail.path.parent.name if self.history_trail else "current session"
-            px.text(55,149,"[H] Route history: " + route,13)
-            px.text(55,165,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
+            px.text(55,177,"[H] Route history: " + route,13)
+            px.text(55,190,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
             items = list(self.notables.values())
-            offset = max(0,self.detail_selection-5) if self.details else max(0,len(items)-6)
-            for i,item in enumerate(items[offset:offset+6]):
+            offset = max(0,self.detail_selection-4) if self.details else max(0,len(items)-5)
+            for i,item in enumerate(items[offset:offset+5]):
                 selected = self.details and i+offset == self.detail_selection
                 label = ("> " if selected else "  ")+item["label"]+" "+item["mac"]+" "+str(item["rssi"])+"dBm"
                 if item["identity"] in self.settings["suppressed_devices"]: label += " MUTED"
-                px.text(55,180+i*15,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
+                px.text(55,204+i*14,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
             if self.details and items:
                 item = items[min(self.detail_selection,len(items)-1)]
                 px.text(55,280,("Rules: "+", ".join(h["id"] for h in item["evidence"]))[:104],13)
@@ -642,6 +752,16 @@ class WardriveUI:
                 elif self.scan.legacy:
                     text = "LEGACY STREAM | " + text
                 if not self.app.gps_fix: text += " GPS unavailable"
+                if self.settings["cell_tracking"]:
+                    cell_state = self.cell.state.upper().replace("WAITING_GPS", "WAIT GPS")
+                    text += f" CELL:{cell_state} {len(self.cell.unique)}/{self.cell.observations}"
+                    if self.cell.latest:
+                        value = self.cell.latest
+                        signal = value.get("signal_dbm")
+                        signal_text = "?dBm" if signal == -113 else f"{round(signal)}dBm"
+                        text += " " + value["technology"] + " " + signal_text
+                    if self.cell.neighbors_paused:
+                        text += " NBR:PAUSED"
             px.rect(4,218,632,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)
         if self.alerts:

@@ -1036,7 +1036,8 @@ class WatchDogsGame(OtaMixin):
         if self.gps.available:
             checks.append((f"  GPS on {self.gps.device}", C_SUCCESS))
         else:
-            checks.append(("  GPS — not found", C_WARNING))
+            reason = getattr(self.gps, "status_reason", "")
+            checks.append(("  GPS — " + (reason[:66] if reason else "not found"), C_WARNING))
 
         # AIO v2 (GPIO power control)
         if self._aio_available:
@@ -1114,7 +1115,8 @@ class WatchDogsGame(OtaMixin):
         if self.gps.available:
             self._term_add(f"[OK] GPS on {self.gps.device}", raw=True)
         else:
-            self._term_add("[WARN] GPS not found", raw=True)
+            reason = getattr(self.gps, "status_reason", "")
+            self._term_add("[WARN] GPS " + (reason or "not found"), raw=True)
 
         self.msg("[SYS] ESP32 Watch Dogs", C_HACK_CYAN)
         self.msg("[SYS] TAB=menu  `=loot  SPACE=hack", C_DIM)
@@ -2383,6 +2385,8 @@ class WatchDogsGame(OtaMixin):
                 self._gps_enabled = False
         else:
             # Disable GPS — close serial, clear fix
+            if hasattr(self, "wardrive"):
+                self.wardrive.cell.stop()
             self.gps.close()
             self._gps_enabled = False
             self.gps_fix = False
@@ -4993,7 +4997,7 @@ class WatchDogsGame(OtaMixin):
         t_wifi = self._loot_totals.get("wifi", 0) + len(self.wifi_networks)
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         t_hs   = self._loot_totals.get("hs",   0) + n_hs_ses
-        t_cell = self._loot_totals.get("cell", 0)
+        t_cell = self._loot_totals.get("cell", 0) + len(self.wardrive.cell.unique)
         n_pwn  = (sum(1 for d in self.ble_devices if d.hacked)
                   + sum(1 for n in self.wifi_networks if n.hacked))
         t_pwd  = (self._loot_totals.get("passwords", 0)

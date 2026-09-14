@@ -280,6 +280,9 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, and serving-cell tracking |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same GPS/cell path |
+| ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
 
@@ -495,7 +498,22 @@ Requires SX1262 module on AIO v2 (`/dev/spidev1.0`).
 
 ## GPS
 
-Reads NMEA from `/dev/ttyAMA0` (AIO v2) or auto-detects USB GPS.
+For a uConsole SIM7600, WDG reads cached NMEA through ModemManager so the modem
+has one control-plane owner. Explicit external GPS devices remain supported.
+Automatic serial discovery excludes every ModemManager-owned port and known
+ESP32/uConsole ACM control device.
+
+If an older `/etc/systemd/system/uconsole-sim.service` sends `AT+CGPS` directly,
+WDG leaves internal GNSS and cellular tracking disabled until it is migrated:
+
+```sh
+./scripts/migrate_uconsole_sim_service.sh --status
+sudo ./scripts/migrate_uconsole_sim_service.sh --apply
+```
+
+The apply operation saves a restorable copy under `/var/backups/watchdogs/`,
+installs a power-only service, and requires one manual reboot. It never restarts
+or powers down a live cellular connection itself.
 
 Status in bottom HUD:
 - **Left**: LoRa ON/OFF status
@@ -511,7 +529,10 @@ Saved to `loot/<session>/`:
 |------|---------|
 | `serial_full.log` | Complete ESP32 serial output |
 | `wardriving.csv` | WiGLE 1.6 WiFi/BLE/cellular observations + GPS |
-| `cell_diagnostics.jsonl` | Historical cellular measurements from WDG 0.9.29 and earlier |
+| `cell_diagnostics.jsonl` | Valid serving-cell measurements written with WiGLE rows |
+| `cell_health.jsonl` | Cell broker lifecycle, recovery, and clean-stop evidence |
+| `cell_neighbor_candidates.jsonl` | Opt-in provisional PCI/channel observations; never uploaded to WiGLE |
+| `active_cell_session.json` | Present only while cellular collection has not cleanly stopped |
 | `bt_devices.csv` | BLE devices with GPS coordinates |
 | `handshakes/` | PCAP, HCCAPX, .22000 (hashcat-ready) |
 | `mitm/` | MITM pcap captures |

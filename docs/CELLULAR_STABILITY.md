@@ -1,14 +1,83 @@
-# Stable SIM7600 cell collection
+# Stable SIM7600 location ownership
 
-> **Suspended in WDG 0.9.30.** The uConsole continued to crash with the QMI
-> proxy implementation described below. Live cellular collection has therefore
-> been removed from both All Wardrive modes. This document is retained as
-> historical research and must not be treated as a currently enabled or
-> hardware-validated design.
+WDG 0.9.31 restores serving-cell tracking with a different ownership model.
+ModemManager is the only process that controls the internal SIM7600. WDG reads
+its cached `Modem.Location` state over D-Bus for both NMEA and registered-cell
+identity; the safe default never opens a modem device node or launches qmicli.
 
-This note records the source-level diagnosis and the design that was briefly
-used by WDG 0.9.29. It separates what was established from what remained
-unproven.
+## Required one-time migration
+
+Older uConsole setups may run `/usr/local/bin/setup-sim-gps` at boot. That
+script writes `AT+CGPS` directly to `/dev/ttyUSB3` as ModemManager is claiming
+the same composite USB modem. WDG detects this service and leaves its internal
+GNSS and cell features disabled until ownership is migrated.
+
+Check and apply the migration from the repository root:
+
+```sh
+./scripts/migrate_uconsole_sim_service.sh --status
+sudo ./scripts/migrate_uconsole_sim_service.sh --apply
+```
+
+The helper backs up the existing unit and GNSS script under
+`/var/backups/watchdogs/uconsole-sim-<UTC timestamp>.<suffix>/`, validates and
+installs a power-only oneshot service, and leaves the running service/modem untouched. A
+manual reboot is required afterward. To restore a saved definition:
+
+```sh
+sudo ./scripts/migrate_uconsole_sim_service.sh --restore \
+  /var/backups/watchdogs/uconsole-sim-<UTC timestamp>.<suffix>
+```
+
+## Safe serving-cell path
+
+The shared broker enables only ModemManager location sources that WDG needs and
+restores the bits it added at shutdown. One worker owns the SystemBus
+connection, polls cached location once per second with bounded timeouts, and
+publishes immutable snapshots to the UI. D-Bus failures use exponential
+backoff and cannot stop the ESP32 wardrive session.
+
+Cell persistence begins only after the ESP32 acknowledges All Wardrive. A
+registered cell is written with the GPS fix at each completed ten-second
+firmware batch. MCC/MNC stays a string, LAC/TAC/cell ID is converted from the
+ModemManager hexadecimal representation, and missing dBm uses WiGLE's `-113`
+unknown-strength value. Both ESP BLE and host BLE modes use this same path.
+
+On the tested SIM7600G-H, ModemManager returned
+`311,480,0,2038216,8308`, which becomes the valid LTE identity
+`311480_33544_33784342`. The raw qmicli output reported a conflicting PLMN, so
+WDG always treats ModemManager's registered operator and global identity as
+canonical.
+
+## Experimental neighbor candidates
+
+Wardrive Settings includes **Experimental QMI neighbors**, disabled by default.
+When enabled, WDG performs at most one qmi-proxy NAS location request every 60
+seconds after a completed ESP batch. The request has an eight-second deadline,
+cannot overlap, and is disabled for the rest of the session after its first
+failure. Serving-cell collection continues.
+
+SIM7600 LTE neighbor entries provide PCI, channel, and radio measurements but
+no globally unique cell ID. WDG records them only in
+`cell_neighbor_candidates.jsonl` and shows yellow dots where they were heard.
+They are marked provisional and excluded from `wardriving.csv`, WiGLE uploads,
+valid-cell totals, and history. A matching QMI TAC/cell ID may enrich the
+current serving cell's signal, but QMI cannot replace its identity.
+
+## Crash evidence
+
+`cell_health.jsonl` stores state changes, modem generation, query duration,
+circuit-breaker reason, and clean shutdown without storing subscriber or IP
+identifiers. `active_cell_session.json` exists until all cell workers stop; a
+remaining file on next launch identifies an unclean session. If a full console
+power loss occurs, collect that file, `journalctl -b -1`, pstore, and the health
+log before repeating a test.
+
+## Historical 0.9.29 design
+
+The remainder records the source-level diagnosis and QMI-first design briefly
+used by WDG 0.9.29. It is retained to explain why 0.9.31 does not return to
+persistent AT access or automatic qmicli fallback.
 
 ## Finding
 
@@ -92,11 +161,12 @@ selection, exact proxy command arguments, error policy, ModemManager fallback,
 UI retry suppression, WiGLE storage, and the rest of WDG. Hardware use then
 showed that the whole-uConsole crash remained.
 
-WDG 0.9.30 removes the provider module and every All Wardrive lifecycle hook.
-Its host suite also checks that the wardrive UI has no cellular collector.
-If cellular work resumes later, first collect `journalctl -b -1 -k`,
-`journalctl -b -1 -u ModemManager`, and power/undervoltage evidence from a
-crashed previous boot before choosing another modem access path.
+WDG 0.9.30 removed the provider module and every All Wardrive lifecycle hook.
+Before the 0.9.31 redesign, staged read-only testing confirmed that cached
+ModemManager locations, standalone qmi-proxy requests, GNSS, and the ESP32
+batch stream could coexist without a reproduced crash. That result does not
+prove the old path safe; it supports eliminating the independently discovered
+serial ownership races and adding durable breadcrumbs before field rollout.
 
 ## Sources
 

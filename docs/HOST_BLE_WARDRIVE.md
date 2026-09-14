@@ -5,11 +5,12 @@ ESP32 for both radios; host Bluetooth is an explicit separate option. Firmware
 1.7.10 adds the preferred ten-second batch transport; older firmware keeps the
 streaming fallback.
 
-WDG 0.9.30 disables cellular mast collection in both All Wardrive modes after
-continued whole-uConsole crashes. Neither mode calls ModemManager, launches
-qmicli, inspects cellular devices, or opens a modem port. Historical cellular
-rows remain readable. See [the suspended cellular implementation
-notes](CELLULAR_STABILITY.md).
+WDG 0.9.31 records the registered serving cell in both All Wardrive modes from
+ModemManager's cached location state. It uses the same batch boundary and host
+GPS fix whether BLE comes from the ESP32 or BlueZ. The safe default does not
+launch qmicli or open a modem device node. Optional QMI neighbor measurements
+are local-only and disabled by default. See [cellular stability and
+setup](CELLULAR_STABILITY.md).
 
 | Mode | Wi-Fi radio | BLE radio | Firmware required |
 | --- | --- | --- | --- |
@@ -27,7 +28,7 @@ Version 0.9.27 tracks control heartbeats and ESP observations independently.
 After six seconds without control it asks `wardrive_status` for the current
 phase. It stops after 15 seconds only if both control and ESP records are absent.
 Stale sessions, duplicate sequences, malformed records, host BLE observations
-and cell measurements cannot keep an unresponsive ESP32 session alive. The
+and ModemManager cell snapshots cannot keep an unresponsive ESP32 session alive. The
 firmware's 15-second host lease and five-second WDG keepalives remain in effect.
 
 Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html

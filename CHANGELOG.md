@@ -8,6 +8,36 @@ minor versions.
 
 ---
 
+## [0.9.31] — 2026-09-14
+
+### Added
+
+- Restore cellular mast tracking in both All Wardrive modes using
+  ModemManager's cached 3GPP location and GPS-NMEA interfaces. Serving-cell
+  rows are sampled on completed ten-second firmware batches and retain the
+  uConsole GPS fix in WiGLE 1.6 output.
+- Add opt-in experimental QMI neighbor measurements. Anonymous LTE neighbors
+  are saved as provisional local diagnostics and yellow map dots; they are
+  never exported as WiGLE cells.
+- Add bounded cell health logs, an unclean-session sentinel, ModemManager
+  reconnect backoff, QMI timeout cleanup, and a session circuit breaker.
+- Add a reversible migration helper for replacing the uConsole's direct-AT
+  GNSS boot service with a power-only service owned by ModemManager.
+
+### Changed
+
+- Use ModemManager as the internal SIM7600 GNSS owner. GPS discovery no longer
+  opens ModemManager-owned tty ports or known ESP32/uConsole ACM devices.
+- Start cellular work only after an All Wardrive firmware acknowledgement;
+  cell failures do not affect the ESP32 scan lifecycle.
+
+### Fixed
+
+- Avoid the control-plane races caused by direct `AT+CGPS` boot writes and
+  blind probing of SIM7600 AT ports.
+- Ignore the SIM7600 qmicli PLMN when it disagrees with ModemManager's
+  registered operator, preventing invalid WiGLE identities.
+
 ## [0.9.30] — 2026-09-14
 
 ### Fixed

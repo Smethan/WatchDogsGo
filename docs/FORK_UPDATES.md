@@ -33,6 +33,37 @@ When WDG runs as root, Git runs as the checkout directory's owner so new files
 do not become root-owned. Dependency changes, if any, are documented in release
 notes; the updater does not run arbitrary installers automatically.
 
+### SIM7600 ownership migration for WDG 0.9.31+
+
+Cell tracking and ModemManager-backed GNSS require ModemManager to be the only
+process controlling the SIM7600. Older uConsole images install a boot service
+that writes GPS commands directly to `/dev/ttyUSB3`; leaving that service in
+place can race ModemManager and can make the modem or host unstable.
+
+After updating WDG, exit the program and inspect the service without changing
+it:
+
+```sh
+sudo scripts/migrate_uconsole_sim_service.sh --status
+```
+
+If it reports the legacy service, install the backed-up, power-only replacement:
+
+```sh
+sudo scripts/migrate_uconsole_sim_service.sh --apply
+```
+
+The helper prints the exact backup directory and does not restart the modem.
+Reboot the uConsole once at a convenient time, then start WDG. To restore the
+old definition, exit WDG and pass that directory to `--restore`; reboot again
+after restoring.
+
+Serving-cell recording is enabled by default during either All Wardrive mode.
+The neighboring-cell probe is experimental and remains off until explicitly
+enabled in **WARD SETTINGS**. It records candidates separately because the
+SIM7600/QMI neighbor report does not include enough identity fields to create a
+normal WiGLE cell row safely.
+
 ## Optional tools and dump1090
 
 Startup reports missing optional dependencies without rerunning setup. To install

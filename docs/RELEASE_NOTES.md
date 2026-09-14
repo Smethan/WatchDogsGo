@@ -1,5 +1,27 @@
 # Smethan WatchDogsGo
 
+## 0.9.31 — ModemManager-owned cell mast tracking
+
+- Restore serving-cell tracking in **All Wardrive** and **All Wardrive (host
+  BLE)** through ModemManager's cached `Modem.Location` interface. WDG records
+  one valid serving-cell observation at each completed firmware batch without
+  opening an AT, GPS, or QMI device node.
+- Move the internal SIM7600 GNSS feed behind the same ModemManager broker.
+  Serial GPS discovery excludes all ModemManager-owned ports and known ESP32
+  and uConsole ACM control devices.
+- Add **Cell mast tracking** (on by default after its ownership preflight) and
+  **Experimental QMI neighbors** (off by default) to Wardrive Settings.
+  Experimental neighbors are rate-limited, circuit-broken, local-only yellow
+  dots and never become WiGLE cells without a global identity.
+- Add `cell_health.jsonl`, `active_cell_session.json`, and provisional neighbor
+  diagnostics so an unclean stop can be distinguished from a normal session.
+- Add `scripts/migrate_uconsole_sim_service.sh` with status, apply, backup, and
+  restore operations. WDG refuses internal modem GPS/cell access while the old
+  direct-AT GNSS service remains installed.
+
+No projectZero firmware change is required. The service migration is explicit
+and requires one announced manual reboot before hardware validation.
+
 ## 0.9.30 — Disable cellular mast collection
 
 - Remove the cellular background collector from **All Wardrive** and **All

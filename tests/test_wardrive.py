@@ -3,6 +3,7 @@ import csv
 from dataclasses import asdict
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import pytest
@@ -214,6 +215,7 @@ def game(tmp_path,loot,monkeypatch):
     app._clear_scan_state();app._gps_wait=False;app._gps_wait_cmd="";app._whitelist=NS(is_blocked=lambda _:False)
     app.player_lat=40;app.player_lon=-90;app.gps_fix=True;app.ble_devices=[];app.wifi_networks=[]
     app._known_ble=set();app._known_wifi=set();app.state=AppState()
+    app.loot_points=[];app._cluster_zoom=-1
     app.wardrive=WardriveUI(app)
     import watchdogs.wardrive_ui as ui
     monkeypatch.setattr(ui.time,"monotonic",lambda:10)
@@ -638,7 +640,8 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert w.scan.state == "starting"
     assert w.scan.wifi_only is wifi_only and w.scan.diagnostic is diagnostic
     assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
-    assert not hasattr(w, "cell")
+    # Cell work starts only after the firmware acknowledges the new session.
+    assert not w.cell.active
 
 
 def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
@@ -663,6 +666,62 @@ def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
     assert any("Results #1: WiFi 2 | BLE 3" in line for line in lines)
     assert any("Batch #1 complete" in line for line in lines)
     assert len(game.wifi_networks)==1
+
+
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_cell_tracking_starts_after_ack_and_saves_on_batch_done(game, wifi_only):
+    from watchdogs.cell_monitor import HostCellScanner
+    from watchdogs.modem_location import ModemLocationSnapshot
+    broker=NS(error="",enabled_sources=5)
+    broker.acquire=Mock(return_value=True);broker.release=Mock()
+    broker.snapshot=Mock(return_value=ModemLocationSnapshot(
+        observed_monotonic=time.monotonic(),observed_utc=20,modem_generation=1,
+        operator_id="311480",technology="LTE",lac=0,tac=33544,
+        cell_id=33784342,nmea=(),signal_dbm=-101,
+        signal_quality_percent=65,modem_path="/org/freedesktop/ModemManager1/Modem/0",
+        model="SIMCOM_SIM7600G-H",revision="LE20B04",qmi_device="/dev/cdc-wdm0"))
+    w=game.wardrive;w.cell=HostCellScanner(broker,clock=lambda:10)
+    w.scan.supported=True;w.scan.wifi_supported=True
+    w.scan.batch_supported=True;w.scan.wifi_batch_supported=True
+    if wifi_only:
+        w.host_ble=Mock(state="idle",drops=0)
+        w.host_ble.start.return_value=True;w.host_ble.poll.return_value=[]
+    assert w.scan.start(wifi_only=wifi_only)
+    token=w.scan.session
+    assert not w.cell.active
+    w.handle_line(wire(batch_control("started",session=token,seq=1,batch=0)))
+    assert w.cell.active
+    w.handle_line(wire(batch_control("batch_done",session=token,seq=2,
+                                     batch=1,batch_wifi=2,batch_ble=3)))
+    w.poll_cell(10)
+    with (game.loot._session/"wardriving.csv").open(newline="") as stream:
+        next(stream);rows=list(csv.DictReader(stream))
+    assert rows[-1]["MAC"]=="311480_33544_33784342"
+    assert rows[-1]["Type"]=="LTE" and rows[-1]["RSSI"]=="-101"
+    assert len(w.cell.unique)==w.cell.observations==1
+    assert game.loot_points[-1]["type"]=="cell"
+    w.cell.stop()
+
+
+def test_cell_tracking_never_starts_for_dual_test(game):
+    game.wardrive.cell=Mock(active=False)
+    w=game.wardrive;w.scan.supported=True;w.scan.batch_supported=True
+    assert w.scan.start(diagnostic=True)
+    token=w.scan.session
+    w.handle_line(wire(batch_control("started",session=token,seq=1,batch=0)))
+    w.cell.start.assert_not_called()
+
+
+def test_disabling_gps_stops_cell_without_restarting_it(game):
+    cell = Mock(active=True)
+    cell.poll.return_value=[]
+    game.wardrive.cell=cell
+    game.wardrive.scan.state="running"
+    game.wardrive.scan.mode="wardrive"
+    game.gps.available=False
+    game.wardrive.poll_cell(10)
+    cell.stop.assert_called_once()
+    cell.start.assert_not_called()
 
 def test_host_ble_batch_updates_map_immediately_but_groups_terminal(game):
     from watchdogs.host_ble import advertisement_record

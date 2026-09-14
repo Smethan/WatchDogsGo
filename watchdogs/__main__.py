@@ -109,7 +109,7 @@ def _check_deps() -> list[tuple[str, str, bool, bool]]:
     else:
         checks.append(("rtl_433", "NOT INSTALLED", False, False))
 
-    # ModemManager — serving/neighbor cell collection in All Wardrive
+    # ModemManager — cached GNSS/serving-cell location in All Wardrive
     if shutil.which("mmcli"):
         checks.append(("ModemManager", "OK", True, False))
     else:
