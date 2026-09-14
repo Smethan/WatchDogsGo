@@ -33,6 +33,7 @@ class WardriveUI:
         self.cell_neighbors = 0
         self.cell_latest = None
         self.cell_retry_at = 0
+        self.cell_retry_delay = 60
         self.passive = PassiveCapture()
         self.hs_screen = PassiveScreen(app, self)
         self.capture = HandshakeCapture()
@@ -367,7 +368,7 @@ class WardriveUI:
         if not active:
             self.cell.stop()
         elif (self.cell.session != self.scan.session or self.cell.state == "idle"
-              or self.cell.state == "error" and now >= self.cell_retry_at):
+              or (self.cell.state == "error" and now >= self.cell_retry_at)):
             if self.cell.state == "error":
                 self.cell.stop()
             self.cell.start(self.scan.session)
@@ -379,13 +380,18 @@ class WardriveUI:
                 self.app._term_add("[CELL] Provider starting: " + str(data), raw=True)
                 continue
             if kind == "error":
-                self.cell.state = "error"
-                self.cell.error = str(data)
-                self.cell_retry_at = now + 15
+                detail = data if isinstance(data, dict) else {"message": str(data)}
+                self.cell.retryable = bool(detail.get("retryable", True))
+                self.cell.state = "error" if self.cell.retryable else "unsupported"
+                self.cell.error = str(detail.get("message", "Cellular unavailable"))
+                if self.cell.retryable:
+                    self.cell_retry_at = now + self.cell_retry_delay
+                    self.cell_retry_delay = min(300, self.cell_retry_delay * 2)
                 self.app._term_add("[CELL] " + self.cell.error, raw=True)
                 self.app.msg("[CELL] Unavailable; WiFi/BLE still running", 8)
                 continue
             measured, cells = data
+            self.cell_retry_delay = 60
             serving = [cell for cell in cells if cell.serving]
             neighbors = [cell for cell in cells if not cell.serving]
             self.cell_serving, self.cell_neighbors = len(serving), len(neighbors)
@@ -705,7 +711,8 @@ class WardriveUI:
                 cell = " CELL:" + self.cell.state.upper()
                 cell += f" {len(self.cell_unique)}/{self.cell_observations}"
                 if self.cell.provider:
-                    cell += " " + self.cell.provider.replace("modemmanager", "MM").replace("sim7600_at", "AT")
+                    cell += " " + self.cell.provider.replace(
+                        "modemmanager", "MM").replace("qmi_proxy", "QMI")
                 if self.cell_latest:
                     cell += " " + self.cell_latest["technology"] + " " + str(round(self.cell_latest.get("signal_dbm") or 0)) + "dBm"
                 text += cell

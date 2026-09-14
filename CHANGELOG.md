@@ -8,6 +8,27 @@ minor versions.
 
 ---
 
+## [0.9.29] — 2026-09-14
+
+### Fixed
+
+- Remove persistent raw-serial `AT+CPSI?` polling from the SIM7600 cellular
+  fallback. Older QMI-backed ModemManager releases now use the synchronized
+  qmi-proxy control path on `/dev/cdc-wdm*`, without opening any modem TTY.
+- Slow cell sampling from 10 to 30 seconds. Permanently unsupported providers
+  disable cellular collection for the current wardrive session; transient QMI
+  errors retry after 60 seconds with exponential backoff capped at five minutes.
+  Wi-Fi and BLE collection continue during either condition.
+- Record only cellular observations with complete WiGLE identities. QMI LTE
+  and UMTS neighbor measurements lacking global cell IDs are no longer
+  representable as distinct masts.
+
+### Documentation
+
+- Add a source-cited SIM7600/ModemManager/libqmi stability analysis and clearly
+  separate the established software defect from the unproven cause of the
+  reported whole-console crash.
+
 ## [0.9.28] — 2026-09-14
 
 ### Fixed

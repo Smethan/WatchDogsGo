@@ -5,6 +5,12 @@ ESP32 for both radios; host Bluetooth is an explicit separate option. Firmware
 1.7.10 adds the preferred ten-second batch transport; older firmware keeps the
 streaming fallback.
 
+Both All Wardrive modes also run the same host cellular collector. WDG 0.9.29
+uses ModemManager CellInfo when supported and otherwise shares the SIM7600 QMI
+control port through qmi-proxy. It never opens the modem's AT serial ports.
+Permanent cellular errors disable that collector for the current session while
+Wi-Fi and BLE continue. See [Stable SIM7600 cell collection](CELLULAR_STABILITY.md).
+
 | Mode | Wi-Fi radio | BLE radio | Firmware required |
 | --- | --- | --- | --- |
 | All Wardrive (6) | ESP32, ten-second batch | ESP32, same batch | 1.7.10 preferred; v1 fallback |

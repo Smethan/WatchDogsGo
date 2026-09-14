@@ -6,9 +6,10 @@ from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import watchdogs.cell_monitor as cell_monitor
-from watchdogs.cell_monitor import (CellObservation, HostCellScanner,
-    discover_secondary_at, discover_udev_secondary_at, modemmanager_cell, parse_cpsi)
+import pytest
+from watchdogs.cell_monitor import (AutoCellProvider, CellObservation,
+    HostCellScanner, PermanentCellError, QmiProxyProvider, discover_qmi_device,
+    modemmanager_cell, parse_qmicli_cell_location)
 from watchdogs.gps_manager import GpsFix
 from watchdogs.loot_manager import LootManager
 from plugins.wardrive_upload import WardriveUpload
@@ -27,32 +28,94 @@ def test_modemmanager_serving_and_neighbor_cells():
     assert modemmanager_cell({"cell-type":5, "operator-id":"310260", "tac":"AF"}) is None
 
 
-def test_sim7600_lte_and_no_service():
-    cell = parse_cpsi("AT+CPSI?\r\n+CPSI: LTE,Online,310-260,0x00AF,0ABCDEF,42,LTE BAND 66,66486,5,5,-120,-915,-650,120\r\nOK\r\n")
+QMICLI_LTE = """[/dev/cdc-wdm0] Successfully got cell location info
+Intrafrequency LTE Info
+\tUE In Idle: 'no'
+\tPLMN: '310260'
+\tTracking Area Code: '175'
+\tGlobal Cell ID: '11259375'
+\tEUTRA Absolute RF Channel Number: '66486' (LTE band 66)
+\tServing Cell ID: '42'
+\tCell [0]:
+\t\tPhysical Cell ID: '41'
+\t\tRSRQ: '-15.0' dB
+\t\tRSRP: '-105.0' dBm
+\t\tRSSI: '-75.0' dBm
+\tCell [1]:
+\t\tPhysical Cell ID: '42'
+\t\tRSRQ: '-12.0' dB
+\t\tRSRP: '-91.5' dBm
+\t\tRSSI: '-65.0' dBm
+Interfrequency LTE Info
+\tUE In Idle: 'no'
+"""
+
+
+def test_qmicli_lte_keeps_only_globally_identified_serving_cell():
+    cells = parse_qmicli_cell_location(QMICLI_LTE)
+    assert len(cells) == 1
+    cell = cells[0]
     assert cell.identity == "310260_175_11259375"
     assert cell.channel == 66486 and cell.pci == 42
-    assert cell.rsrp == -91.5 and cell.serving
-    assert parse_cpsi("+CPSI: NO SERVICE, Online\r\nOK\r\n") is None
+    assert cell.rsrp == -91.5 and cell.rsrq == -12 and cell.serving
+    assert cell.provider == "qmi_proxy"
+    assert parse_qmicli_cell_location("Successfully got cell location info\n") == []
 
 
-def test_udev_secondary_at_requires_role_and_same_physical_modem(tmp_path):
-    for name in ("ttyUSB1", "ttyUSB3", "ttyUSB8"):
-        (tmp_path / name).touch()
-    properties = {
-        "ttyUSB1": {"DEVPATH": "/devices/usb1/1-3/1-3:1.1",
-                    "ID_MM_PORT_TYPE_GPS": "1"},
-        "ttyUSB3": {"DEVPATH": "/devices/usb1/1-3/1-3:1.3",
-                    "ID_MM_PORT_TYPE_AT_SECONDARY": "1"},
-        "ttyUSB8": {"DEVPATH": "/devices/usb1/1-30/1-30:1.3",
-                    "ID_MM_PORT_TYPE_AT_SECONDARY": "1"},
-    }
-    selected = discover_udev_secondary_at(
-        "/sys/devices/usb1/1-3", port_names=properties,
-        property_reader=lambda port: properties[port.name], device_root=tmp_path)
-    assert selected == str(tmp_path / "ttyUSB3")
+def test_qmicli_umts_and_nr_serving_cells():
+    text = """UMTS Info
+\tCell ID: '1234'
+\tPLMN: '310260'
+\tLocation Area Code: '42'
+\tUTRA Absolute RF Channel Number: '10688'
+\tPrimary Scrambling Code: '17'
+\tRSCP: '-85' dBm
+\tECIO: '-9' dBm
+5GNR cell information
+\tPLMN: '310260'
+\tTracking Area Code: '66051'
+\tGlobal Cell ID: '1234567890'
+\tPhysical Cell ID: '321'
+\tRSRQ: '-12.5 dB'
+\tRSRP: '-96.5 dBm'
+\tSNR: '18.0 dB'
+"""
+    cells = parse_qmicli_cell_location(text)
+    assert [(cell.technology, cell.signal_dbm) for cell in cells] == [
+        ("NR", -96.5), ("WCDMA", -85)]
+    assert cells[0].sinr == 18 and cells[1].channel == 10688
 
 
-def test_dbus_port_omission_uses_same_modems_udev_secondary(monkeypatch):
+def test_qmicli_geran_neighbor_requires_full_identity():
+    text = """GERAN Info
+\tCell ID: '1234'
+\tPLMN: '310260'
+\tLocation Area Code: '42'
+\tGERAN Absolute RF Channel Number: '512'
+\tBase Station Identity Code: '7'
+\tRX Level: -80 dBm > level > -79 dBm ('31')
+\tCell [0]:
+\t\tCell ID: '1235'
+\t\tPLMN: '310260'
+\t\tLocation Area Code: '42'
+\t\tGERAN Absolute RF Channel Number: '513'
+\t\tBase Station Identity Code: '8'
+\t\tRX Level: -90 dBm > level > -89 dBm ('21')
+\tCell [1]:
+\t\tCell ID: 'unavailable'
+\t\tPLMN: 'unavailable'
+\t\tLocation Area Code: 'unavailable'
+\t\tGERAN Absolute RF Channel Number: '514'
+\t\tBase Station Identity Code: '9'
+\t\tRX Level: -95 dBm > level > -94 dBm ('16')
+"""
+    cells = parse_qmicli_cell_location(text)
+    assert [cell.identity for cell in cells] == [
+        "310260_42_1234", "310260_42_1235"]
+    assert cells[0].serving and not cells[1].serving
+
+
+def test_qmi_discovery_selects_sim7600_control_port(monkeypatch):
     modem_path = "/org/freedesktop/ModemManager1/Modem/0"
     interface = "org.freedesktop.ModemManager1.Modem"
     root = Mock()
@@ -62,13 +125,56 @@ def test_dbus_port_omission_uses_same_modems_udev_secondary(monkeypatch):
         "Ports": (("cdc-wdm0", 6), ("ttyUSB1", 4), ("wwan0", 8)),
     }}}
     bus = Mock()
-    bus.get_object.side_effect = [root, Mock()]
+    bus.get_object.return_value = root
     monkeypatch.setitem(sys.modules, "dbus", SimpleNamespace(Interface=lambda obj, _name: obj))
-    fallback = Mock(return_value="/dev/ttyUSB3")
-    monkeypatch.setattr(cell_monitor, "discover_udev_secondary_at", fallback)
 
-    assert discover_secondary_at(bus) == "/dev/ttyUSB3"
-    fallback.assert_called_once_with("/sys/devices/usb1/1-3")
+    assert discover_qmi_device(bus) == "/dev/cdc-wdm0"
+
+
+def test_qmi_provider_uses_proxy_and_never_an_at_port():
+    runner = Mock(return_value=SimpleNamespace(
+        returncode=0, stdout=QMICLI_LTE, stderr=""))
+    provider = QmiProxyProvider(
+        "/dev/cdc-wdm0", binary="/usr/bin/qmicli", runner=runner)
+    assert provider.scan()[0].identity == "310260_175_11259375"
+    command = runner.call_args.args[0]
+    assert command == ["/usr/bin/qmicli", "--device=/dev/cdc-wdm0",
+                       "--device-open-proxy", "--nas-get-cell-location-info"]
+    assert all("ttyUSB" not in argument for argument in command)
+
+
+def test_qmi_provider_classifies_unsupported_as_permanent():
+    runner = Mock(return_value=SimpleNamespace(
+        returncode=1, stdout="", stderr="error: operation not supported"))
+    provider = QmiProxyProvider(
+        "/dev/cdc-wdm0", binary="/usr/bin/qmicli", runner=runner)
+    with pytest.raises(PermanentCellError):
+        provider.scan()
+
+
+def test_auto_provider_switches_once_from_modemmanager_to_qmi():
+    first = Mock(name="modemmanager")
+    first.name = "modemmanager"
+    first.scan.side_effect = RuntimeError("operation not supported")
+    second = Mock(name="qmi_proxy")
+    second.name = "qmi_proxy"
+    second.scan.return_value = parse_qmicli_cell_location(QMICLI_LTE)
+    provider = AutoCellProvider(lambda: first, lambda: second)
+    assert provider.scan()[0].provider == "qmi_proxy"
+    assert provider.name == "qmi_proxy"
+    first.close.assert_called_once()
+    assert provider.scan()[0].provider == "qmi_proxy"
+    assert first.scan.call_count == 1
+
+
+def test_auto_provider_uses_qmi_when_modemmanager_is_unavailable():
+    second = Mock(name="qmi_proxy")
+    second.name = "qmi_proxy"
+    second.scan.return_value = parse_qmicli_cell_location(QMICLI_LTE)
+    provider = AutoCellProvider(
+        Mock(side_effect=RuntimeError("D-Bus unavailable")), lambda: second)
+    assert provider.fallback_used and provider.name == "qmi_proxy"
+    assert provider.scan()[0].identity == "310260_175_11259375"
 
 
 def test_cell_wigle_rows_repeat_and_keep_mnc_width(tmp_path):
@@ -106,6 +212,22 @@ def test_background_scanner_delivers_serving_and_neighbors():
     scanner.stop()
     update = next(e for e in events if e[1] == "cells")
     assert update[0] == "session" and len(update[2][1]) == 2
+
+
+def test_background_scanner_marks_permanent_failure_non_retryable():
+    class Provider:
+        name = "fixture"
+        def scan(self): raise PermanentCellError("unsupported")
+        def close(self): pass
+    scanner = HostCellScanner(Provider, interval=60)
+    scanner.start("session")
+    deadline = time.time() + 2
+    events = []
+    while time.time() < deadline and not any(e[1] == "error" for e in events):
+        events += scanner.poll()
+        time.sleep(.01)
+    error = next(e for e in events if e[1] == "error")
+    assert error[2] == {"message": "unsupported", "retryable": False}
 
 
 def test_wdgwars_parser_preserves_cell_type_and_reads_legacy(tmp_path):

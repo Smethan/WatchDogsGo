@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.9.29 — Safe QMI cellular collection
+
+- Remove the persistent SIM7600 AT-port fallback introduced in 0.9.28. WDG no
+  longer opens `ttyUSB2`, `ttyUSB3`, or any other modem serial interface for
+  cell collection.
+- On the affected ModemManager 1.20/QMI combination, use the same read-only NAS
+  cell-location request that newer ModemManager releases use, submitted through
+  qmi-proxy on `/dev/cdc-wdm0` so access is synchronized with the existing
+  cellular data connection.
+- Sample every 30 seconds, enforce a 12-second query deadline, stop retrying
+  permanently unsupported configurations for the current session, and back off
+  transient retries from 60 seconds to a five-minute cap. All Wardrive Wi-Fi
+  and BLE continue if cellular collection is unavailable.
+- Save LTE/UMTS neighbors only when the backend supplies a complete global
+  identity. QMI physical-cell measurements without a global cell ID are not
+  mislabeled as distinct WiGLE masts.
+
+The source-level diagnosis and remaining hardware test are documented in
+`docs/CELLULAR_STABILITY.md`. The complete 241-test suite passed on the host;
+no patched code or AT command was run on the uConsole during this repair.
+
 ## 0.9.28 — SIM7600 cellular fallback discovery
 
 - Fix **All Wardrive** cellular detection on QMI-controlled SIM7600 modems where

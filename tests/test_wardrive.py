@@ -646,6 +646,44 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
     w.cell.start.assert_called_once_with(w.scan.session)
 
+
+def test_cell_permanent_failure_disables_retries_for_current_wardrive(game):
+    w = game.wardrive
+    w.scan.state = "running"
+    w.scan.mode = "wardrive"
+    w.scan.session = "cell-session"
+    w.cell = Mock(state="starting", session="cell-session", provider="",
+                  error="", retryable=True, drops=0)
+    w.cell.poll.return_value = [
+        ("cell-session", "error",
+         {"message": "operation not supported", "retryable": False})]
+    w.poll_cell(100)
+    assert w.cell.state == "unsupported"
+    assert w.cell.error == "operation not supported"
+    w.cell.poll.return_value = []
+    w.poll_cell(1000)
+    w.cell.start.assert_not_called()
+
+
+def test_cell_transient_failure_uses_capped_background_retry(game):
+    w = game.wardrive
+    w.scan.state = "running"
+    w.scan.mode = "wardrive"
+    w.scan.session = "cell-session"
+    w.cell = Mock(state="starting", session="cell-session", provider="",
+                  error="", retryable=True, drops=0)
+    w.cell.poll.return_value = [
+        ("cell-session", "error", {"message": "QMI busy", "retryable": True})]
+    w.poll_cell(100)
+    assert w.cell.state == "error" and w.cell_retry_at == 160
+    assert w.cell_retry_delay == 120
+    w.cell.poll.return_value = []
+    w.poll_cell(159)
+    w.cell.start.assert_not_called()
+    w.poll_cell(160)
+    w.cell.start.assert_called_once_with("cell-session")
+
+
 def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
     w=game.wardrive
     w.cell=Mock(state="idle",session="",provider="",error="",drops=0)
