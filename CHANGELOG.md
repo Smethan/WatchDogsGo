@@ -8,6 +8,19 @@ minor versions.
 
 ---
 
+## [0.9.30] — 2026-09-14
+
+### Fixed
+
+- Remove live cellular mast detection from both All Wardrive modes after
+  continued whole-uConsole crashes. WDG no longer creates a cellular worker,
+  calls ModemManager, starts `qmicli`, discovers modem ports, or displays a
+  live cellular status during a scan.
+- Preserve parsing, upload, loot totals, and display of cellular rows written
+  by earlier releases. Existing wardrive sessions are not modified.
+- Remove cellular control utilities from WDG's setup dependency list. Existing
+  system packages and the uConsole's cellular-data configuration are untouched.
+
 ## [0.9.29] — 2026-09-14
 
 ### Fixed

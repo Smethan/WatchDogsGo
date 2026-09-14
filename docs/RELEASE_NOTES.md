@@ -1,5 +1,23 @@
 # Smethan WatchDogsGo
 
+## 0.9.30 — Disable cellular mast collection
+
+- Remove the cellular background collector from **All Wardrive** and **All
+  Wardrive (host BLE)** after crashes continued with the QMI proxy
+  implementation. These modes no longer call ModemManager, launch `qmicli`,
+  inspect cellular devices, open modem ports, or run a cellular retry timer.
+- Remove the live `CELL:...` wardrive overlay. Wi-Fi, ESP BLE, host BlueZ BLE,
+  GPS trails, Flock/Axon detection, and map behavior are unchanged.
+- Keep existing cellular WiGLE rows readable, uploadable, and included in
+  historical loot totals. This update does not delete or rewrite prior loot.
+- Stop installing ModemManager/libqmi/libmbim tools as WDG dependencies. The
+  update does not uninstall existing packages or alter the uConsole's cellular
+  connection.
+
+The complete 228-test suite passed on the host, including a regression check
+that the All Wardrive UI has no cellular collector. No code was run or installed
+on the uConsole during this rollback.
+
 ## 0.9.29 — Safe QMI cellular collection
 
 - Remove the persistent SIM7600 AT-port fallback introduced in 0.9.28. WDG no

@@ -511,7 +511,7 @@ Saved to `loot/<session>/`:
 |------|---------|
 | `serial_full.log` | Complete ESP32 serial output |
 | `wardriving.csv` | WiGLE 1.6 WiFi/BLE/cellular observations + GPS |
-| `cell_diagnostics.jsonl` | Full serving/neighbor radio measurements and provider status |
+| `cell_diagnostics.jsonl` | Historical cellular measurements from WDG 0.9.29 and earlier |
 | `bt_devices.csv` | BLE devices with GPS coordinates |
 | `handshakes/` | PCAP, HCCAPX, .22000 (hashcat-ready) |
 | `mitm/` | MITM pcap captures |

@@ -108,7 +108,6 @@ if command -v apt-get &>/dev/null; then
     RPI_PKGS=(
         python3-rpi-lgpio python3-lgpio   # CM5/RPi5 GPIO for LoRa
         raspi-utils                       # provides pinctrl
-        modemmanager libqmi-utils libmbim-utils # cellular CellInfo + diagnostics
     )
 
     SYS_PKGS=("${CORE_PKGS[@]}")

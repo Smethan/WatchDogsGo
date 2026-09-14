@@ -4993,7 +4993,7 @@ class WatchDogsGame(OtaMixin):
         t_wifi = self._loot_totals.get("wifi", 0) + len(self.wifi_networks)
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         t_hs   = self._loot_totals.get("hs",   0) + n_hs_ses
-        t_cell = self._loot_totals.get("cell", 0) + len(self.wardrive.cell_unique)
+        t_cell = self._loot_totals.get("cell", 0)
         n_pwn  = (sum(1 for d in self.ble_devices if d.hacked)
                   + sum(1 for n in self.wifi_networks if n.hacked))
         t_pwd  = (self._loot_totals.get("passwords", 0)

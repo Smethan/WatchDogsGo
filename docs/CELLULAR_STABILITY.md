@@ -1,7 +1,14 @@
 # Stable SIM7600 cell collection
 
-This note records the source-level diagnosis and the design used by WDG 0.9.29.
-It separates what is established from what still needs a hardware soak.
+> **Suspended in WDG 0.9.30.** The uConsole continued to crash with the QMI
+> proxy implementation described below. Live cellular collection has therefore
+> been removed from both All Wardrive modes. This document is retained as
+> historical research and must not be treated as a currently enabled or
+> hardware-validated design.
+
+This note records the source-level diagnosis and the design that was briefly
+used by WDG 0.9.29. It separates what was established from what remained
+unproven.
 
 ## Finding
 
@@ -32,9 +39,9 @@ AT port for maintenance and diagnostics.[^4] They do not establish persistent
 AT polling alongside a ModemManager-managed QMI bearer as a supported
 application interface.
 
-## Implemented access path
+## 0.9.29 access path (removed)
 
-WDG now follows the QMI control plane already in use:
+WDG 0.9.29 followed the QMI control plane already in use:
 
 1. Ask ModemManager for `GetCellInfo`. This preserves native serving and
    neighbor support on backends that implement it.
@@ -52,10 +59,10 @@ WDG now follows the QMI control plane already in use:
    failure retries after 60 seconds, then doubles to a five-minute cap. Wi-Fi
    and BLE wardriving continue either way.
 
-The Debian package containing `qmicli` is `libqmi-utils`; WDG's setup script
-already installs it on Raspberry Pi/Clockwork systems. The host validation used
-qmicli 1.38.0 and confirmed the NAS option is present. WDG uses only an argument
-array, never a shell command.
+The Debian package containing `qmicli` is `libqmi-utils`; WDG 0.9.29 briefly
+added it to the Raspberry Pi/Clockwork setup package list. WDG 0.9.30 removed
+that dependency. The 0.9.29 host validation used qmicli 1.38.0 and confirmed
+the NAS option was present.
 
 ## What can be recorded
 
@@ -79,19 +86,17 @@ modem response.
 
 ## Validation and remaining evidence
 
-The host test suite covers the official qmicli LTE text format, serving-cell
-selection among multiple physical cells, SIM7600 QMI-port selection, exact
-proxy command arguments, permanent and transient error policy, one-time
-ModemManager fallback, UI retry suppression, WiGLE storage, and the rest of
-WDG. It also scans the shipped code to ensure no cellular provider references
-`ttyUSB`, `AT+CPSI`, or pySerial.
+The 0.9.29 host test suite covered the official qmicli LTE text format,
+serving-cell selection among multiple physical cells, SIM7600 QMI-port
+selection, exact proxy command arguments, error policy, ModemManager fallback,
+UI retry suppression, WiGLE storage, and the rest of WDG. Hardware use then
+showed that the whole-uConsole crash remained.
 
-No patched WDG code or AT command was run on the uConsole during this repair.
-A post-release hardware check should first confirm that cellular data remains
-connected and the console remains stable during a long All Wardrive session.
-If a whole-console crash remains, collect `journalctl -b -1 -k`,
-`journalctl -b -1 -u ModemManager`, and power/undervoltage evidence from the
-previous boot before changing the modem path again.
+WDG 0.9.30 removes the provider module and every All Wardrive lifecycle hook.
+Its host suite also checks that the wardrive UI has no cellular collector.
+If cellular work resumes later, first collect `journalctl -b -1 -k`,
+`journalctl -b -1 -u ModemManager`, and power/undervoltage evidence from a
+crashed previous boot before choosing another modem access path.
 
 ## Sources
 
