@@ -1,5 +1,19 @@
 # Smethan WatchDogsGo
 
+## 0.9.33 — Safe map refresh and clear bottom HUD
+
+- Keep native `pyxel.Image` tile resources owned by the Pyxel draw thread.
+  Background map-download completion can invalidate decoded Python tile data,
+  but native display images are released by the next draw callback. This fixes
+  the repeated `Image is unsendable, but is being dropped on another thread`
+  traceback seen after a map manifest refresh.
+- Place the bottom shortcut and active-tool text after the rendered `CELL`
+  counter and before the reserved GPS region. The shortcut is right-aligned and
+  switches to a complete compact form when visible LoRa status reduces space.
+
+The complete 268-test host suite passes. No projectZero firmware update is
+required, and no patched code was run on the uConsole during this repair.
+
 ## 0.9.32 — Faster detailed maps and large wardrive sessions
 
 - Replace per-frame Python tile pixel loops with prepared `pyxel.Image` tiles
