@@ -97,6 +97,25 @@ def test_clusters_reuse_unchanged_result_and_rebuild_after_append(monkeypatch):
     assert game._clusters is not first_clusters
 
 
+def test_close_map_caps_labels_but_keeps_every_point(monkeypatch):
+    import watchdogs.app as appmod
+    px = NS(circ=Mock(), text=Mock(), circb=Mock(), rect=Mock(), pset=Mock(),
+            frame_count=100)
+    monkeypatch.setattr(appmod, "pyxel", px)
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.proj = NS(zoom=13)
+    game._cluster_sel = -1
+    game._clusters = [
+        {"x": i, "y": 30, "color": 11, "count": 1,
+         "points": [{"label": f"network-{i}"}]}
+        for i in range(200)
+    ]
+    game._update_clusters = Mock()
+    game._draw_loot_points()
+    assert px.circ.call_count == 200
+    assert px.text.call_count == 80
+
+
 def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
         monkeypatch):
     trail = WardriveTrail()

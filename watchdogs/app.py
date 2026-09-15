@@ -4438,6 +4438,7 @@ class WatchDogsGame(OtaMixin):
     def _draw_loot_points(self):
         self._update_clusters()
         zoom = self.proj.zoom
+        labels_left = 80
         for idx, cl in enumerate(self._clusters):
             selected = (idx == self._cluster_sel)
             c = cl["color"]
@@ -4446,9 +4447,11 @@ class WatchDogsGame(OtaMixin):
                 pt = cl["points"][0]
                 if zoom >= 8:
                     pyxel.circ(cl["x"], cl["y"], 2, c)
-                    if zoom >= 10:
+                    if zoom >= 10 and (labels_left > 0 or selected):
                         pyxel.text(cl["x"] + 4, cl["y"] - 2,
                                    pt.get("label", "")[:16], c)
+                        if not selected:
+                            labels_left -= 1
                 elif zoom >= 3:
                     pyxel.rect(cl["x"], cl["y"], 2, 2, c)
                 else:
