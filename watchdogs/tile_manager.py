@@ -329,6 +329,11 @@ class TileRenderer:
         self._display_cache: OrderedDict[tuple, tuple[object, int]] = OrderedDict()
         self._display_cache_bytes = 0
         self._max_display_cache_bytes = 8 * 1024 * 1024
+        # Pyxel Image objects are bound to the thread that created them.  Map
+        # downloads call reload_manifest() from a worker, so native display
+        # resources must be released later by draw() on Pyxel's thread.
+        self._display_owner_thread: int | None = None
+        self._display_reset_pending = False
         self._manifest: dict | None = None
         self._load_manifest()
         self.tiles_visible = False
@@ -353,9 +358,18 @@ class TileRenderer:
             self._cache.clear()
             self._missing.clear()
             self._resolved.clear()
-            self._display_cache.clear()
-            self._display_cache_bytes = 0
-            self._fb = None
+            if (self._display_owner_thread is None
+                    or self._display_owner_thread == threading.get_ident()):
+                self._clear_display_cache()
+            else:
+                self._display_reset_pending = True
+
+    def _clear_display_cache(self):
+        """Release Pyxel-owned display resources on their creating thread."""
+        self._display_cache.clear()
+        self._display_cache_bytes = 0
+        self._fb = None
+        self._display_reset_pending = False
 
     def draw(self, proj, W: int, H: int, HUD_TOP: int, TERM_Y: int) -> bool:
         """Render visible tiles onto pyxel screen.
@@ -368,6 +382,13 @@ class TileRenderer:
     def _draw_locked(self, proj, W: int, H: int,
                      HUD_TOP: int, TERM_Y: int) -> bool:
         import pyxel as px
+
+        draw_thread = threading.get_ident()
+        if self._display_owner_thread is None:
+            self._display_owner_thread = draw_thread
+        if (self._display_reset_pending
+                and self._display_owner_thread == draw_thread):
+            self._clear_display_cache()
 
         self.tiles_visible = False
         game_zoom = proj.zoom

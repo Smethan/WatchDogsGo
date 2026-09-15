@@ -3,6 +3,7 @@ import csv
 from dataclasses import asdict
 import json
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -335,6 +336,37 @@ def test_map_manifest_reload_invalidates_render_caches(tmp_path):
     renderer.reload_manifest()
     assert not renderer._cache and not renderer._missing
     assert not renderer._resolved and not renderer._display_cache
+    assert renderer._display_cache_bytes==0
+
+
+def test_map_manifest_reload_defers_native_image_release_to_draw_thread(tmp_path):
+    from watchdogs.tile_manager import TileRenderer
+
+    renderer=TileRenderer(tmp_path)
+    owner=threading.get_ident()
+    renderer._display_owner_thread=owner
+    native_image=object()
+    renderer._display_cache[(13,2,2,64,64)]=(native_image,4096)
+    renderer._display_cache_bytes=4096
+    errors=[]
+
+    def reload_on_worker():
+        try:
+            renderer.reload_manifest()
+        except Exception as exc:
+            errors.append(exc)
+
+    worker=threading.Thread(target=reload_on_worker)
+    worker.start();worker.join()
+
+    assert not errors
+    assert renderer._display_reset_pending
+    assert renderer._display_cache
+
+    # Even an out-of-range zoom drains the native cache before returning.
+    renderer._draw_locked(NS(zoom=0),640,360,16,234)
+    assert not renderer._display_reset_pending
+    assert not renderer._display_cache
     assert renderer._display_cache_bytes==0
 
 
