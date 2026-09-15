@@ -7,6 +7,7 @@ as a dark retro-styled offline map layer.
 
 import json
 import math
+import threading
 import time
 import zlib
 from collections import OrderedDict
@@ -318,6 +319,7 @@ class TileRenderer:
 
     def __init__(self, maps_dir: Path):
         self.maps_dir = maps_dir
+        self._lock = threading.RLock()
         self._cache: OrderedDict[tuple[int, int, int], object] = OrderedDict()
         # A viewport can need child tiles and their cropped parents together.
         # Sixteen entries caused a cyclic LRU miss on ordinary z13 views.
@@ -345,19 +347,26 @@ class TileRenderer:
                 and self._manifest.get("tile_count", 0) > 0)
 
     def reload_manifest(self):
-        self._load_manifest()
-        self._cache.clear()
-        self._missing.clear()
-        self._resolved.clear()
-        self._display_cache.clear()
-        self._display_cache_bytes = 0
-        self._fb = None
+        # Map downloads finish on a worker while draw() runs on Pyxel's thread.
+        with self._lock:
+            self._load_manifest()
+            self._cache.clear()
+            self._missing.clear()
+            self._resolved.clear()
+            self._display_cache.clear()
+            self._display_cache_bytes = 0
+            self._fb = None
 
     def draw(self, proj, W: int, H: int, HUD_TOP: int, TERM_Y: int) -> bool:
         """Render visible tiles onto pyxel screen.
 
         Returns True if any tiles were drawn (caller can skip coastlines).
         """
+        with self._lock:
+            return self._draw_locked(proj, W, H, HUD_TOP, TERM_Y)
+
+    def _draw_locked(self, proj, W: int, H: int,
+                     HUD_TOP: int, TERM_Y: int) -> bool:
         import pyxel as px
 
         self.tiles_visible = False
