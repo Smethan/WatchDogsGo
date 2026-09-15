@@ -82,6 +82,29 @@ C_MENU_BORDER = 5
 C_MENU_SEL = 3
 C_MENU_TEXT = 7
 
+HUD_FONT_W = 5
+
+
+def _fit_hud_text(text: str, left: int, right: int,
+                  *, align_right: bool = False) -> tuple[int, str]:
+    """Fit fixed-width HUD text inside the half-open [left, right) region."""
+    capacity = max(0, (right - left) // HUD_FONT_W)
+    if capacity == 0:
+        return left, ""
+    if len(text) > capacity:
+        text = text[:capacity]
+    width = len(text) * HUD_FONT_W
+    return (right - width if align_right else left), text
+
+
+def _bottom_menu_hint(left: int, right: int) -> tuple[int, str]:
+    """Choose the most useful complete shortcut hint that fits the HUD."""
+    capacity = max(0, (right - left) // HUD_FONT_W)
+    for text in ("[TAB]Menu [`]Loot [S]Stop", "[TAB]Menu [S]Stop", "[TAB]Menu"):
+        if len(text) <= capacity:
+            return _fit_hud_text(text, left, right, align_right=True)
+    return left, ""
+
 ZOOM_LEVELS = [
     (360.0, "WORLD"),
     (180.0, "HEMISPHERE"),
@@ -5133,7 +5156,24 @@ class WatchDogsGame(OtaMixin):
         pyxel.text(125, y, f"HS:{t_hs}",    C_ERROR)
         pyxel.text(170, y, f"PWD:{t_pwd}",  12)  # blue
         pyxel.text(220, y, f"PWN:{n_pwn}",  C_SUCCESS)
-        pyxel.text(275, y, f"CELL:{t_cell}", 11)
+        cell_x = 275
+        cell_txt = f"CELL:{t_cell}"
+        pyxel.text(cell_x, y, cell_txt, 11)
+
+        # Reserve the exact region used by GPS and, when visible, LoRa before
+        # placing the center status.  Counts can grow beyond four digits, so
+        # derive the left edge from the rendered CELL text instead of using a
+        # second fixed x coordinate that can overlap it.
+        if self.gps_fix:
+            gps_left = W - 108
+        elif self.gps.available:
+            gps_left = W - (120 if self.gps_sats_vis > 0 else 100)
+        else:
+            gps_left = W - 60
+        right_status_edge = gps_left - 6
+        if self._lora.running or self._lora_enabled:
+            right_status_edge = min(right_status_edge, W - 206)
+        left_status_edge = cell_x + len(cell_txt) * HUD_FONT_W + 8
 
         tools = []
         if self.wardrive.scan.active:
@@ -5153,9 +5193,15 @@ class WatchDogsGame(OtaMixin):
             tools.append(f"433:{self._sdr.total_sensors_seen}")
         if tools:
             dots = "." * ((pyxel.frame_count // 10) % 4)
-            pyxel.text(270, y, " ".join(tools) + dots, 12)
+            status_x, status_txt = _fit_hud_text(
+                " ".join(tools) + dots, left_status_edge, right_status_edge)
+            if status_txt:
+                pyxel.text(status_x, y, status_txt, 12)
         elif not self.menu_open:
-            pyxel.text(270, y, "[TAB]Menu [`]Loot [S]Stop", C_COAST)
+            status_x, status_txt = _bottom_menu_hint(
+                left_status_edge, right_status_edge)
+            if status_txt:
+                pyxel.text(status_x, y, status_txt, C_COAST)
 
         # GPS status — "DD.DDDDDS DDD.DDDDDW" = 20 chars × 5 = 100px
         if self.gps_fix:
