@@ -811,6 +811,8 @@ class WatchDogsGame(OtaMixin):
         # Loot GPS points (loaded from all loot sessions)
         self.loot_points: list[dict] = []
         self._loot_points_ts = 0.0
+        self._loot_refresh_result: Queue = Queue(maxsize=1)
+        self._loot_refresh_active = False
 
         # Init
         self.proj.smooth_move(self.player_lat, self.player_lon)
@@ -1430,9 +1432,11 @@ class WatchDogsGame(OtaMixin):
         if pyxel.frame_count % 15 == 0:
             self.scan_lines = [random.randint(0, H-1) for _ in range(random.randint(0, 2))]
 
-        # Refresh loot points every 30s + persist XP
+        # Refresh historical files away from the Pyxel update thread.  Large
+        # wardrive archives otherwise freeze input and serial polling here.
+        self._poll_loot_refresh()
         if time.time() - self._loot_points_ts > 30:
-            self._refresh_loot_points()
+            self._start_loot_refresh()
             self._save_xp_if_dirty()
             self._battery_pct = self._read_battery()
             self._loot_points_ts = time.time()
@@ -3937,24 +3941,81 @@ class WatchDogsGame(OtaMixin):
     def _refresh_loot_points(self):
         if not self.loot:
             return
+        self._apply_loot_snapshot(self._collect_loot_snapshot())
+
+    def _collect_loot_snapshot(self):
+        """Read historical map and password data without mutating game state."""
+        snapshot = {"points": None, "passwords": None, "totals": None}
         try:
-            pts = self.loot.get_gps_points()
-            if pts:
-                self.loot_points = pts
-                self._cluster_zoom = -1  # force re-cluster
+            snapshot["points"] = self.loot.get_gps_points()
         except Exception:
             pass
-        # Load cracked passwords from potfile (for map popup)
         try:
             loot_dir = Path(self._app_dir) / "loot"
             pwd_data = upload_manager.load_wpasec_passwords(loot_dir)
-            self._cracked_ssids = {
+            snapshot["passwords"] = {
                 ssid: entries[0]["password"]
                 for ssid, entries in pwd_data.get("by_ssid", {}).items()
             }
         except Exception:
             pass
-        self._load_loot_totals()
+        try:
+            t = dict(self.loot.loot_totals)
+            snapshot["totals"] = {
+                "sessions":    t.get("sessions", 0),
+                "wifi":        t.get("wardriving_wifi", t.get("wardriving", 0)),
+                "bt":          t.get("bt_devices", 0),
+                "cell":        t.get("cell_cells", 0),
+                "hs":          t.get("hc22000", 0),
+                "pcap":        t.get("pcap", 0),
+                "passwords":   t.get("passwords", 0),
+                "et_captures": t.get("et_captures", 0),
+                "mc_nodes":    t.get("mc_nodes", 0),
+                "mc_msgs":     t.get("mc_messages", 0),
+            }
+        except Exception:
+            pass
+        return snapshot
+
+    def _apply_loot_snapshot(self, snapshot):
+        points = snapshot.get("points")
+        if points:
+            self.loot_points = points
+            self._cluster_zoom = -1
+        passwords = snapshot.get("passwords")
+        if passwords is not None:
+            self._cracked_ssids = passwords
+        totals = snapshot.get("totals")
+        if totals is not None:
+            self._loot_totals = totals
+
+    def _start_loot_refresh(self):
+        if not self.loot or getattr(self, "_loot_refresh_active", False):
+            return
+        if not hasattr(self, "_loot_refresh_result"):
+            self._loot_refresh_result = Queue(maxsize=1)
+        self._loot_refresh_active = True
+
+        def worker():
+            try:
+                result = self._collect_loot_snapshot()
+            except Exception:
+                result = None
+            self._loot_refresh_result.put(result)
+
+        threading.Thread(target=worker, name="loot-map-refresh", daemon=True).start()
+
+    def _poll_loot_refresh(self):
+        result_queue = getattr(self, "_loot_refresh_result", None)
+        if result_queue is None:
+            return
+        try:
+            snapshot = result_queue.get_nowait()
+        except Exception:
+            return
+        self._loot_refresh_active = False
+        if snapshot is not None:
+            self._apply_loot_snapshot(snapshot)
 
     def _load_loot_totals(self):
         if not self.loot:
