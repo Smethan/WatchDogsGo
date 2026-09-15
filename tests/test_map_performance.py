@@ -1,11 +1,13 @@
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 from queue import Queue
+import zlib
 
 from watchdogs.app import MapProjection, WatchDogsGame
 from watchdogs.map_index import GeoObjectIndex, GeoPointIndex
 from watchdogs.wardrive_trail import WardriveTrail
 from watchdogs.wardrive_ui import WardriveUI
+from watchdogs.tile_manager import OSM_TILE_SIZE, TileRenderer
 
 
 def test_geo_index_filters_to_close_view_and_preserves_order():
@@ -18,6 +20,16 @@ def test_geo_index_filters_to_close_view_and_preserves_order():
     index.ensure(points)
     assert [p["label"] for p in index.query(40, -90, 0.02, 0.02)] == [
         "first", "second"]
+
+
+def test_packed_tile_nibbles_decode_in_order(tmp_path):
+    tile_dir = tmp_path / "12"
+    tile_dir.mkdir()
+    raw = bytes([0x01, 0x2F]) * (OSM_TILE_SIZE * OSM_TILE_SIZE // 4)
+    (tile_dir / "1_2.dat").write_bytes(zlib.compress(raw))
+    pixels = TileRenderer(tmp_path)._get_tile_image(12, 1, 2)
+    assert pixels[:8] == bytearray([0, 1, 2, 15, 0, 1, 2, 15])
+    assert len(pixels) == OSM_TILE_SIZE * OSM_TILE_SIZE
 
 
 def test_geo_index_handles_dateline_view():

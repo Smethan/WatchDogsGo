@@ -52,6 +52,8 @@ DOWNLOAD_TIERS = [
 
 OSM_TILE_SIZE = 256
 USER_AGENT = "WatchDogsGo/1.0 (security-research-game)"
+_UNPACK_NIBBLES = tuple(bytes((value >> 4, value & 0x0F))
+                        for value in range(256))
 
 # Stadia Maps — Alidade Smooth Dark style
 # Free tier, raster PNG tiles, dark theme matching game aesthetic
@@ -567,11 +569,9 @@ class TileRenderer:
             if len(raw) != OSM_TILE_SIZE * OSM_TILE_SIZE // 2:
                 self._missing.add(key)
                 return None
-            # Unpack 4-bit pairs to flat array
-            pixels = bytearray(OSM_TILE_SIZE * OSM_TILE_SIZE)
-            for i, byte in enumerate(raw):
-                pixels[i * 2] = (byte >> 4) & 0x0F
-                pixels[i * 2 + 1] = byte & 0x0F
+            # Joining a 256-entry lookup runs in C for most of the work and is
+            # several times faster than assigning 65,536 nibbles in Python.
+            pixels = bytearray(b"".join(_UNPACK_NIBBLES[byte] for byte in raw))
         except Exception:
             self._missing.add(key)
             return None
