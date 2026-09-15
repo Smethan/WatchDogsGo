@@ -280,6 +280,51 @@ def test_map_detail_and_parent_fallback(tmp_path):
     assert renderer._draw_tile(px,proj,16,100,100,640,360,16,234)
 
 
+def test_map_tiles_prepare_native_image_once(tmp_path):
+    from watchdogs.tile_manager import TileRenderer
+
+    made=[]
+    class Image:
+        def __init__(self,w,h):
+            self.width=w;self.height=h;self.data=bytearray(w*h);made.append(self)
+        def data_ptr(self): return self.data
+
+    renderer=TileRenderer(tmp_path)
+    renderer._get_tile_image=Mock(return_value=bytearray([7]*65536))
+    px=NS(Image=Image,blt=Mock())
+    proj=NS(geo_to_screen=Mock(side_effect=[(0,16),(64,48)]*2))
+    assert renderer._draw_tile(px,proj,16,100,100,640,360,16,234)
+    assert renderer._draw_tile(px,proj,16,100,100,640,360,16,234)
+    assert len(made)==1
+    assert px.blt.call_count==2
+
+
+def test_map_missing_tile_and_resolution_are_cached(tmp_path):
+    from watchdogs.tile_manager import TileRenderer
+
+    renderer=TileRenderer(tmp_path)
+    assert renderer._resolve_tile(16,100,100) is None
+    missing=set(renderer._missing)
+    assert missing
+    assert renderer._resolve_tile(16,100,100) is None
+    assert renderer._missing==missing
+
+
+def test_map_manifest_reload_invalidates_render_caches(tmp_path):
+    from watchdogs.tile_manager import TileRenderer
+
+    renderer=TileRenderer(tmp_path)
+    renderer._cache[(12,1,1)]=bytearray(65536)
+    renderer._missing.add((13,2,2))
+    renderer._resolved[(13,2,2)]=None
+    renderer._display_cache[(13,2,2,64,64)]=(object(),4096)
+    renderer._display_cache_bytes=4096
+    renderer.reload_manifest()
+    assert not renderer._cache and not renderer._missing
+    assert not renderer._resolved and not renderer._display_cache
+    assert renderer._display_cache_bytes==0
+
+
 def test_delayed_observation_keeps_original_fix(game, monkeypatch):
     import watchdogs.wardrive_ui as ui
     w=game.wardrive

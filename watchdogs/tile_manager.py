@@ -312,12 +312,19 @@ def download_tiles(lat: float, lon: float, maps_dir: Path,
 # ---------------------------------------------------------------------------
 
 class TileRenderer:
-    """Loads cached .dat tiles and renders them via pyxel pixel-by-pixel."""
+    """Load cached tiles and prepare native Pyxel images for repeated draws."""
 
     def __init__(self, maps_dir: Path):
         self.maps_dir = maps_dir
         self._cache: OrderedDict[tuple[int, int, int], object] = OrderedDict()
-        self._max_cache = 16  # fewer tiles, less RAM
+        # A viewport can need child tiles and their cropped parents together.
+        # Sixteen entries caused a cyclic LRU miss on ordinary z13 views.
+        self._max_cache = 64  # 64 KiB each, at most 4 MiB decoded
+        self._missing: set[tuple[int, int, int]] = set()
+        self._resolved: dict[tuple[int, int, int], tuple | None] = {}
+        self._display_cache: OrderedDict[tuple, tuple[object, int]] = OrderedDict()
+        self._display_cache_bytes = 0
+        self._max_display_cache_bytes = 8 * 1024 * 1024
         self._manifest: dict | None = None
         self._load_manifest()
         self.tiles_visible = False
@@ -337,6 +344,12 @@ class TileRenderer:
 
     def reload_manifest(self):
         self._load_manifest()
+        self._cache.clear()
+        self._missing.clear()
+        self._resolved.clear()
+        self._display_cache.clear()
+        self._display_cache_bytes = 0
+        self._fb = None
 
     def draw(self, proj, W: int, H: int, HUD_TOP: int, TERM_Y: int) -> bool:
         """Render visible tiles onto pyxel screen.
@@ -362,11 +375,18 @@ class TileRenderer:
         tx_max, ty_max = _lat_lon_to_tile(lat_s, lon_e, osm_zoom)
 
         drawn = False
-        for tx in range(tx_min, tx_max + 1):
-            for ty in range(ty_min, ty_max + 1):
-                if self._draw_tile(px, proj, osm_zoom, tx, ty,
-                                   W, H, HUD_TOP, TERM_Y):
-                    drawn = True
+        native_clip = callable(getattr(px, "clip", None))
+        if native_clip:
+            px.clip(0, HUD_TOP, W, TERM_Y - HUD_TOP)
+        try:
+            for tx in range(tx_min, tx_max + 1):
+                for ty in range(ty_min, ty_max + 1):
+                    if self._draw_tile(px, proj, osm_zoom, tx, ty,
+                                       W, H, HUD_TOP, TERM_Y):
+                        drawn = True
+        finally:
+            if native_clip:
+                px.clip()
 
         self.tiles_visible = drawn
         return drawn
@@ -388,21 +408,6 @@ class TileRenderer:
         if sx_br < 0 or sx_tl > W or sy_br < HUD_TOP or sy_tl > TERM_Y:
             return False
 
-        img = self._get_tile_image(z, tx, ty)
-        source_size, source_x, source_y = OSM_TILE_SIZE, 0, 0
-        if img is None:
-            # Existing caches remain usable; missing fine tiles use a cropped parent.
-            for parent_z in range(z - 1, 11, -1):
-                factor = 2 ** (z - parent_z)
-                img = self._get_tile_image(parent_z, tx // factor, ty // factor)
-                if img is not None:
-                    source_size = OSM_TILE_SIZE / factor
-                    source_x = (tx % factor) * source_size
-                    source_y = (ty % factor) * source_size
-                    break
-        if img is None:
-            return False
-
         # Clip to visible area
         x_start = max(sx_tl, 0)
         x_end = min(sx_br, W)
@@ -411,6 +416,34 @@ class TileRenderer:
 
         if x_end <= x_start or y_end <= y_start:
             return False
+
+        # Build a correctly sized Pyxel image once, then use the engine's native
+        # blitter on every subsequent frame.  Keeping width and height in the
+        # key preserves the existing equirectangular/Mercator projection shape.
+        display_key = (z, tx, ty, tile_w, tile_h)
+        display = self._display_cache.get(display_key)
+        if display is not None:
+            self._display_cache.move_to_end(display_key)
+            prepared = display[0]
+        else:
+            resolved = self._resolve_tile(z, tx, ty)
+            if resolved is None:
+                return False
+            img, source_size, source_x, source_y = resolved
+            prepared = self._prepare_display_image(
+                px, img, source_size, source_x, source_y, tile_w, tile_h)
+            if prepared is not None:
+                self._remember_display(display_key, prepared, tile_w * tile_h)
+
+        if prepared is not None and callable(getattr(px, "blt", None)):
+            px.blt(sx_tl, sy_tl, prepared, 0, 0, tile_w, tile_h)
+            return True
+
+        # Compatibility path for tests or old Pyxel builds without Image/blt.
+        resolved = self._resolve_tile(z, tx, ty)
+        if resolved is None:
+            return False
+        img, source_size, source_x, source_y = resolved
 
         # Direct framebuffer access (100x faster than pset loop)
         try:
@@ -450,21 +483,89 @@ class TileRenderer:
 
         return True
 
+    def _resolve_tile(self, z: int, tx: int, ty: int):
+        """Resolve a requested tile to itself or a cached cropped parent."""
+        key = (z, tx, ty)
+        if key not in self._resolved:
+            spec = None
+            if self._get_tile_image(*key) is not None:
+                spec = (key, OSM_TILE_SIZE, 0, 0)
+            else:
+                for parent_z in range(z - 1, 11, -1):
+                    factor = 2 ** (z - parent_z)
+                    parent_key = (parent_z, tx // factor, ty // factor)
+                    if self._get_tile_image(*parent_key) is not None:
+                        source_size = OSM_TILE_SIZE // factor
+                        spec = (parent_key, source_size,
+                                (tx % factor) * source_size,
+                                (ty % factor) * source_size)
+                        break
+            self._resolved[key] = spec
+
+        spec = self._resolved[key]
+        if spec is None:
+            return None
+        source_key, source_size, source_x, source_y = spec
+        img = self._get_tile_image(*source_key)
+        if img is None:
+            # A map directory changed without reload_manifest().  Recover on
+            # the next draw instead of retaining a stale resolution forever.
+            self._resolved.pop(key, None)
+            return None
+        return img, source_size, source_x, source_y
+
+    @staticmethod
+    def _prepare_display_image(px, img, source_size, source_x, source_y,
+                               width: int, height: int):
+        """Scale a palette tile crop into a reusable Pyxel Image."""
+        image_ctor = getattr(px, "Image", None)
+        if not callable(image_ctor):
+            return None
+        try:
+            prepared = image_ctor(width, height)
+            out = prepared.data_ptr()
+        except Exception:
+            return None
+
+        x_lookup = [min(OSM_TILE_SIZE - 1,
+                        int(source_x + x * source_size / width))
+                    for x in range(width)]
+        for y in range(height):
+            src_y = min(OSM_TILE_SIZE - 1,
+                        int(source_y + y * source_size / height))
+            src_row = src_y * OSM_TILE_SIZE
+            dst_row = y * width
+            for x, src_x in enumerate(x_lookup):
+                out[dst_row + x] = img[src_row + src_x]
+        return prepared
+
+    def _remember_display(self, key: tuple, image, size: int):
+        while (self._display_cache and
+               self._display_cache_bytes + size > self._max_display_cache_bytes):
+            _old_key, (_old_image, old_size) = self._display_cache.popitem(last=False)
+            self._display_cache_bytes -= old_size
+        self._display_cache[key] = (image, size)
+        self._display_cache_bytes += size
+
     def _get_tile_image(self, z: int, tx: int, ty: int):
         """Load tile from cache or disk. Returns flat array of palette indices."""
         key = (z, tx, ty)
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
+        if key in self._missing:
+            return None
 
         tile_path = self.maps_dir / str(z) / f"{tx}_{ty}.dat"
         if not tile_path.exists():
+            self._missing.add(key)
             return None
 
         try:
             compressed = tile_path.read_bytes()
             raw = zlib.decompress(compressed)
             if len(raw) != OSM_TILE_SIZE * OSM_TILE_SIZE // 2:
+                self._missing.add(key)
                 return None
             # Unpack 4-bit pairs to flat array
             pixels = bytearray(OSM_TILE_SIZE * OSM_TILE_SIZE)
@@ -472,6 +573,7 @@ class TileRenderer:
                 pixels[i * 2] = (byte >> 4) & 0x0F
                 pixels[i * 2 + 1] = byte & 0x0F
         except Exception:
+            self._missing.add(key)
             return None
 
         # LRU eviction
