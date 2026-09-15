@@ -1,5 +1,32 @@
 # Smethan WatchDogsGo
 
+## 0.9.32 — Faster detailed maps and large wardrive sessions
+
+- Replace per-frame Python tile pixel loops with prepared `pyxel.Image` tiles
+  and native blits. Prepared tiles retain the existing projection dimensions,
+  parent fallback crops and z15/z16 close-up detail.
+- Raise the decoded source cache to 64 tiles, add bounded prepared-image,
+  missing-tile and resolved-parent caches, and synchronize cache invalidation
+  with the background map downloader. A faster nibble lookup also reduces the
+  one-time cost when entering an unseen area or zoom.
+- Index historical loot and live Wi-Fi/BLE objects geographically. Clustering,
+  map markers and radar views query the visible area instead of projecting the
+  complete archive every frame. Appended observations update these indexes
+  incrementally.
+- Cache projected map and radar trails while leaving the complete JSONL route
+  unchanged. Fully offscreen and zero-length display segments are skipped, and
+  close-map labels are capped while every point remains visible.
+- Move the recurring historical CSV, password and loot-total refresh off the
+  Pyxel update thread. Refresh workers are single-flight and publish completed
+  snapshots back to the game thread.
+- Replace the growing linear BSSID search used for target selection and repeated
+  full-list hacked-device HUD counts with indexed or event-maintained state.
+
+Representative host probes reduced prepared detailed-tile frames from roughly
+20–116 ms to 0.1–0.6 ms; a one-pixel pan across a 50,000-point synthetic archive
+fell from a full scan to about 0.3 ms. Absolute uConsole timings will differ.
+The full 264-test host suite passes. No projectZero firmware update is required.
+
 ## 0.9.31 — ModemManager-owned cell mast tracking
 
 - Restore serving-cell tracking in **All Wardrive** and **All Wardrive (host
