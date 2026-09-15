@@ -30,7 +30,7 @@ from .app_state import AppState, Network
 from .network_manager import NetworkManager
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
-from .map_index import GeoPointIndex
+from .map_index import GeoObjectIndex, GeoPointIndex
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -679,6 +679,10 @@ class WatchDogsGame(OtaMixin):
                     self.loot.save_xp(self.xp)
         self.ble_devices: list[BleDevice] = []
         self.wifi_networks: list[WifiNetwork] = []
+        self._ble_map_index = GeoObjectIndex()
+        self._wifi_map_index = GeoObjectIndex()
+        self._state_network_by_bssid: dict[str, int] = {}
+        self._pwned_count = 0
         self.markers: list[MapMarker] = []
         self.particles: list[Particle] = []
         self.msgs: list[tuple[str, int, int]] = []
@@ -2042,6 +2046,7 @@ class WatchDogsGame(OtaMixin):
                 self._attack_step = "scanning"
                 self._et_scan_pending = True
                 self.state.networks.clear()
+                self._state_network_by_bssid.clear()
                 self._send("scan_networks")
                 self.msg("[ET] Scanning for networks...", C_HACK_CYAN)
             return
@@ -3669,14 +3674,32 @@ class WatchDogsGame(OtaMixin):
             except (TypeError, ValueError):
                 detection_rssi = -100
             self.wardrive.observe_legacy("wifi", bssid, net.ssid, detection_rssi, observation)
-            # Keep full Network objects for Evil Twin target selection
-            for i, existing in enumerate(self.state.networks):
-                if existing.bssid.upper() == bssid.upper():
-                    self.state.networks[i] = net
-                    break
-            else:
-                self.state.networks.append(net)
             bssid_upper = bssid.upper()
+            # Keep full objects for target selection.  The old linear lookup
+            # made large incoming scan batches progressively more expensive.
+            network_index = getattr(self, "_state_network_by_bssid", None)
+            if network_index is None:
+                network_index = self._state_network_by_bssid = {
+                    item.bssid.upper(): i
+                    for i, item in enumerate(self.state.networks) if item.bssid}
+            existing_index = network_index.get(bssid_upper)
+            if (existing_index is not None
+                    and existing_index < len(self.state.networks)
+                    and self.state.networks[existing_index].bssid.upper() == bssid_upper):
+                self.state.networks[existing_index] = net
+            else:
+                # Recover if a caller cleared or replaced the public list.
+                if existing_index is not None:
+                    network_index.clear()
+                    network_index.update({
+                        item.bssid.upper(): i
+                        for i, item in enumerate(self.state.networks) if item.bssid})
+                    existing_index = network_index.get(bssid_upper)
+                if existing_index is None:
+                    network_index[bssid_upper] = len(self.state.networks)
+                    self.state.networks.append(net)
+                else:
+                    self.state.networks[existing_index] = net
             is_new = bssid_upper not in self._known_wifi
             if is_new:
                 self._known_wifi.add(bssid_upper)
@@ -4040,7 +4063,9 @@ class WatchDogsGame(OtaMixin):
                 self.hack_progress += 1
                 if pyxel.frame_count % 3 == 0: self.glitch_timer = 2
                 if self.hack_progress >= 45:
+                    hacked_before = self._current_hacked_count()
                     self.hack_target.hacked = True
+                    self._pwned_count = hacked_before + 1
                     self.hacking = False
                     self.gain_xp(50)
                     name = getattr(self.hack_target, "name",
@@ -4613,7 +4638,8 @@ class WatchDogsGame(OtaMixin):
                     pyxel.text(sx + 5, sy - 3, m.label, C_ERROR)
 
     def _draw_wifi(self):
-        for net in self.wifi_networks:
+        for net in self._visible_live_objects(
+                self.wifi_networks, "_wifi_map_index"):
             if self.wardrive.is_notable("wifi", net.bssid):
                 continue
             if net.lat == 0.0 and net.lon == 0.0:
@@ -4636,7 +4662,8 @@ class WatchDogsGame(OtaMixin):
                 if self.proj.zoom >= 5: pyxel.circb(sx, sy, 3, c)
 
     def _draw_ble(self):
-        for d in self.ble_devices:
+        for d in self._visible_live_objects(
+                self.ble_devices, "_ble_map_index"):
             if self.wardrive.is_notable("ble", d.mac):
                 continue
             if d.lat == 0.0 and d.lon == 0.0:
@@ -4653,6 +4680,19 @@ class WatchDogsGame(OtaMixin):
             else:
                 blink = math.sin(pyxel.frame_count * 0.15 + d.blink_phase)
                 pyxel.rect(sx-1, sy-1, 3, 3, d.color if blink > 0 else 2)
+
+    def _visible_live_objects(self, objects, index_name, center_lat=None,
+                              center_lon=None, lat_span=None, lon_span=None):
+        index = getattr(self, index_name, None)
+        if index is None:
+            index = GeoObjectIndex()
+            setattr(self, index_name, index)
+        index.ensure(objects)
+        return index.query(
+            self.proj.center_lat if center_lat is None else center_lat,
+            self.proj.center_lon if center_lon is None else center_lon,
+            self.proj.lat_span if lat_span is None else lat_span,
+            self.proj.lon_span if lon_span is None else lon_span)
 
     def _draw_aircraft(self):
         """Draw ADS-B aircraft on the map. Always visible regardless of
@@ -4909,8 +4949,7 @@ class WatchDogsGame(OtaMixin):
         creds = (t.get("passwords", 0) + t.get("et_captures", 0)
                  + self.state.submitted_forms
                  + len(self.state.evil_twin_captured_data))
-        hacked = sum(1 for d in self.ble_devices if d.hacked) + \
-                 sum(1 for n in self.wifi_networks if n.hacked)
+        hacked = self._current_hacked_count()
 
         attack_score = hs * 3 + creds * 10 + hacked * 2
         total = scan + attack_score
@@ -4929,6 +4968,14 @@ class WatchDogsGame(OtaMixin):
         if scan > 50:
             return "BLUE", 12
         return "WHITE", 7
+
+    def _current_hacked_count(self) -> int:
+        cached = getattr(self, "_pwned_count", None)
+        if cached is None:
+            cached = (sum(1 for d in self.ble_devices if d.hacked)
+                      + sum(1 for n in self.wifi_networks if n.hacked))
+            self._pwned_count = cached
+        return cached
 
     def _draw_hud_top(self):
         # Spleen 5x8: each char = 5px wide, 8px tall. HUD is 16px tall so
@@ -5011,8 +5058,7 @@ class WatchDogsGame(OtaMixin):
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         t_hs   = self._loot_totals.get("hs",   0) + n_hs_ses
         t_cell = self._loot_totals.get("cell", 0) + len(self.wardrive.cell.unique)
-        n_pwn  = (sum(1 for d in self.ble_devices if d.hacked)
-                  + sum(1 for n in self.wifi_networks if n.hacked))
+        n_pwn  = self._current_hacked_count()
         t_pwd  = (self._loot_totals.get("passwords", 0)
                   + self._loot_totals.get("et_captures", 0)
                   + self.state.submitted_forms
@@ -5088,14 +5134,19 @@ class WatchDogsGame(OtaMixin):
         sa = pyxel.frame_count * 0.04
         pyxel.line(rx, ry, rx+int(math.cos(sa)*rr), ry+int(math.sin(sa)*rr), C_HACK_CYAN)
         scale = rr / max(self.proj.lon_span * 0.5, 0.001)
-        for d in self.ble_devices:
+        radar_span = 2 * rr / scale
+        for d in self._visible_live_objects(
+                self.ble_devices, "_ble_map_index",
+                self.player_lat, self.player_lon, radar_span, radar_span):
             if self.wardrive.is_notable("ble", d.mac):
                 continue
             dx = (d.lon - self.player_lon) * scale
             dy = (self.player_lat - d.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
                 pyxel.pset(rx+int(dx), ry+int(dy), C_SUCCESS if d.hacked else d.color)
-        for n in self.wifi_networks:
+        for n in self._visible_live_objects(
+                self.wifi_networks, "_wifi_map_index",
+                self.player_lat, self.player_lon, radar_span, radar_span):
             if self.wardrive.is_notable("wifi", n.bssid):
                 continue
             dx = (n.lon - self.player_lon) * scale
@@ -7753,8 +7804,7 @@ class WatchDogsGame(OtaMixin):
         pyxel.line(col2, y + 10, col2 + 100, y + 10, 1)
         y += 14
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
-        n_pwn = (sum(1 for d in self.ble_devices if d.hacked)
-                 + sum(1 for n in self.wifi_networks if n.hacked))
+        n_pwn = self._current_hacked_count()
         pyxel.text(col2, y, f"WiFi", C_DIM)
         pyxel.text(col2 + 70, y, f"{len(self.wifi_networks)}", C_SUCCESS)
         y += ROW_H

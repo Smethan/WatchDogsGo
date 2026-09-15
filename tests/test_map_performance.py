@@ -2,7 +2,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 from watchdogs.app import MapProjection, WatchDogsGame
-from watchdogs.map_index import GeoPointIndex
+from watchdogs.map_index import GeoObjectIndex, GeoPointIndex
 from watchdogs.wardrive_trail import WardriveTrail
 from watchdogs.wardrive_ui import WardriveUI
 
@@ -28,6 +28,25 @@ def test_geo_index_handles_dateline_view():
     index = GeoPointIndex()
     index.ensure(points)
     assert index.query(0, 179.995, 0.1, 0.1) == points[:2]
+
+
+def test_geo_object_index_filters_live_devices():
+    devices = [NS(lat=40, lon=-90), NS(lat=50, lon=-80)]
+    index = GeoObjectIndex()
+    index.ensure(devices)
+    assert index.query(40, -90, 0.1, 0.1) == devices[:1]
+
+
+def test_geo_index_adds_appended_objects_incrementally():
+    devices = [NS(lat=40, lon=-90), NS(lat=50, lon=-80)]
+    index = GeoObjectIndex()
+    coordinates = index._coordinates
+    index._coordinates = Mock(side_effect=coordinates)
+    index.ensure(devices)
+    assert index._coordinates.call_count == 2
+    devices.append(NS(lat=40.001, lon=-90.001))
+    index.ensure(devices)
+    assert index._coordinates.call_count == 3
 
 
 def test_clusters_reuse_unchanged_result_and_rebuild_after_append(monkeypatch):

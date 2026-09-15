@@ -239,6 +239,19 @@ def test_integration_both_radios_precise_toggle_and_raw_gps(game):
         next(f);rows=list(csv.reader(f))[1:]
     assert {row[-1] for row in rows}=={"WIFI","BLE"}
 
+
+def test_wifi_target_index_recovers_after_public_list_clear(game):
+    first=Network(bssid="00:11:22:33:44:55",ssid="first",rssi="-70")
+    game._ingest_wifi(first)
+    updated=Network(bssid=first.bssid,ssid="updated",rssi="-50")
+    game._ingest_wifi(updated)
+    assert len(game.state.networks)==1
+    assert game.state.networks[0].ssid=="updated"
+
+    game.state.networks.clear()
+    game._ingest_wifi(updated)
+    assert game.state.networks==[updated]
+
 def test_transition_cancels_old_timers_and_waits_for_final_stop(game):
     game.wifi_scanning=True;game._wifi_scan_done_time=1;game._bt_scan_done_time=1
     game._start_scan_cmd("scan_bt","bt_scanning","BT Wardrive")
