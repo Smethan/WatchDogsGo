@@ -30,6 +30,7 @@ from .app_state import AppState, Network
 from .network_manager import NetworkManager
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
+from .map_index import GeoPointIndex
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -522,7 +523,8 @@ class WatchDogsGame(OtaMixin):
         self._clusters: list[dict] = []
         self._cluster_zoom = -1
         self._cluster_center = (0.0, 0.0)
-        self._cluster_frame = 0
+        self._cluster_data_token = None
+        self._loot_point_index = GeoPointIndex()
         self._cluster_sel = -1             # selected cluster index (-1 = none)
         self._cluster_popup: dict | None = None
         self._popup_scroll = 0
@@ -4264,15 +4266,23 @@ class WatchDogsGame(OtaMixin):
         in, geo_to_screen spreads points further apart so clusters split
         naturally — just like Leaflet MarkerCluster.
         """
-        cur_center = (round(self.proj.center_lat, 4),
-                      round(self.proj.center_lon, 4))
+        # Quantize by an actual screen pixel.  The old four-decimal-degree key
+        # invalidated continuously at wide zooms and still forced a full scan
+        # once a second even when neither the camera nor data had changed.
+        pixels_per_degree = W / self.proj.lon_span
+        cur_center = (round(self.proj.center_lat * pixels_per_degree),
+                      round(self.proj.center_lon * pixels_per_degree))
+        point_index = getattr(self, "_loot_point_index", None)
+        if point_index is None:
+            point_index = self._loot_point_index = GeoPointIndex()
+        data_token = point_index.ensure(self.loot_points)
         if (self.proj.zoom == self._cluster_zoom
                 and self._cluster_center == cur_center
-                and pyxel.frame_count - self._cluster_frame < 30):
+                and self._cluster_data_token == data_token):
             return
         self._cluster_zoom = self.proj.zoom
         self._cluster_center = cur_center
-        self._cluster_frame = pyxel.frame_count
+        self._cluster_data_token = data_token
 
         CLUSTER_PX = 30  # constant screen-space merge radius (pixels)
         R2 = CLUSTER_PX * CLUSTER_PX
@@ -4284,7 +4294,10 @@ class WatchDogsGame(OtaMixin):
         geo2scr = self.proj.geo_to_screen
         vis = self.proj.screen_visible
 
-        for pt in self.loot_points:
+        candidates = point_index.query(
+            self.proj.center_lat, self.proj.center_lon,
+            self.proj.lat_span, self.proj.lon_span)
+        for pt in candidates:
             sx, sy = geo2scr(pt["lat"], pt["lon"])
             if not vis(sx, sy):
                 continue
