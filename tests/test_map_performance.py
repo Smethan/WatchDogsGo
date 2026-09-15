@@ -3,6 +3,8 @@ from unittest.mock import Mock
 
 from watchdogs.app import MapProjection, WatchDogsGame
 from watchdogs.map_index import GeoPointIndex
+from watchdogs.wardrive_trail import WardriveTrail
+from watchdogs.wardrive_ui import WardriveUI
 
 
 def test_geo_index_filters_to_close_view_and_preserves_order():
@@ -61,3 +63,53 @@ def test_clusters_reuse_unchanged_result_and_rebuild_after_append(monkeypatch):
     game._update_clusters()
     assert game.proj.geo_to_screen.call_count == 3
     assert game._clusters is not first_clusters
+
+
+def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
+        monkeypatch):
+    trail = WardriveTrail()
+    trail.points.extend([
+        {"lat": 40, "lon": -90, "segment": 1},
+        {"lat": 40.0001, "lon": -90.0001, "segment": 1},
+        {"lat": 50, "lon": -80, "segment": 2},
+        {"lat": 50.0001, "lon": -80.0001, "segment": 2},
+    ])
+    trail.revision += 1
+    projection = MapProjection()
+    projection.zoom = 13
+    projection.center_lat = 40
+    projection.center_lon = -90
+    original = projection.geo_to_screen
+    projection.geo_to_screen = Mock(side_effect=original)
+
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = {"trail": True}
+    ui.trail = trail
+    ui.history_trail = None
+    ui.app = NS(proj=projection)
+    ui._map_trail_key = None
+    ui._map_trail_segments = []
+    px = NS(clip=Mock(), line=Mock())
+    monkeypatch.setitem(__import__("sys").modules, "pyxel", px)
+
+    ui.draw_trail()
+    ui.draw_trail()
+    assert projection.geo_to_screen.call_count == 4
+    assert px.line.call_count == 2
+
+    trail.points.append({"lat": 40.0002, "lon": -90.0002, "segment": 2})
+    trail.revision += 1
+    ui.draw_trail()
+    assert projection.geo_to_screen.call_count == 9
+
+
+def test_trail_revision_changes_only_when_display_points_change(tmp_path):
+    trail = WardriveTrail()
+    trail.set_path(tmp_path / "trail.jsonl")
+    initial = trail.revision
+    fix = {"latitude": 40, "longitude": -90, "altitude": 0,
+           "hdop": 1, "received_at": 1}
+    trail.sample(fix, 1, True)
+    assert trail.revision == initial + 1
+    trail.sample(fix, 2, True)
+    assert trail.revision == initial + 1

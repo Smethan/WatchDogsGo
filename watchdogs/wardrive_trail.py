@@ -34,6 +34,7 @@ class WardriveTrail:
     def __init__(self):
         self.path = None
         self.points = deque(maxlen=4096)  # display window; full route remains on disk
+        self.revision = 0
         self.segment = 0
         self.last = None
         self.last_stamp = None
@@ -62,6 +63,7 @@ class WardriveTrail:
                                 f.truncate()  # discard only incomplete final record before resuming
                             break
         self.segment = max((p["segment"] for p in self.points), default=0)
+        self.revision += 1
         self.break_segment()
 
     def break_segment(self):
@@ -95,6 +97,7 @@ class WardriveTrail:
         self.last_stamp = stamp
         self.last = (p, now)
         self.points.append(p)
+        self.revision += 1
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:

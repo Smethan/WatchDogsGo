@@ -42,6 +42,10 @@ class WardriveUI:
         self.fixes = FixHistory()
         self.trail = WardriveTrail()
         self.history_trail = None
+        self._map_trail_key = None
+        self._map_trail_segments = []
+        self._radar_trail_key = None
+        self._radar_trail_segments = []
         self.history_notables = OrderedDict()
         self.history_index = -1
         self.settings_path = Path(app._app_dir) / "wardrive_settings.json"
@@ -573,13 +577,30 @@ class WardriveUI:
         import pyxel as px
         if not self.settings["trail"]:
             return
+        source = self.history_trail or self.trail
+        proj = self.app.proj
+        pixels_per_degree = 640 / proj.lon_span
+        key = (id(source), source.revision, proj.zoom,
+               round(proj.center_lat * pixels_per_degree),
+               round(proj.center_lon * pixels_per_degree))
+        if key != self._map_trail_key:
+            segments = []
+            previous = None
+            for p in source.points:
+                xy = proj.geo_to_screen(p["lat"], p["lon"])
+                if previous and previous[0]["segment"] == p["segment"]:
+                    old_xy = previous[1]
+                    if (xy != old_xy and max(old_xy[0], xy[0]) >= 0
+                            and min(old_xy[0], xy[0]) < 640
+                            and max(old_xy[1], xy[1]) >= 16
+                            and min(old_xy[1], xy[1]) < 234):
+                        segments.append((*old_xy, *xy))
+                previous = p, xy
+            self._map_trail_key = key
+            self._map_trail_segments = segments
         px.clip(0,16,640,218)
-        previous = None
-        for p in (self.history_trail or self.trail).points:
-            xy = self.app.proj.geo_to_screen(p["lat"],p["lon"])
-            if previous and previous[0]["segment"] == p["segment"]:
-                px.line(*previous[1],*xy,CYAN)
-            previous = p,xy
+        for segment in self._map_trail_segments:
+            px.line(*segment, CYAN)
         px.clip()
 
     def draw_radar(self, rx, ry, rr, scale):
@@ -587,23 +608,35 @@ class WardriveUI:
         def xy(lat,lon):
             return rx+(lon-self.app.player_lon)*scale, ry+(self.app.player_lat-lat)*scale
         if self.settings["trail"]:
-            previous = None
-            for p in (self.history_trail or self.trail).points:
-                point = xy(p["lat"],p["lon"])
-                if previous and previous[0]["segment"] == p["segment"]:
-                    # Clip a segment to the circle analytically before drawing.
-                    a,b = previous[1],point
-                    dx,dy = b[0]-a[0],b[1]-a[1]
-                    qa = dx*dx+dy*dy
-                    if qa:
-                        qb = 2*((a[0]-rx)*dx+(a[1]-ry)*dy)
-                        qc = (a[0]-rx)**2+(a[1]-ry)**2-(rr-1)**2
-                        disc = qb*qb-4*qa*qc
-                        if disc >= 0:
-                            lo,hi = max(0,(-qb-disc**0.5)/(2*qa)),min(1,(-qb+disc**0.5)/(2*qa))
-                            if lo<=hi:
-                                px.line(a[0]+lo*dx,a[1]+lo*dy,a[0]+hi*dx,a[1]+hi*dy,CYAN)
-                previous = p,point
+            source = self.history_trail or self.trail
+            key = (id(source), source.revision, rx, ry, rr, round(scale, 4),
+                   round(self.app.player_lat * scale),
+                   round(self.app.player_lon * scale))
+            if key != self._radar_trail_key:
+                segments = []
+                previous = None
+                for p in source.points:
+                    point = xy(p["lat"],p["lon"])
+                    if previous and previous[0]["segment"] == p["segment"]:
+                        # Clip a segment to the circle analytically before drawing.
+                        a,b = previous[1],point
+                        dx,dy = b[0]-a[0],b[1]-a[1]
+                        qa = dx*dx+dy*dy
+                        if qa:
+                            qb = 2*((a[0]-rx)*dx+(a[1]-ry)*dy)
+                            qc = (a[0]-rx)**2+(a[1]-ry)**2-(rr-1)**2
+                            disc = qb*qb-4*qa*qc
+                            if disc >= 0:
+                                lo=max(0,(-qb-disc**0.5)/(2*qa))
+                                hi=min(1,(-qb+disc**0.5)/(2*qa))
+                                if lo<=hi:
+                                    segments.append((a[0]+lo*dx,a[1]+lo*dy,
+                                                     a[0]+hi*dx,a[1]+hi*dy))
+                    previous = p,point
+                self._radar_trail_key = key
+                self._radar_trail_segments = segments
+            for segment in self._radar_trail_segments:
+                px.line(*segment, CYAN)
         for item,pos in self.visible_notables():
             x,y = xy(*pos)
             if (x-rx)**2+(y-ry)**2 < (rr-3)**2:
