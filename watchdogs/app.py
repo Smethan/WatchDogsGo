@@ -30,7 +30,8 @@ from .app_state import AppState, Network
 from .network_manager import NetworkManager
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
-from .map_index import GeoObjectIndex, GeoPointIndex
+from .map_index import GeoObjectIndex
+from .map_layers import HistoricalNodeLayer
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -544,10 +545,10 @@ class WatchDogsGame(OtaMixin):
 
         # Map clustering + popup
         self._clusters: list[dict] = []
-        self._cluster_zoom = -1
-        self._cluster_center = (0.0, 0.0)
-        self._cluster_data_token = None
-        self._loot_point_index = GeoPointIndex()
+        self._history_node_layer = HistoricalNodeLayer(
+            W, HUD_TOP, MAP_H, wifi_color=C_SUCCESS,
+            bt_color=C_HACK_CYAN, cell_color=11)
+        self._cluster_layer_revision = 0
         self._cluster_sel = -1             # selected cluster index (-1 = none)
         self._cluster_popup: dict | None = None
         self._popup_scroll = 0
@@ -1417,6 +1418,9 @@ class WatchDogsGame(OtaMixin):
         # Camera follows player
         self.proj.smooth_move(self.player_lat, self.player_lon)
         self.proj.update()
+        history_layer = self._get_history_node_layer()
+        history_layer.request(self.loot_points, self.proj)
+        history_layer.step()
 
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
@@ -4004,7 +4008,6 @@ class WatchDogsGame(OtaMixin):
         points = snapshot.get("points")
         if points:
             self.loot_points = points
-            self._cluster_zoom = -1
         passwords = snapshot.get("passwords")
         if passwords is not None:
             self._cracked_ssids = passwords
@@ -4294,14 +4297,16 @@ class WatchDogsGame(OtaMixin):
         if self._cluster_popup:
             self._draw_cluster_popup()
         # Cluster mode hint (above terminal, visible on map)
-        if not self.menu_open and not self._cluster_popup and self._clusters:
+        visible_cluster_count = len(
+            self._get_history_node_layer().visible_clusters(self.proj))
+        if not self.menu_open and not self._cluster_popup and visible_cluster_count:
             if self._cluster_sel >= 0:
                 cl = self._clusters[self._cluster_sel] if self._cluster_sel < len(self._clusters) else None
                 n = cl["count"] if cl else 0
                 hint = f"[C]exit  [arrows]nav  [RET]open  ({n} APs)"
                 pyxel.text(W - len(hint) * 4 - 4, TERM_Y - 8, hint, C_HACK_CYAN)
             else:
-                hint = f"[C] Cluster Select  ({len(self._clusters)})"
+                hint = f"[C] Cluster Select  ({visible_cluster_count})"
                 pyxel.text(W - len(hint) * 4 - 4, TERM_Y - 8, hint, C_TEXT)
         if self.menu_open:
             self._draw_menu()
@@ -4368,136 +4373,32 @@ class WatchDogsGame(OtaMixin):
     # Map clustering
     # ------------------------------------------------------------------
 
+    def _get_history_node_layer(self):
+        """Return the cached historical-node layer, including test instances."""
+        layer = getattr(self, "_history_node_layer", None)
+        if layer is None:
+            layer = self._history_node_layer = HistoricalNodeLayer(
+                W, HUD_TOP, MAP_H, wifi_color=C_SUCCESS,
+                bt_color=C_HACK_CYAN, cell_color=11)
+        return layer
+
     def _update_clusters(self):
-        """Recompute clusters when zoom/pan changes.
-
-        Uses a fixed screen-space radius (CLUSTER_PX).  As the user zooms
-        in, geo_to_screen spreads points further apart so clusters split
-        naturally — just like Leaflet MarkerCluster.
-        """
-        # Quantize by an actual screen pixel.  The old four-decimal-degree key
-        # invalidated continuously at wide zooms and still forced a full scan
-        # once a second even when neither the camera nor data had changed.
-        pixels_per_degree = W / self.proj.lon_span
-        cur_center = (round(self.proj.center_lat * pixels_per_degree),
-                      round(self.proj.center_lon * pixels_per_degree))
-        point_index = getattr(self, "_loot_point_index", None)
-        if point_index is None:
-            point_index = self._loot_point_index = GeoPointIndex()
-        data_token = point_index.ensure(self.loot_points)
-        if (self.proj.zoom == self._cluster_zoom
-                and self._cluster_center == cur_center
-                and self._cluster_data_token == data_token):
-            return
-        self._cluster_zoom = self.proj.zoom
-        self._cluster_center = cur_center
-        self._cluster_data_token = data_token
-
-        CLUSTER_PX = 30  # constant screen-space merge radius (pixels)
-        R2 = CLUSTER_PX * CLUSTER_PX
-
-        # Grid-based clustering — O(n) amortised.
-        # Points are NOT copied; original dicts are referenced directly.
-        grid: dict[tuple[int, int], list[int]] = {}
-        clusters: list[dict] = []
-        geo2scr = self.proj.geo_to_screen
-        vis = self.proj.screen_visible
-
-        candidates = point_index.query(
-            self.proj.center_lat, self.proj.center_lon,
-            self.proj.lat_span, self.proj.lon_span)
-        for pt in candidates:
-            sx, sy = geo2scr(pt["lat"], pt["lon"])
-            if not vis(sx, sy):
-                continue
-            gcx, gcy = sx // CLUSTER_PX, sy // CLUSTER_PX
-            merged = False
-            for dx in (-1, 0, 1):
-                if merged:
-                    break
-                for dy in (-1, 0, 1):
-                    for ci in grid.get((gcx + dx, gcy + dy), ()):
-                        cl = clusters[ci]
-                        ddx = sx - cl["x"]
-                        ddy = sy - cl["y"]
-                        if ddx * ddx + ddy * ddy <= R2:
-                            n = cl["count"]
-                            cl["x"] = (cl["x"] * n + sx) // (n + 1)
-                            cl["y"] = (cl["y"] * n + sy) // (n + 1)
-                            cl["points"].append(pt)
-                            cl["_sx"].append(sx)
-                            cl["_sy"].append(sy)
-                            cl["count"] = n + 1
-                            merged = True
-                            break
-            if not merged:
-                clusters.append({
-                    "x": sx, "y": sy,
-                    "points": [pt], "_sx": [sx], "_sy": [sy],
-                    "count": 1,
-                })
-                grid.setdefault((gcx, gcy), []).append(len(clusters) - 1)
-
-        for cl in clusters:
-            pts = cl["points"]
-            if cl["count"] == 1:
-                point_type = pts[0].get("type")
-                cl["color"] = 11 if point_type == "cell" else C_HACK_CYAN if point_type == "bt" else C_SUCCESS
-                cl["radius"] = 0
-            else:
-                cl["color"] = self._cluster_color(pts)
-                cl["radius"] = min(5 + cl["count"] // 3, 12)
-
-        self._clusters = clusters
-
-    @staticmethod
-    def _cluster_color(points: list[dict]) -> int:
-        """Dominant color for a cluster: wifi=green, bt=cyan, cell=lime."""
-        wifi = sum(1 for p in points if p.get("type") == "wifi")
-        bt = sum(1 for p in points if p.get("type") == "bt")
-        cell = sum(1 for p in points if p.get("type") == "cell")
-        return 11 if cell >= max(wifi, bt) else C_HACK_CYAN if bt > wifi else C_SUCCESS
+        """Advance the bounded cluster build used by legacy callers/tests."""
+        layer = self._get_history_node_layer()
+        layer.request(self.loot_points, self.proj)
+        layer.step()
+        self._clusters = layer.clusters
 
     def _draw_loot_points(self):
-        self._update_clusters()
-        zoom = self.proj.zoom
-        labels_left = 80
-        for idx, cl in enumerate(self._clusters):
-            selected = (idx == self._cluster_sel)
-            c = cl["color"]
-            if cl["count"] == 1:
-                # Single point — small dot, label at high zoom
-                pt = cl["points"][0]
-                if zoom >= 8:
-                    pyxel.circ(cl["x"], cl["y"], 2, c)
-                    if zoom >= 10 and (labels_left > 0 or selected):
-                        pyxel.text(cl["x"] + 4, cl["y"] - 2,
-                                   pt.get("label", "")[:16], c)
-                        if not selected:
-                            labels_left -= 1
-                elif zoom >= 3:
-                    pyxel.rect(cl["x"], cl["y"], 2, 2, c)
-                else:
-                    pyxel.pset(cl["x"], cl["y"], c)
-                # Selection ring for single points
-                if selected:
-                    pyxel.circb(cl["x"], cl["y"], 5, C_TEXT)
-                    if pyxel.frame_count % 20 < 14:
-                        pyxel.circb(cl["x"], cl["y"], 7, C_HACK_CYAN)
-            else:
-                # Cluster bubble — radius scales with count
-                r = cl["radius"]
-                pyxel.circ(cl["x"], cl["y"], r, c)
-                pyxel.circb(cl["x"], cl["y"], r, 0)
-                txt = str(cl["count"])
-                # Center label — 5px per glyph halved
-                tx = cl["x"] - (len(txt) * 5) // 2
-                pyxel.text(tx, cl["y"] - 3, txt, 0)
-                # Selection ring for clusters
-                if selected:
-                    pyxel.circb(cl["x"], cl["y"], r + 3, C_TEXT)
-                    if pyxel.frame_count % 20 < 14:
-                        pyxel.circb(cl["x"], cl["y"], r + 5, C_HACK_CYAN)
+        layer = self._get_history_node_layer()
+        layer.request(self.loot_points, self.proj)
+        layer.draw(pyxel, self.proj, self._cluster_sel)
+        self._clusters = layer.clusters
+        revision = getattr(self, "_cluster_layer_revision", -1)
+        if layer.revision != revision:
+            if self._cluster_sel >= len(self._clusters):
+                self._cluster_sel = -1
+            self._cluster_layer_revision = layer.revision
 
     # ------------------------------------------------------------------
     # Cluster popup (mouse click)
@@ -4521,35 +4422,39 @@ class WatchDogsGame(OtaMixin):
         dx/dy: -1, 0, +1 for direction (LEFT/RIGHT, UP/DOWN).
         Returns cluster index or -1.
         """
-        if not self._clusters:
+        layer = self._get_history_node_layer()
+        visible = layer.visible_clusters(self.proj)
+        if not visible:
             return -1
-        if self._cluster_sel < 0 or self._cluster_sel >= len(self._clusters):
+        visible_by_index = {index: (cluster, x, y)
+                            for index, cluster, x, y in visible}
+        if self._cluster_sel not in visible_by_index:
             # No selection — pick cluster closest to screen center
             cx, cy = W // 2, (HUD_TOP + TERM_Y) // 2
-            best, bd = 0, 999999
-            for i, cl in enumerate(self._clusters):
-                d = (cl["x"] - cx) ** 2 + (cl["y"] - cy) ** 2
+            best, bd = -1, 999999
+            for i, _cl, x, y in visible:
+                d = (x - cx) ** 2 + (y - cy) ** 2
                 if d < bd:
                     bd, best = d, i
             return best
-        cur = self._clusters[self._cluster_sel]
+        _cur, cur_x, cur_y = visible_by_index[self._cluster_sel]
         best, bd = -1, 999999
-        for i, cl in enumerate(self._clusters):
+        for i, _cl, x, y in visible:
             if i == self._cluster_sel:
                 continue
             # Direction filter — only consider clusters in the pressed direction
             ok = True
-            if dx < 0 and cl["x"] >= cur["x"]:
+            if dx < 0 and x >= cur_x:
                 ok = False
-            if dx > 0 and cl["x"] <= cur["x"]:
+            if dx > 0 and x <= cur_x:
                 ok = False
-            if dy < 0 and cl["y"] >= cur["y"]:
+            if dy < 0 and y >= cur_y:
                 ok = False
-            if dy > 0 and cl["y"] <= cur["y"]:
+            if dy > 0 and y <= cur_y:
                 ok = False
             if not ok:
                 continue
-            d = (cl["x"] - cur["x"]) ** 2 + (cl["y"] - cur["y"]) ** 2
+            d = (x - cur_x) ** 2 + (y - cur_y) ** 2
             if d < bd:
                 bd, best = d, i
         return best if best >= 0 else self._cluster_sel
@@ -4644,9 +4549,13 @@ class WatchDogsGame(OtaMixin):
         # Popup dimensions — 14px rows for 5x8 font
         ROW_H = 14
         pw, ph = 340, min(200, 50 + min(n, 8) * ROW_H + 16)
-        px = max(4, min(W - pw - 4, self._cluster_popup["x"] - pw // 2))
+        position = self._get_history_node_layer().screen_position(
+            self._cluster_popup, self.proj)
+        anchor_x, anchor_y = position or (
+            self._cluster_popup["x"], self._cluster_popup["y"])
+        px = max(4, min(W - pw - 4, anchor_x - pw // 2))
         py = max(HUD_TOP + 4, min(TERM_Y - ph - 4,
-                                   self._cluster_popup["y"] - ph // 2))
+                                   anchor_y - ph // 2))
         # Background + border
         pyxel.rect(px, py, pw, ph, 0)
         pyxel.rectb(px, py, pw, ph, C_HACK_CYAN)

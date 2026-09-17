@@ -93,60 +93,6 @@ def test_geo_index_uses_fine_bucket_for_dense_close_view():
     assert index._last_query_candidates < len(points) // 10
 
 
-def test_clusters_reuse_unchanged_result_and_rebuild_after_append(monkeypatch):
-    import watchdogs.app as appmod
-    monkeypatch.setattr(appmod, "pyxel", NS(frame_count=100))
-    game = WatchDogsGame.__new__(WatchDogsGame)
-    game.proj = MapProjection()
-    game.proj.zoom = 13
-    game.proj.center_lat = 40
-    game.proj.center_lon = -90
-    game.loot_points = [
-        {"lat": 40, "lon": -90, "type": "wifi", "label": "near"},
-        *({"lat": 45 + i / 10000, "lon": -80, "type": "wifi"}
-          for i in range(1000)),
-    ]
-    game._clusters = []
-    game._cluster_zoom = -1
-    game._cluster_center = (0, 0)
-    game._cluster_data_token = None
-    game._loot_point_index = GeoPointIndex()
-    original = game.proj.geo_to_screen
-    game.proj.geo_to_screen = Mock(side_effect=original)
-
-    game._update_clusters()
-    assert game.proj.geo_to_screen.call_count == 1
-    first_clusters = game._clusters
-    game._update_clusters()
-    assert game._clusters is first_clusters
-    assert game.proj.geo_to_screen.call_count == 1
-
-    game.loot_points.append(
-        {"lat": 40.0001, "lon": -90.0001, "type": "bt", "label": "new"})
-    game._update_clusters()
-    assert game.proj.geo_to_screen.call_count == 3
-    assert game._clusters is not first_clusters
-
-
-def test_close_map_caps_labels_but_keeps_every_point(monkeypatch):
-    import watchdogs.app as appmod
-    px = NS(circ=Mock(), text=Mock(), circb=Mock(), rect=Mock(), pset=Mock(),
-            frame_count=100)
-    monkeypatch.setattr(appmod, "pyxel", px)
-    game = WatchDogsGame.__new__(WatchDogsGame)
-    game.proj = NS(zoom=13)
-    game._cluster_sel = -1
-    game._clusters = [
-        {"x": i, "y": 30, "color": 11, "count": 1,
-         "points": [{"label": f"network-{i}"}]}
-        for i in range(200)
-    ]
-    game._update_clusters = Mock()
-    game._draw_loot_points()
-    assert px.circ.call_count == 200
-    assert px.text.call_count == 80
-
-
 def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
         monkeypatch):
     trail = WardriveTrail()
@@ -203,7 +149,6 @@ def test_periodic_loot_snapshot_is_applied_on_game_thread(monkeypatch):
     game.loot = NS(loot_totals={"wardriving_wifi": 7})
     game._app_dir = "/tmp"
     game.loot_points = []
-    game._cluster_zoom = 13
     game._cracked_ssids = {}
     game._loot_totals = {}
     game._loot_refresh_result = Queue(maxsize=1)
@@ -219,7 +164,6 @@ def test_periodic_loot_snapshot_is_applied_on_game_thread(monkeypatch):
     assert game.loot_points == snapshot["points"]
     assert game._cracked_ssids == snapshot["passwords"]
     assert game._loot_totals == snapshot["totals"]
-    assert game._cluster_zoom == -1
 
 
 def test_periodic_loot_refresh_worker_only_publishes_snapshot(monkeypatch):

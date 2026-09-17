@@ -438,7 +438,6 @@ class WardriveUI:
                     self.app.loot_points.append({
                         "lat": fix["latitude"], "lon": fix["longitude"],
                         "type": "cell", "label": cell.identity})
-                    self.app._cluster_zoom = -1
             except Exception as exc:
                 self.app._term_add("[CELL] Save failed: " + str(exc)[:120], raw=True)
 
