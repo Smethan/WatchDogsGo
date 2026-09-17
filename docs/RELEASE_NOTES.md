@@ -1,5 +1,31 @@
 # Smethan WatchDogsGo
 
+## 0.9.34 — Cached wardrive nodes and smoother moving maps
+
+- Deduplicate historical map identities across sessions before rendering,
+  retaining the observation with the strongest RSSI. Source loot files and
+  their totals remain unchanged.
+- Use adaptive geographic index levels for both wide and close views. Dense
+  close-map queries no longer scan every point stored in a coarse degree cell.
+- Build historical clusters incrementally under a two-millisecond frame budget,
+  render them into an overscanned native image, and translate that image during
+  ordinary GPS motion. Cluster selection and popups follow the translated
+  positions.
+- Render mature live Wi-Fi/BLE markers into two cached blink frames. The
+  per-frame marker loops now contain only the short discovery-ring animations;
+  Flock and Axon detections keep their existing precise colored overlays.
+- Cache and deduplicate the small radar's dense node dots, with a one-millisecond
+  build budget and translation across small GPS movements. Aircraft, handshake
+  markers, and notable-device overlays remain live.
+- Settle camera easing exactly when less than half a display pixel remains,
+  avoiding endless subpixel cache and tile movement.
+- Add a repeatable synthetic benchmark for geographic indexing, background
+  model construction, raster dispatch, and cached drawing.
+
+The complete 281-test host suite, Python bytecode compilation, shell syntax
+checks, and source diff checks pass. No projectZero firmware update is required,
+and no patched code was installed or run on the uConsole during this work.
+
 ## 0.9.33 — Safe map refresh and clear bottom HUD
 
 - Keep native `pyxel.Image` tile resources owned by the Pyxel draw thread.
