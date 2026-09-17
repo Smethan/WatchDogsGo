@@ -62,6 +62,8 @@ class WardriveUI:
         self.details = False
         self.detail_selection = 0
         self.notables = OrderedDict()
+        self._notable_identities = frozenset()
+        self._notable_revision = 0
         self.alerts = deque(maxlen=16)
         self.alert_until = 0
         self.connection = None
@@ -171,6 +173,7 @@ class WardriveUI:
                                 self.notables.popitem(last=False)
                         except (ValueError, KeyError, TypeError):
                             pass
+            self._refresh_notable_identities()
             self.trail.set_path(session / "wardrive_trail.jsonl" if session else None)
         active = app.wifi_scanning or app.ble_scanning or (self.scan.state == "running" and self.scan.mode == "wardrive")
         fix = self.fixes.at(now) if app.gps.available else None
@@ -532,6 +535,19 @@ class WardriveUI:
                 else:
                     self.alerts.append(item)
                 self.app._term_add("[DETECT] " + item["label"] + " " + d["mac"] + " " + ",".join(h["id"] for h in hit["evidence"]), raw=True)
+        self._refresh_notable_identities()
+
+    def _refresh_notable_identities(self):
+        identities = frozenset(
+            item["identity"] for item in self.notables.values()
+            if self.settings.get(item["category"], False)
+            and item.get("strength", 0) > 0)
+        if identities != self._notable_identities:
+            self._notable_identities = identities
+            self._notable_revision += 1
+
+    def live_notable_identities(self):
+        return self._notable_identities, self._notable_revision
 
     def is_notable(self, kind, mac):
         return any(kind+":"+mac.upper()+":"+cat in self.notables and self.settings[cat]
@@ -714,6 +730,8 @@ class WardriveUI:
         if px.btnp(px.KEY_RETURN):
             key = keys[self.selection]
             self.settings[key] = not self.settings[key]
+            if key in ("flock", "axon"):
+                self._refresh_notable_identities()
             if key == "trail": self.trail.break_segment()
             if key == "cell_tracking" and not self.settings[key]:
                 self.cell.stop()

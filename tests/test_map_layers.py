@@ -1,7 +1,7 @@
 from types import SimpleNamespace as NS
 
-from watchdogs.app import HUD_TOP, MAP_H, W, MapProjection
-from watchdogs.map_layers import HistoricalNodeLayer
+from watchdogs.app import HUD_TOP, MAP_H, MapProjection, W
+from watchdogs.map_layers import HistoricalNodeLayer, LiveNodeLayer
 
 
 class FakeImage:
@@ -122,3 +122,44 @@ def test_history_layer_keeps_cluster_members_for_popup_and_translates_nav():
     proj.center_lon += 7 * proj.lon_span / W
     shifted = subject.screen_position(subject.clusters[0], proj)
     assert shifted == (original[0] - 7, original[1])
+
+
+def test_live_layer_builds_two_cached_blink_frames_and_reuses_them():
+    wifi = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+               color=10, hacked=False)]
+    ble = [NS(lat=40.0001, lon=-90, mac="AA:BB:CC:DD:EE:FF",
+              color=9, hacked=False, blink_phase=1.2)]
+    subject = LiveNodeLayer(W, HUD_TOP, MAP_H)
+    proj, px = projection(), FakePyxel()
+    subject.request(wifi, ble, 1, frozenset(), proj)
+    while subject._job is not None:
+        subject.step(max_ms=1000)
+    assert subject.images == (None, None)
+    subject.draw(px, proj)
+    first_images = subject.images
+    assert all(image is not None for image in first_images)
+    assert first_images[0] is not first_images[1]
+
+    proj.center_lon += 10 * proj.lon_span / W
+    subject.request(wifi, ble, 1, frozenset(), proj)
+    assert subject._job is None
+    subject.draw(px, proj)
+    assert subject.images == first_images
+    assert px.blit_calls[-1][0] == -subject.overscan - 10
+
+
+def test_live_layer_excludes_notable_devices_from_cached_dots():
+    wifi = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+               color=10, hacked=False)]
+    subject = LiveNodeLayer(W, HUD_TOP, MAP_H)
+    proj, px = projection(), FakePyxel()
+    notable = frozenset({"wifi:00:11:22:33:44:55"})
+    subject.request(wifi, [], 1, notable, proj)
+    while subject._job is not None:
+        subject.step(max_ms=1000)
+    subject.draw(px, proj)
+    primitive_calls = {
+        name for image in subject.images for name, _args in image.calls
+        if name != "cls"
+    }
+    assert primitive_calls == set()

@@ -31,7 +31,7 @@ from .network_manager import NetworkManager
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
 from .map_index import GeoObjectIndex
-from .map_layers import HistoricalNodeLayer
+from .map_layers import HistoricalNodeLayer, LiveNodeLayer
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -703,6 +703,10 @@ class WatchDogsGame(OtaMixin):
                     self.loot.save_xp(self.xp)
         self.ble_devices: list[BleDevice] = []
         self.wifi_networks: list[WifiNetwork] = []
+        self._recent_ble_fx: list[BleDevice] = []
+        self._recent_wifi_fx: list[WifiNetwork] = []
+        self._live_map_revision = 0
+        self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
         self._ble_map_index = GeoObjectIndex()
         self._wifi_map_index = GeoObjectIndex()
         self._state_network_by_bssid: dict[str, int] = {}
@@ -1421,6 +1425,12 @@ class WatchDogsGame(OtaMixin):
         history_layer = self._get_history_node_layer()
         history_layer.request(self.loot_points, self.proj)
         history_layer.step()
+        live_layer = self._get_live_node_layer()
+        notable, notable_revision = self.wardrive.live_notable_identities()
+        live_layer.request(
+            self.wifi_networks, self.ble_devices,
+            (self._live_map_revision, notable_revision), notable, self.proj)
+        live_layer.step()
 
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
@@ -3673,6 +3683,11 @@ class WatchDogsGame(OtaMixin):
                 mac, name, rssi)
             d.spawn_frame = pyxel.frame_count
             self.ble_devices.append(d)
+            recent = getattr(self, "_recent_ble_fx", None)
+            if recent is None:
+                recent = self._recent_ble_fx = []
+            recent.append(d)
+            self._live_map_revision = getattr(self, "_live_map_revision", 0) + 1
             self.msg(f"[BLE] {d.name} {mac[-8:]} {rssi}dBm", C_HACK_CYAN)
             self.gain_xp(10)  # new device: full XP
         else:
@@ -3753,6 +3768,11 @@ class WatchDogsGame(OtaMixin):
                     bssid, net.ssid, ch, rssi_v)
                 n.spawn_frame = pyxel.frame_count
                 self.wifi_networks.append(n)
+                recent = getattr(self, "_recent_wifi_fx", None)
+                if recent is None:
+                    recent = self._recent_wifi_fx = []
+                recent.append(n)
+                self._live_map_revision = getattr(self, "_live_map_revision", 0) + 1
                 self.msg(f"[WiFi] {n.ssid} Ch:{ch}", C_WARNING)
                 self.gain_xp(15)  # new network: full XP
             else:
@@ -4152,6 +4172,8 @@ class WatchDogsGame(OtaMixin):
                 if self.hack_progress >= 45:
                     hacked_before = self._current_hacked_count()
                     self.hack_target.hacked = True
+                    self._live_map_revision = getattr(
+                        self, "_live_map_revision", 0) + 1
                     self._pwned_count = hacked_before + 1
                     self.hacking = False
                     self.gain_xp(50)
@@ -4274,6 +4296,7 @@ class WatchDogsGame(OtaMixin):
         self._draw_grid()
         self.wardrive.draw_trail()
         self._draw_loot_points()
+        self._draw_live_nodes()
         self._draw_wifi()
         self._draw_ble()
         self._draw_scan_fx()
@@ -4633,49 +4656,51 @@ class WatchDogsGame(OtaMixin):
                 if zoom >= 5:
                     pyxel.text(sx + 5, sy - 3, m.label, C_ERROR)
 
+    def _get_live_node_layer(self):
+        layer = getattr(self, "_live_node_layer", None)
+        if layer is None:
+            layer = self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
+        return layer
+
+    def _draw_live_nodes(self):
+        layer = self._get_live_node_layer()
+        notable, notable_revision = self.wardrive.live_notable_identities()
+        revision = getattr(self, "_live_map_revision", 0)
+        layer.request(self.wifi_networks, self.ble_devices,
+                      (revision, notable_revision), notable, self.proj)
+        layer.draw(pyxel, self.proj)
+
     def _draw_wifi(self):
-        for net in self._visible_live_objects(
-                self.wifi_networks, "_wifi_map_index"):
+        """Draw only short-lived discovery rings; mature nodes are cached."""
+        recent = getattr(self, "_recent_wifi_fx", [])
+        keep = []
+        for net in recent:
+            age = pyxel.frame_count - net.spawn_frame
+            if age >= 15:
+                continue
+            keep.append(net)
             if self.wardrive.is_notable("wifi", net.bssid):
                 continue
-            if net.lat == 0.0 and net.lon == 0.0:
-                continue  # no GPS fix when discovered — skip
             sx, sy = self.proj.geo_to_screen(net.lat, net.lon)
-            if not self.proj.screen_visible(sx, sy): continue
-            age = pyxel.frame_count - net.spawn_frame
-            if age < 15:
-                if age % 2 == 0: pyxel.circb(sx, sy, 15-age, C_WARNING)
-                continue
-            if net.hacked:
-                pyxel.line(sx-2, sy, sx, sy-3, C_SUCCESS)
-                pyxel.line(sx+2, sy, sx, sy-3, C_SUCCESS)
-                pyxel.line(sx-2, sy, sx, sy+2, C_SUCCESS)
-                pyxel.line(sx+2, sy, sx, sy+2, C_SUCCESS)
-            else:
-                blink = math.sin(pyxel.frame_count * 0.1 + hash(net.bssid) % 100)
-                c = net.color if blink > 0 else 2
-                pyxel.pset(sx, sy, c)
-                if self.proj.zoom >= 5: pyxel.circb(sx, sy, 3, c)
+            if self.proj.screen_visible(sx, sy) and age % 2 == 0:
+                pyxel.circb(sx, sy, 15 - age, C_WARNING)
+        self._recent_wifi_fx = keep
 
     def _draw_ble(self):
-        for d in self._visible_live_objects(
-                self.ble_devices, "_ble_map_index"):
-            if self.wardrive.is_notable("ble", d.mac):
+        """Draw only short-lived discovery rings; mature nodes are cached."""
+        recent = getattr(self, "_recent_ble_fx", [])
+        keep = []
+        for device in recent:
+            age = pyxel.frame_count - device.spawn_frame
+            if age >= 15:
                 continue
-            if d.lat == 0.0 and d.lon == 0.0:
-                continue  # no GPS fix when discovered — skip
-            sx, sy = self.proj.geo_to_screen(d.lat, d.lon)
-            if not self.proj.screen_visible(sx, sy): continue
-            age = pyxel.frame_count - d.spawn_frame
-            if age < 15:
-                if age % 2 == 0: pyxel.circb(sx, sy, 15-age, C_HACK_CYAN)
+            keep.append(device)
+            if self.wardrive.is_notable("ble", device.mac):
                 continue
-            if d.hacked:
-                pyxel.rect(sx-2, sy-2, 5, 5, C_HACK_CYAN)
-                pyxel.pset(sx, sy, C_SUCCESS)
-            else:
-                blink = math.sin(pyxel.frame_count * 0.15 + d.blink_phase)
-                pyxel.rect(sx-1, sy-1, 3, 3, d.color if blink > 0 else 2)
+            sx, sy = self.proj.geo_to_screen(device.lat, device.lon)
+            if self.proj.screen_visible(sx, sy) and age % 2 == 0:
+                pyxel.circb(sx, sy, 15 - age, C_HACK_CYAN)
+        self._recent_ble_fx = keep
 
     def _visible_live_objects(self, objects, index_name, center_lat=None,
                               center_lon=None, lat_span=None, lon_span=None):

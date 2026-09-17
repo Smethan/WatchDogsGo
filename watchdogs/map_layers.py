@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 
@@ -320,3 +319,214 @@ class HistoricalNodeLayer:
                 if px.frame_count % 20 < 14:
                     pulse = 7 if cluster["count"] == 1 else cluster["radius"] + 5
                     px.circb(x, y, pulse, 3)
+
+
+@dataclass(frozen=True)
+class _LiveRequest:
+    wifi: list
+    ble: list
+    token: tuple
+    notable: frozenset[str]
+    zoom: int
+    center_lat: float
+    center_lon: float
+    lon_span: float
+
+    @property
+    def key(self):
+        return (self.token, self.zoom, self.center_lat, self.center_lon)
+
+
+class _LiveBuild:
+    """Incrementally project live devices into draw commands."""
+
+    def __init__(self, request: _LiveRequest, width: int, map_top: int,
+                 map_height: int, overscan: int):
+        self.request = request
+        self.width = width
+        self.map_top = map_top
+        self.map_height = map_height
+        self.overscan = overscan
+        self.kind = "wifi"
+        self.index = 0
+        self.commands = []
+
+    def _objects(self):
+        return self.request.wifi if self.kind == "wifi" else self.request.ble
+
+    def _consume(self, obj):
+        try:
+            lat, lon = float(obj.lat), float(obj.lon)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if (lat == 0.0 and lon == 0.0) or not (-90.0 <= lat <= 90.0):
+            return
+        identity = ("wifi:" + obj.bssid.upper() if self.kind == "wifi"
+                    else "ble:" + obj.mac.upper())
+        if identity in self.request.notable:
+            return
+        scale = self.width / self.request.lon_span
+        x = int(self.width / 2
+                + _wrapped_delta(lon, self.request.center_lon) * scale)
+        y = int(self.map_top + self.map_height / 2
+                + (self.request.center_lat - lat) * scale)
+        if not (-self.overscan <= x < self.width + self.overscan
+                and self.map_top - self.overscan <= y
+                < self.map_top + self.map_height + self.overscan):
+            return
+        phase = ((sum(ord(char) for char in obj.bssid) & 1)
+                 if self.kind == "wifi"
+                 else int(getattr(obj, "blink_phase", 0) * 1000) & 1)
+        self.commands.append((
+            self.kind, x, y, int(obj.color), bool(obj.hacked), phase))
+
+    def step(self, max_ms: float, max_records: int | None = None) -> bool:
+        deadline = time.perf_counter() + max_ms / 1000.0
+        processed = 0
+        while True:
+            objects = self._objects()
+            while self.index < len(objects):
+                end = min(len(objects), self.index + 128)
+                while self.index < end:
+                    self._consume(objects[self.index])
+                    self.index += 1
+                    processed += 1
+                    if max_records is not None and processed >= max_records:
+                        return False
+                if time.perf_counter() >= deadline:
+                    return False
+            if self.kind == "wifi":
+                self.kind = "ble"
+                self.index = 0
+                continue
+            return True
+
+
+class LiveNodeLayer:
+    """Two cached blink frames for mature Wi-Fi and BLE map nodes."""
+
+    def __init__(self, width: int, map_top: int, map_height: int,
+                 *, overscan: int = 128, rebuild_shift: int = 64,
+                 transparent: int = 15):
+        self.width = width
+        self.map_top = map_top
+        self.map_height = map_height
+        self.overscan = overscan
+        self.rebuild_shift = rebuild_shift
+        self.transparent = transparent
+        self.images = (None, None)
+        self.anchor_lat = 0.0
+        self.anchor_lon = 0.0
+        self.zoom = -1
+        self.data_token = None
+        self._job: _LiveBuild | None = None
+        self._queued: _LiveRequest | None = None
+        self._ready: tuple[_LiveRequest, list] | None = None
+        self.revision = 0
+
+    @staticmethod
+    def _request(wifi, ble, revision, notable, proj):
+        token = (id(wifi), len(wifi), id(ble), len(ble), revision,
+                 len(notable), hash(notable))
+        return _LiveRequest(
+            wifi=wifi, ble=ble, token=token, notable=notable,
+            zoom=proj.zoom, center_lat=proj.center_lat,
+            center_lon=proj.center_lon, lon_span=proj.lon_span)
+
+    def offset(self, proj):
+        if proj.zoom != self.zoom:
+            return None
+        scale = self.width / proj.lon_span
+        return (round(_wrapped_delta(self.anchor_lon, proj.center_lon) * scale),
+                round((proj.center_lat - self.anchor_lat) * scale))
+
+    def request(self, wifi, ble, revision, notable, proj):
+        request = self._request(wifi, ble, revision, notable, proj)
+        has_image = self.images[0] is not None
+        offset = self.offset(proj) if has_image else None
+        current = (has_image and self.data_token == request.token
+                   and offset is not None
+                   and abs(offset[0]) <= self.rebuild_shift
+                   and abs(offset[1]) <= self.rebuild_shift)
+        if current:
+            return
+        if has_image and proj.zoom != self.zoom:
+            self.images = (None, None)
+            self._ready = self._queued = None
+            self._job = _LiveBuild(
+                request, self.width, self.map_top, self.map_height,
+                self.overscan)
+            return
+        if self._job is not None:
+            if self._job.request.key != request.key:
+                self._queued = request
+            return
+        if self._ready is not None and self._ready[0].key == request.key:
+            return
+        self._job = _LiveBuild(
+            request, self.width, self.map_top, self.map_height, self.overscan)
+
+    def step(self, max_ms: float = 2.0, max_records: int | None = None):
+        if self._job is None or not self._job.step(max_ms, max_records):
+            return
+        request, commands = self._job.request, self._job.commands
+        self._ready = request, commands
+        self._job = None
+        queued, self._queued = self._queued, None
+        if queued is not None and queued.key != request.key:
+            self._job = _LiveBuild(
+                queued, self.width, self.map_top, self.map_height,
+                self.overscan)
+
+    def _render_phase(self, px, request, commands, blink_phase):
+        image = px.Image(
+            self.width + 2 * self.overscan,
+            self.map_height + 2 * self.overscan)
+        image.cls(self.transparent)
+        for kind, sx, sy, color, hacked, phase in commands:
+            x = sx + self.overscan
+            y = sy - self.map_top + self.overscan
+            if kind == "wifi":
+                if hacked:
+                    image.line(x - 2, y, x, y - 3, 11)
+                    image.line(x + 2, y, x, y - 3, 11)
+                    image.line(x - 2, y, x, y + 2, 11)
+                    image.line(x + 2, y, x, y + 2, 11)
+                else:
+                    draw_color = color if phase == blink_phase else 2
+                    image.pset(x, y, draw_color)
+                    if request.zoom >= 5:
+                        image.circb(x, y, 3, draw_color)
+            elif hacked:
+                image.rect(x - 2, y - 2, 5, 5, 3)
+                image.pset(x, y, 11)
+            else:
+                draw_color = color if phase == blink_phase else 2
+                image.rect(x - 1, y - 1, 3, 3, draw_color)
+        return image
+
+    def _publish(self, px):
+        if self._ready is None:
+            return
+        request, commands = self._ready
+        self._ready = None
+        self.images = (
+            self._render_phase(px, request, commands, 0),
+            self._render_phase(px, request, commands, 1))
+        self.anchor_lat = request.center_lat
+        self.anchor_lon = request.center_lon
+        self.zoom = request.zoom
+        self.data_token = request.token
+        self.revision += 1
+
+    def draw(self, px, proj):
+        self._publish(px)
+        offset = self.offset(proj)
+        image = self.images[(px.frame_count // 10) & 1]
+        if image is None or offset is None:
+            return
+        px.clip(0, self.map_top, self.width, self.map_height)
+        px.blt(-self.overscan + offset[0],
+               self.map_top - self.overscan + offset[1],
+               image, 0, 0, image.width, image.height, self.transparent)
+        px.clip()
