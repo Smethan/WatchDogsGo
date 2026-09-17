@@ -1,5 +1,33 @@
 # Smethan WatchDogsGo
 
+## 0.9.35 — Bounded and optional wardrive dots
+
+- Add **Regular wardrive dots (2048 max)** to Wardrive Settings. It is enabled
+  by default and persists in `wardrive_settings.json`. Turning it off hides
+  ordinary historical clusters, live Wi-Fi/BLE nodes, discovery rings, and
+  ordinary radar dots while collection and loot storage continue.
+- Keep Flock/Axon map and radar markers, detection alerts, GPS trails, cellular
+  neighbor indicators, aircraft, sensors, MeshCore nodes, handshake markers,
+  and other special overlays visible when ordinary wardrive dots are disabled.
+- Bound the combined ordinary map display to 2,048 nodes for the 4 GB CM4.
+  New live Wi-Fi/BLE discoveries evict the globally oldest live visual node;
+  live nodes reserve space from the historical display in 128-node blocks, so
+  older historical points fall away as the current wardrive grows.
+- Preserve complete WiGLE/loot files, identity history, Flock/Axon evidence,
+  hacked totals, and session discovery counters when visual nodes are evicted.
+  Historical data remains available to loot search and is restored as the
+  newest bounded window after restart.
+- Cap short discovery-ring queues at 256 per radio and coalesce live-map and
+  radar cache publication to at most twice per second during dense result
+  bursts. New rings still appear immediately while cached dots catch up.
+
+The 2,048-point host benchmark measured about 2.8 ms for a complete historical
+model build and 2.6 ms for a complete live model build before their frame
+budgets are applied. Cached dispatch remained below 0.01 ms in the synthetic
+backend. The complete 286-test host suite, Python bytecode compilation, shell
+syntax checks, and source diff checks pass. No projectZero firmware update is
+required, and no patched code was installed or run on the uConsole.
+
 ## 0.9.34 — Cached wardrive nodes and smoother moving maps
 
 - Deduplicate historical map identities across sessions before rendering,
