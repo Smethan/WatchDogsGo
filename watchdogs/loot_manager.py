@@ -102,6 +102,7 @@ class LootManager:
         self._base = Path(app_dir) / "loot"
         self._session = self._base / ts
         self._serial_fh: Optional[io.TextIOWrapper] = None
+        self._serial_last_flush = time.monotonic()
         self._handshake_dir: Optional[Path] = None
         self._session_active = False
 
@@ -149,6 +150,18 @@ class LootManager:
         # Load or build aggregate loot database
         self._db = self._load_or_build_db()
 
+        # Wi-Fi/BLE scans arrive in bursts. Re-reading and atomically rewriting
+        # the complete CSV for every observation used to block the Pyxel thread
+        # for the duration of each burst. Keep the de-duplication indexes in
+        # memory and let one worker coalesce durable snapshots.
+        self._init_scan_loot_state(async_writes=True)
+        self._scan_loot_thread = threading.Thread(
+            target=self._scan_loot_writer_loop,
+            name="loot-scan-writer",
+            daemon=True,
+        )
+        self._scan_loot_thread.start()
+
         # Periodic background sync — protects against power loss between
         # event-driven fsyncs. Every BACKUP_INTERVAL seconds it fsyncs the
         # open serial log handle and calls os.sync() so everything still
@@ -162,6 +175,194 @@ class LootManager:
         self._backup_thread.start()
 
     BACKUP_INTERVAL = 30  # seconds between sync passes
+    SCAN_LOOT_WRITE_DELAY = 0.20  # quiet period that closes one result burst
+    SCAN_LOOT_WRITE_MAX_DELAY = 1.0  # bound hard-crash exposure under load
+
+    def _init_scan_loot_state(self, *, async_writes: bool) -> None:
+        """Create the session-resident scan indexes and writer controls."""
+        self._scan_loot_lock = threading.Lock()
+        self._scan_loot_write_lock = threading.Lock()
+        self._scan_loot_event = threading.Event()
+        self._scan_loot_stop = False
+        self._scan_loot_async = async_writes
+        self._wardrive_rows = None
+        self._wardrive_index = {}
+        self._wardrive_revision = 0
+        self._wardrive_written_revision = 0
+        self._bt_rows = None
+        self._bt_index = set()
+        self._bt_revision = 0
+        self._bt_written_revision = 0
+        self._cell_diagnostic_lines = []
+
+    def _ensure_scan_loot_state(self) -> None:
+        """Initialize synchronous state for small test/embedded instances.
+
+        A few callers construct LootManager with ``__new__``. Keeping that
+        supported also makes the individual save methods useful in isolation.
+        Normal application instances initialize the asynchronous worker in
+        ``__init__``.
+        """
+        if not hasattr(self, "_scan_loot_lock"):
+            self._init_scan_loot_state(async_writes=False)
+
+    def _load_wardrive_rows_locked(self) -> None:
+        if self._wardrive_rows is not None:
+            return
+        rows = []
+        path = self._session / "wardriving.csv"
+        if path.is_file():
+            try:
+                with path.open(newline="", encoding="utf-8") as stream:
+                    next(stream, None)  # WiGLE pre-header
+                    rows = [dict(row) for row in csv.DictReader(stream)]
+            except OSError as exc:
+                log.error("Cannot load wardriving observations: %s", exc)
+        self._wardrive_rows = rows
+        self._wardrive_index = {
+            (row.get("Type", ""), row.get("MAC", "").upper()): index
+            for index, row in enumerate(rows)
+            if row.get("Type") in ("WIFI", "BLE") and row.get("MAC")
+        }
+
+    def _load_bt_rows_locked(self) -> None:
+        if self._bt_rows is not None:
+            return
+        rows = []
+        path = self._session / "bt_devices.csv"
+        if path.is_file():
+            try:
+                with path.open(newline="", encoding="utf-8") as stream:
+                    rows = [dict(row) for row in csv.DictReader(stream)]
+            except OSError as exc:
+                log.error("Cannot load Bluetooth observations: %s", exc)
+        self._bt_rows = rows
+        self._bt_index = {
+            row.get("mac", "").upper() for row in rows if row.get("mac")
+        }
+
+    def _queue_scan_loot_write(self) -> None:
+        if self._scan_loot_async:
+            self._scan_loot_event.set()
+        else:
+            # Preserve immediate persistence for standalone/test instances.
+            self._write_scan_loot_snapshots()
+
+    def checkpoint_scan_loot(self) -> None:
+        """Request a durable checkpoint without blocking the display loop."""
+        self._ensure_scan_loot_state()
+        self._queue_scan_loot_write()
+
+    def _write_scan_loot_snapshots(self) -> None:
+        """Atomically persist the newest WiGLE/BLE snapshots.
+
+        Only this routine performs the relatively expensive full-file writes.
+        Observations may continue updating the in-memory indexes while a
+        snapshot is being serialized; a newer revision then schedules another
+        pass rather than blocking the producer.
+        """
+        self._ensure_scan_loot_state()
+        retry = False
+        with self._scan_loot_write_lock:
+            with self._scan_loot_lock:
+                wardrive_revision = self._wardrive_revision
+                wardrive_rows = (None if self._wardrive_rows is None
+                                  or wardrive_revision == self._wardrive_written_revision
+                                  else list(self._wardrive_rows))
+                bt_revision = self._bt_revision
+                bt_rows = (None if self._bt_rows is None
+                           or bt_revision == self._bt_written_revision
+                           else list(self._bt_rows))
+                cell_lines = list(self._cell_diagnostic_lines)
+
+            wardrive_ok = wardrive_rows is None
+            if wardrive_rows is not None:
+                path = self._session / "wardriving.csv"
+                try:
+                    temp = path.with_suffix(".csv.tmp")
+                    with temp.open("w", newline="", encoding="utf-8") as stream:
+                        stream.write(self._WIGLE_PRE_HEADER)
+                        writer = csv.DictWriter(
+                            stream, fieldnames=self._WIGLE_FIELDS,
+                            extrasaction="ignore", lineterminator="\n")
+                        writer.writeheader()
+                        writer.writerows(wardrive_rows)
+                        _fsync_file(stream)
+                    temp.replace(path)
+                    wardrive_ok = True
+                except OSError as exc:
+                    log.error("Cannot save wardriving observations: %s", exc)
+
+            bt_ok = bt_rows is None
+            if bt_rows is not None:
+                path = self._session / "bt_devices.csv"
+                fields = ("timestamp", "mac", "rssi", "name", "airtag",
+                          "smarttag", "lat", "lon")
+                try:
+                    temp = path.with_suffix(".csv.tmp")
+                    with temp.open("w", newline="", encoding="utf-8") as stream:
+                        writer = csv.DictWriter(
+                            stream, fieldnames=fields, extrasaction="ignore",
+                            lineterminator="\n")
+                        writer.writeheader()
+                        writer.writerows(bt_rows)
+                        _fsync_file(stream)
+                    temp.replace(path)
+                    bt_ok = True
+                except OSError as exc:
+                    log.error("Cannot save Bluetooth observations: %s", exc)
+
+            cell_ok = not cell_lines
+            if cell_lines:
+                try:
+                    path = self._session / "cell_diagnostics.jsonl"
+                    with path.open("a", encoding="utf-8") as stream:
+                        stream.writelines(cell_lines)
+                        _fsync_file(stream)
+                    cell_ok = True
+                except OSError as exc:
+                    log.error("Cannot save cell diagnostics: %s", exc)
+
+            with self._scan_loot_lock:
+                if wardrive_ok:
+                    self._wardrive_written_revision = max(
+                        self._wardrive_written_revision, wardrive_revision)
+                if bt_ok:
+                    self._bt_written_revision = max(
+                        self._bt_written_revision, bt_revision)
+                if cell_ok:
+                    del self._cell_diagnostic_lines[:len(cell_lines)]
+                retry = (self._wardrive_revision != self._wardrive_written_revision
+                         or self._bt_revision != self._bt_written_revision
+                         or bool(self._cell_diagnostic_lines))
+        if retry and self._scan_loot_async and not self._scan_loot_stop:
+            self._scan_loot_event.set()
+
+    def _scan_loot_writer_loop(self) -> None:
+        """Coalesce result bursts and checkpoint them away from Pyxel."""
+        while True:
+            self._scan_loot_event.wait()
+            self._scan_loot_event.clear()
+            if self._scan_loot_stop:
+                self._write_scan_loot_snapshots()
+                return
+            # Wait for a short quiet period so one firmware batch becomes one
+            # disk write. Continuous host BLE traffic cannot postpone a write
+            # past MAX_DELAY, keeping hard-crash exposure bounded.
+            started = time.monotonic()
+            quiet_deadline = started + self.SCAN_LOOT_WRITE_DELAY
+            hard_deadline = started + self.SCAN_LOOT_WRITE_MAX_DELAY
+            while not self._scan_loot_stop:
+                now = time.monotonic()
+                remaining = min(quiet_deadline, hard_deadline) - now
+                if remaining <= 0:
+                    break
+                if self._scan_loot_event.wait(remaining):
+                    self._scan_loot_event.clear()
+                    quiet_deadline = time.monotonic() + self.SCAN_LOOT_WRITE_DELAY
+            self._write_scan_loot_snapshots()
+            if self._scan_loot_stop:
+                return
 
     def _periodic_backup_loop(self) -> None:
         """Run on a daemon thread; fsync the serial log and os.sync the FS.
@@ -184,6 +385,8 @@ class LootManager:
         Safe to call from any thread. Called automatically every
         BACKUP_INTERVAL seconds; also hookable for pre-shutdown flushes.
         """
+        if hasattr(self, "_scan_loot_lock"):
+            self._write_scan_loot_snapshots()
         fh = self._serial_fh
         if fh is not None:
             try:
@@ -598,7 +801,10 @@ class LootManager:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         try:
             self._serial_fh.write(f"[{ts}] {line}\n")
-            self._serial_fh.flush()
+            now = time.monotonic()
+            if now - getattr(self, "_serial_last_flush", 0.0) >= 1.0:
+                self._serial_fh.flush()
+                self._serial_last_flush = now
         except OSError:
             pass
 
@@ -1001,39 +1207,32 @@ class LootManager:
             accuracy = round(fix.hdop * 5, 1) if fix.hdop < 99 else 0.0
         instant = datetime.fromtimestamp(observed_at, timezone.utc) if observed_at is not None else datetime.now(timezone.utc)
         ts = instant.strftime("%Y-%m-%d %H:%M:%S")
-        path = self._session / "wardriving.csv"
         try:
-            rows = []
-            if path.is_file():
-                with path.open(newline="", encoding="utf-8") as f:
-                    next(f, None)  # WiGLE pre-header
-                    reader = csv.DictReader(f)
-                    rows = [dict(row) for row in reader]
             rssi = int(rssi)
             row = dict(zip(self._WIGLE_FIELDS,
                 (mac, name, auth, ts, channel, frequency, rssi, lat, lon, alt,
                  accuracy, "", "", kind)))
-            for i, old in enumerate(rows if not append else ()):
-                if old.get("MAC", "").upper() == mac.upper() and old.get("Type") == kind:
+            self._ensure_scan_loot_state()
+            with self._scan_loot_lock:
+                self._load_wardrive_rows_locked()
+                index = None if append else self._wardrive_index.get(
+                    (kind, mac.upper()))
+                if index is not None:
+                    old = self._wardrive_rows[index]
                     try:
                         if rssi <= int(old.get("RSSI", -1000)):
                             return False
                     except ValueError:
                         pass
                     row["FirstSeen"] = old.get("FirstSeen", ts)
-                    rows[i] = row
-                    break
-            else:
-                rows.append(row)
-            temp = path.with_suffix(".csv.tmp")
-            with temp.open("w", newline="", encoding="utf-8") as f:
-                f.write(self._WIGLE_PRE_HEADER)
-                writer = csv.DictWriter(f, fieldnames=self._WIGLE_FIELDS,
-                                        extrasaction="ignore", lineterminator="\n")
-                writer.writeheader()
-                writer.writerows(rows)
-                _fsync_file(f)
-            temp.replace(path)
+                    self._wardrive_rows[index] = row
+                else:
+                    index = len(self._wardrive_rows)
+                    self._wardrive_rows.append(row)
+                    if not append:
+                        self._wardrive_index[(kind, mac.upper())] = index
+                self._wardrive_revision += 1
+            self._queue_scan_loot_write()
             return True
         except (OSError, ValueError) as exc:
             log.error("Cannot save wardriving observation: %s", exc)
@@ -1064,14 +1263,12 @@ class LootManager:
             round(float(signal)), kind, observation_fix, observed_at,
             frequency=cell.get("frequency") or "", append=True)
         if saved:
-            try:
-                path = self._session / "cell_diagnostics.jsonl"
-                entry = dict(cell, observed_at=observed_at, fix=observation_fix)
-                with path.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
-                    _fsync_file(stream)
-            except OSError as exc:
-                log.error("Cannot save cell diagnostics: %s", exc)
+            entry = dict(cell, observed_at=observed_at, fix=observation_fix)
+            line = json.dumps(entry, separators=(",", ":")) + "\n"
+            self._ensure_scan_loot_state()
+            with self._scan_loot_lock:
+                self._cell_diagnostic_lines.append(line)
+            self._queue_scan_loot_write()
         return saved
 
     def save_scan_results(self, networks: List[Network]) -> None:
@@ -1219,7 +1416,6 @@ class LootManager:
         """Save BLE inventory with explicit observation GPS when provided."""
         if not self._session_active:
             return
-        path = self._session / "bt_devices.csv"
         lat = lon = ""
         if observation_fix == "current":
             fix = self._gps.fix if self._gps and self._gps.available else None
@@ -1230,19 +1426,21 @@ class LootManager:
             fix = None
         if fix and fix.valid:
             lat, lon = round(fix.latitude, 7), round(fix.longitude, 7)
-        if path.is_file():
-            with path.open(newline="", encoding="utf-8") as f:
-                if any(len(row)>1 and row[1].upper()==mac.upper() for row in csv.reader(f)):
-                    return
-        empty = not path.exists()
         ts = datetime.fromtimestamp(observed_at).isoformat(timespec="seconds") if observed_at is not None else datetime.now().isoformat(timespec="seconds")
-        with path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if empty:
-                writer.writerow(["timestamp","mac","rssi","name","airtag","smarttag","lat","lon"])
-            writer.writerow([ts,mac,rssi,name,is_airtag,is_smarttag,lat,lon])
-            _fsync_file(f)
-        self.update_session_loot()
+        self._ensure_scan_loot_state()
+        with self._scan_loot_lock:
+            self._load_bt_rows_locked()
+            identity = mac.upper()
+            if identity in self._bt_index:
+                return
+            self._bt_index.add(identity)
+            self._bt_rows.append({
+                "timestamp": ts, "mac": mac, "rssi": rssi, "name": name,
+                "airtag": is_airtag, "smarttag": is_smarttag,
+                "lat": lat, "lon": lon,
+            })
+            self._bt_revision += 1
+        self._queue_scan_loot_write()
 
     def save_bt_airtag_event(self, airtags: int, smarttags: int) -> None:
         """Log an AirTag scanner detection event. fsync'd."""
@@ -1393,7 +1591,14 @@ class LootManager:
 
     def close(self) -> None:
         """Close file handles, write session summary, and update loot DB."""
-        # Stop background sync thread before closing the handle it touches
+        # Stop scan persistence first. Its final pass drains all accepted
+        # observations before the session summary and DB totals are computed.
+        if hasattr(self, "_scan_loot_thread"):
+            self._scan_loot_stop = True
+            self._scan_loot_event.set()
+            self._scan_loot_thread.join(timeout=5)
+
+        # Stop background sync thread before closing the handle it touches.
         self._backup_stop = True
         self.flush_all()
 

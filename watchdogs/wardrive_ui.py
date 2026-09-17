@@ -239,6 +239,8 @@ class WardriveUI:
                     self.app._term_add(self.host_ble_batch_lines.popleft(), raw=True)
             elif d["kind"] == "batch_done":
                 self.app._term_add(f"[ALL] Batch #{d['batch']} complete; starting next scan", raw=True)
+                if self.app.loot:
+                    self.app.loot.checkpoint_scan_loot()
                 if self.cell.active:
                     self.cell.observe_batch(self.fixes.at(time.monotonic()), d["batch"])
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:

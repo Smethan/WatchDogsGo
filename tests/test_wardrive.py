@@ -204,6 +204,40 @@ def test_csv_escaping_dedup_and_unknown_gps(loot):
         next(f);rows=list(csv.reader(f))
     assert len(rows)==2 and rows[1][1]=='a,"b\nline' and rows[1][-1]=="WIFI"
 
+def test_async_scan_loot_keeps_disk_writes_off_observation_path(tmp_path):
+    loot=LootManager.__new__(LootManager);loot._session=tmp_path
+    loot._session_active=True;loot._gps=None
+    loot._init_scan_loot_state(async_writes=True)
+    # Keep the worker in its coalescing window until this test asks it to stop.
+    loot.SCAN_LOOT_WRITE_DELAY=10;loot.SCAN_LOOT_WRITE_MAX_DELAY=10
+    loot._scan_loot_thread=threading.Thread(target=loot._scan_loot_writer_loop)
+    loot._scan_loot_thread.start()
+    fix=asdict(GpsFix(valid=True,latitude=40,longitude=-90))
+    for i in range(500):
+        mac=f"02:00:{(i>>16)&255:02X}:{(i>>8)&255:02X}:{i&255:02X}:01"
+        assert loot._save_wardrive_row(mac,f"ap-{i}","[ESS]",i%14+1,-70,
+                                       "WIFI",fix,i+1)
+        loot.save_bt_device(mac,-70,f"ble-{i}",False,False,
+                            observation_fix=fix,observed_at=i+1)
+    assert not (tmp_path/"wardriving.csv").exists()
+    assert not (tmp_path/"bt_devices.csv").exists()
+
+    # A stronger repeat updates the indexed WiGLE row; a weaker one is ignored.
+    mac="02:00:00:00:00:01"
+    assert loot._save_wardrive_row(mac,"strong","[ESS]",1,-40,"WIFI",fix,999)
+    assert not loot._save_wardrive_row(mac,"weak","[ESS]",1,-80,"WIFI",fix,1000)
+    loot._scan_loot_stop=True;loot._scan_loot_event.set()
+    loot._scan_loot_thread.join(timeout=2)
+    assert not loot._scan_loot_thread.is_alive()
+
+    with (tmp_path/"wardriving.csv").open(newline="") as stream:
+        next(stream);rows=list(csv.DictReader(stream))
+    with (tmp_path/"bt_devices.csv").open(newline="") as stream:
+        bt_rows=list(csv.DictReader(stream))
+    assert len(rows)==len(bt_rows)==500
+    winner=next(row for row in rows if row["MAC"]==mac)
+    assert winner["SSID"]=="strong" and winner["RSSI"]=="-40"
+
 @pytest.fixture
 def game(tmp_path,loot,monkeypatch):
     import watchdogs.app as appmod
@@ -793,6 +827,7 @@ def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
     w.handle_line(wire(batch_control("batch_results",session=token,seq=3,
                                      batch_wifi=2,batch_ble=3)))
     w.handle_line(wire(batch_record(session=token,seq=4)))
+    game.loot.checkpoint_scan_loot=Mock()
     w.handle_line(wire(batch_control("batch_done",session=token,seq=5,
                                      batch_wifi=1,batch_ble=0)))
     lines=[call.args[0] for call in game._term_add.call_args_list]
@@ -800,6 +835,7 @@ def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
     assert any("Results #1: WiFi 2 | BLE 3" in line for line in lines)
     assert any("Batch #1 complete" in line for line in lines)
     assert len(game.wifi_networks)==1
+    game.loot.checkpoint_scan_loot.assert_called_once_with()
 
 
 @pytest.mark.parametrize("wifi_only", [False, True])
