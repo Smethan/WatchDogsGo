@@ -1,5 +1,33 @@
 # Smethan WatchDogsGo
 
+## 0.9.36 — Smooth scan ingestion
+
+- Replace per-observation WiGLE CSV reads, full rewrites, and `fsync` calls
+  with session-resident identity indexes. Wi-Fi and BLE de-duplication and
+  strongest-RSSI replacement are now constant-time operations on the display
+  thread.
+- Persist WiGLE rows, the BLE inventory, and cellular diagnostics through a
+  dedicated background writer. It waits for 200 ms of quiet to combine a scan
+  burst into one atomic snapshot and forces a checkpoint within one second
+  when observations arrive continuously.
+- Request a background checkpoint at the end of every batched All Wardrive
+  scan, retain the existing 30-second filesystem sync, and synchronously drain
+  all accepted observations when WDG exits. A sudden power loss can lose at
+  most the newest uncheckpointed window instead of risking a partially
+  rewritten CSV.
+- Buffer the full serial log during a scan burst and flush it at most once per
+  second, while preserving final and periodic durable flushes.
+- Preserve the existing WiGLE 1.6 layout, first-seen timestamps, strongest
+  observation selection, repeated cellular history, and atomic file replace
+  behavior. No projectZero firmware change is required.
+
+On the host benchmark, accepting 500 unique Wi-Fi results fell from about
+0.78 seconds of display-thread work to 0.005 seconds, while the final durable
+snapshot completed in about 0.008 seconds. Concurrent stress testing retained
+all 2,000 unique rows with no temporary files left behind. The complete
+287-test host suite and Python bytecode compilation pass. No patched code was
+installed or run on the uConsole.
+
 ## 0.9.35 — Bounded and optional wardrive dots
 
 - Add **Regular wardrive dots (2048 max)** to Wardrive Settings. It is enabled
