@@ -62,6 +62,37 @@ def test_geo_index_adds_appended_objects_incrementally():
     assert index._coordinates.call_count == 3
 
 
+def test_geo_index_reuses_identical_query_until_source_changes():
+    points = [
+        {"lat": 40, "lon": -90},
+        {"lat": 40.001, "lon": -90.001},
+    ]
+    index = GeoPointIndex()
+    index.ensure(points)
+    first = index.query(40, -90, 0.02, 0.02)
+    second = index.query(40, -90, 0.02, 0.02)
+    assert second is first
+
+    points.append({"lat": 40.002, "lon": -90.002})
+    index.ensure(points)
+    third = index.query(40, -90, 0.02, 0.02)
+    assert third is not first and len(third) == 3
+
+
+def test_geo_index_uses_fine_bucket_for_dense_close_view():
+    points = [
+        {"lat": 40 + (i % 100) / 1000,
+         "lon": -90 + (i // 100) / 1000}
+        for i in range(10_000)
+    ]
+    index = GeoPointIndex()
+    index.ensure(points)
+    result = index.query(40.005, -89.995, 0.01, 0.01)
+
+    assert result
+    assert index._last_query_candidates < len(points) // 10
+
+
 def test_clusters_reuse_unchanged_result_and_rebuild_after_append(monkeypatch):
     import watchdogs.app as appmod
     monkeypatch.setattr(appmod, "pyxel", NS(frame_count=100))
