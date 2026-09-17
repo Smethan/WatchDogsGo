@@ -31,7 +31,7 @@ from .network_manager import NetworkManager
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
 from .map_index import GeoObjectIndex
-from .map_layers import HistoricalNodeLayer, LiveNodeLayer
+from .map_layers import HistoricalNodeLayer, LiveNodeLayer, RadarNodeLayer
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -719,6 +719,11 @@ class WatchDogsGame(OtaMixin):
         self._recent_wifi_fx: list[WifiNetwork] = []
         self._live_map_revision = 0
         self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
+        self._radar_node_layer = RadarNodeLayer(20, colors={
+            "wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
+            "handshake": C_ERROR, "meshcore": C_WARNING, "other": C_DIM,
+            "wifi_live": C_WARNING, "hacked": C_SUCCESS,
+        })
         self._ble_map_index = GeoObjectIndex()
         self._wifi_map_index = GeoObjectIndex()
         self._state_network_by_bssid: dict[str, int] = {}
@@ -1443,6 +1448,13 @@ class WatchDogsGame(OtaMixin):
             self.wifi_networks, self.ble_devices,
             (self._live_map_revision, notable_revision), notable, self.proj)
         live_layer.step()
+        radar_scale = 20 / max(self.proj.lon_span * 0.5, 0.001)
+        radar_layer = self._get_radar_node_layer()
+        radar_layer.request(
+            self.wifi_networks, self.ble_devices, self.loot_points,
+            (self._live_map_revision, notable_revision), notable,
+            self.player_lat, self.player_lon, radar_scale)
+        radar_layer.step()
 
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
@@ -4674,6 +4686,17 @@ class WatchDogsGame(OtaMixin):
             layer = self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
         return layer
 
+    def _get_radar_node_layer(self):
+        layer = getattr(self, "_radar_node_layer", None)
+        if layer is None:
+            layer = self._radar_node_layer = RadarNodeLayer(20, colors={
+                "wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
+                "handshake": C_ERROR, "meshcore": C_WARNING,
+                "other": C_DIM, "wifi_live": C_WARNING,
+                "hacked": C_SUCCESS,
+            })
+        return layer
+
     def _draw_live_nodes(self):
         layer = self._get_live_node_layer()
         notable, notable_revision = self.wardrive.live_notable_identities()
@@ -5190,40 +5213,19 @@ class WatchDogsGame(OtaMixin):
         sa = pyxel.frame_count * 0.04
         pyxel.line(rx, ry, rx+int(math.cos(sa)*rr), ry+int(math.sin(sa)*rr), C_HACK_CYAN)
         scale = rr / max(self.proj.lon_span * 0.5, 0.001)
-        radar_span = 2 * rr / scale
-        for d in self._visible_live_objects(
-                self.ble_devices, "_ble_map_index",
-                self.player_lat, self.player_lon, radar_span, radar_span):
-            if self.wardrive.is_notable("ble", d.mac):
-                continue
-            dx = (d.lon - self.player_lon) * scale
-            dy = (self.player_lat - d.lat) * scale
-            if abs(dx) < rr and abs(dy) < rr:
-                pyxel.pset(rx+int(dx), ry+int(dy), C_SUCCESS if d.hacked else d.color)
-        for n in self._visible_live_objects(
-                self.wifi_networks, "_wifi_map_index",
-                self.player_lat, self.player_lon, radar_span, radar_span):
-            if self.wardrive.is_notable("wifi", n.bssid):
-                continue
-            dx = (n.lon - self.player_lon) * scale
-            dy = (self.player_lat - n.lat) * scale
-            if abs(dx) < rr and abs(dy) < rr:
-                pyxel.pset(rx+int(dx), ry+int(dy), C_SUCCESS if n.hacked else C_WARNING)
+        notable, notable_revision = self.wardrive.live_notable_identities()
+        radar_layer = self._get_radar_node_layer()
+        radar_layer.request(
+            self.wifi_networks, self.ble_devices, self.loot_points,
+            (getattr(self, "_live_map_revision", 0), notable_revision), notable,
+            self.player_lat, self.player_lon, scale)
+        radar_layer.draw(
+            pyxel, rx, ry, self.player_lat, self.player_lon, scale)
         for m in self.markers:
             dx = (m.lon - self.player_lon) * scale
             dy = (self.player_lat - m.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
                 pyxel.pset(rx+int(dx), ry+int(dy), C_ERROR)
-        loot_colors = {"wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
-                       "handshake": C_ERROR, "meshcore": C_WARNING}
-        step = max(1, len(self.loot_points) // 100)
-        for i in range(0, len(self.loot_points), step):
-            pt = self.loot_points[i]
-            dx = (pt["lon"] - self.player_lon) * scale
-            dy = (self.player_lat - pt["lat"]) * scale
-            if abs(dx) < rr and abs(dy) < rr:
-                pyxel.pset(rx+int(dx), ry+int(dy),
-                           loot_colors.get(pt.get("type", ""), C_DIM))
         # ADS-B aircraft on radar
         try:
             for ac in list(self._sdr.aircraft.values()):

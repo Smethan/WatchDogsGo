@@ -1,7 +1,7 @@
 from types import SimpleNamespace as NS
 
 from watchdogs.app import HUD_TOP, MAP_H, MapProjection, W
-from watchdogs.map_layers import HistoricalNodeLayer, LiveNodeLayer
+from watchdogs.map_layers import HistoricalNodeLayer, LiveNodeLayer, RadarNodeLayer
 
 
 class FakeImage:
@@ -163,3 +163,27 @@ def test_live_layer_excludes_notable_devices_from_cached_dots():
         if name != "cls"
     }
     assert primitive_calls == set()
+
+
+def test_radar_layer_deduplicates_pixels_and_translates_small_gps_moves():
+    wifi = [
+        NS(lat=40, lon=-90, bssid=f"00:11:22:33:44:{index:02X}",
+           color=10, hacked=False)
+        for index in range(20)
+    ]
+    subject, px, ble, loot = RadarNodeLayer(20), FakePyxel(), [], []
+    subject.request(
+        wifi, ble, loot, 1, frozenset(), 40, -90, scale=1000)
+    while subject._job is not None:
+        subject.step(max_ms=1000)
+    subject.draw(px, 610, 40, 40, -90, 1000)
+    point_calls = [call for call in subject.image.calls if call[0] == "pset"]
+    assert len(point_calls) == 1
+
+    first_image = subject.image
+    subject.request(
+        wifi, ble, loot, 1, frozenset(), 40, -89.998, scale=1000)
+    assert subject._job is None
+    subject.draw(px, 610, 40, 40, -89.998, 1000)
+    assert subject.image is first_image
+    assert px.blit_calls[-1][0] == 610 - 28 - 2
