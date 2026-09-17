@@ -1288,20 +1288,43 @@ class LootManager:
     def get_gps_points(self) -> list[dict]:
         """Collect all GPS-tagged loot across all sessions.
 
-        Returns list of dicts: {lat, lon, type, label}.
+        Returns one strongest observation per Wi-Fi/BLE/cell identity.  Source
+        files and aggregate loot counts remain observation-complete; this
+        deduplication is only for the map model.
         Cached for 30 seconds to avoid excessive FS scans.
         """
         now = time.monotonic()
         if self._gps_points_cache is not None and now - self._gps_points_ts < 30.0:
             return self._gps_points_cache
 
-        points: list[dict] = []
-        if not self._base.is_dir():
-            self._gps_points_cache = points
-            self._gps_points_ts = now
-            return points
+        winners: dict[tuple[str, str], tuple[float, int, dict]] = {}
+        anonymous: list[dict] = []
+        source_order = 0
 
-        for session_dir in self._base.iterdir():
+        def add_point(point: dict, identity_kind: str, identity: str):
+            nonlocal source_order
+            source_order += 1
+            identity = str(identity or "").strip().upper()
+            if not identity:
+                anonymous.append(point)
+                return
+            try:
+                signal = float(point.get("rssi", ""))
+            except (TypeError, ValueError):
+                signal = float("-inf")
+            key = (identity_kind, identity)
+            previous = winners.get(key)
+            if previous is None or (signal, source_order) >= previous[:2]:
+                winners[key] = (signal, source_order, point)
+
+        if not self._base.is_dir():
+            self._gps_points_cache = []
+            self._gps_points_ts = now
+            return self._gps_points_cache
+
+        # Session directory names are timestamped, so sorted traversal makes a
+        # later session the deterministic winner when RSSI values tie.
+        for session_dir in sorted(self._base.iterdir()):
             if not session_dir.is_dir():
                 continue
 
@@ -1319,10 +1342,11 @@ class LootManager:
                                     continue
                                 raw_type = row.get("Type", "WIFI").upper()
                                 ptype = "bt" if raw_type in ("BT", "BLE") else "cell" if raw_type in ("GSM", "WCDMA", "LTE", "NR") else "wifi"
-                                points.append({"lat":lat, "lon":lon, "type":ptype,
+                                point = {"lat":lat, "lon":lon, "type":ptype,
                                     "label":row.get("SSID") or row.get("MAC", "?"),
                                     "bssid":row.get("MAC", ""), "auth":row.get("AuthMode", ""),
-                                    "rssi":row.get("RSSI", ""), "channel":row.get("Channel", "")})
+                                    "rssi":row.get("RSSI", ""), "channel":row.get("Channel", "")}
+                                add_point(point, raw_type, row.get("MAC", ""))
                             except (ValueError, TypeError):
                                 pass
                 except OSError:
@@ -1339,7 +1363,7 @@ class LootManager:
                                 lat = float(row.get("lat", 0))
                                 lon = float(row.get("lon", 0))
                                 if lat != 0.0 or lon != 0.0:
-                                    points.append({
+                                    point = {
                                         "lat": lat, "lon": lon,
                                         "type": "bt",
                                         "label": row.get("name", row.get("mac", "?")),
@@ -1347,15 +1371,18 @@ class LootManager:
                                         "auth": "[BLE]",
                                         "rssi": row.get("rssi", ""),
                                         "channel": "",
-                                    })
+                                    }
+                                    add_point(point, "BLE", row.get("mac", ""))
                             except (ValueError, TypeError):
                                 pass
                 except OSError:
                     pass
 
-        self._gps_points_cache = points
+        # Dict insertion order retains the first-seen identity order even when
+        # a stronger later observation replaces its display data.
+        self._gps_points_cache = [entry[2] for entry in winners.values()] + anonymous
         self._gps_points_ts = now
-        return points
+        return self._gps_points_cache
 
     # ------------------------------------------------------------------
     # Cleanup
