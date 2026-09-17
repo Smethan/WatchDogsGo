@@ -407,13 +407,14 @@ class LiveNodeLayer:
 
     def __init__(self, width: int, map_top: int, map_height: int,
                  *, overscan: int = 128, rebuild_shift: int = 64,
-                 transparent: int = 15):
+                 transparent: int = 15, min_rebuild_interval: float = 0.5):
         self.width = width
         self.map_top = map_top
         self.map_height = map_height
         self.overscan = overscan
         self.rebuild_shift = rebuild_shift
         self.transparent = transparent
+        self.min_rebuild_interval = min_rebuild_interval
         self.images = (None, None)
         self.anchor_lat = 0.0
         self.anchor_lon = 0.0
@@ -422,6 +423,7 @@ class LiveNodeLayer:
         self._job: _LiveBuild | None = None
         self._queued: _LiveRequest | None = None
         self._ready: tuple[_LiveRequest, list] | None = None
+        self._last_publish_at = float("-inf")
         self.revision = 0
 
     @staticmethod
@@ -461,22 +463,33 @@ class LiveNodeLayer:
             if self._job.request.key != request.key:
                 self._queued = request
             return
-        if self._ready is not None and self._ready[0].key == request.key:
+        if self._ready is not None:
+            if self._ready[0].key != request.key:
+                self._queued = request
             return
+        if (has_image and self.data_token != request.token
+                and time.perf_counter() - self._last_publish_at
+                < self.min_rebuild_interval):
+            self._queued = request
+            return
+        self._queued = None
         self._job = _LiveBuild(
             request, self.width, self.map_top, self.map_height, self.overscan)
 
     def step(self, max_ms: float = 2.0, max_records: int | None = None):
+        if (self._job is None and self._queued is not None
+                and self._ready is None
+                and time.perf_counter() - self._last_publish_at
+                >= self.min_rebuild_interval):
+            request, self._queued = self._queued, None
+            self._job = _LiveBuild(
+                request, self.width, self.map_top, self.map_height,
+                self.overscan)
         if self._job is None or not self._job.step(max_ms, max_records):
             return
         request, commands = self._job.request, self._job.commands
         self._ready = request, commands
         self._job = None
-        queued, self._queued = self._queued, None
-        if queued is not None and queued.key != request.key:
-            self._job = _LiveBuild(
-                queued, self.width, self.map_top, self.map_height,
-                self.overscan)
 
     def _render_phase(self, px, request, commands, blink_phase):
         image = px.Image(
@@ -517,6 +530,7 @@ class LiveNodeLayer:
         self.anchor_lon = request.center_lon
         self.zoom = request.zoom
         self.data_token = request.token
+        self._last_publish_at = time.perf_counter()
         self.revision += 1
 
     def draw(self, px, proj):
@@ -626,11 +640,13 @@ class RadarNodeLayer:
 
     def __init__(self, radius: int, *, overscan: int = 8,
                  rebuild_shift: int = 4, transparent: int = 15,
+                 min_rebuild_interval: float = 0.5,
                  colors: dict[str, int] | None = None):
         self.radius = radius
         self.overscan = overscan
         self.rebuild_shift = rebuild_shift
         self.transparent = transparent
+        self.min_rebuild_interval = min_rebuild_interval
         self.colors = colors or {
             "wifi": 11, "bt": 3, "cell": 10, "handshake": 8,
             "meshcore": 9, "other": 5, "wifi_live": 9, "hacked": 11,
@@ -642,6 +658,7 @@ class RadarNodeLayer:
         self._job: _RadarBuild | None = None
         self._queued: _RadarRequest | None = None
         self._ready: tuple[_RadarRequest, dict] | None = None
+        self._last_publish_at = float("-inf")
 
     @staticmethod
     def _request(wifi, ble, loot, revision, notable, center_lat, center_lon,
@@ -679,21 +696,32 @@ class RadarNodeLayer:
             if self._job.request.key != request.key:
                 self._queued = request
             return
-        if self._ready is not None and self._ready[0].key == request.key:
+        if self._ready is not None:
+            if self._ready[0].key != request.key:
+                self._queued = request
             return
+        if (self.image is not None and self.data_token != request.token
+                and time.perf_counter() - self._last_publish_at
+                < self.min_rebuild_interval):
+            self._queued = request
+            return
+        self._queued = None
         self._job = _RadarBuild(
             request, self.radius, self.overscan, self.colors)
 
     def step(self, max_ms=1.0, max_records=None):
+        if (self._job is None and self._queued is not None
+                and self._ready is None
+                and time.perf_counter() - self._last_publish_at
+                >= self.min_rebuild_interval):
+            request, self._queued = self._queued, None
+            self._job = _RadarBuild(
+                request, self.radius, self.overscan, self.colors)
         if self._job is None or not self._job.step(max_ms, max_records):
             return
         request, pixels = self._job.request, self._job.pixels
         self._ready = request, pixels
         self._job = None
-        queued, self._queued = self._queued, None
-        if queued is not None and queued.key != request.key:
-            self._job = _RadarBuild(
-                queued, self.radius, self.overscan, self.colors)
 
     def _publish(self, px):
         if self._ready is None:
@@ -710,6 +738,7 @@ class RadarNodeLayer:
         self.anchor_lon = request.center_lon
         self.scale = request.scale
         self.data_token = request.token
+        self._last_publish_at = time.perf_counter()
 
     def draw(self, px, center_x, center_y, center_lat, center_lon, scale):
         self._publish(px)

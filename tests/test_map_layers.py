@@ -165,6 +165,30 @@ def test_live_layer_excludes_notable_devices_from_cached_dots():
     assert primitive_calls == set()
 
 
+def test_live_layer_coalesces_rapid_data_changes_between_publishes():
+    wifi = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+               color=10, hacked=False)]
+    subject = LiveNodeLayer(
+        W, HUD_TOP, MAP_H, min_rebuild_interval=60)
+    proj, px = projection(), FakePyxel()
+    subject.request(wifi, [], 1, frozenset(), proj)
+    while subject._job is not None:
+        subject.step(max_ms=1000)
+    subject.draw(px, proj)
+
+    wifi.append(NS(lat=40, lon=-90.001, bssid="00:11:22:33:44:66",
+                   color=9, hacked=False))
+    subject.request(wifi, [], 2, frozenset(), proj)
+    assert subject._job is None
+    assert subject._queued is not None
+
+    subject._last_publish_at -= 61
+    subject.step(max_ms=1000)
+    assert subject._ready is not None
+    subject.draw(px, proj)
+    assert subject.data_token[1] == 2
+
+
 def test_radar_layer_deduplicates_pixels_and_translates_small_gps_moves():
     wifi = [
         NS(lat=40, lon=-90, bssid=f"00:11:22:33:44:{index:02X}",
@@ -187,3 +211,23 @@ def test_radar_layer_deduplicates_pixels_and_translates_small_gps_moves():
     subject.draw(px, 610, 40, 40, -89.998, 1000)
     assert subject.image is first_image
     assert px.blit_calls[-1][0] == 610 - 28 - 2
+
+
+def test_radar_layer_coalesces_rapid_node_updates():
+    wifi = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+               color=10, hacked=False)]
+    ble, loot = [], []
+    subject = RadarNodeLayer(20, min_rebuild_interval=60)
+    px = FakePyxel()
+    subject.request(wifi, ble, loot, 1, frozenset(), 40, -90, 1000)
+    while subject._job is not None:
+        subject.step(max_ms=1000)
+    subject.draw(px, 610, 40, 40, -90, 1000)
+
+    wifi.append(NS(lat=40, lon=-90.001, bssid="00:11:22:33:44:66",
+                   color=9, hacked=False))
+    subject.request(wifi, ble, loot, 2, frozenset(), 40, -90, 1000)
+    assert subject._job is None and subject._queued is not None
+    subject._last_publish_at -= 61
+    subject.step(max_ms=1000)
+    assert subject._ready is not None
