@@ -56,6 +56,8 @@ HUD_BOT = 16
 TERM_H = 110
 MAP_H = H - HUD_TOP - HUD_BOT - TERM_H
 TERM_Y = H - HUD_BOT - TERM_H
+MAP_NODE_LIMIT = 2048
+RECENT_NODE_FX_LIMIT = 256
 
 # Pyxel palette (16 colors)
 C_WATER = 0
@@ -718,6 +720,11 @@ class WatchDogsGame(OtaMixin):
         self._recent_ble_fx: list[BleDevice] = []
         self._recent_wifi_fx: list[WifiNetwork] = []
         self._live_map_revision = 0
+        self._map_node_sequence = 0
+        self._session_wifi_discovered = 0
+        self._session_ble_discovered = 0
+        self._map_loot_view_key = None
+        self._map_loot_view: list[dict] = []
         self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
         self._radar_node_layer = RadarNodeLayer(20, colors={
             "wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
@@ -1439,22 +1446,24 @@ class WatchDogsGame(OtaMixin):
         # Camera follows player
         self.proj.smooth_move(self.player_lat, self.player_lon)
         self.proj.update()
-        history_layer = self._get_history_node_layer()
-        history_layer.request(self.loot_points, self.proj)
-        history_layer.step()
-        live_layer = self._get_live_node_layer()
-        notable, notable_revision = self.wardrive.live_notable_identities()
-        live_layer.request(
-            self.wifi_networks, self.ble_devices,
-            (self._live_map_revision, notable_revision), notable, self.proj)
-        live_layer.step()
-        radar_scale = 20 / max(self.proj.lon_span * 0.5, 0.001)
-        radar_layer = self._get_radar_node_layer()
-        radar_layer.request(
-            self.wifi_networks, self.ble_devices, self.loot_points,
-            (self._live_map_revision, notable_revision), notable,
-            self.player_lat, self.player_lon, radar_scale)
-        radar_layer.step()
+        if self.wardrive.show_network_dots():
+            history_layer = self._get_history_node_layer()
+            map_loot = self._get_map_loot_points()
+            history_layer.request(map_loot, self.proj)
+            history_layer.step()
+            live_layer = self._get_live_node_layer()
+            notable, notable_revision = self.wardrive.live_notable_identities()
+            live_layer.request(
+                self.wifi_networks, self.ble_devices,
+                (self._live_map_revision, notable_revision), notable, self.proj)
+            live_layer.step()
+            radar_scale = 20 / max(self.proj.lon_span * 0.5, 0.001)
+            radar_layer = self._get_radar_node_layer()
+            radar_layer.request(
+                self.wifi_networks, self.ble_devices, map_loot,
+                (self._live_map_revision, notable_revision), notable,
+                self.player_lat, self.player_lon, radar_scale)
+            radar_layer.step()
 
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
@@ -3688,6 +3697,40 @@ class WatchDogsGame(OtaMixin):
     # GPS polling
     # ------------------------------------------------------------------
 
+    def _remember_live_map_node(self, node, kind):
+        """Append a visual node and evict the globally oldest display node."""
+        self._map_node_sequence = getattr(self, "_map_node_sequence", 0) + 1
+        node.map_sequence = self._map_node_sequence
+        if kind == "wifi":
+            nodes = self.wifi_networks
+            recent_name = "_recent_wifi_fx"
+            count_name = "_session_wifi_discovered"
+        else:
+            nodes = self.ble_devices
+            recent_name = "_recent_ble_fx"
+            count_name = "_session_ble_discovered"
+        nodes.append(node)
+        setattr(self, count_name, getattr(self, count_name, 0) + 1)
+
+        recent = getattr(self, recent_name, None)
+        if recent is None:
+            recent = []
+            setattr(self, recent_name, recent)
+        recent.append(node)
+        if len(recent) > RECENT_NODE_FX_LIMIT:
+            del recent[:-RECENT_NODE_FX_LIMIT]
+
+        while len(self.wifi_networks) + len(self.ble_devices) > MAP_NODE_LIMIT:
+            wifi_seq = (getattr(self.wifi_networks[0], "map_sequence", -1)
+                        if self.wifi_networks else float("inf"))
+            ble_seq = (getattr(self.ble_devices[0], "map_sequence", -1)
+                       if self.ble_devices else float("inf"))
+            if wifi_seq <= ble_seq:
+                del self.wifi_networks[0]
+            else:
+                del self.ble_devices[0]
+        self._live_map_revision = getattr(self, "_live_map_revision", 0) + 1
+
     def _ingest_ble(self, mac, rssi, name, tag_type="", observation=None, terminal=True):
         if self._whitelist.is_blocked(mac):
             return  # silently skip whitelisted BLE device
@@ -3706,12 +3749,7 @@ class WatchDogsGame(OtaMixin):
                 self.player_lon + _dlon,
                 mac, name, rssi)
             d.spawn_frame = pyxel.frame_count
-            self.ble_devices.append(d)
-            recent = getattr(self, "_recent_ble_fx", None)
-            if recent is None:
-                recent = self._recent_ble_fx = []
-            recent.append(d)
-            self._live_map_revision = getattr(self, "_live_map_revision", 0) + 1
+            self._remember_live_map_node(d, "ble")
             self.msg(f"[BLE] {d.name} {mac[-8:]} {rssi}dBm", C_HACK_CYAN)
             self.gain_xp(10)  # new device: full XP
         else:
@@ -3791,12 +3829,7 @@ class WatchDogsGame(OtaMixin):
                     self.player_lon + _dlon,
                     bssid, net.ssid, ch, rssi_v)
                 n.spawn_frame = pyxel.frame_count
-                self.wifi_networks.append(n)
-                recent = getattr(self, "_recent_wifi_fx", None)
-                if recent is None:
-                    recent = self._recent_wifi_fx = []
-                recent.append(n)
-                self._live_map_revision = getattr(self, "_live_map_revision", 0) + 1
+                self._remember_live_map_node(n, "wifi")
                 self.msg(f"[WiFi] {n.ssid} Ch:{ch}", C_WARNING)
                 self.gain_xp(15)  # new network: full XP
             else:
@@ -4319,10 +4352,7 @@ class WatchDogsGame(OtaMixin):
             self._draw_coastlines()
         self._draw_grid()
         self.wardrive.draw_trail()
-        self._draw_loot_points()
-        self._draw_live_nodes()
-        self._draw_wifi()
-        self._draw_ble()
+        self._draw_wardrive_nodes()
         self._draw_scan_fx()
         self._draw_player()
         self.wardrive.draw_markers()
@@ -4344,8 +4374,9 @@ class WatchDogsGame(OtaMixin):
         if self._cluster_popup:
             self._draw_cluster_popup()
         # Cluster mode hint (above terminal, visible on map)
-        visible_cluster_count = len(
+        visible_cluster_count = (len(
             self._get_history_node_layer().visible_clusters(self.proj))
+            if self.wardrive.show_network_dots() else 0)
         if not self.menu_open and not self._cluster_popup and visible_cluster_count:
             if self._cluster_sel >= 0:
                 cl = self._clusters[self._cluster_sel] if self._cluster_sel < len(self._clusters) else None
@@ -4420,6 +4451,25 @@ class WatchDogsGame(OtaMixin):
     # Map clustering
     # ------------------------------------------------------------------
 
+    def _get_map_loot_points(self):
+        """Return historical points within the shared 2,048-node map budget."""
+        points = self.loot_points
+        live_count = min(
+            MAP_NODE_LIMIT,
+            len(getattr(self, "wifi_networks", ()))
+            + len(getattr(self, "ble_devices", ())))
+        # Change the historical slice only every 128 discoveries. This keeps
+        # the total at or below the CM4 display budget without reclustering the
+        # historical layer for every serial record in a scan result burst.
+        live_reservation = min(
+            MAP_NODE_LIMIT, ((live_count + 127) // 128) * 128)
+        history_limit = MAP_NODE_LIMIT - live_reservation
+        key = (id(points), len(points), history_limit)
+        if key != getattr(self, "_map_loot_view_key", None):
+            self._map_loot_view_key = key
+            self._map_loot_view = points[-history_limit:] if history_limit else []
+        return self._map_loot_view
+
     def _get_history_node_layer(self):
         """Return the cached historical-node layer, including test instances."""
         layer = getattr(self, "_history_node_layer", None)
@@ -4432,13 +4482,13 @@ class WatchDogsGame(OtaMixin):
     def _update_clusters(self):
         """Advance the bounded cluster build used by legacy callers/tests."""
         layer = self._get_history_node_layer()
-        layer.request(self.loot_points, self.proj)
+        layer.request(self._get_map_loot_points(), self.proj)
         layer.step()
         self._clusters = layer.clusters
 
     def _draw_loot_points(self):
         layer = self._get_history_node_layer()
-        layer.request(self.loot_points, self.proj)
+        layer.request(self._get_map_loot_points(), self.proj)
         layer.draw(pyxel, self.proj, self._cluster_sel)
         self._clusters = layer.clusters
         revision = getattr(self, "_cluster_layer_revision", -1)
@@ -4514,6 +4564,10 @@ class WatchDogsGame(OtaMixin):
         ENTER: open popup for selected cluster.
         ESC: exit cluster selection.
         """
+        if not self.wardrive.show_network_dots():
+            self._cluster_sel = -1
+            self._cluster_popup = None
+            return
         if not self._clusters:
             self._cluster_sel = -1
             return
@@ -4685,6 +4739,15 @@ class WatchDogsGame(OtaMixin):
         if layer is None:
             layer = self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
         return layer
+
+    def _draw_wardrive_nodes(self):
+        """Draw ordinary nodes only when enabled; special overlays stay live."""
+        if not self.wardrive.show_network_dots():
+            return
+        self._draw_loot_points()
+        self._draw_live_nodes()
+        self._draw_wifi()
+        self._draw_ble()
 
     def _get_radar_node_layer(self):
         layer = getattr(self, "_radar_node_layer", None)
@@ -5109,8 +5172,10 @@ class WatchDogsGame(OtaMixin):
         y = H - HUD_BOT + 5
 
         # All-time totals from loot_db + current session additions
-        t_bt   = self._loot_totals.get("bt",   0) + len(self.ble_devices)
-        t_wifi = self._loot_totals.get("wifi", 0) + len(self.wifi_networks)
+        t_bt = self._loot_totals.get("bt", 0) + getattr(
+            self, "_session_ble_discovered", len(self.ble_devices))
+        t_wifi = self._loot_totals.get("wifi", 0) + getattr(
+            self, "_session_wifi_discovered", len(self.wifi_networks))
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         t_hs   = self._loot_totals.get("hs",   0) + n_hs_ses
         t_cell = self._loot_totals.get("cell", 0) + len(self.wardrive.cell.unique)
@@ -5215,12 +5280,14 @@ class WatchDogsGame(OtaMixin):
         scale = rr / max(self.proj.lon_span * 0.5, 0.001)
         notable, notable_revision = self.wardrive.live_notable_identities()
         radar_layer = self._get_radar_node_layer()
-        radar_layer.request(
-            self.wifi_networks, self.ble_devices, self.loot_points,
-            (getattr(self, "_live_map_revision", 0), notable_revision), notable,
-            self.player_lat, self.player_lon, scale)
-        radar_layer.draw(
-            pyxel, rx, ry, self.player_lat, self.player_lon, scale)
+        if self.wardrive.show_network_dots():
+            radar_layer.request(
+                self.wifi_networks, self.ble_devices,
+                self._get_map_loot_points(),
+                (getattr(self, "_live_map_revision", 0), notable_revision),
+                notable, self.player_lat, self.player_lon, scale)
+            radar_layer.draw(
+                pyxel, rx, ry, self.player_lat, self.player_lon, scale)
         for m in self.markers:
             dx = (m.lon - self.player_lon) * scale
             dy = (self.player_lat - m.lat) * scale
@@ -7864,10 +7931,14 @@ class WatchDogsGame(OtaMixin):
         n_hs_ses = sum(1 for m in self.markers if m.type == "handshake")
         n_pwn = self._current_hacked_count()
         pyxel.text(col2, y, f"WiFi", C_DIM)
-        pyxel.text(col2 + 70, y, f"{len(self.wifi_networks)}", C_SUCCESS)
+        pyxel.text(col2 + 70, y,
+                   f"{getattr(self, '_session_wifi_discovered', len(self.wifi_networks))}",
+                   C_SUCCESS)
         y += ROW_H
         pyxel.text(col2, y, f"BLE", C_DIM)
-        pyxel.text(col2 + 70, y, f"{len(self.ble_devices)}", C_HACK_CYAN)
+        pyxel.text(col2 + 70, y,
+                   f"{getattr(self, '_session_ble_discovered', len(self.ble_devices))}",
+                   C_HACK_CYAN)
         y += ROW_H
         pyxel.text(col2, y, f"Handshakes", C_DIM)
         pyxel.text(col2 + 70, y, f"{n_hs_ses}", C_ERROR)

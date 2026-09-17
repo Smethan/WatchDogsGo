@@ -16,7 +16,7 @@ from watchdogs.wardrive_trail import FixHistory, WardriveTrail
 from watchdogs.gps_manager import GpsFix, GpsManager
 from watchdogs.loot_manager import LootManager
 from watchdogs.app_state import AppState, Network
-from watchdogs.app import WatchDogsGame
+from watchdogs.app import MAP_NODE_LIMIT, RECENT_NODE_FX_LIMIT, WatchDogsGame
 from watchdogs.wardrive_ui import WardriveUI
 
 def record(kind="wifi", **kwargs):
@@ -236,9 +236,53 @@ def test_integration_both_radios_precise_toggle_and_raw_gps(game):
     w.handle_line(wire(record("wifi",session=token,seq=4)))
     assert game.gain_xp.call_count==before and len(game.state.networks)==1
     assert len(w.alerts)==2
+    w.settings["network_dots"] = False
+    assert list(w.visible_notables())  # special Flock/Axon markers stay enabled
     with (game.loot._session/"wardriving.csv").open(newline="") as f:
         next(f);rows=list(csv.reader(f))[1:]
     assert {row[-1] for row in rows}=={"WIFI","BLE"}
+
+
+def test_live_map_node_window_evicts_globally_oldest_without_losing_counts():
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.wifi_networks = []
+    game.ble_devices = []
+    for index in range(MAP_NODE_LIMIT + 10):
+        node = NS()
+        game._remember_live_map_node(node, "wifi" if index % 2 else "ble")
+
+    retained = sorted(
+        game.wifi_networks + game.ble_devices,
+        key=lambda node: node.map_sequence)
+    assert len(retained) == MAP_NODE_LIMIT
+    assert retained[0].map_sequence == 11
+    assert retained[-1].map_sequence == MAP_NODE_LIMIT + 10
+    assert (game._session_wifi_discovered + game._session_ble_discovered
+            == MAP_NODE_LIMIT + 10)
+    assert len(game._recent_wifi_fx) <= RECENT_NODE_FX_LIMIT
+    assert len(game._recent_ble_fx) <= RECENT_NODE_FX_LIMIT
+
+
+def test_network_dot_toggle_skips_only_generic_node_layers():
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.wardrive = NS(show_network_dots=lambda: False)
+    game._draw_loot_points = Mock()
+    game._draw_live_nodes = Mock()
+    game._draw_wifi = Mock()
+    game._draw_ble = Mock()
+
+    game._draw_wardrive_nodes()
+
+    assert not game._draw_loot_points.called
+    assert not game._draw_live_nodes.called
+    assert not game._draw_wifi.called
+    assert not game._draw_ble.called
+
+    game.wardrive.show_network_dots = lambda: True
+    game._draw_wardrive_nodes()
+    assert all(method.called for method in (
+        game._draw_loot_points, game._draw_live_nodes,
+        game._draw_wifi, game._draw_ble))
 
 
 def test_wifi_target_index_recovers_after_public_list_clear(game):

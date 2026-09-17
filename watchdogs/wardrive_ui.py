@@ -18,7 +18,8 @@ from .host_ble import HostBleScanner
 from .cell_monitor import HostCellScanner, find_unclean_cell_session
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
-DEFAULTS = {"flock": True, "axon": True, "precise": True, "trail": False,
+DEFAULTS = {"flock": True, "axon": True, "precise": True,
+            "network_dots": True, "trail": False,
             "cell_tracking": True, "cell_neighbors": False,
             "realert_seconds": 60, "suppressed_rules": [], "suppressed_devices": []}
 
@@ -549,6 +550,10 @@ class WardriveUI:
     def live_notable_identities(self):
         return self._notable_identities, self._notable_revision
 
+    def show_network_dots(self):
+        """Whether ordinary Wi-Fi/BLE/cell map and radar dots are visible."""
+        return self.settings.get("network_dots", True)
+
     def is_notable(self, kind, mac):
         return any(kind+":"+mac.upper()+":"+cat in self.notables and self.settings[cat]
                    and self.notables[kind+":"+mac.upper()+":"+cat]["strength"] > 0 for cat in ("flock", "axon"))
@@ -724,7 +729,8 @@ class WardriveUI:
                 self.settings["suppressed_devices"] = []
                 self.persist_settings()
             return
-        keys = ("flock", "axon", "precise", "trail", "cell_tracking", "cell_neighbors")
+        keys = ("flock", "axon", "precise", "network_dots", "trail",
+                "cell_tracking", "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
@@ -732,6 +738,9 @@ class WardriveUI:
             self.settings[key] = not self.settings[key]
             if key in ("flock", "axon"):
                 self._refresh_notable_identities()
+            if key == "network_dots" and not self.settings[key]:
+                self.app._cluster_sel = -1
+                self.app._cluster_popup = None
             if key == "trail": self.trail.break_segment()
             if key == "cell_tracking" and not self.settings[key]:
                 self.cell.stop()
@@ -754,12 +763,13 @@ class WardriveUI:
             px.rect(40,35,560,285,0)
             px.rectb(40,35,560,285,PURPLE)
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
-            keys = ("flock", "axon", "precise", "trail", "cell_tracking", "cell_neighbors")
+            keys = ("flock", "axon", "precise", "network_dots", "trail",
+                    "cell_tracking", "cell_neighbors")
             labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
-                      "Wardrive trail", "Cell mast tracking",
+                      "Regular wardrive dots (2048 max)", "Wardrive trail", "Cell mast tracking",
                       "Experimental QMI neighbors")
             for i,(key,label) in enumerate(zip(keys,labels)):
-                px.text(55,68+i*14,("> " if i==self.selection else "  ")+label+": "+("ON" if self.settings[key] else "OFF"),11 if i==self.selection else 7)
+                px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+("ON" if self.settings[key] else "OFF"),11 if i==self.selection else 7)
             px.text(55,155,"Precise = where YOU heard it, not the camera location.",13)
             px.text(55,166,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
             route = self.history_trail.path.parent.name if self.history_trail else "current session"

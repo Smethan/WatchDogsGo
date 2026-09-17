@@ -3,7 +3,7 @@ from unittest.mock import Mock
 from queue import Queue
 import zlib
 
-from watchdogs.app import MapProjection, WatchDogsGame
+from watchdogs.app import MAP_NODE_LIMIT, MapProjection, WatchDogsGame
 from watchdogs.map_index import GeoObjectIndex, GeoPointIndex
 from watchdogs.wardrive_trail import WardriveTrail
 from watchdogs.wardrive_ui import WardriveUI
@@ -118,6 +118,24 @@ def test_projection_keeps_smoothing_visible_camera_motion():
 
     assert projection.center_lat == 40.0008
     assert projection.center_lon == -90.0008
+
+
+def test_map_history_view_keeps_only_newest_points_without_truncating_loot():
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.loot_points = [{"id": index} for index in range(MAP_NODE_LIMIT + 12)]
+
+    view = game._get_map_loot_points()
+
+    assert len(view) == MAP_NODE_LIMIT
+    assert view[0]["id"] == 12
+    assert view[-1]["id"] == MAP_NODE_LIMIT + 11
+    assert len(game.loot_points) == MAP_NODE_LIMIT + 12
+    assert game._get_map_loot_points() is view
+
+    game.wifi_networks = [object()] * 130
+    reduced = game._get_map_loot_points()
+    assert len(reduced) == MAP_NODE_LIMIT - 256
+    assert len(reduced) + len(game.wifi_networks) <= MAP_NODE_LIMIT
 
 
 def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(

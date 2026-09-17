@@ -1298,7 +1298,7 @@ class LootManager:
             return self._gps_points_cache
 
         winners: dict[tuple[str, str], tuple[float, int, dict]] = {}
-        anonymous: list[dict] = []
+        anonymous: list[tuple[int, dict]] = []
         source_order = 0
 
         def add_point(point: dict, identity_kind: str, identity: str):
@@ -1306,7 +1306,7 @@ class LootManager:
             source_order += 1
             identity = str(identity or "").strip().upper()
             if not identity:
-                anonymous.append(point)
+                anonymous.append((source_order, point))
                 return
             try:
                 signal = float(point.get("rssi", ""))
@@ -1378,9 +1378,12 @@ class LootManager:
                 except OSError:
                     pass
 
-        # Dict insertion order retains the first-seen identity order even when
-        # a stronger later observation replaces its display data.
-        self._gps_points_cache = [entry[2] for entry in winners.values()] + anonymous
+        # Sort by the winning observation's source order so callers can retain
+        # a bounded newest-first display window without changing stored loot.
+        ordered = [(entry[1], entry[2]) for entry in winners.values()]
+        ordered.extend(anonymous)
+        ordered.sort(key=lambda entry: entry[0])
+        self._gps_points_cache = [point for _order, point in ordered]
         self._gps_points_ts = now
         return self._gps_points_cache
 
