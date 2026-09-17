@@ -352,8 +352,20 @@ class MapProjection:
         self._target_lat, self._target_lon = lat, lon
 
     def update(self):
-        self.center_lat += (self._target_lat - self.center_lat) * 0.08
-        self.center_lon += (self._target_lon - self.center_lon) * 0.08
+        scale = W / self.lon_span
+        lat_delta = self._target_lat - self.center_lat
+        lon_delta = self._target_lon - self.center_lon
+        # Exponential easing otherwise approaches the target forever.  Once
+        # the remaining movement is below half a screen pixel, settle exactly
+        # so map caches and tile placement stop receiving meaningless changes.
+        if abs(lat_delta * scale) < 0.5:
+            self.center_lat = self._target_lat
+        else:
+            self.center_lat += lat_delta * 0.08
+        if abs(lon_delta * scale) < 0.5:
+            self.center_lon = self._target_lon
+        else:
+            self.center_lon += lon_delta * 0.08
 
     def geo_to_screen(self, lat, lon):
         dx = lon - self.center_lon

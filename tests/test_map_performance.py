@@ -93,6 +93,33 @@ def test_geo_index_uses_fine_bucket_for_dense_close_view():
     assert index._last_query_candidates < len(points) // 10
 
 
+def test_projection_settles_when_camera_is_within_half_a_pixel():
+    projection = MapProjection()
+    projection.zoom = 13
+    projection.center_lat = 40.0
+    projection.center_lon = -90.0
+    subpixel = 0.49 * projection.lon_span / 640
+    projection.smooth_move(40.0 + subpixel, -90.0 - subpixel)
+
+    projection.update()
+
+    assert projection.center_lat == projection._target_lat
+    assert projection.center_lon == projection._target_lon
+
+
+def test_projection_keeps_smoothing_visible_camera_motion():
+    projection = MapProjection()
+    projection.zoom = 13
+    projection.center_lat = 40.0
+    projection.center_lon = -90.0
+    projection.smooth_move(40.01, -90.01)
+
+    projection.update()
+
+    assert projection.center_lat == 40.0008
+    assert projection.center_lon == -90.0008
+
+
 def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
         monkeypatch):
     trail = WardriveTrail()
