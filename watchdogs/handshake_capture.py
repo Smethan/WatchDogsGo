@@ -8,6 +8,7 @@ from .passive_capture import PassiveCapture
 from .wardrive_protocol import integer, MAC, TOKEN
 
 COMMANDS = {"sd": "start_handshake", "serial": "start_handshake_serial"}
+MAX_EXCLUSIONS = 32
 
 
 def capture_storage(command):
@@ -22,7 +23,9 @@ def capture_storage(command):
     if len(parts) == 3:
         return parts[1] if parts[2] == 'all' else None
     macs = parts[3].split(',')
-    if not TOKEN.fullmatch(parts[2]) or not 1 <= len(macs) <= 16 or any(not MAC.fullmatch(mac) for mac in macs):
+    limit = MAX_EXCLUSIONS if parts[2] == 'all-except' else 16
+    scope_valid = parts[2] == 'all-except' or TOKEN.fullmatch(parts[2])
+    if not scope_valid or not 1 <= len(macs) <= limit or any(not MAC.fullmatch(mac) for mac in macs):
         return None
     return parts[1]
 
@@ -96,7 +99,9 @@ class HandshakeCapture:
         run.state = "starting"
         parts = command.split()
         if len(parts) == 4 and parts[0] == "start_handshake_scope":
-            run.scope = f"SELECTED: {len(parts[3].split(chr(44)))}"
+            count = len(parts[3].split(chr(44)))
+            run.scope = (f"ALL NEARBY / {count} WHITELISTED"
+                         if parts[2] == "all-except" else f"SELECTED: {count}")
 
     def stop(self):
         if self.current and self.current.active and self.current.state != "finishing":

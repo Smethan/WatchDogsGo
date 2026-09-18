@@ -6,6 +6,7 @@ import time
 from .wardrive_protocol import MAC, TOKEN, integer, display_bytes
 
 MAX_TARGETS = 16
+MAX_EXCLUSIONS = 32
 MAX_NETWORKS = 64
 ERRORS = {
     'scan_expired': 'Scan changed or expired. Scan and select networks again.',
@@ -154,10 +155,29 @@ class HandshakeTargets:
             raise ValueError('Open/WEP networks have no WPA handshake to capture.')
         self.choices[storage] = (self.token, tuple(sorted(self.draft)))
 
-    def command(self, storage, supported, blocked=lambda _: False):
+    def command(self, storage, supported, blocked=lambda _: False,
+                exclusions_supported=False, excluded=()):
         from .handshake_capture import COMMANDS
         selected = self.choices[storage]
         if selected is None:
+            exclusions = []
+            for value in excluded:
+                mac = str(value).strip().upper()
+                try:
+                    raw = bytes.fromhex(mac.replace(':', ''))
+                except ValueError:
+                    raw = b''
+                if (not MAC.fullmatch(mac) or len(raw) != 6 or raw[0] & 1
+                        or not any(raw)):
+                    raise ValueError('The Wi-Fi whitelist contains an invalid BSSID; fix it before all-nearby capture.')
+                if mac not in exclusions:
+                    exclusions.append(mac)
+            if exclusions:
+                if supported is not True or exclusions_supported is not True:
+                    raise ValueError('All-nearby whitelist protection requires firmware 1.7.11+. Update the ESP32 first.')
+                if len(exclusions) > MAX_EXCLUSIONS:
+                    raise ValueError('All-nearby capture supports up to 32 whitelisted Wi-Fi BSSIDs.')
+                return f'start_handshake_scope {storage} all-except ' + ','.join(exclusions)
             return f'start_handshake_scope {storage} all' if supported is True else COMMANDS[storage]
         if supported is not True:
             raise ValueError('Selected capture requires firmware 1.7.9+. Update the ESP32 first.')

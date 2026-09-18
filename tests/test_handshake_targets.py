@@ -7,6 +7,7 @@ import pytest
 
 from watchdogs.handshake_capture import COMMANDS
 from watchdogs.handshake_targets import (
+    MAX_EXCLUSIONS,
     MAX_NETWORKS,
     MAX_TARGETS,
     HandshakeTargets,
@@ -181,6 +182,48 @@ def test_per_storage_choices_and_selected_commands_are_independent():
     assert target.command("sd", None) == COMMANDS["sd"]
     assert target.command("sd", False) == COMMANDS["sd"]
     assert target.command("serial", True).endswith("02:00:00:00:00:02")
+
+
+@pytest.mark.parametrize("storage", ["sd", "serial"])
+def test_all_nearby_sends_whitelist_exclusions_and_fails_closed(storage):
+    target = HandshakeTargets()
+    blocked = ["02:00:00:00:00:02", "02:00:00:00:00:01",
+               "02:00:00:00:00:02"]
+    assert target.command(storage, True, exclusions_supported=True,
+                          excluded=blocked) == (
+        f"start_handshake_scope {storage} all-except "
+        "02:00:00:00:00:02,02:00:00:00:00:01"
+    )
+    with pytest.raises(ValueError, match="firmware 1.7.11"):
+        target.command(storage, True, exclusions_supported=False,
+                       excluded=blocked)
+    with pytest.raises(ValueError, match="invalid BSSID"):
+        target.command(storage, True, exclusions_supported=True,
+                       excluded=["not-a-mac"])
+    too_many = [f"02:00:00:00:{i // 256:02X}:{i % 256:02X}"
+                for i in range(MAX_EXCLUSIONS + 1)]
+    with pytest.raises(ValueError, match="up to 32"):
+        target.command(storage, True, exclusions_supported=True,
+                       excluded=too_many)
+
+
+@pytest.mark.parametrize("storage", ["sd", "serial"])
+def test_capture_screen_protects_wifi_whitelist_in_all_mode(game, monkeypatch, storage):
+    screen = game.wardrive.capture_screen
+    game.wardrive.scan.capture_targets_supported = True
+    game.wardrive.scan.capture_exclusions_supported = True
+    game._whitelist.entries = [
+        type("Entry", (), {"type": "wifi", "mac": "02:00:00:00:00:01"})(),
+        type("Entry", (), {"type": "ble", "mac": "02:00:00:00:00:02"})(),
+    ]
+    game._is_running = Mock(return_value=False)
+    screen.show(storage)
+    px = sys.modules["pyxel"]
+    monkeypatch.setattr(px, "btnp", lambda key: key == px.KEY_RETURN)
+    screen.update()
+    assert game._pending_cmd == (
+        f"start_handshake_scope {storage} all-except 02:00:00:00:00:01"
+    )
 
 
 def test_selected_mode_never_falls_back_to_all_after_capability_or_snapshot_change():

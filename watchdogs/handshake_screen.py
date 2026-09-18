@@ -20,6 +20,13 @@ class HandshakeScreen(PassiveScreen):
         self.picker = False
         self.open = True
 
+    def wifi_whitelist(self):
+        """Return only AP BSSIDs; BLE whitelist entries are unrelated."""
+        return tuple(
+            entry.mac for entry in getattr(self.app._whitelist, "entries", ())
+            if str(getattr(entry, "type", "")).lower() == "wifi"
+        )
+
     def update(self):
         import pyxel as px
         if self.picker:
@@ -48,7 +55,13 @@ class HandshakeScreen(PassiveScreen):
             # If the other capture variant is running, use the regular stop/start
             # transition rather than treating ENTER as a shared-state toggle.
             try:
-                command = self.owner.targets.command(self.storage, self.owner.scan.capture_targets_supported, self.app._whitelist.is_blocked)
+                command = self.owner.targets.command(
+                    self.storage,
+                    self.owner.scan.capture_targets_supported,
+                    self.app._whitelist.is_blocked,
+                    self.owner.scan.capture_exclusions_supported,
+                    self.wifi_whitelist(),
+                )
             except ValueError as exc:
                 self.app.msg(str(exc), 9)
                 return
@@ -71,6 +84,9 @@ class HandshakeScreen(PassiveScreen):
         pmkid = str(run.pmkids) if run.session else "N/A"
         px.text(8,40,f"EAPOL:{run.eapol}  PMKID:{pmkid}  Frames:{run.frames}  Drops:{run.drops}  Gaps:{run.gaps}  Incomplete:{run.lost}",7)
         scope = run.scope if run.active else self.owner.targets.label(self.storage)
+        if (not run.active and self.owner.targets.choices[self.storage] is None
+                and self.wifi_whitelist()):
+            scope += f" / EXCLUDES {len(self.wifi_whitelist())} WL"
         px.text(8,55,"Targets: " + scope + " | Packet counts; matching pairs are not checked.",13)
         self.draw_rows(run, active=True)
         destination = "Files: ESP32 SD /lab/handshakes/ (requires SD card on ESP32)." if self.storage == "sd" else "Files: uConsole loot/handshakes after capture stops; wait for transfer."

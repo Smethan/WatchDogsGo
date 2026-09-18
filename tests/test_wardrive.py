@@ -76,7 +76,9 @@ def test_v2_protocol_boundaries_and_batches():
 def test_v2_is_default_with_legacy_fallback_and_independent_liveness():
     now=[0];sent=[];c=ScanController(sent.append,lambda:now[0])
     c.handle(dict(kind="capabilities",wardrive_serial_v1=True,wardrive_wifi_serial_v1=True,
-                  wardrive_batch_serial_v2=True,wardrive_wifi_batch_serial_v2=True))
+                  wardrive_batch_serial_v2=True,wardrive_wifi_batch_serial_v2=True,
+                  hs_capture_targets_v1=True,hs_capture_exclusions_v1=True))
+    assert c.capture_targets_supported and c.capture_exclusions_supported
     assert c.start() and sent[-1].startswith("start_wardrive_batch_serial ")
     token=c.session
     c.handle(batch_control("started",session=token,seq=1,batch=0))

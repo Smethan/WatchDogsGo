@@ -6,7 +6,12 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import pytest
 
-from watchdogs.handshake_capture import HandshakeCapture, parse_progress, COMMANDS
+from watchdogs.handshake_capture import (
+    COMMANDS,
+    HandshakeCapture,
+    capture_storage,
+    parse_progress,
+)
 from test_wardrive import game, loot, passive_frame, passive_records
 
 
@@ -29,6 +34,15 @@ def started():
     c.start(COMMANDS["serial"])
     c.handle(wire(status()))
     return c
+
+
+def test_all_except_command_parsing_and_scope_label():
+    command = ("start_handshake_scope serial all-except "
+               "02:00:00:00:00:01,02:00:00:00:00:02")
+    assert capture_storage(command) == "serial"
+    capture = HandshakeCapture();capture.start(command)
+    assert capture.current.scope == "ALL NEARBY / 2 WHITELISTED"
+    assert capture_storage("start_handshake_scope serial all-except bad") is None
 
 
 @pytest.mark.parametrize("change", [dict(v=True), dict(seq=0), dict(storage="other"),
