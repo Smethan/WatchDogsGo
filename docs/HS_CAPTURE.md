@@ -82,9 +82,18 @@ callback has drained. Each serial artifact declares `VALID`, `PMKID` or
 line commits the complete sequence. It requires a canonical final BSSID and
 bounds/sanitizes both filename components before writing.
 
-With older firmware, all-nearby capture still works. The picker requires the
-`hs_capture_targets_v1` capability and refuses selected startup when it is not
-available. WDG displays any existing M1–M4
+With older firmware, all-nearby capture still works when the Wi-Fi whitelist is
+empty. Firmware 1.7.11 advertises `hs_capture_exclusions_v1`; when one or more
+Wi-Fi BSSIDs are whitelisted, WDG sends them as an immutable all-nearby
+exclusion set for both capture destinations. Firmware rejects their frames at
+the receive callback and checks the exclusion again before deauthentication.
+WDG refuses to start all-nearby capture with a nonempty Wi-Fi whitelist when
+that capability is unavailable, so protected networks are never silently sent
+to older firmware. BLE whitelist entries do not affect Wi-Fi capture. Up to 32
+Wi-Fi BSSIDs can be excluded; a larger or malformed list fails closed.
+
+The picker requires the `hs_capture_targets_v1` capability and refuses selected
+startup when it is not available. WDG displays any existing M1–M4
 log sightings under their AP, with unknown client/channel/RSSI. **PMKID: N/A**
 means live PMKID reporting is unavailable, not that none were captured. Selected
 network mode on older firmware may not provide these coarse M-number logs.

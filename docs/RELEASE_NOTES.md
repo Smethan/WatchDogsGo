@@ -1,5 +1,22 @@
 # Smethan WatchDogsGo
 
+## 0.9.37 — Whitelist-safe active HS capture
+
+- Apply the host Wi-Fi whitelist to **All nearby** in both HS Capture
+  destinations. WDG sends up to 32 protected BSSIDs through firmware 1.7.11's
+  `all-except` scope; BLE whitelist entries are ignored for this Wi-Fi policy.
+- Fail closed when all-nearby capture has protected Wi-Fi BSSIDs but the
+  firmware lacks `hs_capture_exclusions_v1`, the list is malformed, or more
+  than 32 Wi-Fi entries would be required. WDG no longer silently falls back to
+  the unprotected legacy command in those cases.
+- Show the excluded whitelist count before startup and in the active capture
+  scope. Manually selected capture retains its existing per-BSSID whitelist
+  validation and firmware 1.7.9 compatibility.
+
+Requires projectZero 1.7.11 when the Wi-Fi whitelist is nonempty. An empty
+whitelist retains compatibility with older firmware. No device commands were
+sent while implementing or testing this change.
+
 ## 0.9.36 — Smooth scan ingestion
 
 - Replace per-observation WiGLE CSV reads, full rewrites, and `fsync` calls
