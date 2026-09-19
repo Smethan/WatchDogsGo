@@ -286,7 +286,7 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
     from watchdogs.loot_manager import LootManager, _TARGET_PCAP_MAX
 
     loot = LootManager(str(tmp_path))
-    assert _TARGET_PCAP_MAX == 2136
+    assert _TARGET_PCAP_MAX == 3192
     monkeypatch.setattr(loot, "_try_generate_22000", lambda _: None)
     pcap = base64.b64encode(b"P" * 40).decode()
     hccapx = base64.b64encode(b"H" * 393).decode()
@@ -461,3 +461,51 @@ def test_empty_capture_with_drops_explains_usb_ring_fix(game, monkeypatch):
     monkeypatch.setattr(px, 'text', text)
     w.capture_screen.draw()
     assert any('1.7.6 fixes the USB buffer' in c.args[2] for c in text.call_args_list)
+
+
+def test_serial_artifact_pcapng_is_required_validated_rebased_and_saved(tmp_path, monkeypatch):
+    import io
+    from watchdogs.loot_manager import LootManager
+    from watchdogs.pcapng import PcapngWriter, validate_pcapng
+
+    output = io.BytesIO()
+    writer = PcapngWriter(output)
+    writer.write_packet(b"\x80" + b"\0" * 35, 1.25, channel=6, rssi=-44)
+    pcapng = output.getvalue()
+
+    loot = LootManager(str(tmp_path))
+    monkeypatch.setattr(loot, "_try_generate_22000", lambda _: None)
+    lines = (
+        "CAPTURE_KIND: PARTIAL",
+        "CAPTURE_FORMAT: PCAPNG",
+        "--- PCAPNG BEGIN ---", base64.b64encode(pcapng).decode(),
+        "--- PCAPNG END ---", f"PCAPNG_SIZE: {len(pcapng)}",
+        "SSID: RichCapture  AP: 02:00:00:00:00:91",
+    )
+    for line in lines:
+        loot._detect_pcap_stream(line)
+    saved = next(loot._handshake_dir.glob("*.pcapng"))
+    info = validate_pcapng(saved.read_bytes())
+    assert info.packets == 1 and info.last_timestamp_us >= 946684800000000
+    assert not list(loot._handshake_dir.glob("*.pcap"))
+
+    before = set(loot._handshake_dir.glob("*"))
+    for line in (
+        "CAPTURE_KIND: PARTIAL",
+        "CAPTURE_FORMAT: PCAPNG",
+        "SSID: MissingNG  AP: 02:00:00:00:00:92",
+    ):
+        loot._detect_pcap_stream(line)
+    assert set(loot._handshake_dir.glob("*")) == before
+
+    corrupt = bytearray(pcapng); corrupt[-1] ^= 1
+    for line in (
+        "CAPTURE_KIND: PARTIAL",
+        "CAPTURE_FORMAT: PCAPNG",
+        "--- PCAPNG BEGIN ---", base64.b64encode(corrupt).decode(),
+        "--- PCAPNG END ---", f"PCAPNG_SIZE: {len(corrupt)}",
+        "SSID: BadNG  AP: 02:00:00:00:00:93",
+    ):
+        loot._detect_pcap_stream(line)
+    assert set(loot._handshake_dir.glob("*")) == before
+    loot.close()

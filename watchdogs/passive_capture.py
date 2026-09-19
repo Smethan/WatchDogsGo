@@ -6,8 +6,9 @@ from collections import OrderedDict
 import json
 import os
 from pathlib import Path
-import struct
 import time
+
+from .pcapng import PcapngWriter
 
 
 def tagged_fields(data):
@@ -117,6 +118,7 @@ class PassiveCapture:
         # Reuse bounded frame assembly/observations without a second PCAP.
         self.monitor_only = monitor_only
         self.file = self.events = None
+        self.pcapng = None
         self.path = None
         self.frames = self.eapol = self.pmkids = self.lost = 0
         self.partial = None
@@ -129,11 +131,11 @@ class PassiveCapture:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.time_ns()
-        self.path = directory / f"passive_{stamp}.pcap"
+        self.path = directory / f"passive_{stamp}.pcapng"
         try:
             self.file = self.path.open("xb")
             self.events = self.path.with_suffix(".jsonl").open("x", encoding="utf-8")
-            self.file.write(struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 2304, 105))
+            self.pcapng = PcapngWriter(self.file)
             self.file.flush()
         except OSError:
             self.close()
@@ -164,6 +166,7 @@ class PassiveCapture:
                     except OSError as exc:
                         error = exc
                     setattr(self, name, None)
+        self.pcapng = None
         if error:
             raise error
 
@@ -192,8 +195,8 @@ class PassiveCapture:
         self.partial = None
         at = p["at"]
         if self.file:
-            self.file.write(struct.pack("<IIII", int(at), int((at % 1)*1000000), len(frame), len(frame)))
-            self.file.write(frame)
+            self.pcapng.write_packet(
+                frame, at, channel=d["channel"], rssi=d["rssi"])
         self.frames += 1
         info = inspect_frame(frame)
         self.eapol += int(info["eapol"])

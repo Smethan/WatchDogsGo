@@ -1,4 +1,4 @@
-"""WPA-sec integration — upload handshake pcaps, download cracked passwords."""
+"""WPA-sec integration — upload handshake captures, download passwords."""
 
 import json
 import logging
@@ -64,20 +64,20 @@ def save_wpasec_key(app_dir: str, key: str) -> None:
 
 # ── Upload ────────────────────────────────────────────────────────────────
 
-def upload_wpasec(pcap_path: Path) -> tuple[bool, str]:
-    """Upload a single .pcap to WPA-sec.  Returns (ok, message)."""
+def upload_wpasec(capture_path: Path) -> tuple[bool, str]:
+    """Upload one PCAP/PCAPNG capture to WPA-sec."""
     key = get_wpasec_key()
     if not key:
         return False, "WPA-sec key not configured"
-    if not pcap_path.is_file():
-        return False, f"File not found: {pcap_path}"
+    if not capture_path.is_file():
+        return False, f"File not found: {capture_path}"
     try:
         import requests
     except ImportError:
         return False, "requests library not installed"
     try:
-        with open(pcap_path, "rb") as fh:
-            files = {"file": (pcap_path.name, fh, "application/octet-stream")}
+        with open(capture_path, "rb") as fh:
+            files = {"file": (capture_path.name, fh, "application/octet-stream")}
             resp = requests.post(
                 WPASEC_URL,
                 files=files,
@@ -96,11 +96,11 @@ def upload_wpasec(pcap_path: Path) -> tuple[bool, str]:
 
 
 def _bssid_from_filename(name: str) -> str:
-    """Extract BSSID from pcap filename like 'SSID_AABBCCDDEEFF_HHMMSS.pcap'.
+    """Extract BSSID from a capture filename such as `SSID_AABB..._HHMMSS.pcapng`.
 
     Returns MAC with colons (e.g. 'AA:BB:CC:DD:EE:FF') or empty string.
     """
-    stem = name.rsplit(".", 1)[0]  # strip .pcap
+    stem = name.rsplit(".", 1)[0]  # strip capture extension
     parts = stem.split("_")
     for part in parts:
         clean = part.replace("-", "").replace(":", "")
@@ -109,41 +109,50 @@ def _bssid_from_filename(name: str) -> str:
     return ""
 
 
+def _capture_candidates(loot_dir: Path) -> list[Path]:
+    """Prefer each capture's PCAPNG twin; retain legacy PCAP-only files."""
+    candidates: dict[tuple[Path, str], Path] = {}
+    for suffix in (".pcap", ".pcapng"):
+        for path in loot_dir.rglob(f"handshakes/*{suffix}"):
+            key = (path.parent, path.stem)
+            current = candidates.get(key)
+            if current is None or path.suffix.lower() == ".pcapng":
+                candidates[key] = path
+    return sorted(candidates.values())
+
+
 def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
                       ) -> tuple[int, int, str]:
-    """Upload all .pcap from loot/*/handshakes/.  Returns (up, total, msg).
-
-    blocked_macs: set of uppercase MACs to skip (whitelist).
-    """
-    pcaps = list(loot_dir.rglob("handshakes/*.pcap"))
-    if not pcaps:
-        return 0, 0, "No .pcap files found"
+    """Upload preferred PCAPNG or legacy PCAP captures from handshakes/."""
+    captures = _capture_candidates(loot_dir)
+    if not captures:
+        return 0, 0, "No PCAP/PCAPNG files found"
 
     # Filter out whitelisted BSSIDs
     skipped = 0
     if blocked_macs:
         filtered = []
-        for p in pcaps:
+        for p in captures:
             bssid = _bssid_from_filename(p.name)
             if bssid and bssid in blocked_macs:
                 skipped += 1
             else:
                 filtered.append(p)
-        pcaps = filtered
+        captures = filtered
 
     uploaded, errors = 0, []
-    for p in pcaps:
+    for p in captures:
         ok, msg = upload_wpasec(p)
         if ok:
             uploaded += 1
         else:
             errors.append(f"{p.name}: {msg}")
-    summary = f"{uploaded}/{len(pcaps)} uploaded"
+    summary = f"{uploaded}/{len(captures)} uploaded"
     if skipped:
         summary += f" | {skipped} skipped (whitelist)"
     if errors:
         summary += f" | Errors: {'; '.join(errors[:3])}"
-    return uploaded, len(pcaps), summary
+    return uploaded, len(captures), summary
 
 
 # ── Download (potfile) ────────────────────────────────────────────────────

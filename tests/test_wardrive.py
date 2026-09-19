@@ -592,7 +592,6 @@ def passive_records(frame, session="test", packet=1, seq=1):
 
 
 def test_passive_pcap_pmkid_and_corrupt_fragment(tmp_path):
-    import struct
     from watchdogs.passive_capture import PassiveCapture
     p=PassiveCapture();p.open(tmp_path)
     frame=passive_frame()
@@ -605,10 +604,10 @@ def test_passive_pcap_pmkid_and_corrupt_fragment(tmp_path):
     p.accept(parts[0]);p.accept(parts[2])
     assert p.frames==1 and p.lost==1
     p.close()
-    raw=p.path.read_bytes()
-    assert struct.unpack("<IHHIIII",raw[:24])[-1]==105
-    assert struct.unpack("<IIII",raw[24:40])[2:]==(len(frame),len(frame))
-    assert raw[40:]==frame
+    from watchdogs.pcapng import validate_pcapng
+    assert p.path.suffix==".pcapng"
+    ng=validate_pcapng(p.path.read_bytes())
+    assert ng.packets==1 and ng.last_timestamp_us>=946684800000000
     entry=next(d for d in map(json.loads,p.path.with_suffix(".jsonl").read_text().splitlines()) if d["kind"]=="pmkid")
     assert entry["pmkid"]==bytes(range(16)).hex()
     assert entry["bssid"]=="02:00:00:00:00:02" and entry["station"]=="02:00:00:00:00:01"

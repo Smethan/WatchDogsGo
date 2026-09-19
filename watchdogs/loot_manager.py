@@ -8,7 +8,7 @@ Session directory layout:
         sniffer_probes.csv       – probe requests captured
         handshakes/
             <ssid>_<bssid>.txt   – handshake metadata from serial
-            <ssid>_<bssid>.pcap  – real pcap (from start_handshake_serial)
+            <ssid>_<bssid>.pcapng – radiotap capture (from start_handshake_serial)
             <ssid>_<bssid>.hccapx – hashcat format (from start_handshake_serial)
             <ssid>_<bssid>.22000 – hc22000 hash (auto-generated from complete hccapx)
         portal_passwords.log     – portal form submissions
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .app_state import AppState, Network, SnifferAP, ProbeEntry
+from .pcapng import rebase_boot_timestamps, validate_pcapng
 
 log = logging.getLogger(__name__)
 
@@ -40,9 +41,10 @@ _PCAP_META_RE = re.compile(
 )
 _CAPTURE_KINDS = {"VALID", "PMKID", "PARTIAL"}
 _HCCAPX_SIZE = 393
-# Must match projectZero HSX_PCAP_MAX: global header plus four bounded 512-byte
-# frames (each preceded by a 16-byte PCAP record header).
-_TARGET_PCAP_MAX = 24 + 4 * (16 + 512)
+# Must match projectZero: beacon + association + M1-M4, each bounded to 512 bytes.
+_TARGET_PCAP_MAX = 24 + 6 * (16 + 512)
+_TARGET_PCAPNG_MAX = 4096
+_CAPTURE_FORMAT_PCAPNG = "PCAPNG"
 
 
 def _fsync_file(fh) -> None:
@@ -116,18 +118,23 @@ class LootManager:
         #   <base64 lines>
         #   --- PCAP END ---
         #   PCAP_SIZE: <N>
+        #   --- PCAPNG BEGIN --- / END / PCAPNG_SIZE: <N> (firmware 1.7.12+)
         #   --- HCCAPX BEGIN ---
         #   <base64 lines>
         #   --- HCCAPX END ---
         #   SSID: <ssid>  AP: <bssid>
         self._pcap_collecting = False
         self._pcap_b64_lines: List[str] = []
+        self._pcapng_collecting = False
+        self._pcapng_b64_lines: List[str] = []
         self._hccapx_collecting = False
         self._hccapx_b64_lines: List[str] = []
         self._pcap_meta_ssid = "unknown"
         self._pcap_meta_bssid = "unknown"
         self._pcap_capture_kind: Optional[str] = None
         self._pcap_expected_size: Optional[int] = None
+        self._pcapng_expected_size: Optional[int] = None
+        self._pcapng_required = False
         self._pcap_protocol_error = False
 
         # Aggregate loot database
@@ -474,7 +481,7 @@ class LootManager:
         if hs_dir.is_dir():
             try:
                 for f in hs_dir.iterdir():
-                    if f.suffix == ".pcap":
+                    if f.suffix in (".pcap", ".pcapng"):
                         counts["pcap"] += 1
                     elif f.suffix == ".hccapx":
                         counts["hccapx"] += 1
@@ -590,7 +597,8 @@ class LootManager:
         if mitm_dir.is_dir():
             try:
                 counts["mitm_pcaps"] = sum(
-                    1 for f in mitm_dir.iterdir() if f.suffix == ".pcap"
+                    1 for f in mitm_dir.iterdir()
+                    if f.suffix in (".pcap", ".pcapng")
                 )
             except OSError:
                 pass
@@ -931,15 +939,28 @@ class LootManager:
             self._pcap_protocol_error = kind not in _CAPTURE_KINDS
             return
 
+        if stripped.startswith("CAPTURE_FORMAT:"):
+            capture_format = stripped.partition(":")[2].strip()
+            if (self._pcap_capture_kind is None or self._pcap_b64_lines
+                    or self._pcapng_b64_lines or self._hccapx_b64_lines
+                    or capture_format != _CAPTURE_FORMAT_PCAPNG):
+                self._pcap_protocol_error = True
+            else:
+                self._pcapng_required = True
+            return
+
         # PCAP block
         if stripped == "--- PCAP BEGIN ---":
             # A legacy transaction has no CAPTURE_KIND. A new typed
             # transaction keeps the kind established immediately above.
             self._pcap_collecting = True
             self._pcap_b64_lines = []
+            self._pcapng_collecting = False
+            self._pcapng_b64_lines = []
             self._hccapx_collecting = False
             self._hccapx_b64_lines = []
             self._pcap_expected_size = None
+            self._pcapng_expected_size = None
             return
 
         if self._pcap_collecting:
@@ -960,6 +981,35 @@ class LootManager:
                 size = int(value)
                 self._pcap_expected_size = size
                 if self._pcap_capture_kind is not None and not 24 < size <= _TARGET_PCAP_MAX:
+                    self._pcap_protocol_error = True
+            return
+
+        # PCAPNG block (firmware 1.7.12+)
+        if stripped == "--- PCAPNG BEGIN ---":
+            self._pcapng_collecting = True
+            self._pcapng_b64_lines = []
+            self._pcapng_expected_size = None
+            if self._pcap_capture_kind is None:
+                self._pcap_protocol_error = True
+            return
+
+        if self._pcapng_collecting:
+            if stripped == "--- PCAPNG END ---":
+                self._pcapng_collecting = False
+            else:
+                clean = stripped.replace(" ", "")
+                if clean:
+                    self._pcapng_b64_lines.append(clean)
+            return
+
+        if stripped.startswith("PCAPNG_SIZE:"):
+            value = stripped.partition(":")[2].strip()
+            if not value.isdecimal():
+                self._pcap_protocol_error = True
+            else:
+                size = int(value)
+                self._pcapng_expected_size = size
+                if not 28 < size <= _TARGET_PCAPNG_MAX:
                     self._pcap_protocol_error = True
             return
 
@@ -987,8 +1037,9 @@ class LootManager:
         if metadata:
             self._pcap_meta_ssid = metadata.group("ssid").strip()
             self._pcap_meta_bssid = metadata.group("bssid").replace(":", "").upper()
-            # Save when we have both pcap and hccapx (or at least pcap)
-            if self._pcap_b64_lines:
+            # The metadata line commits either a modern PCAPNG transaction
+            # or a legacy PCAP transaction.
+            if self._pcapng_b64_lines or self._pcap_b64_lines:
                 kind = self._pcap_capture_kind or "LEGACY"
                 if self._save_pcap_from_b64():
                     return kind
@@ -1011,7 +1062,8 @@ class LootManager:
 
     def _save_pcap_from_b64(self) -> bool:
         """Decode/save a capture transaction and report whether it committed."""
-        if not self._handshake_dir or not self._pcap_b64_lines:
+        if (not self._handshake_dir
+                or not (self._pcapng_b64_lines or self._pcap_b64_lines)):
             self._reset_pcap_stream()
             return False
 
@@ -1020,9 +1072,16 @@ class LootManager:
         # strict checks apply to the typed 1.7.9 protocol; legacy captures keep
         # their historical optional-size/optional-HCCAPX behavior.
         try:
-            pcap_data = base64.b64decode("".join(self._pcap_b64_lines), validate=True)
+            pcap_data = (base64.b64decode("".join(self._pcap_b64_lines), validate=True)
+                         if self._pcap_b64_lines else None)
+            pcapng_data = (base64.b64decode("".join(self._pcapng_b64_lines), validate=True)
+                            if self._pcapng_b64_lines else None)
             hccapx_data = (base64.b64decode("".join(self._hccapx_b64_lines), validate=True)
                             if self._hccapx_b64_lines else None)
+            if pcapng_data is not None:
+                if not validate_pcapng(pcapng_data).packets:
+                    raise ValueError("PCAPNG contains no packets")
+                pcapng_data = rebase_boot_timestamps(pcapng_data)
         except (ValueError, TypeError, binascii.Error) as exc:
             log.error("Cannot decode serial capture: %s", exc)
             self._reset_pcap_stream()
@@ -1030,9 +1089,18 @@ class LootManager:
         if self._pcap_capture_kind is not None:
             valid = (
                 not self._pcap_protocol_error
-                and self._pcap_expected_size is not None
-                and len(pcap_data) == self._pcap_expected_size
-                and 24 < len(pcap_data) <= _TARGET_PCAP_MAX
+                and ((self._pcapng_required
+                      and pcap_data is None
+                      and pcapng_data is not None
+                      and self._pcapng_expected_size is not None
+                      and len(pcapng_data) == self._pcapng_expected_size
+                      and len(pcapng_data) <= _TARGET_PCAPNG_MAX)
+                     or (not self._pcapng_required
+                         and pcap_data is not None
+                         and self._pcap_expected_size is not None
+                         and len(pcap_data) == self._pcap_expected_size
+                         and 24 < len(pcap_data) <= _TARGET_PCAP_MAX
+                         and pcapng_data is None))
                 and ((self._pcap_capture_kind == "VALID" and hccapx_data is not None
                       and len(hccapx_data) == _HCCAPX_SIZE)
                      or (self._pcap_capture_kind in ("PMKID", "PARTIAL")
@@ -1042,7 +1110,8 @@ class LootManager:
                 log.error("Rejected incomplete or inconsistent typed serial capture")
                 self._reset_pcap_stream()
                 return False
-        elif self._pcap_expected_size is not None and len(pcap_data) != self._pcap_expected_size:
+        elif (self._pcap_expected_size is not None
+              and (pcap_data is None or len(pcap_data) != self._pcap_expected_size)):
             log.error("Rejected serial PCAP with mismatched declared size")
             self._reset_pcap_stream()
             return False
@@ -1057,18 +1126,35 @@ class LootManager:
                        else "unknown")
         base_name = f"{safe_ssid}_{safe_bssid}_{ts}"
 
-        # Save .pcap — fsync'd, this is unrecoverable capture data
-        pcap_saved = False
-        try:
-            pcap_path = self._handshake_dir / f"{base_name}.pcap"
-            with open(pcap_path, "wb") as fh:
-                fh.write(pcap_data)
-                _fsync_file(fh)
-            pcap_saved = True
-            log.info("PCAP saved: %s (%d bytes)", pcap_path, len(pcap_data))
-            self._save_gps_sidecar(pcap_path)
-        except Exception as exc:
-            log.error("Cannot save PCAP: %s", exc)
+        # Save classic PCAP only when an older firmware transaction supplied it.
+        pcap_saved = pcap_data is None
+        if pcap_data is not None:
+            try:
+                pcap_path = self._handshake_dir / f"{base_name}.pcap"
+                with open(pcap_path, "wb") as fh:
+                    fh.write(pcap_data)
+                    _fsync_file(fh)
+                pcap_saved = True
+                log.info("Legacy PCAP saved: %s (%d bytes)", pcap_path,
+                         len(pcap_data))
+                self._save_gps_sidecar(pcap_path)
+            except Exception as exc:
+                log.error("Cannot save legacy PCAP: %s", exc)
+
+        # Save metadata-rich .pcapng when supplied by modern firmware.
+        pcapng_saved = pcapng_data is None
+        if pcapng_data is not None:
+            try:
+                pcapng_path = self._handshake_dir / f"{base_name}.pcapng"
+                with open(pcapng_path, "wb") as fh:
+                    fh.write(pcapng_data)
+                    _fsync_file(fh)
+                pcapng_saved = True
+                log.info("PCAPNG saved: %s (%d bytes)", pcapng_path,
+                         len(pcapng_data))
+                self._save_gps_sidecar(pcapng_path)
+            except Exception as exc:
+                log.error("Cannot save PCAPNG: %s", exc)
 
         # Save .hccapx (if present) — fsync'd
         hccapx_saved = hccapx_data is None
@@ -1090,17 +1176,21 @@ class LootManager:
         # Reset state and update DB
         self._reset_pcap_stream()
         self.update_session_loot()
-        return pcap_saved and hccapx_saved
+        return pcap_saved and pcapng_saved and hccapx_saved
 
     def _reset_pcap_stream(self) -> None:
         self._pcap_collecting = False
         self._pcap_b64_lines = []
+        self._pcapng_collecting = False
+        self._pcapng_b64_lines = []
         self._hccapx_collecting = False
         self._hccapx_b64_lines = []
         self._pcap_meta_ssid = "unknown"
         self._pcap_meta_bssid = "unknown"
         self._pcap_capture_kind = None
         self._pcap_expected_size = None
+        self._pcapng_expected_size = None
+        self._pcapng_required = False
         self._pcap_protocol_error = False
 
     # ------------------------------------------------------------------
@@ -1110,7 +1200,7 @@ class LootManager:
     def _save_gps_sidecar(self, base_path: Path) -> None:
         """Write a .gps.json sidecar alongside a capture file.
 
-        Creates e.g. MyWiFi_AABB_143022.pcap.gps.json with raw GPS fix.
+        Creates e.g. MyWiFi_AABB_143022.pcapng.gps.json with raw GPS fix.
         Loot always contains full (unmasked) data.
         """
         if not self._gps or not self._gps.available:

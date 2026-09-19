@@ -2636,7 +2636,7 @@ class WatchDogsGame(OtaMixin):
             self.msg("[WPA-sec] No loot directory", C_ERROR)
             return
         self._wpasec_busy = True
-        self.msg("[WPA-sec] Uploading pcap files...", C_DIM)
+        self.msg("[WPA-sec] Uploading capture files...", C_DIM)
         self._term_add("[WPA-sec] Starting handshake upload...", raw=True)
 
         # Pass whitelisted MACs so their handshakes are NOT uploaded
