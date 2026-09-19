@@ -1,10 +1,14 @@
 """Fork-only application updates and verified firmware release downloads."""
 import hashlib
+import grp
 import io
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import shlex
+import stat
 import subprocess
 import tempfile
 from urllib.request import Request, urlopen
@@ -120,18 +124,102 @@ def prepare_firmware(directory, board, release=None):
     (target/'release.json').write_text(json.dumps(dict(repository=FIRMWARE_REPO, tag=tag, board=board)))
     return tag, target
 
+
+def _repair_hint(directory):
+    return "Run: cd " + shlex.quote(str(directory)) + " && sudo bash setup.sh"
+
+
+def _git_identity(directory):
+    """Return the non-root Git account and its command prefix."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        try:
+            return pwd.getpwuid(os.geteuid()).pw_name, []
+        except (AttributeError, KeyError):
+            return os.environ.get("USER", "current user"), []
+
+    sudo_user = os.environ.get("SUDO_USER", "")
+    sudo_uid = os.environ.get("SUDO_UID", "")
+    if sudo_user and sudo_user != "root":
+        try:
+            account = pwd.getpwnam(sudo_user)
+            uid_matches = not sudo_uid or int(sudo_uid) == account.pw_uid
+            if account.pw_uid != 0 and uid_matches:
+                return account.pw_name, [
+                    "sudo", "-n", "-H", "-u", account.pw_name, "--"]
+        except (KeyError, ValueError):
+            pass
+
+    try:
+        account = pwd.getpwuid(directory.stat().st_uid)
+    except KeyError:
+        account = None
+    if account is not None and account.pw_uid != 0:
+        return account.pw_name, [
+            "sudo", "-n", "-H", "-u", account.pw_name, "--"]
+    raise RuntimeError(
+        "Cannot identify a non-root owner for application updates. "
+        + _repair_hint(directory))
+
+
+def _path_identity(path):
+    try:
+        info = path.stat()
+        try:
+            owner = pwd.getpwuid(info.st_uid).pw_name
+        except KeyError:
+            owner = str(info.st_uid)
+        try:
+            group = grp.getgrgid(info.st_gid).gr_name
+        except KeyError:
+            group = str(info.st_gid)
+        return f"{owner}:{group} mode {stat.S_IMODE(info.st_mode):03o}"
+    except OSError as exc:
+        return str(exc)
+
+
+def _path_writable(prefix, path):
+    result = subprocess.run(
+        prefix + ["test", "-w", str(path)],
+        capture_output=True, text=True, timeout=10)
+    return result.returncode == 0
+
+
+def _check_update_permissions(directory, username, prefix):
+    paths = [directory, directory / ".git"]
+    index = directory / ".git/index"
+    if index.exists():
+        paths.append(index)
+    package = directory / "watchdogs"
+    if package.exists():
+        paths.append(package)
+    for path in paths:
+        if not path.exists() or not _path_writable(prefix, path):
+            raise RuntimeError(
+                f"Update user {username} cannot write {path} "
+                f"({_path_identity(path)}). {_repair_hint(directory)}")
+
+
 def update_app(directory, report=print):
     """Fast-forward only, with an explicit migration from the old feature branch."""
     directory = Path(directory).resolve()
-    prefix = []
-    if hasattr(os, 'geteuid') and os.geteuid() == 0 and directory.stat().st_uid != 0:
-        import pwd
-        prefix = ['sudo', '-n', '-u', pwd.getpwuid(directory.stat().st_uid).pw_name, '--']
+    username, prefix = _git_identity(directory)
+    _check_update_permissions(directory, username, prefix)
+
     def git(*args):
         result = subprocess.run(prefix+['git','-C',str(directory),*args],
             capture_output=True, text=True, timeout=120)
         if result.returncode:
-            raise RuntimeError((result.stderr or result.stdout).strip() or 'Git update failed')
+            error = ((result.stderr or result.stdout).strip()
+                     or 'Git update failed')
+            lowered = error.lower()
+            permission_errors = (
+                "permission denied", "dubious ownership",
+                "unable to create", "could not open", "cannot lock",
+                "index.lock",
+            )
+            if any(text in lowered for text in permission_errors):
+                error += ". " + _repair_hint(directory)
+            raise RuntimeError(error)
         return result.stdout.strip()
     remote = git('remote','get-url','origin').lower().removesuffix('.git')
     allowed = {f'https://github.com/{APP_UPDATE_REPO}'.lower(), f'git@github.com:{APP_UPDATE_REPO}'.lower()}

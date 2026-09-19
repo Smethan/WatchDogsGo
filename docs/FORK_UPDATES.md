@@ -33,6 +33,21 @@ When WDG runs as root, Git runs as the checkout directory's owner so new files
 do not become root-owned. Dependency changes, if any, are documented in release
 notes; the updater does not run arbitrary installers automatically.
 
+Older setup versions could leave a root-owned virtual environment, configuration
+file, runtime directory or Git metadata in an otherwise user-owned checkout.
+The in-game updater now checks the effective update account and every required
+Git path before fetching. If it reports mixed ownership, exit WDG and run:
+
+```sh
+cd ~/python/WatchDogsGo
+sudo bash setup.sh
+```
+
+Setup repairs the complete checkout to the login user, keeps `secrets.conf`
+private, and verifies that Git, the virtual environment and runtime directories
+are writable before reporting success. It is safe to rerun after a manual
+`chown`; an already-correct checkout is left unchanged.
+
 ### SIM7600 ownership migration for WDG 0.9.31+
 
 Cell tracking and ModemManager-backed GNSS require ModemManager to be the only

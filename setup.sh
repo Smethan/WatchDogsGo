@@ -44,6 +44,59 @@ echo ""
 
 ERRORS=0
 
+# Resolve the account that owns this per-user checkout.  The setup script may
+# run under sudo for apt/system installs, but Git, the venv and runtime data
+# must remain owned by the login user.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/dev/null 2>&1 && [ "$(id -u "$SUDO_USER")" -ne 0 ]; then
+    TARGET_USER="$SUDO_USER"
+elif [ "$(id -u)" -ne 0 ]; then
+    TARGET_USER="$(id -un)"
+else
+    fail "Cannot determine a non-root installation owner."
+    fail "Log in as the intended user, then run: sudo bash setup.sh"
+    exit 1
+fi
+TARGET_UID="$(id -u "$TARGET_USER")"
+TARGET_GROUP="$(id -gn "$TARGET_USER")"
+
+run_as_target() {
+    if [ "$(id -u)" -eq "$TARGET_UID" ]; then
+        "$@"
+    else
+        sudo -n -H -u "$TARGET_USER" -- "$@"
+    fi
+}
+
+ownership_mismatch_count() {
+    find "$SCRIPT_DIR" -xdev \( ! -user "$TARGET_USER" -o ! -group "$TARGET_GROUP" \) -printf '.' 2>/dev/null | wc -c | tr -d '[:space:]'
+}
+
+repair_checkout_ownership() {
+    local count
+    count="$(ownership_mismatch_count)"
+    if [ "${count:-0}" -eq 0 ]; then
+        ok "Checkout ownership already correct ($TARGET_USER:$TARGET_GROUP)"
+        return 0
+    fi
+    info "Repairing $count mixed-owner path(s) in the checkout..."
+    if [ "$(id -u)" -eq 0 ]; then
+        find "$SCRIPT_DIR" -xdev -exec chown -h "$TARGET_USER:$TARGET_GROUP" {} +
+    else
+        sudo find "$SCRIPT_DIR" -xdev -exec chown -h "$TARGET_USER:$TARGET_GROUP" {} +
+    fi
+    count="$(ownership_mismatch_count)"
+    if [ "${count:-0}" -ne 0 ]; then
+        fail "$count path(s) still have the wrong owner under $SCRIPT_DIR"
+        return 1
+    fi
+    ok "Checkout ownership repaired ($TARGET_USER:$TARGET_GROUP)"
+}
+
+# Repair old sudo-created files before target-owned venv operations begin.
+if ! repair_checkout_ownership; then
+    exit 1
+fi
+
 # --- 0. Internet connectivity ---
 echo "[0/8] Checking internet connectivity..."
 if ping -c 1 -W 3 github.com &>/dev/null || ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
@@ -156,7 +209,7 @@ fi
 echo "[4/8] Setting up virtual environment..."
 if [ ! -d ".venv" ]; then
     info "Creating .venv..."
-    python3 -m venv .venv 2>/dev/null || python3 -m venv .venv --without-pip
+    run_as_target python3 -m venv .venv 2>/dev/null || run_as_target python3 -m venv .venv --without-pip
     ok "Created .venv"
 else
     ok ".venv exists"
@@ -165,7 +218,7 @@ fi
 if [ ! -f ".venv/bin/pip" ] && [ ! -f ".venv/bin/pip3" ]; then
     info "Bootstrapping pip..."
     curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
-    .venv/bin/python3 /tmp/get-pip.py --quiet
+    run_as_target .venv/bin/python3 /tmp/get-pip.py --quiet
     rm -f /tmp/get-pip.py
     ok "pip installed"
 fi
@@ -179,7 +232,7 @@ echo "[5/8] Installing Python packages..."
 pip_run() {
     local desc="$1"; shift
     info "$desc"
-    if .venv/bin/pip "$@" >>"$PIP_LOG" 2>&1 ; then
+    if run_as_target .venv/bin/pip "$@" >>"$PIP_LOG" 2>&1 ; then
         ok "$desc"
         return 0
     else
@@ -211,11 +264,11 @@ if [[ "$(uname)" == "Linux" ]]; then
        [ -f "/usr/lib/python3/dist-packages/RPi/GPIO/__init__.py" ]; then
         for sp in .venv/lib/python3.*/site-packages; do
             if [ -d "$sp" ]; then
-                rm -rf "$sp/RPi" "$sp/RPi.GPIO"* 2>/dev/null
-                ln -sf /usr/lib/python3/dist-packages/RPi "$sp/RPi"
-                ln -sf /usr/lib/python3/dist-packages/lgpio.py "$sp/lgpio.py" 2>/dev/null
+                run_as_target rm -rf "$sp/RPi" "$sp/RPi.GPIO"* 2>/dev/null
+                run_as_target ln -sf /usr/lib/python3/dist-packages/RPi "$sp/RPi"
+                run_as_target ln -sf /usr/lib/python3/dist-packages/lgpio.py "$sp/lgpio.py" 2>/dev/null
                 for so in /usr/lib/python3/dist-packages/_lgpio*.so; do
-                    [ -f "$so" ] && ln -sf "$so" "$sp/$(basename $so)"
+                    [ -f "$so" ] && run_as_target ln -sf "$so" "$sp/$(basename "$so")"
                 done
                 ok "rpi-lgpio linked into venv (LoRa GPIO)"
                 break
@@ -228,14 +281,14 @@ if [[ "$(uname)" == "Linux" ]]; then
     if [ -d "/usr/lib/python3/dist-packages/gi" ]; then
         for sp in .venv/lib/python3.*/site-packages; do
             if [ -d "$sp" ] && [ ! -e "$sp/gi" ]; then
-                ln -sf /usr/lib/python3/dist-packages/gi "$sp/gi"
+                run_as_target ln -sf /usr/lib/python3/dist-packages/gi "$sp/gi"
                 for so in /usr/lib/python3/dist-packages/_gi*.so \
                           /usr/lib/python3/dist-packages/_gi_cairo*.so; do
-                    [ -f "$so" ] && ln -sf "$so" "$sp/$(basename $so)"
+                    [ -f "$so" ] && run_as_target ln -sf "$so" "$sp/$(basename "$so")"
                 done
                 for extra in pygobject_compat.py; do
                     f="/usr/lib/python3/dist-packages/$extra"
-                    [ -f "$f" ] && ln -sf "$f" "$sp/$extra"
+                    [ -f "$f" ] && run_as_target ln -sf "$f" "$sp/$extra"
                 done
                 ok "python3-gi linked into venv (BlueZ pairing)"
                 break
@@ -246,9 +299,9 @@ fi
 
 # Verify required imports
 MISSING_REQ=""
-.venv/bin/python3 -c "import pyxel" 2>/dev/null || MISSING_REQ="$MISSING_REQ pyxel"
-.venv/bin/python3 -c "import serial" 2>/dev/null || MISSING_REQ="$MISSING_REQ pyserial"
-.venv/bin/python3 -c "from PIL import Image" 2>/dev/null || MISSING_REQ="$MISSING_REQ Pillow"
+run_as_target .venv/bin/python3 -c "import pyxel" 2>/dev/null || MISSING_REQ="$MISSING_REQ pyxel"
+run_as_target .venv/bin/python3 -c "import serial" 2>/dev/null || MISSING_REQ="$MISSING_REQ pyserial"
+run_as_target .venv/bin/python3 -c "from PIL import Image" 2>/dev/null || MISSING_REQ="$MISSING_REQ Pillow"
 
 if [ -z "$MISSING_REQ" ]; then
     ok "Required Python imports verified"
@@ -260,13 +313,13 @@ fi
 
 # Verify optional imports (advanced attacks + LoRa)
 MISSING_OPT=""
-.venv/bin/python3 -c "import scapy" 2>/dev/null || MISSING_OPT="$MISSING_OPT scapy"
-.venv/bin/python3 -c "import netifaces" 2>/dev/null || MISSING_OPT="$MISSING_OPT netifaces"
-.venv/bin/python3 -c "import bleak" 2>/dev/null || MISSING_OPT="$MISSING_OPT bleak"
-.venv/bin/python3 -c "import dbus" 2>/dev/null || MISSING_OPT="$MISSING_OPT dbus-python"
-.venv/bin/python3 -c "from gi.repository import GLib" 2>/dev/null || MISSING_OPT="$MISSING_OPT python3-gi"
-.venv/bin/python3 -c "import LoRaRF" 2>/dev/null || MISSING_OPT="$MISSING_OPT LoRaRF"
-.venv/bin/python3 -c "import nacl" 2>/dev/null || MISSING_OPT="$MISSING_OPT PyNaCl"
+run_as_target .venv/bin/python3 -c "import scapy" 2>/dev/null || MISSING_OPT="$MISSING_OPT scapy"
+run_as_target .venv/bin/python3 -c "import netifaces" 2>/dev/null || MISSING_OPT="$MISSING_OPT netifaces"
+run_as_target .venv/bin/python3 -c "import bleak" 2>/dev/null || MISSING_OPT="$MISSING_OPT bleak"
+run_as_target .venv/bin/python3 -c "import dbus" 2>/dev/null || MISSING_OPT="$MISSING_OPT dbus-python"
+run_as_target .venv/bin/python3 -c "from gi.repository import GLib" 2>/dev/null || MISSING_OPT="$MISSING_OPT python3-gi"
+run_as_target .venv/bin/python3 -c "import LoRaRF" 2>/dev/null || MISSING_OPT="$MISSING_OPT LoRaRF"
+run_as_target .venv/bin/python3 -c "import nacl" 2>/dev/null || MISSING_OPT="$MISSING_OPT PyNaCl"
 
 if [ -z "$MISSING_OPT" ]; then
     ok "Optional Python imports verified (all attacks available)"
@@ -278,7 +331,7 @@ fi
 # --- 7. dump1090 from source + aiov2_ctl (uConsole only) ---
 echo "[7/8] Checking dump1090 + uConsole tools..."
 
-if DUMP1090_PATH=$(python3 -m watchdogs.sdr_tools); then
+if DUMP1090_PATH=$(run_as_target python3 -m watchdogs.sdr_tools); then
     ok "dump1090 present ($DUMP1090_PATH) — reusing existing installation"
 else
     info "Building FlightAware dump1090 from source..."
@@ -314,13 +367,13 @@ fi
 
 # --- 8. Permissions and data directories ---
 echo "[8/8] Permissions and data directories..."
-[ -f "run.sh" ] && chmod +x run.sh
-[ -f "setup.sh" ] && chmod +x setup.sh
-[ -f "watchdogs-launcher" ] && chmod +x watchdogs-launcher
+[ -f "run.sh" ] && run_as_target chmod 755 run.sh
+[ -f "setup.sh" ] && run_as_target chmod 755 setup.sh
+[ -f "update.sh" ] && run_as_target chmod 755 update.sh
+[ -f "watchdogs-launcher" ] && run_as_target chmod 755 watchdogs-launcher
 ok "Scripts executable"
 
 if [[ "$(uname)" == "Linux" ]]; then
-    TARGET_USER="${SUDO_USER:-$(whoami)}"
     if id -nG "$TARGET_USER" 2>/dev/null | grep -qE '\b(dialout|tty)\b'; then
         ok "User '$TARGET_USER' in dialout/tty group (serial access)"
     else
@@ -329,13 +382,61 @@ if [[ "$(uname)" == "Linux" ]]; then
     fi
 fi
 
-mkdir -p loot maps plugins firmware_cache
+run_as_target mkdir -p loot maps plugins firmware_cache
+run_as_target chmod 755 loot maps plugins firmware_cache
 ok "Data directories ready (loot, maps, plugins, firmware_cache)"
 
 if [ ! -f "secrets.conf" ] && [ -f "secrets.conf.example" ]; then
-    cp secrets.conf.example secrets.conf
-    chmod 600 secrets.conf 2>/dev/null || true
+    run_as_target cp secrets.conf.example secrets.conf
     ok "secrets.conf created from template (edit to add API keys)"
+fi
+[ ! -f "secrets.conf" ] || run_as_target chmod 600 secrets.conf
+
+# System-level steps above may have produced local files while elevated.
+# Normalize once more, then verify using the target account rather than root.
+if ! repair_checkout_ownership; then
+    ERRORS=$((ERRORS + 1))
+fi
+
+permission_fail() {
+    local path="$1" expectation="$2"
+    fail "$path: expected $TARGET_USER:$TARGET_GROUP and $expectation"
+    stat -c "  actual: %U:%G mode %a %n" "$path" 2>/dev/null || true
+    fail "Repair: cd $SCRIPT_DIR && sudo bash setup.sh"
+    ERRORS=$((ERRORS + 1))
+}
+
+for path in "$SCRIPT_DIR" "$SCRIPT_DIR/.git"; do
+    if [ ! -e "$path" ] || ! run_as_target test -w "$path"; then
+        permission_fail "$path" "writable by $TARGET_USER"
+    fi
+done
+if [ -e "$SCRIPT_DIR/.git/index" ] && ! run_as_target test -w "$SCRIPT_DIR/.git/index"; then
+    permission_fail "$SCRIPT_DIR/.git/index" "writable by $TARGET_USER"
+fi
+if [ ! -x "$SCRIPT_DIR/.venv/bin/python3" ] || ! run_as_target test -x "$SCRIPT_DIR/.venv/bin/python3"; then
+    permission_fail "$SCRIPT_DIR/.venv/bin/python3" "an executable target-owned Python"
+fi
+for path in loot maps plugins firmware_cache; do
+    if ! run_as_target test -w "$SCRIPT_DIR/$path"; then
+        permission_fail "$SCRIPT_DIR/$path" "writable by $TARGET_USER"
+    fi
+done
+if [ -f "$SCRIPT_DIR/secrets.conf" ]; then
+    secret_owner="$(stat -c '%U:%G' "$SCRIPT_DIR/secrets.conf")"
+    secret_mode="$(stat -c '%a' "$SCRIPT_DIR/secrets.conf")"
+    if [ "$secret_owner" != "$TARGET_USER:$TARGET_GROUP" ] || [ "$secret_mode" != "600" ]; then
+        permission_fail "$SCRIPT_DIR/secrets.conf" "$TARGET_USER:$TARGET_GROUP mode 600"
+    fi
+fi
+remaining="$(ownership_mismatch_count)"
+if [ "${remaining:-0}" -ne 0 ]; then
+    fail "$remaining mixed-owner path(s) remain in $SCRIPT_DIR"
+    find "$SCRIPT_DIR" -xdev \( ! -user "$TARGET_USER" -o ! -group "$TARGET_GROUP" \) -printf '  %u:%g %m %p\n' 2>/dev/null | head -20 || true
+    fail "Repair: cd $SCRIPT_DIR && sudo bash setup.sh"
+    ERRORS=$((ERRORS + 1))
+else
+    ok "Ownership verified for Git, venv, config and runtime data"
 fi
 
 # --- Summary ---

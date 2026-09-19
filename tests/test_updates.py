@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace as NS
 import zipfile
 import pytest
 from watchdogs import updates
@@ -158,3 +159,99 @@ def test_app_update_refuses_dirty_diverged_and_upstream(tmp_path,monkeypatch):
     git(client,'remote','set-url','origin','https://github.com/LOCOSP/WatchDogsGo.git')
     with pytest.raises(RuntimeError,match='Origin must'):
         updates.update_app(client)
+
+
+def test_root_update_prefers_valid_sudo_user(tmp_path, monkeypatch):
+    monkeypatch.setattr(updates.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "sam")
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(
+        updates.pwd, "getpwnam",
+        lambda name: NS(pw_name=name, pw_uid=1000))
+    username, prefix = updates._git_identity(tmp_path)
+    assert username == "sam"
+    assert prefix == ["sudo", "-n", "-H", "-u", "sam", "--"]
+
+
+def test_nonroot_update_uses_current_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(updates.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        updates.pwd, "getpwuid",
+        lambda uid: NS(pw_name="sam", pw_uid=1000))
+    assert updates._git_identity(tmp_path) == ("sam", [])
+
+
+def test_root_update_rejects_mismatched_sudo_uid_and_uses_owner(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(updates.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "wrong-user")
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(
+        updates.pwd, "getpwnam",
+        lambda name: NS(pw_name=name, pw_uid=1002))
+    monkeypatch.setattr(
+        updates.pwd, "getpwuid",
+        lambda uid: NS(pw_name="owner", pw_uid=1001))
+    assert updates._git_identity(tmp_path) == (
+        "owner", ["sudo", "-n", "-H", "-u", "owner", "--"])
+
+
+def test_root_update_falls_back_to_nonroot_checkout_owner(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(updates.os, "geteuid", lambda: 0)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    monkeypatch.setattr(
+        updates.pwd, "getpwuid",
+        lambda uid: NS(pw_name="owner", pw_uid=1001))
+    username, prefix = updates._git_identity(tmp_path)
+    assert username == "owner"
+    assert prefix == ["sudo", "-n", "-H", "-u", "owner", "--"]
+
+
+def test_root_owned_checkout_without_login_user_is_refused(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(updates.os, "geteuid", lambda: 0)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    monkeypatch.setattr(
+        updates.pwd, "getpwuid",
+        lambda uid: NS(pw_name="root", pw_uid=0))
+    with pytest.raises(RuntimeError, match="non-root owner.*setup.sh"):
+        updates._git_identity(tmp_path)
+
+
+def test_permission_preflight_names_path_owner_and_repair(
+        tmp_path, monkeypatch):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    monkeypatch.setattr(
+        updates, "_path_writable",
+        lambda prefix, path: path != git_dir)
+    with pytest.raises(RuntimeError) as error:
+        updates._check_update_permissions(tmp_path, "sam", [])
+    message = str(error.value)
+    assert "Update user sam" in message
+    assert str(git_dir) in message
+    assert "sudo bash setup.sh" in message
+
+
+@pytest.mark.parametrize("git_error", [
+    "fatal: detected dubious ownership in repository",
+    "error: cannot lock ref: Permission denied",
+])
+def test_git_permission_error_preserves_error_and_adds_repair(
+        tmp_path, monkeypatch, git_error):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "watchdogs").mkdir()
+    monkeypatch.setattr(
+        updates, "_git_identity", lambda directory: ("sam", []))
+    monkeypatch.setattr(updates, "_check_update_permissions", Mock())
+    monkeypatch.setattr(
+        updates.subprocess, "run",
+        Mock(return_value=NS(returncode=1, stdout="", stderr=git_error)))
+    with pytest.raises(RuntimeError) as error:
+        updates.update_app(tmp_path)
+    message = str(error.value)
+    assert git_error in message
+    assert "sudo bash setup.sh" in message

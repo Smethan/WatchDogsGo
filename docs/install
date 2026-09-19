@@ -29,10 +29,18 @@ if ! ping -c 1 -W 3 github.com >/dev/null 2>&1 && ! ping -c 1 -W 3 1.1.1.1 >/dev
     err "No internet (cannot reach github.com or 1.1.1.1). Check your network."
 fi
 
-# Resolve install user (works under sudo and non-sudo)
-TARGET_USER="${SUDO_USER:-$(whoami)}"
+# Resolve a real login user (works under sudo and non-sudo).  Refuse a direct
+# root install because setup must be able to assign the checkout consistently.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/dev/null 2>&1 && [ "$(id -u "$SUDO_USER")" -ne 0 ]; then
+    TARGET_USER="$SUDO_USER"
+elif [ "$(id -u)" -ne 0 ]; then
+    TARGET_USER="$(id -un)"
+else
+    err "Cannot determine the login user. Run this installer through sudo from the intended account."
+fi
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 [ -n "$TARGET_HOME" ] || err "Cannot resolve home directory for user '$TARGET_USER'."
+TARGET_GROUP=$(id -gn "$TARGET_USER")
 
 INSTALL_DIR="${INSTALL_DIR:-$TARGET_HOME/python/WatchDogsGo}"
 REPO_URL="https://github.com/Smethan/WatchDogsGo.git"
@@ -58,13 +66,13 @@ if [ -d "$INSTALL_DIR/.git" ]; then
 
     # Use the fork updater so branch migration and local edits are checked.
     [ -f scripts/update_app.py ] || err "Older checkout: pull Smethan/WatchDogsGo main once, then rerun."
-    sudo -u "$TARGET_USER" python3 scripts/update_app.py || err "Update stopped; resolve the reported Git issue first."
+    sudo -H -u "$TARGET_USER" python3 scripts/update_app.py || err "Update stopped; resolve the reported Git issue first."
 elif [ -d "$INSTALL_DIR" ]; then
     err "$INSTALL_DIR exists but is not a git repo. Remove it first or set INSTALL_DIR=..."
 else
     mkdir -p "$(dirname "$INSTALL_DIR")"
-    chown "$TARGET_USER:$TARGET_USER" "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
-    if ! sudo -u "$TARGET_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
+    chown "$TARGET_USER:$TARGET_GROUP" "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+    if ! sudo -H -u "$TARGET_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
         err "git clone failed — check internet connection and try again"
     fi
     cd "$INSTALL_DIR" || err "Cannot enter $INSTALL_DIR after clone"
@@ -92,7 +100,7 @@ Categories=Game;Security;
 Icon=$INSTALL_DIR/assets/icon.png
 DESKTOP
     chmod +x "$DESKTOP_FILE" 2>/dev/null || true
-    chown "$TARGET_USER:$TARGET_USER" "$DESKTOP_FILE" 2>/dev/null || true
+    chown "$TARGET_USER:$TARGET_GROUP" "$DESKTOP_FILE" 2>/dev/null || true
     echo "  Created: $DESKTOP_FILE"
 else
     warn "No Desktop folder at $DESKTOP_DIR — skipping launcher"
