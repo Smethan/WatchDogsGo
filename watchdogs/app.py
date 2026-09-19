@@ -552,10 +552,14 @@ class WatchDogsGame(OtaMixin):
         self._wl_add_step = ""   # "" | "type" | "scan_select" | (input via dialog)
         self._wl_add_type = ""   # "wifi" or "ble"
         self._wl_add_mac = ""
-        self._wl_scan_list: list[dict] = []   # merged WiFi+BLE for scan picker
-        self._wl_scan_sel = 0                 # selected index in scan picker
-        self._wl_scan_status = ""             # "" | "wifi" | "ble" (what's scanning)
-        self._wl_scan_timer = 0.0             # time.time() when scan started
+        self._wl_scan_list: list[dict] = []
+        self._wl_scan_sel = 0
+        self._wl_scan_results: dict[tuple[str, str], dict] = {}
+        self._wl_scan_phase = "idle"
+        self._wl_scan_deadline = 0.0
+        self._wl_scan_error = ""
+        self._wl_scan_partial = False
+        self._wl_stop_outcome = "idle"
 
         # WPA-sec upload/download
         self._wpasec_busy = False
@@ -1474,8 +1478,12 @@ class WatchDogsGame(OtaMixin):
 
         self.wardrive.tick()
         if self._pending_cmd and time.monotonic() > self._pending_deadline:
+            pending_state = getattr(self, "_pending_state", "")
             self._pending_cmd = None
-            self.msg("[ERR] Stop not confirmed; command cancelled. Retry STOP.", C_ERROR)
+            if pending_state in ("wl_wifi_scan", "wl_ble_scan"):
+                self._wl_scan_fail("Stop not confirmed; scan cancelled")
+            else:
+                self.msg("[ERR] Stop not confirmed; command cancelled. Retry STOP.", C_ERROR)
 
         if not getattr(self, '_ota_screen', False):
             self._update_hack()
@@ -1938,6 +1946,8 @@ class WatchDogsGame(OtaMixin):
         """True if any ESP32 operation is currently active."""
         return (self.wardrive.scan.active or self.wifi_scanning or self.ble_scanning
                 or self._wifi_scan_only or self._ble_scan_only
+                or getattr(self, "_wl_scan_phase", "idle") in
+                   ("waiting_stop", "scanning_wifi", "scanning_ble", "stopping")
                 or self._bt_tracking or self._bt_airtag
                 or self.sniffing or self.capturing_hs
                 or self.state.portal_running
@@ -2004,6 +2014,12 @@ class WatchDogsGame(OtaMixin):
                 self._earn_badge("wardriver")
         elif state_key == "wifi_scan":    self._wifi_scan_only = val
         elif state_key == "ble_scan":     self._ble_scan_only  = val
+        elif state_key in ("wl_wifi_scan", "wl_ble_scan"):
+            if val:
+                kind = "wifi" if state_key == "wl_wifi_scan" else "ble"
+                self._wl_scan_phase = "scanning_" + kind
+                self._wl_scan_deadline = time.monotonic() + (
+                    45.0 if kind == "wifi" else 20.0)
         elif state_key == "bt_tracking":  self._bt_tracking    = val
         elif state_key == "bt_airtag":    self._bt_airtag      = val
         elif state_key == "sniffer":      self.sniffing        = val
@@ -3497,6 +3513,9 @@ class WatchDogsGame(OtaMixin):
                 pass
             self.serial = None
             self._serial_capture_kind = None
+            if getattr(self, "_wl_scan_phase", "idle") in (
+                    "waiting_stop", "scanning_wifi", "scanning_ble", "stopping"):
+                self._wl_scan_fail("ESP32 disconnected during scan")
             self.msg("[ERR] ESP32 disconnected!", C_ERROR)
             self._term_add("[ERR] ESP32 disconnected — plug in & retry", raw=True)
             return
@@ -3579,15 +3598,21 @@ class WatchDogsGame(OtaMixin):
 
         m = _BLE_RE.match(s)
         if m:
+            self._wl_observe_ble(
+                m.group(1), int(m.group(2)),
+                (m.group(3) or "").strip() or "?",
+                (m.group(4) or "").strip())
             self._ingest_ble(m.group(1), int(m.group(2)), (m.group(3) or "").strip() or "?", (m.group(4) or "").strip())
             return
         net = self.net_mgr.parse_network_line(s)
         if net:
+            self._wl_observe_wifi(net)
             self._ingest_wifi(net)
             return
 
         # --- Operation state from serial output ---
         sl = s.lower()
+        self._wl_handle_scan_status(s, sl)
         if "sniffer start" in sl or "packet sniffer" in sl:
             self.sniffing = True
         elif "handshake attack cleanup complete" in sl or "handshake attack task finished" in sl:
@@ -6785,29 +6810,172 @@ class WatchDogsGame(OtaMixin):
     # Whitelist screen
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _wl_rssi(value) -> int:
+        try:
+            return int(str(value).replace("dBm", "").strip())
+        except (TypeError, ValueError):
+            return -100
+
+    def _wl_scan_active(self) -> bool:
+        return getattr(self, "_wl_scan_phase", "idle") in (
+            "waiting_stop", "scanning_wifi", "scanning_ble", "stopping")
+
     def _wl_build_scan_list(self):
-        """Build merged WiFi + BLE device list for scan picker."""
-        seen: set[str] = set()
-        items: list[dict] = []
-        for n in self.wifi_networks:
-            mac = n.bssid.upper()
-            if mac in seen or self._whitelist.is_blocked(mac):
-                continue
-            seen.add(mac)
-            items.append({"type": "wifi", "mac": mac,
-                          "name": n.ssid, "rssi": n.rssi,
-                          "extra": f"Ch:{n.channel}"})
-        for d in self.ble_devices:
-            mac = d.mac.upper()
-            if mac in seen or self._whitelist.is_blocked(mac):
-                continue
-            seen.add(mac)
-            items.append({"type": "ble", "mac": mac,
-                          "name": d.name, "rssi": d.rssi,
-                          "extra": ""})
-        # Sort by RSSI (strongest first)
-        items.sort(key=lambda x: x["rssi"], reverse=True)
+        """Build the picker from the dedicated scan cache, never map nodes."""
+        items = [
+            dict(item)
+            for item in getattr(self, "_wl_scan_results", {}).values()
+            if not self._whitelist.is_blocked(item["mac"])
+        ]
+        items.sort(key=lambda item: (-self._wl_rssi(item["rssi"]), item["mac"]))
         return items
+
+    def _wl_refresh_scan_list(self, reset_selection=False):
+        self._wl_scan_list = self._wl_build_scan_list()
+        if reset_selection:
+            self._wl_scan_sel = 0
+        else:
+            self._wl_scan_sel = min(
+                getattr(self, "_wl_scan_sel", 0),
+                max(0, len(self._wl_scan_list) - 1))
+
+    def _wl_store_result(self, kind, mac, name, rssi, extra=""):
+        if getattr(self, "_wl_scan_phase", "idle") != "scanning_" + kind:
+            return
+        mac = (mac or "").upper().strip()
+        if not mac or self._whitelist.is_blocked(mac):
+            return
+        value = self._wl_rssi(rssi)
+        key = (kind, mac)
+        previous = self._wl_scan_results.get(key)
+        display_name = (name or "").strip()
+        if kind == "wifi" and (not display_name or display_name == "?"):
+            display_name = "<hidden>"
+        elif not display_name:
+            display_name = "?"
+        if previous:
+            previous["rssi"] = max(previous["rssi"], value)
+            if display_name not in ("?", "<hidden>"):
+                previous["name"] = display_name
+            if extra:
+                previous["extra"] = extra
+            return
+        self._wl_scan_results[key] = {
+            "type": kind,
+            "mac": mac,
+            "name": display_name,
+            "rssi": value,
+            "extra": extra,
+        }
+
+    def _wl_observe_wifi(self, net):
+        self._wl_store_result(
+            "wifi", getattr(net, "bssid", ""), getattr(net, "ssid", ""),
+            getattr(net, "rssi", -100),
+            f"Ch:{getattr(net, 'channel', '?')}")
+
+    def _wl_observe_ble(self, mac, rssi, name, _tag_type=""):
+        self._wl_store_result("ble", mac, name, rssi)
+
+    def _wl_start_scan(self, kind):
+        if kind not in ("wifi", "ble"):
+            raise ValueError("Unknown whitelist scan kind")
+        if self._wl_scan_active() or self._pending_cmd:
+            self.msg("[SCAN] Another operation is still changing state",
+                     C_WARNING)
+            return False
+        self._wl_scan_results = {}
+        self._wl_scan_list = []
+        self._wl_scan_sel = 0
+        self._wl_scan_error = ""
+        self._wl_scan_partial = False
+        self._wl_scan_deadline = 0.0
+        self._wl_stop_outcome = "idle"
+        self._wl_scan_phase = "waiting_stop"
+        command = "scan_networks" if kind == "wifi" else "scan_bt"
+        state = "wl_wifi_scan" if kind == "wifi" else "wl_ble_scan"
+        self._start_scan_cmd(
+            command, state, "Whitelist " + kind.upper() + " scan")
+        return True
+
+    def _wl_finish_scan(self):
+        self._wl_refresh_scan_list(reset_selection=True)
+        self._wl_scan_deadline = 0.0
+        self._wl_scan_error = ""
+        self._wl_scan_partial = False
+        self._wl_scan_phase = "complete"
+        self.msg(f"[SCAN] Done — {len(self._wl_scan_list)} devices",
+                 C_SUCCESS)
+
+    def _wl_scan_fail(self, message, *, stop=False, partial=False):
+        self._wl_refresh_scan_list(reset_selection=True)
+        self._wl_scan_deadline = 0.0
+        self._wl_scan_error = message
+        self._wl_scan_partial = partial
+        if stop and getattr(self, "_wl_scan_phase", "idle") in (
+                "scanning_wifi", "scanning_ble"):
+            self._wl_scan_phase = "stopping"
+            self._wl_stop_outcome = "error"
+            self._send("stop")
+        else:
+            self._wl_scan_phase = "error"
+        suffix = (
+            f" — {len(self._wl_scan_list)} partial" if partial else "")
+        self.msg("[SCAN] " + message + suffix, C_WARNING)
+
+    def _wl_cancel_scan(self):
+        phase = getattr(self, "_wl_scan_phase", "idle")
+        if phase == "waiting_stop":
+            if getattr(self, "_pending_state", "") in (
+                    "wl_wifi_scan", "wl_ble_scan"):
+                self._pending_cmd = None
+            self._wl_scan_phase = "stopping"
+            self._wl_stop_outcome = "idle"
+            return
+        if phase in ("scanning_wifi", "scanning_ble"):
+            self._wl_scan_phase = "stopping"
+            self._wl_stop_outcome = "idle"
+            self._send("stop")
+
+    def _wl_stop_ack(self):
+        if getattr(self, "_wl_scan_phase", "idle") != "stopping":
+            return
+        self._wl_scan_deadline = 0.0
+        self._wl_scan_phase = (
+            "error"
+            if getattr(self, "_wl_stop_outcome", "idle") == "error"
+            else "idle")
+
+    def _wl_tick_scan(self):
+        phase = getattr(self, "_wl_scan_phase", "idle")
+        deadline = getattr(self, "_wl_scan_deadline", 0.0)
+        if (phase in ("scanning_wifi", "scanning_ble") and deadline
+                and time.monotonic() >= deadline):
+            self._wl_scan_fail("Timed out", stop=True, partial=True)
+
+    def _wl_handle_scan_status(self, original, lowered):
+        phase = getattr(self, "_wl_scan_phase", "idle")
+        if phase == "scanning_wifi" and "scan results printed" in lowered:
+            self._wl_finish_scan()
+            return
+        if phase == "scanning_ble" and "summary:" in lowered:
+            self._wl_finish_scan()
+            return
+        if phase not in ("scanning_wifi", "scanning_ble"):
+            return
+        failures = (
+            "scan already in progress",
+            "wardrive is active",
+            "failed to start scan",
+            "scan start failed",
+            "ble scan start failed",
+            "operation rejected",
+        )
+        if any(text in lowered for text in failures):
+            self._wl_scan_fail(
+                original[:90], stop=True,
+                partial=bool(self._wl_scan_results))
 
     # ------------------------------------------------------------------
     # PipBoy Watch screen
@@ -7058,6 +7226,7 @@ class WatchDogsGame(OtaMixin):
             pyxel.text(4, H - 12, "[ENTER] Execute  [ESC] Back", C_DIM)
 
     def _update_wl_screen(self):
+        self._wl_tick_scan()
         if self._wl_add_step == "type":
             if pyxel.btnp(pyxel.KEY_1) or pyxel.btnp(pyxel.KEY_W):
                 self._wl_add_type = "wifi"
@@ -7076,8 +7245,7 @@ class WatchDogsGame(OtaMixin):
                 self._input_pending_cat = -3
                 self._input_pending_item = -1
             elif pyxel.btnp(pyxel.KEY_S):
-                # Scan & Select — build list from live scan data
-                self._wl_scan_list = self._wl_build_scan_list()
+                self._wl_refresh_scan_list()
                 self._wl_scan_sel = 0
                 self._wl_add_step = "scan_select"
             elif pyxel.btnp(pyxel.KEY_ESCAPE):
@@ -7085,14 +7253,6 @@ class WatchDogsGame(OtaMixin):
             return
 
         if self._wl_add_step == "scan_select":
-            # Auto-refresh: 10s after scan started, rebuild list and stop status
-            if self._wl_scan_status and time.time() - self._wl_scan_timer >= 10:
-                self._wl_scan_list = self._wl_build_scan_list()
-                self._wl_scan_sel = 0
-                self.msg(f"[SCAN] Done — {len(self._wl_scan_list)} devices",
-                         C_SUCCESS)
-                self._wl_scan_status = ""
-
             items = self._wl_scan_list
             if pyxel.btnp(pyxel.KEY_UP) and items:
                 self._wl_scan_sel = (self._wl_scan_sel - 1) % len(items)
@@ -7106,35 +7266,20 @@ class WatchDogsGame(OtaMixin):
                         f"[WL] Added: {it['name']} ({it['mac'][-8:]})",
                         raw=True)
                     self.msg("[WL] Entry added", C_SUCCESS)
-                    self._wl_scan_list = self._wl_build_scan_list()
-                    if self._wl_scan_sel >= len(self._wl_scan_list):
-                        self._wl_scan_sel = max(0, len(self._wl_scan_list) - 1)
+                    self._wl_refresh_scan_list()
                 else:
                     self.msg("[WL] MAC already exists", C_WARNING)
-            elif pyxel.btnp(pyxel.KEY_W) and not self._wl_scan_status:
-                self._wl_scan_list = []
-                self._wl_scan_sel = 0
-                self._send("scan_networks")
-                self._wl_scan_status = "wifi"
-                self._wl_scan_timer = time.time()
-                self.msg("[SCAN] WiFi scan started", C_SUCCESS)
-            elif pyxel.btnp(pyxel.KEY_B) and not self._wl_scan_status:
-                self._wl_scan_list = []
-                self._wl_scan_sel = 0
-                self._send("scan_bt")
-                self._wl_scan_status = "ble"
-                self._wl_scan_timer = time.time()
-                self.msg("[SCAN] BLE scan started", C_HACK_CYAN)
+            elif pyxel.btnp(pyxel.KEY_W) and not self._wl_scan_active():
+                self._wl_start_scan("wifi")
+            elif pyxel.btnp(pyxel.KEY_B) and not self._wl_scan_active():
+                self._wl_start_scan("ble")
             elif pyxel.btnp(pyxel.KEY_R):
-                self._wl_scan_list = self._wl_build_scan_list()
-                self._wl_scan_sel = min(self._wl_scan_sel,
-                                        max(0, len(self._wl_scan_list) - 1))
+                self._wl_refresh_scan_list()
                 self.msg(f"[WL] {len(self._wl_scan_list)} devices",
                          C_HACK_CYAN)
             elif pyxel.btnp(pyxel.KEY_ESCAPE):
+                self._wl_cancel_scan()
                 self._wl_add_step = ""
-                self._wl_scan_list = []
-                self._wl_scan_status = ""
             return
 
         # Main list view
@@ -7145,7 +7290,7 @@ class WatchDogsGame(OtaMixin):
             self._wl_sel = (self._wl_sel + 1) % len(entries)
         if pyxel.btnp(pyxel.KEY_S):
             # Direct shortcut: scan & select from main whitelist screen
-            self._wl_scan_list = self._wl_build_scan_list()
+            self._wl_refresh_scan_list()
             self._wl_scan_sel = 0
             self._wl_add_step = "scan_select"
             return
@@ -7160,6 +7305,7 @@ class WatchDogsGame(OtaMixin):
             if self._wl_sel >= self._whitelist.count:
                 self._wl_sel = max(0, self._whitelist.count - 1)
         if pyxel.btnp(pyxel.KEY_ESCAPE):
+            self._wl_cancel_scan()
             self._wl_screen = False
             self._esc_consumed_frame = pyxel.frame_count
 
@@ -7172,7 +7318,7 @@ class WatchDogsGame(OtaMixin):
 
         if self._wl_add_step == "type":
             # Type selection — manual or scan
-            n_dev = len(self.wifi_networks) + len(self.ble_devices)
+            n_dev = len(self._wl_scan_list)
             pyxel.text(20, 36, "Add device to whitelist:", C_TEXT)
             pyxel.text(20, 54, "[1] WiFi  (manual BSSID + SSID)", C_SUCCESS)
             pyxel.text(20, 66, "[2] BLE   (manual MAC + Name)", C_HACK_CYAN)
@@ -7216,12 +7362,23 @@ class WatchDogsGame(OtaMixin):
         """Draw the scan-and-select device picker for whitelist."""
         items = self._wl_scan_list
         # Sub-title + scan status
-        scanning = self._wl_scan_status
+        phase = getattr(self, "_wl_scan_phase", "idle")
+        scanning = phase in (
+            "waiting_stop", "scanning_wifi", "scanning_ble", "stopping")
         title = f"Select device to whitelist  ({len(items)} found)"
         pyxel.text(4, 18, title, C_TEXT)
         if scanning and pyxel.frame_count % 30 < 20:
-            status = "WiFi scanning..." if scanning == "wifi" else "BLE scanning..."
+            status = {
+                "waiting_stop": "Preparing scan...",
+                "scanning_wifi": "WiFi scanning...",
+                "scanning_ble": "BLE scanning...",
+                "stopping": "Stopping scan...",
+            }[phase]
             pyxel.text(4 + len(title) * 5 + 8, 18, status, C_WARNING)
+        elif phase == "complete":
+            pyxel.text(4 + len(title) * 5 + 8, 18, "cached", C_DIM)
+        elif phase == "error" and self._wl_scan_error:
+            pyxel.text(4, 28, self._wl_scan_error[:80], C_WARNING)
 
         if not items:
             pyxel.text(20, 50, "No devices discovered yet.", C_DIM)

@@ -257,6 +257,7 @@ class WardriveUI:
             # v2 emits a structured stop first, but this global cleanup line is
             # an independent acknowledgement if USB congestion lost that frame.
             self.scan.accept_plain_stop()
+            app._wl_stop_ack()
             if self.scan.state != "running":
                 app.sniffing = app.capturing_hs = False
                 app._bt_tracking = app._bt_airtag = False
