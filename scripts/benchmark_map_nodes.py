@@ -8,8 +8,13 @@ cached-blit dispatch. It deliberately excludes GPU/display-driver time.
 import argparse
 import json
 import random
+import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace as NS
+
+# Direct execution puts scripts/ on sys.path, so add the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from watchdogs.map_index import GeoPointIndex
 from watchdogs.map_layers import HistoricalNodeLayer, LiveNodeLayer
