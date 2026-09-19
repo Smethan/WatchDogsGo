@@ -1,5 +1,32 @@
 # Smethan WatchDogsGo
 
+## 0.9.39 — Optional LTE module and AIOv2-safe GPS fallback
+
+- Add a persistent **LTE modem integration** switch to Wardrive Settings. WDG
+  reads it before GPS initialization, so OFF skips the ModemManager broker and
+  modem-port inventory on every launch instead of probing for removed hardware.
+- When LTE integration is OFF, stop serving-cell and experimental-neighbor
+  collection while leaving ESP Wi-Fi/BLE, host BLE, loot, and the All Wardrive
+  scan lifecycle unchanged. Cell controls remain saved and are shown as
+  inactive until LTE integration is enabled again.
+- Keep AIOv2 and external GPS independent of the LTE module. Automatic
+  LTE-disabled discovery selects the documented `/dev/ttyS0` CM4 or
+  `/dev/ttyAMA0` CM5 GPS UART and safe ACM devices without broadly probing
+  Bluetooth-capable platform UARTs or modem-style `ttyUSB` ports. An explicitly
+  configured USB GPS remains supported.
+- Apply the toggle immediately. Disabling it releases ModemManager-backed GNSS
+  and searches for the AIO/external receiver; enabling it keeps a working
+  external GPS or reacquires SIM7600 GNSS when no other provider is active.
+- Preserve the existing SIM7600-safe path when LTE integration is ON:
+  ModemManager remains the sole control-plane owner, GPS and serving-cell data
+  share its cached Location interface, and no modem TTY is opened directly.
+- Gracefully fall back to external GPS when LTE integration is ON but no modem
+  exists or the ModemManager location interface is unavailable.
+
+Focused modem ownership, settings migration, AIO UART fallback, absent-modem,
+cell gating, and both All Wardrive-mode tests pass. No uConsole hardware was
+accessed or modified for this release.
+
 ## 0.9.38 — Metadata-rich PCAPNG captures
 
 - Save new passive HS Sniff and firmware-transferred active handshake captures

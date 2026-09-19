@@ -8,6 +8,27 @@ minor versions.
 
 ---
 
+## [0.9.39] — 2026-09-19
+
+### Added
+
+- Add a persistent LTE modem integration toggle that is loaded before GPS
+  startup and can be applied immediately from Wardrive Settings.
+
+### Changed
+
+- Select the documented AIOv2 GPS UART (`ttyS0` on CM4, `ttyAMA0` on CM5) and
+  safe external GPS devices without requiring the SIM7600 or ModemManager. Both
+  All Wardrive modes and host Bluetooth remain independent of the cellular
+  setting.
+
+### Fixed
+
+- Skip all ModemManager startup work and automatic generic `ttyUSB` probing
+  when LTE integration is disabled, while preserving the existing safe
+  ModemManager GNSS and serving-cell path when enabled.
+- Gracefully fall back to external GPS when the LTE module is absent.
+
 ## [0.9.31] — 2026-09-14
 
 ### Added
