@@ -322,7 +322,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
 | LoRa | — | Toggle LoRa module ON/OFF (AIO GPIO, auto-starts MeshCore) |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
-| Upload WPA-SEC | — | Upload all handshake .pcap files to wpa-sec.stanev.org (prompts for API key if not configured) |
+| Upload WPA-SEC | — | Upload handshake `.pcapng` captures to wpa-sec.stanev.org (prompts for API key if not configured; old PCAP-only loot remains readable) |
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
 | Reboot ESP32 | `restart` | Restart ESP32 device |
 | Download Map | — | Download OSM tiles (~10 km radius around current position) for offline street-level map. Press again to cancel. |
@@ -534,7 +534,7 @@ Saved to `loot/<session>/`:
 | `cell_neighbor_candidates.jsonl` | Opt-in provisional PCI/channel observations; never uploaded to WiGLE |
 | `active_cell_session.json` | Present only while cellular collection has not cleanly stopped |
 | `bt_devices.csv` | BLE devices with GPS coordinates |
-| `handshakes/` | PCAP, HCCAPX, .22000 (hashcat-ready) |
+| `handshakes/` | PCAPNG with radiotap metadata, HCCAPX, .22000 (hashcat-ready) |
 | `mitm/` | MITM pcap captures |
 | `attack_events.log` | Attack start/stop/credential log |
 | `meshcore_nodes.csv` | Discovered MeshCore nodes with GPS |
@@ -549,7 +549,7 @@ watchdogs/
   app.py              Main game loop, UI rendering, menu system
   serial_manager.py   ESP32 serial comm (115200 baud, USB auto-detect)
   gps_manager.py      NMEA parser (/dev/ttyAMA0 default)
-  loot_manager.py     Loot saving (CSV, PCAP, handshakes)
+  loot_manager.py     Loot saving (CSV, PCAPNG, handshakes)
   network_manager.py  WiFi scan result parsing
   app_state.py        Shared state (networks, GPS, BLE devices)
   config.py           Constants, ESP32 commands, API endpoints

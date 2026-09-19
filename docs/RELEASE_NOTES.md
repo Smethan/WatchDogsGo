@@ -1,5 +1,31 @@
 # Smethan WatchDogsGo
 
+## 0.9.38 — Metadata-rich PCAPNG captures
+
+- Save new passive HS Sniff and firmware-transferred active handshake captures
+  as PCAPNG only. Each file uses radiotap IEEE 802.11 records with channel,
+  RSSI, explicit microsecond timestamp resolution and consistent FCS stripping.
+- Validate every firmware PCAPNG block, interface, radiotap header and declared
+  transfer length before committing it. Rebase ESP boot-relative timestamps to
+  host wall time while preserving packet intervals. A partial or malformed
+  serial transaction creates no capture file.
+- Accept projectZero 1.7.12's `CAPTURE_FORMAT: PCAPNG` transaction and require
+  it to contain PCAPNG without a duplicate PCAP block. Existing older firmware
+  PCAP transactions remain readable; new WDG capture paths do not create PCAP.
+- Prefer a PCAPNG capture over a same-stem legacy PCAP during WPA-Sec upload,
+  so only the richer artifact is transferred. Keep old PCAP-only loot
+  uploadable and apply the Wi-Fi whitelist filter to both extensions.
+- Save host MITM packet captures through `dumpcap` in native PCAPNG and count
+  both PCAPNG and historical PCAP files in the loot database.
+- Record the new `hs_capture_pcapng_v1` firmware capability. Complete active
+  captures still retain HCCAPX for local `.22000` conversion; the PCAPNG is the
+  artifact uploaded to WPA-Sec because it carries the surrounding packets.
+
+The complete 299-test host suite passes. The generated files are accepted as
+PCAPNG/radiotap by Wireshark tools and hcxtools. Real RF completeness still
+depends on which beacon, authentication, association, probe and EAPOL packets
+the radio observes; the container validation cannot create missing air traffic.
+
 ## 0.9.37 — Whitelist-safe active HS capture
 
 - Apply the host Wi-Fi whitelist to **All nearby** in both HS Capture

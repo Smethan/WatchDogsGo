@@ -60,27 +60,44 @@ firmware 1.7.4+. Update WDG through SYSTEM → Update WDG and restart; flash the
 correct board through SYSTEM → Flash ESP32. The XIAO ESP32-C5 requires the XIAO
 image.
 
+Use **WDG 0.9.38+** with **firmware 1.7.12+** for PCAPNG-only capture storage.
+The new format keeps each observed M1-M4 packet plus beacon, authentication and
+association context when those frames were seen. It uses radiotap link type 127
+to preserve ESP-reported channel/RSSI and strips the FCS consistently. WDG
+validates every block and rebases the ESP boot-relative timestamps to wall time
+before committing the host file. It does not create a duplicate classic PCAP.
+
 | Mode | Capture storage | Live display |
 | --- | --- | --- |
-| HS Capture | ESP32 SD card, `/lab/handshakes/` | Serial progress copies |
-| HS Capture no SD | Existing serial PCAP/HCCAPX dump to the uConsole loot session on stop | Serial progress copies |
+| HS Capture | ESP32 SD card, `/lab/handshakes/*.pcapng` | Serial progress copies |
+| HS Capture no SD | Serial PCAPNG/HCCAPX dump to the uConsole loot session on stop | Serial progress copies |
 
-Progress copies do not create a second PCAP or change when the existing capture
+Progress copies do not create a second capture file or change when the capture
 files are saved. No-SD capture still keeps its capture data on the ESP32 until
 the existing file dump runs; the table does not make it crash-persistent.
 WDG 0.9.19 waits for final capture cleanup even if the firmware's general stop
 acknowledgement arrives first, so a pending mode switch cannot start mid-dump.
 
-Firmware 1.7.9 builds each stored artifact from one AP/station/replay exchange.
-A matching M1+M2 or M2+M3 pair produces a `valid` PCAP and HCCAPX. A captured
-association request can still produce a `pmkid` or `partial` PCAP at stop without
-being labeled a valid EAPOL exchange. The SD mode writes valid pairs as they are
-found and flushes remaining association evidence at stop. The no-SD mode sends
+Firmware 1.7.12 builds each stored artifact from one AP/station/replay exchange.
+A matching M1+M2 or M2+M3 pair produces a `valid` PCAPNG and HCCAPX. A captured
+association request can still produce a `pmkid` or `partial` PCAPNG at stop without
+being labeled a valid EAPOL exchange. The SD mode waits up to two seconds after
+the first validated pair, or saves immediately when all M1-M4 have arrived, so
+later exchange messages can join the same artifact. It flushes remaining
+association evidence at stop. The no-SD mode sends
 its bounded per-network artifacts only after capture has stopped and the radio
 callback has drained. Each serial artifact declares `VALID`, `PMKID` or
-`PARTIAL` before its blocks; WDG saves it only when the final SSID/AP metadata
+`PARTIAL` plus `CAPTURE_FORMAT: PCAPNG` before its blocks; WDG saves it only
+when the final SSID/AP metadata
 line commits the complete sequence. It requires a canonical final BSSID and
 bounds/sanitizes both filename components before writing.
+
+SYSTEM → Upload WPA-SEC prefers PCAPNG when a same-stem legacy PCAP is also
+present and uploads only one copy. Old PCAP-only loot remains uploadable, but
+firmware 1.7.12 and WDG 0.9.38 create only PCAPNG for new handshake and packet
+captures. PCAPNG supplies useful capture context to WPA-Sec/hcxtools; it cannot
+reconstruct authentication, association, probe or EAPOL packets that were not
+heard over the air.
 
 With older firmware, all-nearby capture still works when the Wi-Fi whitelist is
 empty. Firmware 1.7.11 advertises `hs_capture_exclusions_v1`; when one or more
@@ -103,7 +120,7 @@ network mode on older firmware may not provide these coarse M-number logs.
 The table counts EAPOL packets and distinct observed, unencrypted PMKIDs per
 AP/client. PMKIDs are parsed from RSN elements and EAPOL-Key PMKID KDEs, using
 the same parser as HS Sniff. Existing firmware capture filters and deduplication
-still determine which frames reach the PCAP and progress stream.
+still determine which frames reach the PCAPNG and progress stream.
 
 **The UI shows packet sightings; it does not validate an exchange.** A row with
 all four M columns populated can include separate connection attempts or
@@ -116,9 +133,10 @@ need only a matching pair; a PMKID is a separate capture type.
 See the [Hashcat message-pair format](https://hashcat.net/wiki/doku.php?id=hccapx)
 and [WPA-PBKDF2-PMKID+EAPOL documentation](https://hashcat.net/wiki/doku.php?id=cracking_wpawpa2).
 
-The active capture PCAP observer does not receive channel/RSSI metadata. These
-columns show **--** instead of guessed values. SSIDs remain unknown unless
-SSID-bearing context was forwarded.
+The saved PCAPNG receives channel/RSSI metadata directly from the firmware
+capture queue. The lower-bandwidth live progress stream still forwards only raw
+802.11 bytes, so its table columns show **--** instead of guessed values. SSIDs
+remain unknown unless SSID-bearing context was forwarded.
 
 ## Transport and limits
 
@@ -132,7 +150,7 @@ WDG binds progress to an expected capture/storage, rejects retired sessions and
 non-increasing sequence numbers, and only parses complete, contiguous frames.
 Frames are bounded to 2304 bytes, rows to 512, SSID context to 1024, and the PMKID
 deduplication cache to 4096. Telemetry loss can undercount the display even when
-the original frame was saved in the ESP32's PCAP.
+the original frame was saved in the ESP32's PCAPNG.
 
 **Drops** reports firmware progress queue/output/age losses; **Gaps** counts
 missing progress sequence positions, and **Incomplete** counts abandoned

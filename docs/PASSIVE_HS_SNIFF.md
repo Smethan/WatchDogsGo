@@ -33,16 +33,18 @@ current session and waits for its final acknowledgement.
 
 ## Capture files and counters
 
-WDG saves `handshakes/passive_<timestamp>.pcap` under the current loot session on
-the uConsole. The PCAP link type is raw IEEE 802.11 (105), without the FCS.
-Packets are timestamped using host receipt time minus firmware-reported age;
-this includes residual serial delay. No GPS fix is required.
+WDG saves `handshakes/passive_<timestamp>.pcapng` under the current loot session
+on the uConsole. The capture uses IEEE 802.11 radiotap (link type 127), without
+the FCS, and records the channel and RSSI reported by the ESP32. Packets are
+timestamped using host receipt time minus firmware-reported age; this includes
+residual serial delay. No GPS fix is required. New captures do not also create
+a classic PCAP copy.
 
 A same-named `.jsonl` records EAPOL message classifications and observed,
 unencrypted PMKIDs with AP/client MACs, channel, RSSI and the SSID when known.
 PMKIDs are recognized in RSN information
 elements and RSN EAPOL-Key PMKID KDEs. Encrypted key data is not decoded. An
-absent SSID remains unknown. The PCAP retains the original packets for later
+absent SSID remains unknown. The PCAPNG retains the original packets for later
 analysis; this mode does not generate HCCAPX or claim a complete handshake.
 
 The display counts **EAPOL frames** and distinct observed **PMKIDs**. Each AP/client
@@ -68,7 +70,7 @@ deduplicated by the firmware. Unsupported/oversized or aged queued frames can be
 dropped and are counted. Channel hopping can miss part or all of an exchange.
 
 WDG accepts only complete, correctly sequenced packets from the current session;
-partial/corrupt packets never become PCAP records. Complete writes are flushed,
+partial/corrupt packets never become PCAPNG records. Complete writes are flushed,
 synced periodically and synced on close. A storage error stops capture.
 Use Stop and wait for completion before unplugging to allow the bounded queue
 drain. Forced exit/cable removal can lose packets still in transit.

@@ -20,5 +20,5 @@ The worker uses a 10 KB stack. Repeat beacons/probe responses with identical
 BSSID/tagged fields are limited to one per ten seconds. The ordinary two-second
 age limit applies. Stop disables reception, drains for up to 1.5 seconds plus
 one in-progress frame, counts remaining drops, frees the queue and emits stopped.
-WDG writes PCAP and identifies visible PMKIDs on the uConsole; receiving EAPOL
+WDG writes radiotap PCAPNG and identifies visible PMKIDs on the uConsole; receiving EAPOL
 does not by itself establish handshake completeness.
