@@ -230,6 +230,15 @@ MENU_CATS = [
     ]),
 ]
 
+
+def _menu_hotkey_key(hotkey: str):
+    """Return the Pyxel key constant for one menu letter or digit."""
+    if (not isinstance(hotkey, str) or len(hotkey) != 1
+            or not hotkey.isascii() or not hotkey.isalnum()):
+        return None
+    return getattr(pyxel, "KEY_" + hotkey.upper(), None)
+
+
 # BLE device line regex (from JanOS bt_wardriving)
 # Groups: 1=MAC, 2=RSSI, 3=Name (optional), 4=[AirTag]/[SmartTag] (optional)
 _BLE_RE = re.compile(
@@ -1705,16 +1714,28 @@ class WatchDogsGame(OtaMixin):
         if pyxel.btnp(pyxel.KEY_LEFT):
             self.menu_cat = (self.menu_cat - 1) % len(MENU_CATS)
             self.menu_sel = 0
+            return
         if pyxel.btnp(pyxel.KEY_RIGHT):
             self.menu_cat = (self.menu_cat + 1) % len(MENU_CATS)
             self.menu_sel = 0
+            return
         _, items = MENU_CATS[self.menu_cat]
         if pyxel.btnp(pyxel.KEY_UP):
             self.menu_sel = (self.menu_sel - 1) % len(items)
+            return
         if pyxel.btnp(pyxel.KEY_DOWN):
             self.menu_sel = (self.menu_sel + 1) % len(items)
+            return
         if pyxel.btnp(pyxel.KEY_RETURN):
             self._activate_menu_item(self.menu_cat, self.menu_sel)
+            return
+        for item_idx, item in enumerate(items):
+            hotkey = item[0]
+            key = _menu_hotkey_key(hotkey)
+            if key is not None and pyxel.btnp(key):
+                self.menu_sel = item_idx
+                self._activate_menu_item(self.menu_cat, item_idx)
+                return
 
     def _activate_menu_item(self, cat_idx: int, item_idx: int):
         _, items = MENU_CATS[cat_idx]
