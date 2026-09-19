@@ -58,7 +58,8 @@ Or double-click **Watch Dogs Go** on your desktop.
 
 1. Load player profile (XP, level, badges) from `loot/loot_db.json`
 2. Auto-detect ESP32 on `/dev/ttyUSB0` or `/dev/ttyACM0` (no serial = "ESP32 not found", that's OK to test the UI)
-3. Try to open GPS on `/dev/ttyAMA0` (uConsole AIO) or USB GPS — optional
+3. Try the documented AIO GPS UART (`/dev/ttyS0` on CM4,
+   `/dev/ttyAMA0` on CM5) or a safe external GPS — optional
 4. Discover and load plugins from `plugins/` (currently: Wars Sync, JanOS Loot Import)
 5. Show the cyberdeck UI
 
@@ -113,7 +114,7 @@ And these Python packages (in `.venv`):
 |-----------|-------------|
 | **ClockworkPi uConsole** | Primary platform (or any Linux with pyxel-compatible display) |
 | **ESP32-C5** | Running [projectZero](https://github.com/LOCOSP/projectZero) firmware — WiFi/BLE scanning, deauth, handshake capture, Evil Twin, BLE HID |
-| **GPS module** | AIO v2 GPS on `/dev/ttyAMA0` (or USB GPS) — real-time positioning, wardriving logs, map tracking |
+| **GPS module** | AIO v2 GPS on `/dev/ttyS0` (CM4) or `/dev/ttyAMA0` (CM5), or an external GPS — real-time positioning, wardriving logs, map tracking |
 
 ### Optional (for full functionality)
 
@@ -280,8 +281,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
-| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, and serving-cell tracking |
-| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same GPS/cell path |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, and optional serving-cell tracking |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same independent GPS/optional-cell path |
 | ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
@@ -503,6 +504,25 @@ has one control-plane owner. Explicit external GPS devices remain supported.
 Automatic serial discovery excludes every ModemManager-owned port and known
 ESP32/uConsole ACM control device.
 
+Before removing the LTE board, open **SNIFF → Wardrive Settings** and turn
+**LTE modem integration** OFF. The choice persists and is read before GPS
+startup, so later launches do not start the ModemManager broker or enumerate
+its ports. Cell mast tracking and experimental neighbors become inactive, but
+Wi-Fi, ESP BLE, uConsole host BLE, and All Wardrive continue normally.
+
+With LTE integration OFF, WDG discovers the AIOv2 GPS on the documented
+`/dev/ttyS0` CM4 UART or `/dev/ttyAMA0` CM5 UART, plus safe external ACM
+receivers, without probing generic `ttyUSB` modem ports or unrelated platform
+UARTs. Turn the AIO GPS rail on from **SYSTEM → GPS**.
+An explicitly configured USB GPS through `WDG_GPS_DEVICE` is still honored.
+If LTE integration remains ON while the module is absent, WDG handles the
+missing ModemManager location provider and falls back to external GPS.
+
+Turn LTE integration ON after reinstalling the SIM7600. A working external GPS
+continues to be used; otherwise WDG reacquires ModemManager GNSS. The separate
+**Cell mast tracking** setting controls WiGLE cell observations without
+disabling SIM7600 GPS. Both All Wardrive radio modes use the same setting.
+
 If an older `/etc/systemd/system/uconsole-sim.service` sends `AT+CGPS` directly,
 WDG leaves internal GNSS and cellular tracking disabled until it is migrated:
 
@@ -548,7 +568,7 @@ Saved to `loot/<session>/`:
 watchdogs/
   app.py              Main game loop, UI rendering, menu system
   serial_manager.py   ESP32 serial comm (115200 baud, USB auto-detect)
-  gps_manager.py      NMEA parser (/dev/ttyAMA0 default)
+  gps_manager.py      NMEA parser (CM4/CM5 AIO UART or external GPS)
   loot_manager.py     Loot saving (CSV, PCAPNG, handshakes)
   network_manager.py  WiFi scan result parsing
   app_state.py        Shared state (networks, GPS, BLE devices)

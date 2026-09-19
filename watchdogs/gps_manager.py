@@ -57,8 +57,10 @@ class GpsManager:
 
     def __init__(self, device: str = GPS_DEVICE,
                  baud: int = GPS_BAUD_RATE,
-                 modem_broker: Optional[ModemLocationBroker] = None) -> None:
+                 modem_broker: Optional[ModemLocationBroker] = None,
+                 modem_enabled: bool = True) -> None:
         self.device = device
+        self._configured_device = device
         self._baud = baud
         self._user_configured = bool(
             os.environ.get("WDG_GPS_DEVICE")
@@ -69,6 +71,7 @@ class GpsManager:
         self._available = False
         self._gsv_visible: dict = {}  # constellation prefix → satellite count
         self.modem_broker = modem_broker or ModemLocationBroker()
+        self.modem_enabled = bool(modem_enabled)
         self.provider = ""
         self.status_reason = ""
 
@@ -85,11 +88,20 @@ class GpsManager:
         Explicit external devices take priority.  Otherwise use ModemManager's
         GNSS feed, then probe only serial ports that ModemManager does not own.
         Never raises — GPS is optional."""
-        device = self.device
+        if self._available:
+            return True
+        # ``self.device`` is the active provider label/path and becomes
+        # ``ModemManager GNSS`` while the SIM7600 supplies fixes.  Keep the
+        # configured UART separately so a runtime LTE-off switch can fall back
+        # to the AIO receiver immediately.
+        device = self._configured_device
         self.status_reason = ""
 
         if self._user_configured:
-            if self._is_managed_port(device):
+            # An explicit external device is the only ttyUSB path allowed while
+            # LTE integration is disabled.  It is a deliberate operator choice;
+            # automatic discovery below still skips every ttyUSB device.
+            if self.modem_enabled and self._is_managed_port(device):
                 self.status_reason = (
                     f"{device} is owned by ModemManager; configure an external GPS")
                 log.warning(self.status_reason)
@@ -100,36 +112,72 @@ class GpsManager:
                      device)
             return False
 
-        # The internal SIM7600 is accessed only through ModemManager.  Starting
-        # this broker does not open its GPS/AT/QMI device nodes.
-        if self.modem_broker.acquire("gps", gps=True):
-            if self.modem_broker.wait_ready(5):
-                self.device = "ModemManager GNSS"
-                self.provider = "modemmanager"
-                self._available = True
-                log.info("GPS provided by ModemManager")
-                return True
-            self.status_reason = self.modem_broker.error
-            self.modem_broker.release("gps")
-            self.modem_broker.close()
+        if self.modem_enabled:
+            # The internal SIM7600 is accessed only through ModemManager.
+            # Starting this broker does not open its GPS/AT/QMI device nodes.
+            if self.modem_broker.acquire("gps", gps=True):
+                if self.modem_broker.wait_ready(5):
+                    self.device = "ModemManager GNSS"
+                    self.provider = "modemmanager"
+                    self._available = True
+                    log.info("GPS provided by ModemManager")
+                    return True
+                self.status_reason = self.modem_broker.error
+                self.modem_broker.release("gps")
+                self.modem_broker.close()
+            else:
+                self.status_reason = self.modem_broker.error
         else:
-            self.status_reason = self.modem_broker.error
+            log.info("LTE modem integration disabled; skipping ModemManager GPS")
 
-        # No usable internal GNSS — probe the configured default and external
-        # ports only after excluding every device node managed by MM.
-        if (not self._is_managed_port(device) and os.path.exists(device)
-                and self._probe_nmea(device, self._baud)):
-            if self._try_open(device):
+        # No usable internal GNSS — probe only the documented platform UART
+        # for this Compute Module.  Avoid broad ttyAMA/ttyS discovery because
+        # another UART may carry the onboard Bluetooth HCI transport.
+        for candidate in self._platform_gps_candidates(device):
+            if (self.modem_enabled and self._is_managed_port(candidate)):
+                continue
+            if (os.path.exists(candidate)
+                    and self._probe_nmea(candidate, self._baud)
+                    and self._try_open(candidate)):
+                self.device = candidate
                 return True
 
         log.info("GPS not on %s, scanning for USB GPS...", device)
-        detected = self._auto_detect(exclude={device})
+        detected = self._auto_detect(exclude={device},
+                                     include_tty_usb=self.modem_enabled)
         if detected:
             self.device = detected
             if self._try_open(detected):
                 return True
+        if not self.modem_enabled:
+            self.status_reason = "LTE modem disabled; no external GPS found"
         log.info("No GPS found — GPS disabled")
         return False
+
+    def set_modem_enabled(self, enabled: bool, reconnect: bool = True) -> bool:
+        """Apply the persistent LTE integration choice without touching scans.
+
+        Disabling the modem releases ModemManager-backed GNSS immediately and
+        optionally searches for an external/AIO receiver.  Enabling it leaves
+        an already working external receiver alone, but can acquire SIM7600
+        GNSS when no other provider is active.
+        """
+        enabled = bool(enabled)
+        if enabled == self.modem_enabled:
+            if reconnect and not self.available:
+                return self.setup()
+            return self.available
+        if not enabled:
+            self.modem_enabled = False
+            if self.provider == "modemmanager":
+                self.close()
+            else:
+                # A cell owner must be stopped by WardriveUI first.  Closing a
+                # dormant broker here guarantees OFF means no MM worker remains.
+                self.modem_broker.close()
+            return self.setup() if reconnect and not self.available else self.available
+        self.modem_enabled = True
+        return self.setup() if reconnect and not self.available else self.available
 
     @staticmethod
     def _probe_nmea(device: str, baud: int) -> bool:
@@ -173,6 +221,43 @@ class GpsManager:
         return name in names if names is not None else name.startswith("ttyUSB")
 
     @staticmethod
+    def _platform_model() -> str:
+        for path in (Path("/proc/device-tree/model"),
+                     Path("/sys/firmware/devicetree/base/model")):
+            try:
+                return path.read_text(errors="replace").replace("\x00", "").strip()
+            except OSError:
+                continue
+        return ""
+
+    @classmethod
+    def _platform_gps_candidates(cls, configured: str) -> list[str]:
+        """Return only UARTs documented for the installed Compute Module.
+
+        HackerGadgets maps AIOv2 GPS to ttyS0 on CM4 and ttyAMA0 on CM5.
+        ``serial0`` is retained as a stable alias fallback.  A non-default
+        programmatic device remains authoritative; environment-configured
+        devices are handled earlier in :meth:`setup`.
+        """
+        if configured != GPS_DEVICE:
+            return [configured]
+        model = cls._platform_model().lower()
+        if "compute module 4" in model or "cm4" in model:
+            candidates = ["/dev/ttyS0", "/dev/serial0"]
+        elif "compute module 5" in model or "cm5" in model:
+            candidates = ["/dev/ttyAMA0", "/dev/serial0"]
+        else:
+            candidates = [configured, "/dev/serial0"]
+        result = []
+        seen = set()
+        for candidate in candidates:
+            resolved = os.path.realpath(candidate) if os.path.exists(candidate) else candidate
+            if resolved not in seen:
+                seen.add(resolved)
+                result.append(candidate)
+        return result
+
+    @staticmethod
     def _unsafe_acm(path: str) -> bool:
         """Exclude known control devices whose open can reset hardware."""
         name = Path(path).name
@@ -192,14 +277,18 @@ class GpsManager:
         return False
 
     @classmethod
-    def _auto_detect(cls, exclude: Optional[set] = None) -> Optional[str]:
+    def _auto_detect(cls, exclude: Optional[set] = None,
+                     include_tty_usb: bool = True) -> Optional[str]:
         """Probe serial ports outside ModemManager's physical device."""
         skip = exclude or set()
-        managed = managed_port_names()
+        # With LTE integration OFF, never query ModemManager and never probe a
+        # generic ttyUSB automatically.  The documented AIOv2 platform UART was
+        # already tried above; explicit USB GPS paths remain available through
+        # WDG_GPS_DEVICE.
+        managed = managed_port_names() if include_tty_usb else set()
         candidates = sorted(
-            glob.glob("/dev/ttyUSB*")
+            (glob.glob("/dev/ttyUSB*") if include_tty_usb else [])
             + glob.glob("/dev/ttyACM*")
-            + glob.glob("/dev/ttyAMA*")
         )
         for path in candidates:
             if path in skip:

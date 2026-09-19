@@ -25,6 +25,7 @@ from .serial_manager import SerialManager, detect_esp32_port
 from .ota_ui import OtaMixin
 from .gps_manager import GpsManager
 from .wardrive_ui import WardriveUI
+from .wardrive_settings import load_settings as load_wardrive_settings
 from .loot_manager import LootManager
 from .app_state import AppState, Network
 from .network_manager import NetworkManager
@@ -430,10 +431,16 @@ class WatchDogsGame(OtaMixin):
             self._coast_bounds.append(
                 (min_lat, max_lat, min_lon, max_lon, antimerid))
 
+        # Resolve the data root before GPS starts because LTE integration is a
+        # persistent wardrive setting and OFF must skip ModemManager at boot.
+        _project_root = Path(__file__).resolve().parent.parent
+        _app_dir = loot_path or str(_project_root)
+        _wardrive_settings = load_wardrive_settings(_app_dir)
+
         # --- Direct serial/GPS (no IPC) ---
         self.state = AppState()
         self.serial: SerialManager | None = None
-        self.gps = GpsManager()
+        self.gps = GpsManager(modem_enabled=_wardrive_settings["lte_modem"])
         self.net_mgr = NetworkManager(self.state)
         self.loot: LootManager | None = None
 
@@ -492,8 +499,6 @@ class WatchDogsGame(OtaMixin):
         # Init loot manager (uses app dir or home)
         # Resolve project root from this file's location (works under sudo).
         # __file__ = .../esp32-watch-dogs/watchdogs/app.py → go up two levels.
-        _project_root = Path(__file__).resolve().parent.parent
-        _app_dir = loot_path or str(_project_root)
         # Load bigger font for messenger (8x8 BDF) — kept for chat overlay
         _font_path = _project_root / "assets" / "font_8x8.bdf"
         try:
@@ -893,7 +898,7 @@ class WatchDogsGame(OtaMixin):
             except Exception:
                 pass
 
-        self.wardrive = WardriveUI(self)
+        self.wardrive = WardriveUI(self, initial_settings=_wardrive_settings)
         pyxel.run(self.update, self.draw)
 
     # ------------------------------------------------------------------

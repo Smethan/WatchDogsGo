@@ -883,6 +883,51 @@ def test_cell_tracking_never_starts_for_dual_test(game):
     w.cell.start.assert_not_called()
 
 
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_lte_off_never_starts_cell_and_does_not_block_all_wardrive(game, wifi_only):
+    w = game.wardrive
+    w.settings["lte_modem"] = False
+    w.cell = Mock(active=False)
+    w.cell.poll.return_value = []
+    w.scan.supported = True
+    w.scan.wifi_supported = True
+    w.scan.batch_supported = True
+    w.scan.wifi_batch_supported = True
+    if wifi_only:
+        w.host_ble = Mock(state="idle", drops=0)
+        w.host_ble.start.return_value = True
+        w.host_ble.poll.return_value = []
+
+    assert w.scan.start(wifi_only=wifi_only)
+    token = w.scan.session
+    w.handle_line(wire(batch_control("started", session=token, seq=1, batch=0)))
+
+    assert w.scan.state == "running"
+    w.cell.start.assert_not_called()
+    if wifi_only:
+        w.host_ble.start.assert_called_once_with(token)
+
+
+def test_lte_toggle_stops_only_cell_and_reconfigures_gps(game):
+    w = game.wardrive
+    w.cell = Mock(active=True)
+    w.host_ble = Mock(state="running")
+    w.scan.state = "running"
+    w.scan.mode = "wardrive"
+    game.gps.provider = "serial"
+    game.gps.set_modem_enabled = Mock(return_value=True)
+
+    w.toggle_setting("lte_modem")
+
+    assert w.settings["lte_modem"] is False
+    w.cell.stop.assert_called_once_with()
+    game.gps.set_modem_enabled.assert_called_once_with(False, reconnect=True)
+    w.host_ble.stop.assert_not_called()
+    assert w.scan.state == "running"
+    assert json.loads((Path(game._app_dir) / "wardrive_settings.json").read_text())[
+        "lte_modem"] is False
+
+
 def test_disabling_gps_stops_cell_without_restarting_it(game):
     cell = Mock(active=True)
     cell.poll.return_value=[]

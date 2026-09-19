@@ -10,6 +10,7 @@ from watchdogs.modem_location import (
     ModemLocationBroker, legacy_modem_service_reason, managed_port_names,
     parse_3gpp_location, split_nmea, technology_from_access)
 from watchdogs.gps_manager import GpsManager
+from watchdogs.config import GPS_DEVICE
 
 
 def test_parse_measured_sim7600_location_and_keep_mnc_width():
@@ -187,3 +188,97 @@ def test_explicit_modem_tty_is_rejected_without_open(monkeypatch):
     assert not gps.setup()
     assert "owned by ModemManager" in gps.status_reason
     gps._try_open.assert_not_called()
+
+
+def test_lte_disabled_skips_modemmanager_and_uses_aio_uart(monkeypatch):
+    monkeypatch.delenv("WDG_GPS_DEVICE", raising=False)
+    monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
+    monkeypatch.setattr("watchdogs.gps_manager.managed_port_names",
+                        Mock(side_effect=AssertionError("MM inventory must not be queried")))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
+                        lambda path: path == "/dev/ttyAMA0")
+    broker = SimpleNamespace(
+        acquire=Mock(side_effect=AssertionError("MM broker must not start")),
+        close=Mock(), error="")
+    gps = GpsManager(device="/dev/ttyAMA0", modem_broker=broker,
+                     modem_enabled=False)
+    gps._probe_nmea = Mock(return_value=True)
+    gps._try_open = Mock(return_value=True)
+
+    assert gps.setup()
+    gps._probe_nmea.assert_called_once_with("/dev/ttyAMA0", gps._baud)
+    gps._try_open.assert_called_once_with("/dev/ttyAMA0")
+    broker.acquire.assert_not_called()
+
+
+def test_cm4_aio_uses_ttys0_without_probing_bluetooth_uart(monkeypatch):
+    monkeypatch.delenv("WDG_GPS_DEVICE", raising=False)
+    monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
+    monkeypatch.setattr(GpsManager, "_platform_model",
+                        staticmethod(lambda: "Raspberry Pi Compute Module 4 Rev 1.1"))
+    monkeypatch.setattr("watchdogs.gps_manager.managed_port_names",
+                        Mock(side_effect=AssertionError("MM inventory must not be queried")))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
+                        lambda path: path in ("/dev/ttyS0", "/dev/ttyAMA0"))
+    broker = SimpleNamespace(acquire=Mock(), close=Mock(), error="")
+    gps = GpsManager(modem_broker=broker, modem_enabled=False)
+    gps._probe_nmea = Mock(return_value=True)
+    gps._try_open = Mock(return_value=True)
+
+    assert gps.setup()
+    gps._probe_nmea.assert_called_once_with("/dev/ttyS0", gps._baud)
+    gps._try_open.assert_called_once_with("/dev/ttyS0")
+    assert gps.device == "/dev/ttyS0"
+    assert not any(call.args[0] == "/dev/ttyAMA0"
+                   for call in gps._probe_nmea.call_args_list)
+
+
+def test_cm5_aio_uses_ttyama0(monkeypatch):
+    monkeypatch.setattr(GpsManager, "_platform_model",
+                        staticmethod(lambda: "Raspberry Pi Compute Module 5 Rev 1.0"))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists", lambda _path: False)
+    assert GpsManager._platform_gps_candidates(GPS_DEVICE) == [
+        "/dev/ttyAMA0", "/dev/serial0"]
+
+
+def test_missing_modem_falls_back_to_external_gps_without_raising(monkeypatch):
+    monkeypatch.delenv("WDG_GPS_DEVICE", raising=False)
+    monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
+    monkeypatch.setattr("watchdogs.gps_manager.managed_port_names", lambda: set())
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
+                        lambda path: path == "/dev/ttyAMA0")
+    broker = SimpleNamespace(
+        error="No ModemManager modem with location support",
+        acquire=Mock(return_value=True), wait_ready=Mock(return_value=False),
+        release=Mock(), close=Mock())
+    gps = GpsManager(device="/dev/ttyAMA0", modem_broker=broker)
+    gps._probe_nmea = Mock(return_value=True)
+    gps._try_open = Mock(return_value=True)
+
+    assert gps.setup()
+    broker.release.assert_called_once_with("gps")
+    broker.close.assert_called_once()
+    gps._try_open.assert_called_once_with("/dev/ttyAMA0")
+
+
+def test_disabling_modem_gps_releases_broker_before_external_reconnect(monkeypatch):
+    monkeypatch.delenv("WDG_GPS_DEVICE", raising=False)
+    monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
+    monkeypatch.setattr("watchdogs.gps_manager.managed_port_names",
+                        Mock(side_effect=AssertionError("MM inventory must not be queried")))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
+                        lambda path: path == "/dev/ttyAMA0")
+    broker = SimpleNamespace(release=Mock(), close=Mock())
+    gps = GpsManager(device="/dev/ttyAMA0", modem_broker=broker)
+    gps.provider = "modemmanager"
+    gps.device = "ModemManager GNSS"
+    gps._available = True
+    gps._probe_nmea = Mock(return_value=True)
+    gps._try_open = Mock(return_value=True)
+
+    assert gps.set_modem_enabled(False)
+    assert not gps.modem_enabled
+    broker.release.assert_called_once_with("gps")
+    broker.close.assert_called_once()
+    gps._probe_nmea.assert_called_once_with("/dev/ttyAMA0", gps._baud)
+    gps._try_open.assert_called_once_with("/dev/ttyAMA0")

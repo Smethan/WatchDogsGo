@@ -16,15 +16,12 @@ from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
 from .cell_monitor import HostCellScanner, find_unclean_cell_session
+from .wardrive_settings import DEFAULTS, load_settings, save_settings, settings_path
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
-DEFAULTS = {"flock": True, "axon": True, "precise": True,
-            "network_dots": True, "trail": False,
-            "cell_tracking": True, "cell_neighbors": False,
-            "realert_seconds": 60, "suppressed_rules": [], "suppressed_devices": []}
 
 class WardriveUI:
-    def __init__(self, app):
+    def __init__(self, app, initial_settings=None):
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
         self.host_ble = HostBleScanner()
@@ -49,15 +46,10 @@ class WardriveUI:
         self._radar_trail_segments = []
         self.history_notables = OrderedDict()
         self.history_index = -1
-        self.settings_path = Path(app._app_dir) / "wardrive_settings.json"
-        self.settings = dict(DEFAULTS)
-        try:
-            saved = json.loads(self.settings_path.read_text())
-            for key, value in DEFAULTS.items():
-                if type(saved.get(key)) is type(value):
-                    self.settings[key] = saved[key]
-        except (OSError, ValueError, TypeError):
-            pass
+        self.settings_path = settings_path(app._app_dir)
+        self.settings = (load_settings(app._app_dir) if initial_settings is None
+                         else {key: initial_settings.get(key, value)
+                               for key, value in DEFAULTS.items()})
         self.settings_open = False
         self.selection = 0
         self.details = False
@@ -378,7 +370,8 @@ class WardriveUI:
 
     def start_cell(self):
         """Start cell collection only after the ESP wardrive is acknowledged."""
-        if (not self.settings["cell_tracking"] or self.scan.mode != "wardrive"
+        if (not self.settings["lte_modem"] or not self.settings["cell_tracking"]
+                or self.scan.mode != "wardrive"
                 or self.scan.diagnostic or self.scan.state != "running"
                 or not self.app.gps.available
                 or self.cell.active or not self.app.loot or not self.app.loot.active):
@@ -397,7 +390,8 @@ class WardriveUI:
 
     def poll_cell(self, now):
         active = (self.scan.state == "running" and self.scan.mode == "wardrive"
-                  and not self.scan.diagnostic and self.settings["cell_tracking"]
+                  and not self.scan.diagnostic and self.settings["lte_modem"]
+                  and self.settings["cell_tracking"]
                   and self.app.gps.available)
         if not active:
             self.cell.stop()
@@ -732,29 +726,49 @@ class WardriveUI:
                 self.persist_settings()
             return
         keys = ("flock", "axon", "precise", "network_dots", "trail",
-                "cell_tracking", "cell_neighbors")
+                "lte_modem", "cell_tracking", "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
-            key = keys[self.selection]
-            self.settings[key] = not self.settings[key]
-            if key in ("flock", "axon"):
-                self._refresh_notable_identities()
-            if key == "network_dots" and not self.settings[key]:
-                self.app._cluster_sel = -1
-                self.app._cluster_popup = None
-            if key == "trail": self.trail.break_segment()
-            if key == "cell_tracking" and not self.settings[key]:
-                self.cell.stop()
-            if key == "cell_neighbors" and self.cell.active:
-                self.app.msg("[CELL] Neighbor setting applies to the next wardrive session", 13)
-            self.persist_settings()
+            self.toggle_setting(keys[self.selection])
+
+    def toggle_setting(self, key):
+        """Apply one Wardrive Settings toggle and persist it."""
+        if key not in DEFAULTS or type(DEFAULTS[key]) is not bool:
+            return
+        self.settings[key] = not self.settings[key]
+        if key in ("flock", "axon"):
+            self._refresh_notable_identities()
+        if key == "network_dots" and not self.settings[key]:
+            self.app._cluster_sel = -1
+            self.app._cluster_popup = None
+        if key == "trail":
+            self.trail.break_segment()
+        if key == "lte_modem":
+            # Stop the shared cell owner before changing broker ownership.
+            # Wi-Fi, ESP BLE, and host BLE sessions remain untouched.
+            self.cell.stop()
+            self.app.gps.set_modem_enabled(self.settings[key], reconnect=True)
+            if not self.app.gps.available:
+                self.app.gps_fix = False
+                self.app.gps_sats = 0
+                self.app.gps_sats_vis = 0
+            state = "enabled" if self.settings[key] else "disabled"
+            provider = self.app.gps.provider or "no GPS provider"
+            self.app._term_add(
+                f"[LTE] Modem integration {state}; GPS: {provider}", raw=True)
+            self.app.msg(
+                f"[LTE] {state.upper()} | GPS: {provider}",
+                CYAN if self.settings[key] else ORANGE)
+        if key == "cell_tracking" and not self.settings[key]:
+            self.cell.stop()
+        if key == "cell_neighbors" and self.cell.active:
+            self.app.msg("[CELL] Neighbor setting applies to the next wardrive session", 13)
+        self.persist_settings()
 
     def persist_settings(self):
         try:
-            temp = self.settings_path.with_suffix(".tmp")
-            temp.write_text(json.dumps(self.settings,indent=2)+"\n")
-            temp.replace(self.settings_path)
+            save_settings(self.app._app_dir, self.settings)
         except OSError as exc:
             self.app.msg("[WDG] Settings save failed: " + str(exc)[:50],8)
 
@@ -766,28 +780,33 @@ class WardriveUI:
             px.rectb(40,35,560,285,PURPLE)
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
             keys = ("flock", "axon", "precise", "network_dots", "trail",
-                    "cell_tracking", "cell_neighbors")
+                    "lte_modem", "cell_tracking", "cell_neighbors")
             labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
-                      "Regular wardrive dots (2048 max)", "Wardrive trail", "Cell mast tracking",
+                      "Regular wardrive dots (2048 max)", "Wardrive trail",
+                      "LTE modem integration", "Cell mast tracking",
                       "Experimental QMI neighbors")
             for i,(key,label) in enumerate(zip(keys,labels)):
-                px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+("ON" if self.settings[key] else "OFF"),11 if i==self.selection else 7)
-            px.text(55,155,"Precise = where YOU heard it, not the camera location.",13)
-            px.text(55,166,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
+                value = "ON" if self.settings[key] else "OFF"
+                if key in ("cell_tracking", "cell_neighbors") and not self.settings["lte_modem"]:
+                    value += " (LTE OFF)"
+                px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
+            px.text(55,168,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
+            px.text(55,179,"Precise = where YOU heard it, not the camera location.",13)
+            px.text(55,190,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
             route = self.history_trail.path.parent.name if self.history_trail else "current session"
-            px.text(55,177,"[H] Route history: " + route,13)
-            px.text(55,190,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
+            px.text(55,202,"[H] Route history: " + route,13)
+            px.text(55,215,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
             items = list(self.notables.values())
             offset = max(0,self.detail_selection-4) if self.details else max(0,len(items)-5)
             for i,item in enumerate(items[offset:offset+5]):
                 selected = self.details and i+offset == self.detail_selection
                 label = ("> " if selected else "  ")+item["label"]+" "+item["mac"]+" "+str(item["rssi"])+"dBm"
                 if item["identity"] in self.settings["suppressed_devices"]: label += " MUTED"
-                px.text(55,204+i*14,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
+                px.text(55,229+i*12,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
             if self.details and items:
                 item = items[min(self.detail_selection,len(items)-1)]
-                px.text(55,280,("Rules: "+", ".join(h["id"] for h in item["evidence"]))[:104],13)
-                px.text(55,293,("Heard: "+time.strftime("%H:%M:%S",time.localtime(item["last"]))+"  "+("GPS recorded" if item["observation_fix"] else "GPS unavailable")),13)
+                px.text(55,291,("Rules: "+", ".join(h["id"] for h in item["evidence"]))[:104],13)
+                px.text(55,303,("Heard: "+time.strftime("%H:%M:%S",time.localtime(item["last"]))+"  "+("GPS recorded" if item["observation_fix"] else "GPS unavailable")),13)
             px.camera()
             self.app._draw_mc_toast()
         if self.scan.active and not self.settings_open and not self.hs_screen.open and not self.capture_screen.open:
@@ -814,7 +833,7 @@ class WardriveUI:
                 elif self.scan.legacy:
                     text = "LEGACY STREAM | " + text
                 if not self.app.gps_fix: text += " GPS unavailable"
-                if self.settings["cell_tracking"]:
+                if self.settings["lte_modem"] and self.settings["cell_tracking"]:
                     cell_state = self.cell.state.upper().replace("WAITING_GPS", "WAIT GPS")
                     text += f" CELL:{cell_state} {len(self.cell.unique)}/{self.cell.observations}"
                     if self.cell.latest:

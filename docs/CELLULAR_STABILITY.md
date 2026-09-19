@@ -5,6 +5,33 @@ ModemManager is the only process that controls the internal SIM7600. WDG reads
 its cached `Modem.Location` state over D-Bus for both NMEA and registered-cell
 identity; the safe default never opens a modem device node or launches qmicli.
 
+## Optional hardware and AIOv2 swaps
+
+WDG 0.9.39 adds **LTE modem integration** under **SNIFF → Wardrive Settings**.
+Turn it OFF before removing the SIM7600. The value is persisted and loaded
+before `GpsManager` starts, so an LTE-disabled launch does not acquire the
+ModemManager broker or query its managed-port inventory.
+
+LTE OFF also gates serving-cell and experimental-neighbor collection. It does
+not stop or alter ESP Wi-Fi/BLE, host BLE, All Wardrive, or ordinary loot. The
+separate cell settings are retained and resume when LTE integration is turned
+back on.
+
+GPS remains independent. With LTE OFF, WDG checks the documented AIOv2 UART
+(`/dev/ttyS0` on CM4 or `/dev/ttyAMA0` on CM5), then safe ACM devices. It does
+not broadly probe other platform UARTs, which may carry Bluetooth, and it skips
+automatic `ttyUSB` probing because a still-installed modem may expose AT ports
+there even when integration is disabled. Operators using an external USB GPS
+can select it explicitly with `WDG_GPS_DEVICE`. The AIOv2 GPS power rail must
+also be enabled through **SYSTEM → GPS** or `aiov2_ctl GPS on`.
+
+Changing the option at runtime first stops the cell owner, then releases
+ModemManager GNSS and searches for an external receiver. Wi-Fi and Bluetooth
+workers are not stopped. Enabling the option leaves a working external GPS in
+place; if no GPS provider is active, it tries ModemManager GNSS. If the modem
+is absent while integration is ON, broker failure is contained and serial GPS
+fallback still runs.
+
 ## Required one-time migration
 
 Older uConsole setups may run `/usr/local/bin/setup-sim-gps` at boot. That
