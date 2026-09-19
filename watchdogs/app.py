@@ -2916,8 +2916,10 @@ class WatchDogsGame(OtaMixin):
         if result[0] == "upload":
             _, up, total, msg = result
             if up > 0:
-                self.msg(f"[WPA-sec] {up}/{total} uploaded", C_SUCCESS)
+                self.msg(f"[WPA-sec] {up}/{total} new uploaded", C_SUCCESS)
                 self._earn_badge("wpasec_uploader")
+            elif total == 0 and "already uploaded" in msg:
+                self.msg("[WPA-sec] All captures already uploaded", C_DIM)
             else:
                 self.msg(f"[WPA-sec] {msg}", C_WARNING if total == 0 else C_ERROR)
             self._term_add(f"[WPA-sec] Upload: {msg}", raw=True)

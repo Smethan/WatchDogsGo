@@ -99,6 +99,13 @@ captures. PCAPNG supplies useful capture context to WPA-Sec/hcxtools; it cannot
 reconstruct authentication, association, probe or EAPOL packets that were not
 heard over the air.
 
+Successful uploads are recorded by SHA-256 in `loot/.wpasec_uploads.json`.
+Later uploads skip matching content for the same WPA-sec account while retrying
+failed or interrupted transfers. A renamed capture remains skipped; changed
+capture bytes and a different WPA-sec API key are treated as new work. The
+receipt file is replaced atomically after each confirmed HTTP success so a
+crash cannot leave a partially written ledger.
+
 With older firmware, all-nearby capture still works when the Wi-Fi whitelist is
 empty. Firmware 1.7.11 advertises `hs_capture_exclusions_v1`; when one or more
 Wi-Fi BSSIDs are whitelisted, WDG sends them as an immutable all-nearby

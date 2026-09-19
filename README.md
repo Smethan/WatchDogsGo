@@ -323,7 +323,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
 | LoRa | — | Toggle LoRa module ON/OFF (AIO GPIO, auto-starts MeshCore) |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
-| Upload WPA-SEC | — | Upload handshake `.pcapng` captures to wpa-sec.stanev.org (prompts for API key if not configured; old PCAP-only loot remains readable) |
+| Upload WPA-SEC | — | Incrementally upload new handshake `.pcapng` captures to wpa-sec.stanev.org; successful content hashes are remembered so later runs skip them (prompts for an API key if needed; old PCAP-only loot remains readable) |
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
 | Reboot ESP32 | `restart` | Restart ESP32 device |
 | Download Map | — | Download OSM tiles (~10 km radius around current position) for offline street-level map. Press again to cancel. |
@@ -595,6 +595,7 @@ watchdogs/
 | `.watchdogs_meshcore.json` | `~/` | MeshCore node name + channels |
 | `.watchdogs_meshcore_key` | `~/` | Ed25519 keypair for MeshCore signing |
 | `loot_db.json` | `loot/` | Aggregate stats, XP, badges |
+| `.wpasec_uploads.json` | `loot/` | Per-account SHA-256 receipts for successful WPA-sec uploads |
 | `last_run.log` | `~/.watchdogs/` | Game log (rotated to `previous_run.log`) |
 
 ## Troubleshooting & Bug Reports

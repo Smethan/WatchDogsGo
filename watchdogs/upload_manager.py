@@ -1,9 +1,12 @@
 """WPA-sec integration — upload handshake captures, download passwords."""
 
+from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import threading
 
 from .config import WPASEC_URL, WPASEC_DL_URL, WPASEC_KEY
 
@@ -11,6 +14,10 @@ log = logging.getLogger(__name__)
 
 # Runtime token cache (set from secrets.conf OR via in-game input dialog)
 _runtime_key: str = ""
+
+_UPLOAD_LEDGER_NAME = ".wpasec_uploads.json"
+_UPLOAD_LEDGER_VERSION = 1
+_upload_lock = threading.Lock()
 
 
 def _env(name: str, default: str) -> str:
@@ -86,9 +93,12 @@ def upload_wpasec(capture_path: Path) -> tuple[bool, str]:
             )
         if resp.status_code == 200:
             body = resp.text.strip()
-            if "already" in body.lower():
+            if "already submitted" in body.lower():
                 return True, "Already submitted"
-            return True, body[:200] if body else "Uploaded"
+            if body.lower().startswith("hcxpcapngtool"):
+                return True, body[:200]
+            return False, (
+                "WPA-sec rejected capture: " + (body[:200] or "empty response"))
         return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
     except Exception as exc:
         log.error("WPA-sec upload error: %s", exc)
@@ -121,38 +131,157 @@ def _capture_candidates(loot_dir: Path) -> list[Path]:
     return sorted(candidates.values())
 
 
+def _capture_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _empty_upload_ledger() -> dict:
+    return {"version": _UPLOAD_LEDGER_VERSION, "accounts": {}}
+
+
+def _load_upload_ledger(loot_dir: Path) -> tuple[dict, str]:
+    """Load upload receipts, failing open so captures are never suppressed."""
+    path = loot_dir / _UPLOAD_LEDGER_NAME
+    if not path.exists():
+        return _empty_upload_ledger(), ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict)
+                or data.get("version") != _UPLOAD_LEDGER_VERSION
+                or not isinstance(data.get("accounts"), dict)):
+            raise ValueError("unsupported receipt format")
+        return data, ""
+    except (OSError, UnicodeError, ValueError) as exc:
+        log.warning("Cannot read WPA-sec upload receipts %s: %s", path, exc)
+        return _empty_upload_ledger(), "upload receipt file unreadable; retried all captures"
+
+
+def _save_upload_ledger(loot_dir: Path, ledger: dict) -> None:
+    """Atomically persist successful-upload receipts after each upload."""
+    loot_dir.mkdir(parents=True, exist_ok=True)
+    path = loot_dir / _UPLOAD_LEDGER_NAME
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(ledger, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(loot_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _upload_account_id() -> str:
+    """Scope receipts to one WPA-sec account without storing its API key."""
+    return hashlib.sha256(get_wpasec_key().encode("utf-8")).hexdigest()
+
+
+def _account_receipts(ledger: dict) -> dict:
+    accounts = ledger["accounts"]
+    account_id = _upload_account_id()
+    account = accounts.setdefault(account_id, {"captures": {}})
+    if not isinstance(account, dict):
+        account = {"captures": {}}
+        accounts[account_id] = account
+    captures = account.get("captures")
+    if not isinstance(captures, dict):
+        captures = {}
+        account["captures"] = captures
+    return captures
+
+
 def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
                       ) -> tuple[int, int, str]:
-    """Upload preferred PCAPNG or legacy PCAP captures from handshakes/."""
-    captures = _capture_candidates(loot_dir)
-    if not captures:
-        return 0, 0, "No PCAP/PCAPNG files found"
+    """Upload only captures without a durable success receipt."""
+    loot_dir = Path(loot_dir)
+    with _upload_lock:
+        captures = _capture_candidates(loot_dir)
+        if not captures:
+            return 0, 0, "No PCAP/PCAPNG files found"
 
-    # Filter out whitelisted BSSIDs
-    skipped = 0
-    if blocked_macs:
-        filtered = []
-        for p in captures:
-            bssid = _bssid_from_filename(p.name)
-            if bssid and bssid in blocked_macs:
-                skipped += 1
+        # Filter out whitelisted BSSIDs before hashing or receipt lookup.
+        whitelist_skipped = 0
+        if blocked_macs:
+            filtered = []
+            blocked_macs = {mac.upper() for mac in blocked_macs}
+            for path in captures:
+                bssid = _bssid_from_filename(path.name)
+                if bssid and bssid in blocked_macs:
+                    whitelist_skipped += 1
+                else:
+                    filtered.append(path)
+            captures = filtered
+
+        ledger, ledger_warning = _load_upload_ledger(loot_dir)
+        receipts = _account_receipts(ledger)
+        pending: list[tuple[Path, str, int]] = []
+        already_uploaded = 0
+        hash_errors = 0
+        errors: list[str] = []
+        for path in captures:
+            try:
+                digest = _capture_sha256(path)
+                size = path.stat().st_size
+            except OSError as exc:
+                hash_errors += 1
+                errors.append(f"{path.name}: cannot hash: {exc}")
+                continue
+            if digest in receipts:
+                already_uploaded += 1
             else:
-                filtered.append(p)
-        captures = filtered
+                pending.append((path, digest, size))
 
-    uploaded, errors = 0, []
-    for p in captures:
-        ok, msg = upload_wpasec(p)
-        if ok:
+        attempted = len(pending) + hash_errors
+        uploaded = 0
+        for path, digest, size in pending:
+            ok, message = upload_wpasec(path)
+            if not ok:
+                errors.append(f"{path.name}: {message}")
+                continue
             uploaded += 1
+            receipts[digest] = {
+                "filename": path.name,
+                "size": size,
+                "uploaded_at": datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"),
+            }
+            try:
+                _save_upload_ledger(loot_dir, ledger)
+            except OSError as exc:
+                errors.append(
+                    f"{path.name}: uploaded but receipt was not saved: {exc}")
+
+        if attempted == 0 and already_uploaded:
+            summary = f"No new captures | {already_uploaded} already uploaded"
+        elif attempted == 0:
+            summary = "No eligible captures"
         else:
-            errors.append(f"{p.name}: {msg}")
-    summary = f"{uploaded}/{len(captures)} uploaded"
-    if skipped:
-        summary += f" | {skipped} skipped (whitelist)"
-    if errors:
-        summary += f" | Errors: {'; '.join(errors[:3])}"
-    return uploaded, len(captures), summary
+            summary = f"{uploaded}/{attempted} uploaded"
+            if already_uploaded:
+                summary += f" | {already_uploaded} already uploaded"
+        if whitelist_skipped:
+            summary += f" | {whitelist_skipped} skipped (whitelist)"
+        if ledger_warning:
+            summary += f" | Warning: {ledger_warning}"
+        if errors:
+            summary += f" | Errors: {'; '.join(errors[:3])}"
+        return uploaded, attempted, summary
 
 
 # ── Download (potfile) ────────────────────────────────────────────────────
