@@ -76,7 +76,7 @@ nano secrets.conf
 
 The installer pulls these system packages (Debian/Ubuntu):
 
-- `python3-venv`, `libsdl2-dev`, `libsdl2-image-dev` — for pyxel game engine
+- `python3-venv`, plus `libsdl2-dev` and `libsdl2-image-dev` on non-Parrot systems — for the pyxel game engine. The SDL2 development packages are intentionally skipped on Parrot OS because they can make dependency installation fail there.
 - `tcpdump`, `aircrack-ng`, `iw` — for MITM and Dragon Drain attacks
 - `rtl-433` — for RTL-SDR 433 MHz sensor decoding
 - `dump1090` — ADS-B; built from [flightaware/dump1090](https://github.com/flightaware/dump1090)

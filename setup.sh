@@ -10,6 +10,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# shellcheck source=scripts/setup_packages.sh
+source "$SCRIPT_DIR/scripts/setup_packages.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -146,8 +149,6 @@ if command -v apt-get &>/dev/null; then
         libdbus-1-dev libglib2.0-dev   # dbus-python
         libsodium-dev                  # PyNaCl
         libffi-dev libssl-dev          # cryptography, indirect deps
-        # SDL2 for pyxel (game engine)
-        libsdl2-dev libsdl2-image-dev
         # Native Python bindings (linked into venv in step 6)
         python3-gi gir1.2-glib-2.0     # BlueZ pairing agent
         # System tools shelled out to by the game
@@ -156,6 +157,12 @@ if command -v apt-get &>/dev/null; then
         # Build deps for dump1090 (built from source in step 7)
         librtlsdr-dev libusb-1.0-0-dev libncurses-dev git
     )
+
+    OS_ID="$(wdg_os_id)"
+    wdg_append_sdl_packages CORE_PKGS "$OS_ID"
+    if [[ "$OS_ID" == parrot* ]]; then
+        info "Parrot OS detected — skipping libsdl2-dev and libsdl2-image-dev"
+    fi
 
     # RPi-only packages — skipped on non-RPi systems (no fail)
     RPI_PKGS=(
