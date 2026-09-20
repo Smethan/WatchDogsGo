@@ -216,6 +216,8 @@ def test_cm4_aio_uses_ttys0_without_probing_bluetooth_uart(monkeypatch):
     monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
     monkeypatch.setattr(GpsManager, "_platform_model",
                         staticmethod(lambda: "Raspberry Pi Compute Module 4 Rev 1.1"))
+    monkeypatch.setattr(GpsManager, "_read_cmdline",
+                        staticmethod(lambda _path: "console=tty1 root=/dev/mmcblk0p2"))
     monkeypatch.setattr("watchdogs.gps_manager.managed_port_names",
                         Mock(side_effect=AssertionError("MM inventory must not be queried")))
     monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
