@@ -14,6 +14,24 @@ minor versions.
 
 - Extend both All Wardrive radio modes with enabled host-side ADS-B and
   MeshCore collection after the ESP32 acknowledges the scan.
+- Add independent `OFF`, `FADE`, and `KEEP` display policies for WiFi, BLE,
+  cell, Flock, Axon, MeshCore, ADS-B, 433 MHz sensor, and handshake map layers.
+  The shared fade lifetime is selectable at 15, 30, 60, or 120 seconds.
+- Add cached three-pixel wardrive trails with `OFF`, `SOLID`, and `HEAT`
+  modes. Heat colors represent unique WiFi/BLE identities heard in the rolling
+  ten-second window around each route sample.
+
+### Changed
+
+- Bound the combined recent WiFi/BLE display registry to 512 deduplicated
+  identities with constant-time refresh and eviction. Map visibility remains
+  independent of complete WiGLE, notable-detection, and route files.
+- Render dense dots and trails through bounded cached overlays. Expired dots
+  invalidate the affected cache instead of remaining visible until an
+  unrelated map rebuild.
+- Let historical, live, radar, and route caches finish while the GPS-following
+  camera moves, cache the bounded historical candidate window across incoming
+  scans, and limit the tiny radar trail to its newest 160 route points.
 
 ### Fixed
 
@@ -21,6 +39,9 @@ minor versions.
   endpoint, including the current MeshCore network discriminator, normalized
   timestamps, validated MeshCore public keys, canonical node IDs, and relay
   hop counts.
+- Allow an empty loot refresh to clear the historical map model, preventing
+  removed or expired source points from looking permanently painted onto the
+  map.
 
 ---
 

@@ -494,7 +494,10 @@ Requires SX1262 module on AIO v2 (`/dev/spidev1.0`).
 - **Tile rendering**: downloadable OSM map tiles for detailed street-level view
 - **Map Downloader**: SYSTEM > Download Map fetches OpenStreetMap tiles in a ~10 km radius around current GPS position (or map center without fix). Progress shown in terminal. Press again to cancel. Tiles saved to `maps/` for offline use.
 - **14 zoom levels**: from WORLD (360deg) to CLOSE-UP (0.02deg)
-- **Markers**: green = WiFi loot, cyan = BT loot, red = handshake, yellow = MeshCore
+- **Map dot layers**: SNIFF > Wardrive Settings > Map dot layers controls WiFi, BLE, cell, Flock, Axon, MeshCore (positioned LoRa), ADS-B, 433 MHz sensors, and handshake markers independently. Each layer can be `OFF`, `FADE`, or `KEEP`; hiding a layer never stops collection or loot storage.
+- **Fade timing**: `FADE` uses a shared 15, 30, 60, or 120 second lifetime. Dots dim through the Pyxel palette, expire from the recent view, and invalidate the cached overlay so they are no longer drawn. WiFi and BLE share a 512-identity, newest-first display registry to prevent long drives from becoming an unbounded red/cyan blob; saved WiGLE data is unaffected. WiFi, BLE, cell, ADS-B, and 433 MHz start in `FADE 30s`; Flock, Axon, MeshCore, and handshake markers start in `KEEP`.
+- **Wardrive trail**: choose `OFF`, a cached three-pixel cyan `SOLID` route, or a three-pixel `HEAT` route colored from cool to red by unique WiFi/BLE activity heard in the preceding ten seconds. GPS gaps, pauses, implausible jumps, and separate sessions remain disconnected. The main map keeps the full 4,096-point display window; the tiny radar uses the newest 160 points to avoid a GPS-update hitch.
+- **Marker colors**: green = WiFi, cyan = BLE/MeshCore, purple = Flock, orange = Axon, red = handshake
 - **Radar**: top-right corner, real-time device positions
 - **GPS tracking**: auto-centers on live position when fix available
 

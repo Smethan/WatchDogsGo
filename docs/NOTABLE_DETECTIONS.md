@@ -8,12 +8,13 @@ Open SNIFF → Wardrive Settings (O).
 
 - Flock detection and Axon detection default ON.
 - Precise Flock/Axon markers defaults ON. Turning it OFF changes only visual placement to the ordinary inventory's existing scatter; stored observation GPS never changes. Probe-only observations without an inventory scatter remain at their recorded fix.
-- Wardrive trail defaults OFF. It records fresh host fixes during Wi-Fi, BLE or All wardriving and draws a cyan path. GPS gaps, pauses, disabled recording, jumps and sessions split the route. No line bridges an unknown section.
+- Map dot layers gives Flock and Axon their own `OFF`, `FADE`, and `KEEP` display policies alongside WiFi, BLE, cell, MeshCore/LoRa, ADS-B, 433 MHz sensors, and handshakes. `OFF` hides only the map/radar marker; signature matching, alerts, and saved evidence continue. `FADE` uses the selected 15, 30, 60, or 120 second lifetime, while `KEEP` retains bounded display history.
+- Wardrive trail defaults OFF. `SOLID` records fresh host fixes during Wi-Fi, BLE or All wardriving and draws a cached three-pixel cyan route. `HEAT` uses the same route but grades it from cool colors to red by unique WiFi/BLE identities heard in the preceding ten seconds. GPS gaps, pauses, disabled recording, jumps and sessions split the route. No line bridges an unknown section.
 - D focuses the recent detection list; arrows select an entry. M mutes that observed identity locally; R resets device mutes. The list shows the supporting rule IDs and last observation time. Muting alerts does not discard ordinary inventory capture.
 - H cycles through saved routes, then back to the current route. Saved routes load their matching notable history. Recording, if active, continues in the current session. The map camera keeps its normal GPS/pan behavior; route selection does not teleport the player.
 - Settings live in `wardrive_settings.json` beside the existing app data. `suppressed_rules` can contain rule IDs; `suppressed_devices` contains `wifi:MAC` / `ble:MAC`. `realert_seconds` defaults to 60 (minimum 10).
 
-Flock alerts use a purple header; Axon uses orange. Both categories use purple markers on the main map/minimap, with F/A labels on the main map. A ring keeps a point at the observer's center visible. Locations older than 60 seconds use an outline. Ordinary marker positioning and radar projection are unchanged.
+Flock alerts and markers use purple; Axon uses orange. Both categories use F/A labels on the main map. A ring keeps a point at the observer's center visible. Persistent locations older than 60 seconds use an outline; a layer in `FADE` mode can disappear sooner when its selected lifetime expires. Ordinary marker positioning and radar projection are unchanged.
 
 ## Rules
 
@@ -45,4 +46,4 @@ The JSON ruleset contains source URLs and checked dates. Numeric identifiers and
 
 `notable_detections.jsonl` and `wardrive_trail.jsonl` are stored alongside the session's existing loot files. Detection rows keep first/last time, evidence, RSSI, the current observation fix (possibly null), and the last valid marker fix separately. Standard WiGLE rows remain WIFI/BLE. GPS-less observations remain in the raw serial log/BLE inventory without invented geotags.
 
-The live list keeps the latest 1024 identities; the route display keeps up to 4096 points. Saved files retain all recorded rows. Older selected routes load as history, not live detections. Complete rows are recoverable after interruption; resuming an active route discards only an incomplete trailing JSON record. Existing background filesystem sync covers these local files; no external sync is added.
+The live notable list keeps the latest 256 identities; the route display keeps up to 4096 points. The separate recent WiFi/BLE map registry keeps 512 combined identities. Saved files retain all recorded rows. Older selected routes load as history, not live detections. Complete rows are recoverable after interruption; resuming an active route discards only an incomplete trailing JSON record. Existing background filesystem sync covers these local files; no external sync is added.

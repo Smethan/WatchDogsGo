@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Add **Map dot layers** under Wardrive Settings. WiFi, BLE, cell, Flock,
+  Axon, MeshCore (the positioned LoRa layer), ADS-B, 433 MHz sensors, and
+  handshake markers each support `OFF`, `FADE`, and `KEEP`. `OFF` changes only
+  the map and radar; collection, alerts, loot, and upload inputs continue.
+- Make the shared fade lifetime selectable at 15, 30, 60, or 120 seconds.
+  Recent dots step through dimmer palette colors, disappear at expiry, and
+  invalidate their cached map/radar overlay so an expired dot cannot remain
+  painted into a reused image.
+- Replace the old 2,048-node ordinary-dot window with a shared 512-identity
+  WiFi/BLE registry. Repeated sightings refresh the same identity in constant
+  time, newest observations evict the oldest display entries, and complete
+  WiGLE/loot and detection history remain unchanged.
+- Add `OFF`, `SOLID`, and `HEAT` wardrive-trail modes. Both visible trail
+  styles are cached three-pixel routes; `HEAT` grades cool colors through red
+  from the rolling ten-second count of unique WiFi/BLE identities. The main
+  map retains the 4,096-point route window while the 40-pixel radar renders
+  only the newest 160 points.
+- Keep incremental node and trail builds progressing while the GPS-following
+  camera moves. Live scan updates reuse a 1,024-point historical candidate
+  cache instead of filtering the complete saved loot set on every batch.
+- Keep all map-layer and trail settings backward compatible with the previous
+  Regular wardrive dots and Wardrive trail booleans.
 - Start the host ADS-B and MeshCore collectors after either real All Wardrive
   mode receives its ESP32 start acknowledgement, when the corresponding
   **SYSTEM > SDR** or **SYSTEM > LoRa** hardware toggle is enabled. Existing
@@ -123,6 +145,10 @@ all 2,000 unique rows with no temporary files left behind. The complete
 installed or run on the uConsole.
 
 ## 0.9.35 — Bounded and optional wardrive dots
+
+> Historical behavior: the Unreleased map-layer controls supersede this
+> release's single toggle and 2,048-node window with per-layer policies and a
+> 512-identity combined WiFi/BLE display registry.
 
 - Add **Regular wardrive dots (2048 max)** to Wardrive Settings. It is enabled
   by default and persists in `wardrive_settings.json`. Turning it off hides
