@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+from collections import OrderedDict
 from queue import Queue
 from pathlib import Path
 
@@ -33,6 +34,10 @@ from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
 from .map_index import GeoObjectIndex
 from .map_layers import HistoricalNodeLayer, LiveNodeLayer, RadarNodeLayer
+from .map_display import (
+    MAX_RECENT_OBSERVATIONS, MODE_KEEP, MODE_OFF,
+    RecentObservationRegistry,
+)
 from .dragon_drain import DragonDrainAttack
 from .mitm import MITMAttack
 from .bt_ducky import BlueDuckyAttack
@@ -57,8 +62,8 @@ HUD_BOT = 16
 TERM_H = 110
 MAP_H = H - HUD_TOP - HUD_BOT - TERM_H
 TERM_Y = H - HUD_BOT - TERM_H
-MAP_NODE_LIMIT = 2048
-RECENT_NODE_FX_LIMIT = 256
+MAP_NODE_LIMIT = MAX_RECENT_OBSERVATIONS
+RECENT_NODE_FX_LIMIT = 64
 
 # Pyxel palette (16 colors)
 C_WATER = 0
@@ -304,6 +309,7 @@ class BleDevice:
         self.rssi, self.hacked = rssi, False
         self.blink_phase = random.random() * 6.28
         self.spawn_frame = 0
+        self.last_seen = time.monotonic()
 
     @property
     def color(self):
@@ -319,6 +325,7 @@ class WifiNetwork:
         self.ssid = ssid[:18]
         self.channel, self.rssi, self.hacked = channel, rssi, False
         self.spawn_frame = 0
+        self.last_seen = time.monotonic()
 
     @property
     def color(self):
@@ -339,8 +346,10 @@ class Particle:
 
 
 class MapMarker:
-    def __init__(self, lat, lon, label, mtype):
+    def __init__(self, lat, lon, label, mtype, key="", last_seen=None):
         self.lat, self.lon, self.label, self.type = lat, lon, label, mtype
+        self.key = key
+        self.last_seen = (time.monotonic() if last_seen is None else last_seen)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +752,15 @@ class WatchDogsGame(OtaMixin):
         self._session_ble_discovered = 0
         self._map_loot_view_key = None
         self._map_loot_view: list[dict] = []
+        self._map_history_candidates_key = None
+        self._map_history_candidates: list[dict] = []
+        self._loot_points_revision = 0
+        self._map_observations = RecentObservationRegistry(
+            capacity=MAP_NODE_LIMIT,
+            lifetime=_wardrive_settings.get("dot_fade_seconds", 30))
+        self._map_live_view_key = None
+        self._map_live_views = ((), ())
+        self._map_display_next_tick = 0.0
         self._live_node_layer = LiveNodeLayer(W, HUD_TOP, MAP_H)
         self._radar_node_layer = RadarNodeLayer(20, colors={
             "wifi": C_SUCCESS, "bt": C_HACK_CYAN, "cell": 11,
@@ -754,6 +772,17 @@ class WatchDogsGame(OtaMixin):
         self._state_network_by_bssid: dict[str, int] = {}
         self._pwned_count = 0
         self.markers: list[MapMarker] = []
+        self._marker_by_key: dict[str, MapMarker] = {}
+        for node in self._mc_nodes:
+            lat, lon = node.get("lat"), node.get("lon")
+            if lat and lon:
+                marker = MapMarker(
+                    lat, lon, node.get("name") or "MC", "meshcore",
+                    key="meshcore:" + str(node.get("id", "")), last_seen=0)
+                self.markers.append(marker)
+                self._marker_by_key[marker.key] = marker
+        self._map_aircraft = OrderedDict()
+        self._map_sensors = OrderedDict()
         self.particles: list[Particle] = []
         self.msgs: list[tuple[str, int, int]] = []
         self.scan_pulse = 0
@@ -1464,22 +1493,28 @@ class WatchDogsGame(OtaMixin):
         # Camera follows player
         self.proj.smooth_move(self.player_lat, self.player_lon)
         self.proj.update()
+        map_now = time.monotonic()
+        self._tick_map_display(map_now)
         if self.wardrive.show_network_dots():
+            wifi_view, ble_view = self._get_live_map_views(map_now)
             history_layer = self._get_history_node_layer()
             map_loot = self._get_map_loot_points()
-            history_layer.request(map_loot, self.proj)
+            history_layer.request(
+                map_loot, self.proj,
+                getattr(self, "_map_loot_view_revision", 0))
             history_layer.step()
             live_layer = self._get_live_node_layer()
             notable, notable_revision = self.wardrive.live_notable_identities()
             live_layer.request(
-                self.wifi_networks, self.ble_devices,
-                (self._live_map_revision, notable_revision), notable, self.proj)
+                wifi_view, ble_view,
+                (self._map_observations.revision, notable_revision),
+                notable, self.proj)
             live_layer.step()
             radar_scale = 20 / max(self.proj.lon_span * 0.5, 0.001)
             radar_layer = self._get_radar_node_layer()
             radar_layer.request(
-                self.wifi_networks, self.ble_devices, map_loot,
-                (self._live_map_revision, notable_revision), notable,
+                wifi_view, ble_view, map_loot,
+                (self._map_observations.revision, notable_revision), notable,
                 self.player_lat, self.player_lon, radar_scale)
             radar_layer.step()
 
@@ -1790,6 +1825,7 @@ class WatchDogsGame(OtaMixin):
             return
         if state_key == "_wardrive_settings":
             self.wardrive.settings_open = True
+            self.wardrive.settings_page = "main"
             return
         if state_key == "hs_sniff" and not self._is_running("hs_sniff"):
             scan = self.wardrive.scan
@@ -2715,8 +2751,36 @@ class WatchDogsGame(OtaMixin):
 
         threading.Thread(target=_bg, daemon=True).start()
 
+    def _sync_sdr_map_history(self):
+        """Retain bounded display records independently of SDR pruning."""
+        if not hasattr(self, "_map_aircraft"):
+            self._map_aircraft = OrderedDict()
+            self._map_sensors = OrderedDict()
+        now = time.monotonic()
+        for key, obj in list(getattr(self._sdr, "aircraft", {}).items()):
+            source_seen = getattr(obj, "last_seen", 0)
+            old = self._map_aircraft.get(key)
+            if old is None or old["source_seen"] != source_seen:
+                self._map_aircraft[key] = {
+                    "object": obj, "source_seen": source_seen,
+                    "last_seen": now}
+                self._map_aircraft.move_to_end(key)
+        while len(self._map_aircraft) > 128:
+            self._map_aircraft.popitem(last=False)
+        for key, obj in list(getattr(self._sdr, "sensors", {}).items()):
+            source_seen = getattr(obj, "last_seen", 0)
+            old = self._map_sensors.get(key)
+            if old is None or old["source_seen"] != source_seen:
+                self._map_sensors[key] = {
+                    "object": obj, "source_seen": source_seen,
+                    "last_seen": now}
+                self._map_sensors.move_to_end(key)
+        while len(self._map_sensors) > 128:
+            self._map_sensors.popitem(last=False)
+
     def _poll_sdr(self):
         """Process SDR events (ADS-B aircraft, 433 MHz sensors)."""
+        self._sync_sdr_map_history()
         if not self._sdr.running:
             return
         try:
@@ -3736,8 +3800,9 @@ class WatchDogsGame(OtaMixin):
         self.gain_xp(200)
         self._earn_badge("handshake_hunter")
         self.glitch_timer = 10
-        self.markers.append(MapMarker(
-            self.player_lat, self.player_lon, "HS", "handshake"))
+        self._remember_marker(MapMarker(
+            self.player_lat, self.player_lon, "HS", "handshake",
+            key=f"handshake:{time.monotonic_ns()}"))
         px, py = self.proj.geo_to_screen(self.player_lat, self.player_lon)
         for _ in range(30):
             self.particles.append(Particle(px, py, random.choice([11, 10, 3])))
@@ -3785,6 +3850,12 @@ class WatchDogsGame(OtaMixin):
             return  # silently skip whitelisted BLE device
         self.wardrive.observe_legacy("ble", mac, name, rssi, observation)
         mac_upper = mac.upper()
+        try:
+            map_rssi = int(rssi)
+        except (TypeError, ValueError):
+            map_rssi = -100
+        self._observe_map_radio(
+            "ble", mac_upper, map_rssi, label=name, observation=observation)
         is_new = mac_upper not in self._known_ble
         if is_new:
             self._known_ble.add(mac_upper)
@@ -3832,6 +3903,9 @@ class WatchDogsGame(OtaMixin):
                 detection_rssi = -100
             self.wardrive.observe_legacy("wifi", bssid, net.ssid, detection_rssi, observation)
             bssid_upper = bssid.upper()
+            self._observe_map_radio(
+                "wifi", bssid_upper, detection_rssi,
+                label=net.ssid or "<hidden>", observation=observation)
             # Keep full objects for target selection.  The old linear lookup
             # made large incoming scan batches progressively more expensive.
             network_index = getattr(self, "_state_network_by_bssid", None)
@@ -4006,9 +4080,10 @@ class WatchDogsGame(OtaMixin):
                         node_data["note"] = ""
                         self._mc_nodes.append(node_data)
                         self.gain_xp(20)  # XP for new contact
-                        if lat and lon and lat != 0 and lon != 0:
-                            self.markers.append(
-                                MapMarker(lat, lon, name or "MC", "meshcore"))
+                    if lat and lon and lat != 0 and lon != 0:
+                        self._remember_marker(MapMarker(
+                            lat, lon, name or "MC", "meshcore",
+                            key="meshcore:" + str(node_id)))
                     # Persist contact to loot_db
                     if self.loot:
                         self.loot.save_contact(node_id, dict(node_data))
@@ -4136,8 +4211,12 @@ class WatchDogsGame(OtaMixin):
 
     def _apply_loot_snapshot(self, snapshot):
         points = snapshot.get("points")
-        if points:
+        if points is not None and points is not self.loot_points:
             self.loot_points = points
+            self._loot_points_revision = getattr(
+                self, "_loot_points_revision", 0) + 1
+            self._map_loot_view_key = None
+            self._map_history_candidates_key = None
         passwords = snapshot.get("passwords")
         if passwords is not None:
             self._cracked_ssids = passwords
@@ -4282,6 +4361,22 @@ class WatchDogsGame(OtaMixin):
                 if self.hack_progress >= 45:
                     hacked_before = self._current_hacked_count()
                     self.hack_target.hacked = True
+                    # Live map rendering uses detached registry snapshots.
+                    # Mirror the game-only hacked flag into that snapshot so
+                    # completing a hack immediately changes the cached dot.
+                    if isinstance(self.hack_target, WifiNetwork):
+                        hack_layer = "wifi"
+                        hack_identity = self.hack_target.bssid
+                    else:
+                        hack_layer = "ble"
+                        hack_identity = self.hack_target.mac
+                    self._map_registry().observe(
+                        hack_layer, hack_identity,
+                        seen_at=time.monotonic(),
+                        lat=self.hack_target.lat,
+                        lon=self.hack_target.lon,
+                        rssi=self.hack_target.rssi,
+                        metadata={"hacked": True})
                     self._live_map_revision = getattr(
                         self, "_live_map_revision", 0) + 1
                     self._pwned_count = hacked_before + 1
@@ -4504,23 +4599,143 @@ class WatchDogsGame(OtaMixin):
     # Map clustering
     # ------------------------------------------------------------------
 
+    def _map_registry(self):
+        registry = getattr(self, "_map_observations", None)
+        if registry is None:
+            wardrive = getattr(self, "wardrive", None)
+            lifetime = (wardrive.fade_seconds()
+                        if wardrive and hasattr(wardrive, "fade_seconds") else 30)
+            registry = self._map_observations = RecentObservationRegistry(
+                capacity=MAP_NODE_LIMIT, lifetime=lifetime)
+        return registry
+
+    def _tick_map_display(self, now=None):
+        now = time.monotonic() if now is None else now
+        if now < getattr(self, "_map_display_next_tick", 0.0):
+            return
+        self._map_display_next_tick = now + 0.5
+        registry = self._map_registry()
+        lifetime = self.wardrive.fade_seconds()
+        if registry.lifetime != lifetime:
+            registry.lifetime = float(lifetime)
+        result = registry.tick(now)
+        refresh_notables = getattr(
+            getattr(self, "wardrive", None),
+            "_refresh_notable_identities", None)
+        if refresh_notables is not None:
+            refresh_notables(now)
+        if result.expired:
+            # Expired pixels must disappear now, even if an older incremental
+            # build was still in flight.
+            for name in ("_live_node_layer", "_radar_node_layer"):
+                layer = getattr(self, name, None)
+                if layer is not None:
+                    layer.invalidate()
+
+    def _get_live_map_views(self, now=None):
+        now = time.monotonic() if now is None else now
+        registry = self._map_registry()
+        wardrive = getattr(self, "wardrive", None)
+        modes = ((wardrive.layer_mode("wifi"), wardrive.layer_mode("ble"))
+                 if wardrive and hasattr(wardrive, "layer_mode")
+                 else (MODE_KEEP, MODE_KEEP))
+        key = (registry.revision, modes, registry.lifetime)
+        if key != getattr(self, "_map_live_view_key", None):
+            self._map_live_view_key = key
+            self._map_live_views = (
+                registry.snapshot(layer="wifi", mode=modes[0], now=now),
+                registry.snapshot(layer="ble", mode=modes[1], now=now),
+            )
+        return self._map_live_views
+
+    def _on_map_policy_changed(self):
+        """Immediately discard overlays built under an older display policy."""
+        self._map_live_view_key = None
+        self._map_loot_view_key = None
+        self._map_history_candidates_key = None
+        self._map_display_next_tick = 0.0
+        registry = self._map_registry()
+        registry.lifetime = float(self.wardrive.fade_seconds())
+        for name in ("_history_node_layer", "_live_node_layer",
+                     "_radar_node_layer"):
+            layer = getattr(self, name, None)
+            if layer is not None:
+                layer.invalidate()
+
+    def _observe_map_radio(self, layer, identity, rssi, *, label="",
+                           observation=None):
+        now = time.monotonic()
+        fix = observation.get("fix") if observation else None
+        if fix:
+            lat, lon = fix.get("latitude"), fix.get("longitude")
+        else:
+            lat, lon = self.player_lat, self.player_lon
+        self._map_registry().observe(
+            layer, identity, seen_at=now, lat=lat, lon=lon, rssi=rssi,
+            metadata={"label": label})
+        self.wardrive.trail.note_observation(f"{layer}:{identity}", now)
+
     def _get_map_loot_points(self):
-        """Return historical points within the shared 2,048-node map budget."""
+        """Return enabled KEEP history within the bounded display budget."""
         points = self.loot_points
-        live_count = min(
-            MAP_NODE_LIMIT,
-            len(getattr(self, "wifi_networks", ()))
-            + len(getattr(self, "ble_devices", ())))
-        # Change the historical slice only every 128 discoveries. This keeps
-        # the total at or below the CM4 display budget without reclustering the
-        # historical layer for every serial record in a scan result burst.
+        wifi_view, ble_view = self._get_live_map_views()
+        live_count = len(wifi_view) + len(ble_view)
+        if not hasattr(self, "wardrive"):
+            live_count = (len(getattr(self, "wifi_networks", ()))
+                          + len(getattr(self, "ble_devices", ())))
+        live_count = min(MAP_NODE_LIMIT, live_count)
+        block = 64 if hasattr(self, "wardrive") else 128
         live_reservation = min(
-            MAP_NODE_LIMIT, ((live_count + 127) // 128) * 128)
+            MAP_NODE_LIMIT, ((live_count + block - 1) // block) * block)
         history_limit = MAP_NODE_LIMIT - live_reservation
-        key = (id(points), len(points), history_limit)
+        wardrive = getattr(self, "wardrive", None)
+        modes = (tuple(wardrive.layer_mode(layer)
+                       for layer in ("wifi", "ble", "cell"))
+                 if wardrive and hasattr(wardrive, "layer_mode")
+                 else (MODE_KEEP, MODE_KEEP, MODE_KEEP))
+        live_ids = frozenset(
+            (item.layer, item.identity)
+            for item in tuple(wifi_view) + tuple(ble_view))
+        if wardrive is not None:
+            live_ids = live_ids.union(
+                ("cell", str(item.get("identity", "")).upper())
+                for item in getattr(wardrive, "cell_candidates", ())
+                if item.get("identity"))
+        source_key = (id(points), len(points),
+                      getattr(self, "_loot_points_revision", 0), modes)
+        if source_key != getattr(self, "_map_history_candidates_key", None):
+            self._map_history_candidates_key = source_key
+            enabled = {
+                "wifi": modes[0] == MODE_KEEP,
+                "bt": modes[1] == MODE_KEEP,
+                "cell": modes[2] == MODE_KEEP,
+            }
+            candidates = [
+                point for point in points
+                if not point.get("type", "")
+                or enabled.get(point.get("type", ""), False)
+            ]
+            # At most 512 live identities can mask saved history. Keeping
+            # twice the display budget guarantees enough older candidates
+            # without rescanning every point on each incoming scan burst.
+            self._map_history_candidates = candidates[-2 * MAP_NODE_LIMIT:]
+        key = (source_key, history_limit, hash(live_ids))
         if key != getattr(self, "_map_loot_view_key", None):
             self._map_loot_view_key = key
-            self._map_loot_view = points[-history_limit:] if history_limit else []
+            filtered = []
+            for point in reversed(self._map_history_candidates):
+                point_type = point.get("type", "")
+                identity = str(point.get("bssid", "")).upper()
+                live_type = "ble" if point_type == "bt" else point_type
+                if identity and (live_type, identity) in live_ids:
+                    continue
+                filtered.append(point)
+                if len(filtered) >= history_limit:
+                    break
+            filtered.reverse()
+            self._map_loot_view = filtered if history_limit else []
+            self._map_loot_view_revision = getattr(
+                self, "_map_loot_view_revision", 0) + 1
         return self._map_loot_view
 
     def _get_history_node_layer(self):
@@ -4535,13 +4750,15 @@ class WatchDogsGame(OtaMixin):
     def _update_clusters(self):
         """Advance the bounded cluster build used by legacy callers/tests."""
         layer = self._get_history_node_layer()
-        layer.request(self._get_map_loot_points(), self.proj)
+        layer.request(self._get_map_loot_points(), self.proj,
+                      getattr(self, "_map_loot_view_revision", 0))
         layer.step()
         self._clusters = layer.clusters
 
     def _draw_loot_points(self):
         layer = self._get_history_node_layer()
-        layer.request(self._get_map_loot_points(), self.proj)
+        layer.request(self._get_map_loot_points(), self.proj,
+                      getattr(self, "_map_loot_view_revision", 0))
         layer.draw(pyxel, self.proj, self._cluster_sel)
         self._clusters = layer.clusters
         revision = getattr(self, "_cluster_layer_revision", -1)
@@ -4756,17 +4973,41 @@ class WatchDogsGame(OtaMixin):
             bar_y = py + 30 + (ph - 46) * self._popup_scroll // max(1, n - 8)
             pyxel.rect(px + pw - 3, bar_y, 2, bar_h, C_DIM)
 
+    def _remember_marker(self, marker):
+        key = marker.key or f"{marker.type}:{time.monotonic_ns()}"
+        marker.key = key
+        existing = getattr(self, "_marker_by_key", {}).get(key)
+        if existing is not None:
+            existing.lat, existing.lon = marker.lat, marker.lon
+            existing.label = marker.label
+            existing.last_seen = marker.last_seen
+            return existing
+        if not hasattr(self, "_marker_by_key"):
+            self._marker_by_key = {}
+        self.markers.append(marker)
+        self._marker_by_key[key] = marker
+        if len(self.markers) > 256:
+            oldest = min(self.markers, key=lambda value: value.last_seen)
+            self.markers.remove(oldest)
+            self._marker_by_key.pop(oldest.key, None)
+        return marker
+
     def _draw_markers(self):
-        """Draw handshake and MeshCore node markers. Always visible at any
-        zoom level; label shown from zoom 5 up."""
+        """Draw enabled handshake and MeshCore markers at any zoom level."""
         zoom = self.proj.zoom
+        now = time.monotonic()
         for m in self.markers:
+            base_color = C_HACK_CYAN if m.type == "meshcore" else C_ERROR
+            c = self.wardrive.layer_color(
+                m.type, base_color, m, now,
+                historical=m.last_seen <= 0)
+            if c is None:
+                continue
             sx, sy = self.proj.geo_to_screen(m.lat, m.lon)
             if not self.proj.screen_visible(sx, sy):
                 continue
             if m.type == "meshcore":
-                # Cyan diamond + pulsing ring, always visible
-                c = C_HACK_CYAN
+                # Cyan diamond + pulsing ring.
                 if pyxel.frame_count % 40 < 22:
                     pyxel.circb(sx, sy, 6, c)
                 pyxel.rect(sx - 2, sy - 2, 5, 5, c)
@@ -4780,12 +5021,12 @@ class WatchDogsGame(OtaMixin):
             else:
                 # Handshake — red skull style
                 if pyxel.frame_count % 30 < 20:
-                    pyxel.circb(sx, sy, 4, C_ERROR)
-                pyxel.rect(sx - 2, sy - 1, 5, 4, C_ERROR)
-                pyxel.rect(sx - 1, sy - 3, 3, 2, C_ERROR)
+                    pyxel.circb(sx, sy, 4, c)
+                pyxel.rect(sx - 2, sy - 1, 5, 4, c)
+                pyxel.rect(sx - 1, sy - 3, 3, 2, c)
                 pyxel.pset(sx, sy, C_WARNING)
                 if zoom >= 5:
-                    pyxel.text(sx + 5, sy - 3, m.label, C_ERROR)
+                    pyxel.text(sx + 5, sy - 3, m.label, c)
 
     def _get_live_node_layer(self):
         layer = getattr(self, "_live_node_layer", None)
@@ -4816,13 +5057,17 @@ class WatchDogsGame(OtaMixin):
     def _draw_live_nodes(self):
         layer = self._get_live_node_layer()
         notable, notable_revision = self.wardrive.live_notable_identities()
-        revision = getattr(self, "_live_map_revision", 0)
-        layer.request(self.wifi_networks, self.ble_devices,
+        wifi_view, ble_view = self._get_live_map_views()
+        revision = self._map_registry().revision
+        layer.request(wifi_view, ble_view,
                       (revision, notable_revision), notable, self.proj)
         layer.draw(pyxel, self.proj)
 
     def _draw_wifi(self):
         """Draw only short-lived discovery rings; mature nodes are cached."""
+        if self.wardrive.layer_mode("wifi") == MODE_OFF:
+            self._recent_wifi_fx = []
+            return
         recent = getattr(self, "_recent_wifi_fx", [])
         keep = []
         for net in recent:
@@ -4839,6 +5084,9 @@ class WatchDogsGame(OtaMixin):
 
     def _draw_ble(self):
         """Draw only short-lived discovery rings; mature nodes are cached."""
+        if self.wardrive.layer_mode("ble") == MODE_OFF:
+            self._recent_ble_fx = []
+            return
         recent = getattr(self, "_recent_ble_fx", [])
         keep = []
         for device in recent:
@@ -4867,14 +5115,15 @@ class WatchDogsGame(OtaMixin):
             self.proj.lon_span if lon_span is None else lon_span)
 
     def _draw_aircraft(self):
-        """Draw ADS-B aircraft on the map. Always visible regardless of
-        zoom; label from zoom 4 up."""
+        """Draw ADS-B aircraft allowed by the map display policy."""
         try:
-            aircraft_list = list(self._sdr.aircraft.values())
+            aircraft_list = list(self._map_aircraft.values())
         except Exception:
             return
         zoom = self.proj.zoom
-        for ac in aircraft_list:
+        now = time.monotonic()
+        for record in aircraft_list:
+            ac = record["object"]
             if not ac.has_position:
                 continue
             sx, sy = self.proj.geo_to_screen(ac.lat, ac.lon)
@@ -4887,6 +5136,9 @@ class WatchDogsGame(OtaMixin):
                 c = C_WARNING
             else:
                 c = C_HACK_CYAN
+            c = self.wardrive.layer_color("adsb", c, record, now)
+            if c is None:
+                continue
             # Plane icon — visible plus-shape with blinking pulse ring
             pyxel.line(sx - 3, sy, sx + 3, sy, c)       # wings
             pyxel.pset(sx, sy - 2, c)                   # nose
@@ -4905,21 +5157,26 @@ class WatchDogsGame(OtaMixin):
     def _draw_sensors(self):
         """Draw 433 MHz sensors on the map."""
         try:
-            sensor_list = list(self._sdr.sensors.values())
+            sensor_list = list(self._map_sensors.values())
         except Exception:
             return
-        for s in sensor_list:
+        now = time.monotonic()
+        for record in sensor_list:
+            s = record["object"]
             if s.lat == 0.0 and s.lon == 0.0:
                 continue
             sx, sy = self.proj.geo_to_screen(s.lat, s.lon)
             if not self.proj.screen_visible(sx, sy):
                 continue
             blink = math.sin(pyxel.frame_count * 0.08 + hash(s.sid) % 100)
-            c = 12 if blink > 0 else 2  # blue blink
+            base = 12 if blink > 0 else 2  # blue blink
+            c = self.wardrive.layer_color("sensor433", base, record, now)
+            if c is None:
+                continue
             pyxel.rect(sx - 1, sy - 1, 3, 3, c)
             pyxel.pset(sx, sy - 2, c)  # antenna dot
             if self.proj.zoom >= 5:
-                pyxel.text(sx + 4, sy - 3, s.model[:12], 12)
+                pyxel.text(sx + 4, sy - 3, s.model[:12], c)
 
     def _draw_scan_fx(self):
         cx, cy = W // 2, HUD_TOP + MAP_H // 2
@@ -5334,27 +5591,50 @@ class WatchDogsGame(OtaMixin):
         notable, notable_revision = self.wardrive.live_notable_identities()
         radar_layer = self._get_radar_node_layer()
         if self.wardrive.show_network_dots():
+            wifi_view, ble_view = self._get_live_map_views()
             radar_layer.request(
-                self.wifi_networks, self.ble_devices,
+                wifi_view, ble_view,
                 self._get_map_loot_points(),
-                (getattr(self, "_live_map_revision", 0), notable_revision),
+                (self._map_registry().revision, notable_revision),
                 notable, self.player_lat, self.player_lon, scale)
             radar_layer.draw(
                 pyxel, rx, ry, self.player_lat, self.player_lon, scale)
+        now = time.monotonic()
         for m in self.markers:
+            base = C_HACK_CYAN if m.type == "meshcore" else C_ERROR
+            color = self.wardrive.layer_color(
+                m.type, base, m, now,
+                historical=m.last_seen <= 0)
+            if color is None:
+                continue
             dx = (m.lon - self.player_lon) * scale
             dy = (self.player_lat - m.lat) * scale
             if abs(dx) < rr and abs(dy) < rr:
-                pyxel.pset(rx+int(dx), ry+int(dy), C_ERROR)
+                pyxel.pset(rx+int(dx), ry+int(dy), color)
         # ADS-B aircraft on radar
         try:
-            for ac in list(self._sdr.aircraft.values()):
+            for record in list(self._map_aircraft.values()):
+                ac = record["object"]
                 if not ac.has_position:
+                    continue
+                color = self.wardrive.layer_color(
+                    "adsb", C_HACK_CYAN, record, now)
+                if color is None:
                     continue
                 dx = (ac.lon - self.player_lon) * scale
                 dy = (self.player_lat - ac.lat) * scale
                 if abs(dx) < rr and abs(dy) < rr:
-                    pyxel.pset(rx+int(dx), ry+int(dy), C_HACK_CYAN)
+                    pyxel.pset(rx+int(dx), ry+int(dy), color)
+            for record in list(self._map_sensors.values()):
+                sensor = record["object"]
+                color = self.wardrive.layer_color(
+                    "sensor433", 12, record, now)
+                if color is None or (sensor.lat == 0 and sensor.lon == 0):
+                    continue
+                dx = (sensor.lon - self.player_lon) * scale
+                dy = (self.player_lat - sensor.lat) * scale
+                if abs(dx) < rr and abs(dy) < rr:
+                    pyxel.pset(rx+int(dx), ry+int(dy), color)
         except Exception:
             pass
 

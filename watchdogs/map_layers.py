@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from .map_display import fade_color
+
 
 def _wrapped_delta(lon: float, center_lon: float) -> float:
     delta = lon - center_lon
@@ -19,7 +21,7 @@ def _wrapped_delta(lon: float, center_lon: float) -> float:
 class _BuildRequest:
     points: list
     limit: int
-    token: tuple[int, int]
+    token: tuple
     zoom: int
     center_lat: float
     center_lon: float
@@ -118,7 +120,9 @@ class _ClusterBuild:
                 cell = accumulator["cell"]
                 color = (cell_color if cell >= max(wifi, bt) else
                          bt_color if bt > wifi else wifi_color)
-                radius = min(5 + count // 3, 12)
+                # Dense history must remain legible over street tiles.  The
+                # old filled radius-12 bubbles obscured entire blocks.
+                radius = min(3 + count // 5, 8)
             clusters.append({
                 "x": accumulator["sum_x"] // count,
                 "y": accumulator["sum_y"] // count,
@@ -162,9 +166,10 @@ class HistoricalNodeLayer:
         self._ready: tuple[_BuildRequest, list[dict]] | None = None
 
     @staticmethod
-    def _request(points: list, proj) -> _BuildRequest:
+    def _request(points: list, proj, revision=0) -> _BuildRequest:
         return _BuildRequest(
-            points=points, limit=len(points), token=(id(points), len(points)),
+            points=points, limit=len(points),
+            token=(id(points), len(points), revision),
             zoom=proj.zoom, center_lat=proj.center_lat,
             center_lon=proj.center_lon, lon_span=proj.lon_span,
             lat_span=proj.lat_span)
@@ -186,8 +191,36 @@ class HistoricalNodeLayer:
         dy = (proj.center_lat - lat) * pixels_per_degree
         return round(dx), round(dy)
 
-    def request(self, points: list, proj):
-        request = self._request(points, proj)
+    def _request_offset(self, anchor: _BuildRequest,
+                        current: _BuildRequest):
+        if anchor.zoom != current.zoom:
+            return None
+        scale = self.width / current.lon_span
+        return (
+            round(_wrapped_delta(anchor.center_lon, current.center_lon)
+                  * scale),
+            round((current.center_lat - anchor.center_lat) * scale),
+        )
+
+    def _camera_compatible(self, anchor: _BuildRequest,
+                           current: _BuildRequest) -> bool:
+        if anchor.token != current.token:
+            return False
+        offset = self._request_offset(anchor, current)
+        return (offset is not None
+                and abs(offset[0]) <= self.rebuild_shift
+                and abs(offset[1]) <= self.rebuild_shift)
+
+    def invalidate(self):
+        """Discard published and in-flight pixels after a policy change."""
+        self.image = None
+        self.clusters = []
+        self.data_token = None
+        self._job = self._queued = self._ready = None
+        self.revision += 1
+
+    def request(self, points: list, proj, revision=0):
+        request = self._request(points, proj, revision)
         zoom_changed = self.zoom >= 0 and proj.zoom != self.zoom
         offset = self.offset(proj) if self.image is not None else None
         current = (self.image is not None and not zoom_changed
@@ -208,11 +241,16 @@ class HistoricalNodeLayer:
             return
 
         if self._job is not None:
-            if self._job.request.key != request.key:
+            if not self._camera_compatible(self._job.request, request):
                 self._queued = request
             return
-        if self._ready is not None and self._ready[0].key == request.key:
-            return
+        if self._ready is not None:
+            if self._camera_compatible(self._ready[0], request):
+                return
+            # A completed model that has not reached draw yet is obsolete.
+            # Discard it so an old policy/data snapshot cannot flash for one
+            # frame while the replacement builds.
+            self._ready = None
         self._start(request)
 
     def step(self, max_ms: float = 2.0, max_records: int | None = None):
@@ -223,11 +261,13 @@ class HistoricalNodeLayer:
         request = self._job.request
         clusters = self._job.finish(
             self.wifi_color, self.bt_color, self.cell_color)
-        self._ready = request, clusters
         self._job = None
         queued, self._queued = self._queued, None
         if queued is not None and queued.key != request.key:
+            # Never publish an obsolete model while its replacement builds.
             self._start(queued)
+        else:
+            self._ready = request, clusters
 
     def _render(self, px, request: _BuildRequest, clusters: list[dict]):
         image_ctor = getattr(px, "Image", None)
@@ -259,10 +299,9 @@ class HistoricalNodeLayer:
                     image.pset(x, y, color)
             else:
                 radius = cluster["radius"]
-                image.circ(x, y, radius, color)
-                image.circb(x, y, radius, 0)
+                image.circb(x, y, radius, color)
                 text = str(cluster["count"])
-                image.text(x - (len(text) * 5) // 2, y - 3, text, 0)
+                image.text(x - (len(text) * 5) // 2, y - 3, text, color)
         return image
 
     def _publish(self, px):
@@ -349,7 +388,9 @@ class _LiveBuild:
         self.overscan = overscan
         self.kind = "wifi"
         self.index = 0
-        self.commands = []
+        # One command per small screen cell prevents a dense scan batch at one
+        # GPS fix from drawing hundreds of identical pixels.
+        self.commands = {}
 
     def _objects(self):
         return self.request.wifi if self.kind == "wifi" else self.request.ble
@@ -361,8 +402,10 @@ class _LiveBuild:
             return
         if (lat == 0.0 and lon == 0.0) or not (-90.0 <= lat <= 90.0):
             return
-        identity = ("wifi:" + obj.bssid.upper() if self.kind == "wifi"
-                    else "ble:" + obj.mac.upper())
+        raw_identity = getattr(
+            obj, "bssid" if self.kind == "wifi" else "mac",
+            getattr(obj, "identity", ""))
+        identity = self.kind + ":" + str(raw_identity).upper()
         if identity in self.request.notable:
             return
         scale = self.width / self.request.lon_span
@@ -374,11 +417,31 @@ class _LiveBuild:
                 and self.map_top - self.overscan <= y
                 < self.map_top + self.map_height + self.overscan):
             return
-        phase = ((sum(ord(char) for char in obj.bssid) & 1)
-                 if self.kind == "wifi"
-                 else int(getattr(obj, "blink_phase", 0) * 1000) & 1)
-        self.commands.append((
-            self.kind, x, y, int(obj.color), bool(obj.hacked), phase))
+        phase = ((sum(ord(char) for char in str(raw_identity)) & 1)
+                 if self.kind == "wifi" or not hasattr(obj, "blink_phase")
+                 else int(obj.blink_phase * 1000) & 1)
+        metadata = getattr(obj, "metadata", {}) or {}
+        rssi = int(getattr(obj, "rssi", -100) or -100)
+        if self.kind == "wifi":
+            base_color = (11 if rssi > -50 else 10 if rssi > -65
+                          else 9 if rssi > -80 else 8)
+        else:
+            base_color = (11 if rssi > -45 else 10 if rssi > -60
+                          else 9 if rssi > -75 else 8)
+        base_color = int(metadata.get(
+            "color", getattr(obj, "color", base_color)))
+        draw_color = fade_color(base_color, getattr(obj, "stage", 0))
+        cell_px = 2 if self.request.zoom >= 8 else 3
+        key = (self.kind, x // cell_px, y // cell_px)
+        command = (
+            self.kind, x, y,
+            int(getattr(obj, "display_color", draw_color)),
+            bool(metadata.get("hacked", getattr(obj, "hacked", False))), phase,
+            float(getattr(obj, "last_seen", 0.0)),
+            int(getattr(obj, "rssi", -100)))
+        current = self.commands.get(key)
+        if current is None or command[-2:] > current[-2:]:
+            self.commands[key] = command
 
     def step(self, max_ms: float, max_records: int | None = None) -> bool:
         deadline = time.perf_counter() + max_ms / 1000.0
@@ -426,6 +489,13 @@ class LiveNodeLayer:
         self._last_publish_at = float("-inf")
         self.revision = 0
 
+    def invalidate(self):
+        """Clear current and queued images so hidden dots cannot reappear."""
+        self.images = (None, None)
+        self.data_token = None
+        self._job = self._queued = self._ready = None
+        self.revision += 1
+
     @staticmethod
     def _request(wifi, ble, revision, notable, proj):
         token = (id(wifi), len(wifi), id(ble), len(ble), revision,
@@ -441,6 +511,25 @@ class LiveNodeLayer:
         scale = self.width / proj.lon_span
         return (round(_wrapped_delta(self.anchor_lon, proj.center_lon) * scale),
                 round((proj.center_lat - self.anchor_lat) * scale))
+
+    def _request_offset(self, anchor: _LiveRequest, current: _LiveRequest):
+        if anchor.zoom != current.zoom:
+            return None
+        scale = self.width / current.lon_span
+        return (
+            round(_wrapped_delta(anchor.center_lon, current.center_lon)
+                  * scale),
+            round((current.center_lat - anchor.center_lat) * scale),
+        )
+
+    def _camera_compatible(self, anchor: _LiveRequest,
+                           current: _LiveRequest) -> bool:
+        if anchor.token != current.token:
+            return False
+        offset = self._request_offset(anchor, current)
+        return (offset is not None
+                and abs(offset[0]) <= self.rebuild_shift
+                and abs(offset[1]) <= self.rebuild_shift)
 
     def request(self, wifi, ble, revision, notable, proj):
         request = self._request(wifi, ble, revision, notable, proj)
@@ -460,13 +549,13 @@ class LiveNodeLayer:
                 self.overscan)
             return
         if self._job is not None:
-            if self._job.request.key != request.key:
+            if not self._camera_compatible(self._job.request, request):
                 self._queued = request
             return
         if self._ready is not None:
-            if self._ready[0].key != request.key:
-                self._queued = request
-            return
+            if self._camera_compatible(self._ready[0], request):
+                return
+            self._ready = None
         if (has_image and self.data_token != request.token
                 and time.perf_counter() - self._last_publish_at
                 < self.min_rebuild_interval):
@@ -487,16 +576,22 @@ class LiveNodeLayer:
                 self.overscan)
         if self._job is None or not self._job.step(max_ms, max_records):
             return
-        request, commands = self._job.request, self._job.commands
-        self._ready = request, commands
+        request, commands = self._job.request, list(self._job.commands.values())
         self._job = None
+        queued, self._queued = self._queued, None
+        if queued is not None and queued.key != request.key:
+            self._job = _LiveBuild(
+                queued, self.width, self.map_top, self.map_height,
+                self.overscan)
+        else:
+            self._ready = request, commands
 
     def _render_phase(self, px, request, commands, blink_phase):
         image = px.Image(
             self.width + 2 * self.overscan,
             self.map_height + 2 * self.overscan)
         image.cls(self.transparent)
-        for kind, sx, sy, color, hacked, phase in commands:
+        for kind, sx, sy, color, hacked, phase, _seen, _rssi in commands:
             x = sx + self.overscan
             y = sy - self.map_top + self.overscan
             if kind == "wifi":
@@ -593,16 +688,28 @@ class _RadarBuild:
                 lat, lon = float(obj.lat), float(obj.lon)
             except (AttributeError, TypeError, ValueError):
                 return
-            identity = ("wifi:" + obj.bssid.upper() if self.kind == "wifi"
-                        else "ble:" + obj.mac.upper())
+            raw_identity = getattr(
+                obj, "bssid" if self.kind == "wifi" else "mac",
+                getattr(obj, "identity", ""))
+            identity = self.kind + ":" + str(raw_identity).upper()
             if identity in self.request.notable:
                 return
-            if obj.hacked:
+            metadata = getattr(obj, "metadata", {}) or {}
+            hacked = bool(metadata.get("hacked", getattr(obj, "hacked", False)))
+            if hacked:
                 color = self.colors["hacked"]
             elif self.kind == "wifi":
-                color = self.colors["wifi_live"]
+                base = self.colors["wifi_live"]
+                color = int(getattr(
+                    obj, "display_color",
+                    fade_color(base, getattr(obj, "stage", 0))))
             else:
-                color = int(obj.color)
+                rssi = int(getattr(obj, "rssi", -100) or -100)
+                base = (11 if rssi > -45 else 10 if rssi > -60
+                        else 9 if rssi > -75 else 8)
+                color = int(getattr(
+                    obj, "display_color",
+                    fade_color(base, getattr(obj, "stage", 0))))
         dx = round(_wrapped_delta(lon, self.request.center_lon)
                    * self.request.scale)
         dy = round((self.request.center_lat - lat) * self.request.scale)
@@ -660,6 +767,12 @@ class RadarNodeLayer:
         self._ready: tuple[_RadarRequest, dict] | None = None
         self._last_publish_at = float("-inf")
 
+    def invalidate(self):
+        """Clear current and queued radar pixels after a policy change."""
+        self.image = None
+        self.data_token = None
+        self._job = self._queued = self._ready = None
+
     @staticmethod
     def _request(wifi, ble, loot, revision, notable, center_lat, center_lon,
                  scale):
@@ -673,6 +786,25 @@ class RadarNodeLayer:
             return None
         return (round(_wrapped_delta(self.anchor_lon, center_lon) * scale),
                 round((center_lat - self.anchor_lat) * scale))
+
+    def _request_offset(self, anchor: _RadarRequest,
+                        current: _RadarRequest):
+        if anchor.scale != current.scale:
+            return None
+        return (
+            round(_wrapped_delta(anchor.center_lon, current.center_lon)
+                  * current.scale),
+            round((current.center_lat - anchor.center_lat) * current.scale),
+        )
+
+    def _camera_compatible(self, anchor: _RadarRequest,
+                           current: _RadarRequest) -> bool:
+        if anchor.token != current.token:
+            return False
+        offset = self._request_offset(anchor, current)
+        return (offset is not None
+                and abs(offset[0]) <= self.rebuild_shift
+                and abs(offset[1]) <= self.rebuild_shift)
 
     def request(self, wifi, ble, loot, revision, notable,
                 center_lat, center_lon, scale):
@@ -693,13 +825,13 @@ class RadarNodeLayer:
                 request, self.radius, self.overscan, self.colors)
             return
         if self._job is not None:
-            if self._job.request.key != request.key:
+            if not self._camera_compatible(self._job.request, request):
                 self._queued = request
             return
         if self._ready is not None:
-            if self._ready[0].key != request.key:
-                self._queued = request
-            return
+            if self._camera_compatible(self._ready[0], request):
+                return
+            self._ready = None
         if (self.image is not None and self.data_token != request.token
                 and time.perf_counter() - self._last_publish_at
                 < self.min_rebuild_interval):
@@ -720,8 +852,13 @@ class RadarNodeLayer:
         if self._job is None or not self._job.step(max_ms, max_records):
             return
         request, pixels = self._job.request, self._job.pixels
-        self._ready = request, pixels
         self._job = None
+        queued, self._queued = self._queued, None
+        if queued is not None and queued.key != request.key:
+            self._job = _RadarBuild(
+                queued, self.radius, self.overscan, self.colors)
+        else:
+            self._ready = request, pixels
 
     def _publish(self, px):
         if self._ready is None:

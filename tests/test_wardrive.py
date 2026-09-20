@@ -279,6 +279,55 @@ def test_integration_both_radios_precise_toggle_and_raw_gps(game):
     assert {row[-1] for row in rows}=={"WIFI","BLE"}
 
 
+def test_recent_notable_stops_suppressing_generic_dot_after_expiry():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = {
+        "flock": True,
+        "axon": False,
+        "dot_flock_mode": "recent",
+        "dot_fade_seconds": 30,
+    }
+    ui.notables = {
+        "wifi:AA:flock": {
+            "identity": "wifi:AA", "category": "flock",
+            "strength": 1, "seen": 100,
+        },
+    }
+    ui._notable_identities = frozenset()
+    ui._notable_revision = 0
+
+    ui._refresh_notable_identities(now=129.999)
+    assert ui.live_notable_identities()[0] == frozenset(("wifi:AA",))
+    visible_revision = ui.live_notable_identities()[1]
+
+    ui._refresh_notable_identities(now=130)
+    assert ui.live_notable_identities()[0] == frozenset()
+    assert ui.live_notable_identities()[1] == visible_revision + 1
+
+
+def test_restored_notable_is_historical_even_during_early_uptime():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = {
+        "flock": True,
+        "axon": False,
+        "dot_flock_mode": "recent",
+        "dot_fade_seconds": 30,
+    }
+    ui.notables = {
+        "wifi:AA:flock": {
+            "identity": "wifi:AA", "category": "flock",
+            "strength": 1, "seen": 0,
+        },
+    }
+    ui._notable_identities = frozenset()
+    ui._notable_revision = 0
+
+    ui._refresh_notable_identities(now=5)
+
+    assert ui.live_notable_identities()[0] == frozenset()
+    assert ui.is_notable("wifi", "AA") is False
+
+
 def test_live_map_node_window_evicts_globally_oldest_without_losing_counts():
     game = WatchDogsGame.__new__(WatchDogsGame)
     game.wifi_networks = []
@@ -362,6 +411,31 @@ def test_route_segments_reload_and_no_discoveries(tmp_path):
     count=len(t.points);t.sample(f,5,False);assert len(t.points)==count
     with t.path.open("a") as out:out.write('{"incomplete":')
     restored=WardriveTrail();restored.set_path(t.path);assert len(restored.points)==3
+
+
+def test_trail_density_counts_unique_radios_and_expires_old_ids():
+    trail = WardriveTrail()
+    trail.note_observation("wifi:AA", 1)
+    trail.note_observation("wifi:AA", 5)
+    trail.note_observation("ble:BB", 6)
+
+    assert trail.recent_unique_count(6) == 2
+    assert trail.recent_unique_count(15) == 2
+    assert trail.recent_unique_count(15.001) == 1
+    assert trail.recent_unique_count(16.001) == 0
+
+
+def test_trail_density_is_saved_and_restored(tmp_path):
+    trail = WardriveTrail()
+    trail.set_path(tmp_path / "trail.jsonl")
+    fix = asdict(GpsFix(
+        valid=True, latitude=40, longitude=-90, received_at=1, hdop=1))
+    trail.sample(fix, 1, True, density=27)
+
+    restored = WardriveTrail()
+    restored.set_path(trail.path)
+
+    assert restored.points[0]["density"] == 27
 
 
 def test_map_detail_and_parent_fallback(tmp_path):

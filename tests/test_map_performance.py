@@ -3,10 +3,10 @@ from unittest.mock import Mock
 from queue import Queue
 import zlib
 
-from watchdogs.app import MAP_NODE_LIMIT, MapProjection, WatchDogsGame
+from watchdogs.app import MAP_NODE_LIMIT, MapMarker, MapProjection, WatchDogsGame
 from watchdogs.map_index import GeoObjectIndex, GeoPointIndex
 from watchdogs.wardrive_trail import WardriveTrail
-from watchdogs.wardrive_ui import WardriveUI
+from watchdogs.wardrive_ui import RADAR_TRAIL_POINT_LIMIT, WardriveUI
 from watchdogs.tile_manager import OSM_TILE_SIZE, TileRenderer
 
 
@@ -138,8 +138,38 @@ def test_map_history_view_keeps_only_newest_points_without_truncating_loot():
     assert len(reduced) + len(game.wifi_networks) <= MAP_NODE_LIMIT
 
 
-def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
-        monkeypatch):
+def test_live_scan_updates_do_not_rescan_complete_historical_loot():
+    class CountingPoints(list):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    points = CountingPoints(
+        {"lat": 40, "lon": -90, "type": "wifi",
+         "bssid": f"00:11:22:33:{index // 256:02X}:{index % 256:02X}"}
+        for index in range(5000))
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.loot_points = points
+    game.wifi_networks = []
+    game.ble_devices = []
+    game.wardrive = NS(
+        layer_mode=lambda _layer: "keep", cell_candidates=[])
+
+    game._get_map_loot_points()
+    assert points.iterations == 1
+
+    game._map_registry().observe(
+        "wifi", "AA:BB:CC:DD:EE:FF", seen_at=1,
+        lat=40, lon=-90, rssi=-50)
+    game._get_map_loot_points()
+
+    assert points.iterations == 1
+    assert len(game._map_history_candidates) <= MAP_NODE_LIMIT * 2
+
+
+def test_trail_draw_dispatches_to_cached_layer(monkeypatch):
     trail = WardriveTrail()
     trail.points.extend([
         {"lat": 40, "lon": -90, "segment": 1},
@@ -152,28 +182,29 @@ def test_trail_projection_is_cached_and_offscreen_segments_are_skipped(
     projection.zoom = 13
     projection.center_lat = 40
     projection.center_lon = -90
-    original = projection.geo_to_screen
-    projection.geo_to_screen = Mock(side_effect=original)
-
     ui = WardriveUI.__new__(WardriveUI)
-    ui.settings = {"trail": True}
+    ui.settings = {"trail": True, "trail_mode": "solid"}
     ui.trail = trail
     ui.history_trail = None
     ui.app = NS(proj=projection)
-    ui._map_trail_key = None
-    ui._map_trail_segments = []
-    px = NS(clip=Mock(), line=Mock())
+    ui._trail_layer = NS(
+        image=None, request=Mock(), step=Mock(), draw=Mock(),
+        invalidate=Mock())
+    px = NS()
     monkeypatch.setitem(__import__("sys").modules, "pyxel", px)
 
     ui.draw_trail()
     ui.draw_trail()
-    assert projection.geo_to_screen.call_count == 4
-    assert px.line.call_count == 2
+    assert ui._trail_layer.request.call_count == 2
+    assert ui._trail_layer.step.call_count == 2
+    assert ui._trail_layer.draw.call_count == 2
+    args = ui._trail_layer.request.call_args.args
+    assert args == (trail.points, trail.revision, "solid", projection)
 
     trail.points.append({"lat": 40.0002, "lon": -90.0002, "segment": 2})
     trail.revision += 1
     ui.draw_trail()
-    assert projection.geo_to_screen.call_count == 9
+    assert ui._trail_layer.request.call_args.args[1] == trail.revision
 
 
 def test_trail_revision_changes_only_when_display_points_change(tmp_path):
@@ -186,6 +217,32 @@ def test_trail_revision_changes_only_when_display_points_change(tmp_path):
     assert trail.revision == initial + 1
     trail.sample(fix, 2, True)
     assert trail.revision == initial + 1
+
+
+def test_radar_trail_uses_only_a_bounded_recent_tail(monkeypatch):
+    trail = WardriveTrail()
+    trail.points.extend(
+        {"lat": 40, "lon": -90 + index / 10_000_000,
+         "segment": 1, "density": 0}
+        for index in range(4096))
+    trail.revision = 4096
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = {"trail": True, "trail_mode": "solid"}
+    ui.trail = trail
+    ui.history_trail = None
+    ui.history_notables = {}
+    ui.notables = {}
+    ui.cell_candidates = []
+    ui._radar_trail_key = None
+    ui._radar_trail_segments = []
+    ui.app = NS(player_lat=40, player_lon=-90)
+    px = NS(line=Mock(), circb=Mock(), pset=Mock())
+    monkeypatch.setitem(__import__("sys").modules, "pyxel", px)
+
+    ui.draw_radar(20, 20, 20, 1000)
+
+    assert len(ui._radar_trail_segments) <= RADAR_TRAIL_POINT_LIMIT - 1
+    assert px.line.call_count <= (RADAR_TRAIL_POINT_LIMIT - 1) * 2
 
 
 def test_periodic_loot_snapshot_is_applied_on_game_thread(monkeypatch):
@@ -209,6 +266,54 @@ def test_periodic_loot_snapshot_is_applied_on_game_thread(monkeypatch):
     assert game.loot_points == snapshot["points"]
     assert game._cracked_ssids == snapshot["passwords"]
     assert game._loot_totals == snapshot["totals"]
+
+
+def test_empty_loot_snapshot_clears_published_map_points():
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.loot_points = [{"lat": 40, "lon": -90}]
+    game._loot_points_revision = 3
+    game._map_loot_view_key = ("old",)
+
+    game._apply_loot_snapshot({"points": []})
+
+    assert game.loot_points == []
+    assert game._loot_points_revision == 4
+    assert game._map_loot_view_key is None
+
+
+def test_map_policy_change_invalidates_every_cached_node_layer():
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.wardrive = NS(fade_seconds=lambda: 60)
+    game._history_node_layer = NS(invalidate=Mock())
+    game._live_node_layer = NS(invalidate=Mock())
+    game._radar_node_layer = NS(invalidate=Mock())
+    game._map_live_view_key = ("old",)
+    game._map_loot_view_key = ("old",)
+    game._map_display_next_tick = 10
+
+    game._on_map_policy_changed()
+
+    assert game._map_live_view_key is None
+    assert game._map_loot_view_key is None
+    assert game._map_display_next_tick == 0
+    assert game._map_observations.lifetime == 60
+    for layer in (game._history_node_layer, game._live_node_layer,
+                  game._radar_node_layer):
+        layer.invalidate.assert_called_once_with()
+
+
+def test_restored_meshcore_marker_uses_historical_display_policy(monkeypatch):
+    import watchdogs.app as appmod
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    game.markers = [MapMarker(
+        40, -90, "saved", "meshcore", key="meshcore:1", last_seen=0)]
+    game.wardrive = NS(layer_color=Mock(return_value=None))
+    game.proj = NS(zoom=0)
+    monkeypatch.setattr(appmod, "pyxel", NS(frame_count=0))
+
+    game._draw_markers()
+
+    assert game.wardrive.layer_color.call_args.kwargs["historical"] is True
 
 
 def test_periodic_loot_refresh_worker_only_publishes_snapshot(monkeypatch):

@@ -1,5 +1,6 @@
 """Wardrive integration kept outside the main game's rendering and menu code."""
 from collections import OrderedDict, deque
+from itertools import islice
 import json
 from pathlib import Path
 import time
@@ -9,6 +10,7 @@ from .wardrive_protocol import parse_record, display_bytes
 from .scan_controller import ScanController
 from .notable_detector import NotableDetector, ble_name
 from .wardrive_trail import FixHistory, WardriveTrail
+from .trail_layer import TrailLayer, heat_color
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
 from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
@@ -16,9 +18,17 @@ from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
 from .host_ble import HostBleScanner
 from .cell_monitor import HostCellScanner, find_unclean_cell_session
-from .wardrive_settings import DEFAULTS, load_settings, save_settings, settings_path
+from .map_display import (
+    MAP_LAYERS, MODE_OFF, MODE_KEEP, MODE_RECENT, color_for_record,
+    cycle_mode, display_state, layer_label, mode_label,
+)
+from .wardrive_settings import (
+    DEFAULTS, DOT_FADE_CHOICES, TRAIL_MODES, load_settings,
+    normalize_settings, save_settings, settings_path,
+)
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
+RADAR_TRAIL_POINT_LIMIT = 160
 
 class WardriveUI:
     def __init__(self, app, initial_settings=None):
@@ -26,7 +36,7 @@ class WardriveUI:
         self.scan = ScanController(app._send, time.monotonic)
         self.host_ble = HostBleScanner()
         self.cell = HostCellScanner(getattr(app.gps, "modem_broker", None))
-        self.cell_candidates = deque(maxlen=512)
+        self.cell_candidates = deque(maxlen=128)
         self.cell_legacy_next = 0
         self.cell_unclean = find_unclean_cell_session(app._app_dir)
         self.cell_unclean_reported = False
@@ -39,6 +49,7 @@ class WardriveUI:
         self.detector = NotableDetector()
         self.fixes = FixHistory()
         self.trail = WardriveTrail()
+        self._trail_layer = TrailLayer(640, 16, 218)
         self.history_trail = None
         self._map_trail_key = None
         self._map_trail_segments = []
@@ -48,10 +59,11 @@ class WardriveUI:
         self.history_index = -1
         self.settings_path = settings_path(app._app_dir)
         self.settings = (load_settings(app._app_dir) if initial_settings is None
-                         else {key: initial_settings.get(key, value)
-                               for key, value in DEFAULTS.items()})
+                         else normalize_settings(initial_settings))
         self.settings_open = False
+        self.settings_page = "main"
         self.selection = 0
+        self.layer_selection = 0
         self.details = False
         self.detail_selection = 0
         self.notables = OrderedDict()
@@ -162,16 +174,20 @@ class WardriveUI:
                             item["fix_seen"] = 0
                             item["seen"] = 0  # restored observations are historical
                             self.notables[item["key"]] = item
-                            if len(self.notables) > 1024:
+                            if len(self.notables) > 256:
                                 self.notables.popitem(last=False)
                         except (ValueError, KeyError, TypeError):
                             pass
             self._refresh_notable_identities()
             self.trail.set_path(session / "wardrive_trail.jsonl" if session else None)
+            self._trail_layer.invalidate()
         active = app.wifi_scanning or app.ble_scanning or (self.scan.state == "running" and self.scan.mode == "wardrive")
         fix = self.fixes.at(now) if app.gps.available else None
         try:
-            self.trail.sample(fix, now, self.settings["trail"] and active)
+            trail_enabled = self.trail_mode() != "off" and active
+            self.trail.sample(
+                fix, now, trail_enabled,
+                density=self.trail.recent_unique_count(now))
         except OSError as exc:
             app.msg("[TRAIL] " + str(exc)[:70], 8)
         if self.alerts and now >= self.alert_until:
@@ -524,7 +540,9 @@ class WardriveUI:
                             for candidate in data.candidates:
                                 record = candidate.record()
                                 stream.write(json.dumps(record, separators=(",", ":")) + "\n")
-                                self.cell_candidates.append(record)
+                                display_record = dict(record)
+                                display_record["seen"] = now
+                                self.cell_candidates.append(display_record)
                             stream.flush()
                             import os
                             os.fsync(stream.fileno())
@@ -542,7 +560,18 @@ class WardriveUI:
                     self.cell.note_saved(cell)
                     self.app.loot_points.append({
                         "lat": fix["latitude"], "lon": fix["longitude"],
-                        "type": "cell", "label": cell.identity})
+                        "type": "cell", "label": cell.identity,
+                        "bssid": cell.identity})
+                    self.cell_candidates.append({
+                        "latitude": fix["latitude"],
+                        "longitude": fix["longitude"],
+                        "key": "serving:" + cell.identity,
+                        "identity": cell.identity,
+                        "seen": now,
+                        "provisional": False,
+                    })
+                    self.app._loot_points_revision = getattr(
+                        self.app, "_loot_points_revision", 0) + 1
             except Exception as exc:
                 self.app._term_add("[CELL] Save failed: " + str(exc)[:120], raw=True)
 
@@ -616,7 +645,7 @@ class WardriveUI:
             # Stored current observation fix stays distinct from last known marker fix.
             item["observation_fix"] = d["fix"]
             self.notables[key] = item
-            while len(self.notables) > 1024:
+            while len(self.notables) > 256:
                 self.notables.popitem(last=False)
             if self.store_path and (not old or now-old.get("saved",0)>=1):
                 item["saved"] = now
@@ -639,10 +668,14 @@ class WardriveUI:
                 self.app._term_add("[DETECT] " + item["label"] + " " + d["mac"] + " " + ",".join(h["id"] for h in hit["evidence"]), raw=True)
         self._refresh_notable_identities()
 
-    def _refresh_notable_identities(self):
+    def _refresh_notable_identities(self, now=None):
+        now = time.monotonic() if now is None else now
         identities = frozenset(
             item["identity"] for item in self.notables.values()
             if self.settings.get(item["category"], False)
+            and self.layer_state(
+                item["category"], item, now,
+                historical=item.get("seen", 0) == 0).visible
             and item.get("strength", 0) > 0)
         if identities != self._notable_identities:
             self._notable_identities = identities
@@ -653,27 +686,83 @@ class WardriveUI:
 
     def show_network_dots(self):
         """Whether ordinary Wi-Fi/BLE/cell map and radar dots are visible."""
-        return self.settings.get("network_dots", True)
+        return any(self.layer_mode(layer) != MODE_OFF
+                   for layer in ("wifi", "ble", "cell"))
+
+    def layer_mode(self, layer):
+        return self.settings.get(f"dot_{layer}_mode", MODE_RECENT)
+
+    def fade_seconds(self):
+        return self.settings.get("dot_fade_seconds", 30)
+
+    def layer_state(self, layer, record, now=None, historical=False):
+        mode = self.layer_mode(layer)
+        if historical and mode != MODE_KEEP:
+            return display_state(MODE_OFF, record, now=now,
+                                 lifetime=self.fade_seconds())
+        return display_state(mode, record, now=now,
+                             lifetime=self.fade_seconds())
+
+    def layer_color(self, layer, base_color, record, now=None,
+                    historical=False):
+        mode = self.layer_mode(layer)
+        if historical and mode != MODE_KEEP:
+            return None
+        return color_for_record(base_color, mode, record, now=now,
+                                lifetime=self.fade_seconds())
+
+    def trail_mode(self):
+        mode = self.settings.get("trail_mode")
+        if mode in TRAIL_MODES:
+            return mode
+        return "solid" if self.settings.get("trail", False) else "off"
 
     def is_notable(self, kind, mac):
-        return any(kind+":"+mac.upper()+":"+cat in self.notables and self.settings[cat]
-                   and self.notables[kind+":"+mac.upper()+":"+cat]["strength"] > 0 for cat in ("flock", "axon"))
+        now = time.monotonic()
+        for cat in ("flock", "axon"):
+            item = self.notables.get(kind + ":" + mac.upper() + ":" + cat)
+            if (item and self.settings[cat] and item["strength"] > 0
+                    and self.layer_state(
+                        cat, item, now,
+                        historical=item.get("seen", 0) == 0).visible):
+                return True
+        return False
 
     def position(self, item):
         if not item["fix"]:
             return None
         if self.settings["precise"]:
             return item["fix"]["latitude"], item["fix"]["longitude"]
+        # The non-precise option intentionally uses the ordinary inventory's
+        # decorative scatter when one exists.  The observation registry keeps
+        # the real heard-here fix, so consult it only as a bounded fallback.
         objects = self.app.wifi_networks if item["kind"] == "wifi" else self.app.ble_devices
         for obj in objects:
             if getattr(obj, "bssid", getattr(obj, "mac", "")).upper() == item["mac"]:
                 return obj.lat, obj.lon
+        registry = getattr(self.app, "_map_observations", None)
+        if registry is not None:
+            observed = registry.get(item["kind"], item["mac"], mode=MODE_KEEP)
+            if (observed is not None and observed.lat is not None
+                    and observed.lon is not None):
+                return observed.lat, observed.lon
         # Probe-only detections have no decorative inventory position.
         return item["fix"]["latitude"], item["fix"]["longitude"]
 
     def visible_notables(self):
-        for item in list(self.history_notables.values()) + list(self.notables.values()):
-            if self.settings[item["category"]] and item["strength"] > 0:
+        now = time.monotonic()
+        for historical, values in (
+                (True, self.history_notables.values()),
+                (False, self.notables.values())):
+            for item in values:
+                if not (self.settings[item["category"]]
+                        and item["strength"] > 0):
+                    continue
+                if not self.layer_state(
+                        item["category"], item, now,
+                        historical=(historical
+                                    or item.get("seen", 0) == 0)).visible:
+                    continue
                 pos = self.position(item)
                 if pos:
                     yield item, pos
@@ -682,61 +771,60 @@ class WardriveUI:
         import pyxel as px
         now = time.monotonic()
         for item in self.cell_candidates:
+            color = self.layer_color("cell", 10, item, now)
+            if color is None:
+                continue
             x, y = self.app.proj.geo_to_screen(item["latitude"], item["longitude"])
             if self.app.proj.screen_visible(x, y):
-                px.circb(x, y, 3, 10)
-                px.pset(x, y, 10)
+                px.circb(x, y, 3, color)
+                px.pset(x, y, color)
         for item, pos in self.visible_notables():
+            base = ORANGE if item["category"] == "axon" else PURPLE
+            color = self.layer_color(
+                item["category"], base, item, now,
+                historical=item.get("seen", 0) == 0)
+            if color is None:
+                continue
             x, y = self.app.proj.geo_to_screen(*pos)
             if self.app.proj.screen_visible(x,y):
-                px.circb(x,y,5,PURPLE)
+                px.circb(x,y,5,color)
                 if now-item.get("fix_seen",0) < 60:
-                    px.circ(x,y,2,PURPLE)
-                px.text(x+6,y-3,item["category"][0].upper(),PURPLE)
+                    px.circ(x,y,2,color)
+                px.text(x+6,y-3,item["category"][0].upper(),color)
 
     def draw_trail(self):
         import pyxel as px
-        if not self.settings["trail"]:
+        style = self.trail_mode()
+        if style == "off":
+            self._trail_layer.invalidate()
             return
         source = self.history_trail or self.trail
-        proj = self.app.proj
-        pixels_per_degree = 640 / proj.lon_span
-        key = (id(source), source.revision, proj.zoom,
-               round(proj.center_lat * pixels_per_degree),
-               round(proj.center_lon * pixels_per_degree))
-        if key != self._map_trail_key:
-            segments = []
-            previous = None
-            for p in source.points:
-                xy = proj.geo_to_screen(p["lat"], p["lon"])
-                if previous and previous[0]["segment"] == p["segment"]:
-                    old_xy = previous[1]
-                    if (xy != old_xy and max(old_xy[0], xy[0]) >= 0
-                            and min(old_xy[0], xy[0]) < 640
-                            and max(old_xy[1], xy[1]) >= 16
-                            and min(old_xy[1], xy[1]) < 234):
-                        segments.append((*old_xy, *xy))
-                previous = p, xy
-            self._map_trail_key = key
-            self._map_trail_segments = segments
-        px.clip(0,16,640,218)
-        for segment in self._map_trail_segments:
-            px.line(*segment, CYAN)
-        px.clip()
+        self._trail_layer.request(
+            source.points, source.revision, style, self.app.proj)
+        self._trail_layer.step()
+        self._trail_layer.draw(px, self.app.proj)
 
     def draw_radar(self, rx, ry, rr, scale):
         import pyxel as px
         def xy(lat,lon):
             return rx+(lon-self.app.player_lon)*scale, ry+(self.app.player_lat-lat)*scale
-        if self.settings["trail"]:
+        style = self.trail_mode()
+        if style != "off":
             source = self.history_trail or self.trail
-            key = (id(source), source.revision, rx, ry, rr, round(scale, 4),
+            key = (id(source), source.revision, style,
+                   rx, ry, rr, round(scale, 4),
                    round(self.app.player_lat * scale),
                    round(self.app.player_lon * scale))
             if key != self._radar_trail_key:
                 segments = []
                 previous = None
-                for p in source.points:
+                # The 40-pixel radar cannot resolve a 4,096-point route.
+                # Use only its newest bounded tail so a fresh GPS sample does
+                # not synchronously reproject the complete drive in draw().
+                radar_points = list(islice(
+                    reversed(source.points), RADAR_TRAIL_POINT_LIMIT))
+                radar_points.reverse()
+                for p in radar_points:
                     point = xy(p["lat"],p["lon"])
                     if previous and previous[0]["segment"] == p["segment"]:
                         # Clip a segment to the circle analytically before drawing.
@@ -751,23 +839,43 @@ class WardriveUI:
                                 lo=max(0,(-qb-disc**0.5)/(2*qa))
                                 hi=min(1,(-qb+disc**0.5)/(2*qa))
                                 if lo<=hi:
-                                    segments.append((a[0]+lo*dx,a[1]+lo*dy,
-                                                     a[0]+hi*dx,a[1]+hi*dy))
+                                    density = max(
+                                        previous[0].get("density", 0),
+                                        p.get("density", 0))
+                                    color = (CYAN if style == "solid"
+                                             else heat_color(density))
+                                    segments.append((
+                                        a[0]+lo*dx,a[1]+lo*dy,
+                                        a[0]+hi*dx,a[1]+hi*dy,color))
                     previous = p,point
                 self._radar_trail_key = key
                 self._radar_trail_segments = segments
             for segment in self._radar_trail_segments:
-                px.line(*segment, CYAN)
+                x1, y1, x2, y2, color = segment
+                px.line(x1, y1, x2, y2, color)
+                if abs(x2-x1) >= abs(y2-y1):
+                    px.line(x1, y1+1, x2, y2+1, color)
+                else:
+                    px.line(x1+1, y1, x2+1, y2, color)
         for item,pos in self.visible_notables():
+            base = ORANGE if item["category"] == "axon" else PURPLE
+            color = self.layer_color(
+                item["category"], base, item, time.monotonic(),
+                historical=item.get("seen", 0) == 0)
+            if color is None:
+                continue
             x,y = xy(*pos)
             if (x-rx)**2+(y-ry)**2 < (rr-3)**2:
-                px.circb(x,y,3,PURPLE)  # ring stays visible under the observer dot
+                px.circb(x,y,3,color)  # ring stays visible under observer dot
                 if time.monotonic()-item.get("fix_seen",0) < 60:
-                    px.pset(x,y,PURPLE)
+                    px.pset(x,y,color)
         for item in self.cell_candidates:
+            color = self.layer_color("cell", 10, item, time.monotonic())
+            if color is None:
+                continue
             x, y = xy(item["latitude"], item["longitude"])
             if (x-rx)**2+(y-ry)**2 < (rr-3)**2:
-                px.circb(x, y, 2, 10)
+                px.circb(x, y, 2, color)
 
     def cycle_history(self):
         if not self.app.loot:
@@ -780,11 +888,13 @@ class WardriveUI:
             self.history_index = -1
             self.history_trail = None
             self.history_notables.clear()
+            self._trail_layer.invalidate()
             return
         path = paths[self.history_index]
         trail = WardriveTrail()
         trail.set_path(path, read_only=True)
         self.history_trail = trail
+        self._trail_layer.invalidate()
         self.history_notables.clear()
         notable_path = path.parent / "notable_detections.jsonl"
         if notable_path.exists():
@@ -796,7 +906,7 @@ class WardriveUI:
                         if item["kind"] not in ("wifi","ble") or item["category"] not in ("flock","axon"):
                             continue
                         self.history_notables[item["key"]] = item
-                        if len(self.history_notables)>1024:
+                        if len(self.history_notables)>256:
                             self.history_notables.popitem(last=False)
                     except (ValueError, KeyError, TypeError):
                         pass
@@ -805,6 +915,32 @@ class WardriveUI:
         import pyxel as px
         if px.btnp(px.KEY_S):
             self.app._send("stop")
+            return
+        if self.settings_page == "layers":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "main"
+                return
+            row_count = len(MAP_LAYERS) + 1
+            if px.btnp(px.KEY_UP):
+                self.layer_selection = max(0, self.layer_selection - 1)
+            if px.btnp(px.KEY_DOWN):
+                self.layer_selection = min(row_count - 1,
+                                           self.layer_selection + 1)
+            direction = 0
+            if px.btnp(px.KEY_LEFT):
+                direction = -1
+            elif px.btnp(px.KEY_RIGHT) or px.btnp(px.KEY_RETURN):
+                direction = 1
+            if direction:
+                if self.layer_selection < len(MAP_LAYERS):
+                    self.cycle_layer_mode(
+                        MAP_LAYERS[self.layer_selection], direction)
+                else:
+                    self.cycle_fade_seconds(direction)
             return
         if px.btnp(px.KEY_ESCAPE) or px.btnp(px.KEY_TAB):
             self.settings_open = False
@@ -830,12 +966,66 @@ class WardriveUI:
                 self.settings["suppressed_devices"] = []
                 self.persist_settings()
             return
-        keys = ("flock", "axon", "precise", "network_dots", "trail",
+        keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
                 "lte_modem", "cell_tracking", "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
-            self.toggle_setting(keys[self.selection])
+            key = keys[self.selection]
+            if key == "_map_layers":
+                self.settings_page = "layers"
+                self.layer_selection = 0
+            elif key == "trail_mode":
+                self.cycle_trail_mode()
+            else:
+                self.toggle_setting(key)
+
+    def _map_policy_changed(self):
+        self._refresh_notable_identities()
+        self.app._cluster_sel = -1
+        self.app._cluster_popup = None
+        callback = getattr(self.app, "_on_map_policy_changed", None)
+        if callback:
+            callback()
+
+    def cycle_layer_mode(self, layer, direction=1):
+        key = f"dot_{layer}_mode"
+        self.settings[key] = cycle_mode(self.settings.get(key), direction)
+        self.settings["network_dots"] = any(
+            self.layer_mode(kind) != MODE_OFF for kind in ("wifi", "ble"))
+        self._map_policy_changed()
+        self.persist_settings()
+
+    def cycle_fade_seconds(self, direction=1):
+        current = self.fade_seconds()
+        try:
+            index = DOT_FADE_CHOICES.index(current)
+        except ValueError:
+            index = 1
+        step = -1 if direction < 0 else 1
+        self.settings["dot_fade_seconds"] = DOT_FADE_CHOICES[
+            (index + step) % len(DOT_FADE_CHOICES)]
+        self._map_policy_changed()
+        self.persist_settings()
+
+    def cycle_trail_mode(self, direction=1):
+        previous = self.trail_mode()
+        try:
+            index = TRAIL_MODES.index(previous)
+        except ValueError:
+            index = 0
+        step = -1 if direction < 0 else 1
+        current = TRAIL_MODES[(index + step) % len(TRAIL_MODES)]
+        self.settings["trail_mode"] = current
+        self.settings["trail"] = current != "off"
+        # Crossing OFF starts or ends a recording interval.  Switching the
+        # rendering style alone must not create a false GPS route break.
+        if previous == "off" or current == "off":
+            self.trail.break_segment()
+        layer = getattr(self, "_trail_layer", None)
+        if layer:
+            layer.invalidate()
+        self.persist_settings()
 
     def toggle_setting(self, key):
         """Apply one Wardrive Settings toggle and persist it."""
@@ -844,11 +1034,6 @@ class WardriveUI:
         self.settings[key] = not self.settings[key]
         if key in ("flock", "axon"):
             self._refresh_notable_identities()
-        if key == "network_dots" and not self.settings[key]:
-            self.app._cluster_sel = -1
-            self.app._cluster_popup = None
-        if key == "trail":
-            self.trail.break_segment()
         if key == "lte_modem":
             # Stop the shared cell owner before changing broker ownership.
             # Wi-Fi, ESP BLE, and host BLE sessions remain untouched.
@@ -883,15 +1068,40 @@ class WardriveUI:
             px.camera(0,-24)
             px.rect(40,35,560,285,0)
             px.rectb(40,35,560,285,PURPLE)
+            if self.settings_page == "layers":
+                px.text(55,47,"MAP DOT LAYERS   arrows / ENTER / ESC",7)
+                for i, layer in enumerate(MAP_LAYERS):
+                    selected = i == self.layer_selection
+                    value = mode_label(self.layer_mode(layer), self.fade_seconds())
+                    text = (("> " if selected else "  ")
+                            + layer_label(layer) + ": " + value)
+                    px.text(55,66+i*18,text,11 if selected else 7)
+                row = len(MAP_LAYERS)
+                selected = row == self.layer_selection
+                px.text(55,66+row*18,
+                        ("> " if selected else "  ")
+                        + f"Fade time: {self.fade_seconds()} seconds",
+                        11 if selected else 7)
+                px.text(55,259,"OFF hides only the marker; collection and loot continue.",13)
+                px.text(55,271,"FADE dims then removes recent dots. KEEP uses bounded history.",13)
+                px.text(55,291,"MeshCore is the positioned LoRa layer.  ESC returns.",10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
-            keys = ("flock", "axon", "precise", "network_dots", "trail",
+            keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
                     "lte_modem", "cell_tracking", "cell_neighbors")
             labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
-                      "Regular wardrive dots (2048 max)", "Wardrive trail",
+                      "Map dot layers", "Wardrive trail",
                       "LTE modem integration", "Cell mast tracking",
                       "Experimental QMI neighbors")
             for i,(key,label) in enumerate(zip(keys,labels)):
-                value = "ON" if self.settings[key] else "OFF"
+                if key == "_map_layers":
+                    value = "OPEN..."
+                elif key == "trail_mode":
+                    value = self.trail_mode().upper()
+                else:
+                    value = "ON" if self.settings[key] else "OFF"
                 if key in ("cell_tracking", "cell_neighbors") and not self.settings["lte_modem"]:
                     value += " (LTE OFF)"
                 px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)

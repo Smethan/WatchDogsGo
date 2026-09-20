@@ -17,7 +17,9 @@ from types import SimpleNamespace as NS
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from watchdogs.map_index import GeoPointIndex
+from watchdogs.map_display import RecentObservationRegistry
 from watchdogs.map_layers import HistoricalNodeLayer, LiveNodeLayer
+from watchdogs.trail_layer import TrailLayer
 
 
 WIDTH, MAP_TOP, MAP_HEIGHT = 640, 16, 218
@@ -97,6 +99,36 @@ def main():
     live_publish = elapsed(lambda: live.draw(px, proj))
     live_cached = elapsed(lambda: live.draw(px, proj))
 
+    registry = RecentObservationRegistry(capacity=512, lifetime=30)
+    radio_rows = list(zip(wifi, ble))
+
+    def ingest_registry():
+        for sequence, (wifi_item, ble_item) in enumerate(radio_rows):
+            heard = 1000 + sequence / 1000
+            registry.observe(
+                "wifi", wifi_item.bssid, seen_at=heard,
+                lat=wifi_item.lat, lon=wifi_item.lon, rssi=-60)
+            registry.observe(
+                "ble", ble_item.mac, seen_at=heard,
+                lat=ble_item.lat, lon=ble_item.lon, rssi=-65)
+
+    registry_ingest = elapsed(ingest_registry)
+    snapshot_now = 1000 + max(0, len(radio_rows) - 1) / 1000
+    registry_snapshot = elapsed(lambda: registry.snapshots_by_layer(
+        {"wifi": "recent", "ble": "recent"}, now=snapshot_now))
+    registry_expiry = elapsed(lambda: registry.tick(snapshot_now + 31))
+
+    trail_points = [
+        {"lat": point["lat"], "lon": point["lon"], "segment": 1,
+         "density": index % 64}
+        for index, point in enumerate(points[-4096:])
+    ]
+    trail = TrailLayer(WIDTH, MAP_TOP, MAP_HEIGHT)
+    trail.request(trail_points, 1, "heat", proj)
+    trail_build = elapsed(lambda: finish(trail))
+    trail_publish = elapsed(lambda: trail.draw(px, proj))
+    trail_cached = elapsed(lambda: trail.draw(px, proj))
+
     print(json.dumps({
         "points": args.points,
         "visible_index_candidates": index._last_query_candidates,
@@ -109,6 +141,12 @@ def main():
             "live_model_build": live_build,
             "live_two_frame_fake_raster_publish": live_publish,
             "live_cached_dispatch": live_cached,
+            "bounded_registry_ingest": registry_ingest,
+            "bounded_registry_snapshot": registry_snapshot,
+            "bounded_registry_expiry": registry_expiry,
+            "heat_trail_model_build": trail_build,
+            "heat_trail_fake_raster_publish": trail_publish,
+            "heat_trail_cached_dispatch": trail_cached,
         },
     }, indent=2))
 

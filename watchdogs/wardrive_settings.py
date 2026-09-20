@@ -11,6 +11,18 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
+from .map_display import (
+    DEFAULT_LAYER_MODES,
+    MAP_LAYERS,
+    MODE_KEEP,
+    MODE_OFF,
+    normalize_mode,
+)
+
+
+DOT_FADE_CHOICES = (15, 30, 60, 120)
+TRAIL_MODES = ("off", "solid", "heat")
+
 
 DEFAULTS = {
     "flock": True,
@@ -18,17 +30,66 @@ DEFAULTS = {
     "precise": True,
     "network_dots": True,
     "trail": False,
+    "trail_mode": "off",
+    "dot_fade_seconds": 30,
     "lte_modem": True,
     "cell_tracking": True,
     "cell_neighbors": False,
     "realert_seconds": 60,
     "suppressed_rules": [],
     "suppressed_devices": [],
+    **{f"dot_{layer}_mode": mode
+       for layer, mode in DEFAULT_LAYER_MODES.items()},
 }
 
 
 def settings_path(app_dir: str | Path) -> Path:
     return Path(app_dir) / "wardrive_settings.json"
+
+
+def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate settings and migrate the old all-dots/trail booleans."""
+    result = deepcopy(DEFAULTS)
+    if not isinstance(saved, Mapping):
+        return result
+    for key, default in DEFAULTS.items():
+        value = saved.get(key)
+        if type(value) is type(default):
+            result[key] = deepcopy(value)
+
+    has_legacy_dots = type(saved.get("network_dots")) is bool
+    legacy_dots = saved.get("network_dots")
+    for layer in MAP_LAYERS:
+        key = f"dot_{layer}_mode"
+        if key in saved:
+            result[key] = normalize_mode(saved.get(key), DEFAULT_LAYER_MODES[layer])
+        elif layer in ("wifi", "ble", "cell") and has_legacy_dots:
+            # Preserve the old toggle's behavior for existing installations:
+            # ON retained bounded ordinary dots until eviction. OFF hid WiFi
+            # and BLE, but its separate live cell indicators stayed visible.
+            if legacy_dots is True:
+                result[key] = MODE_KEEP
+            elif layer in ("wifi", "ble"):
+                result[key] = MODE_OFF
+            else:
+                result[key] = DEFAULT_LAYER_MODES[layer]
+        else:
+            result[key] = DEFAULT_LAYER_MODES[layer]
+
+    seconds = saved.get("dot_fade_seconds", DEFAULTS["dot_fade_seconds"])
+    result["dot_fade_seconds"] = (
+        seconds if type(seconds) is int and seconds in DOT_FADE_CHOICES
+        else DEFAULTS["dot_fade_seconds"])
+
+    if "trail_mode" in saved and saved.get("trail_mode") in TRAIL_MODES:
+        result["trail_mode"] = saved["trail_mode"]
+    else:
+        result["trail_mode"] = "solid" if saved.get("trail") is True else "off"
+    result["trail"] = result["trail_mode"] != "off"
+    result["network_dots"] = any(
+        result[f"dot_{layer}_mode"] != MODE_OFF
+        for layer in ("wifi", "ble"))
+    return result
 
 
 def load_settings(app_dir: str | Path) -> dict[str, Any]:
@@ -38,28 +99,17 @@ def load_settings(app_dir: str | Path) -> dict[str, Any]:
     the existing SIM7600 behavior until the user explicitly disables it.
     Invalid or partially written files are treated like a first launch.
     """
-    result = deepcopy(DEFAULTS)
     try:
         saved = json.loads(settings_path(app_dir).read_text(encoding="utf-8"))
-        if not isinstance(saved, dict):
-            return result
-        for key, default in DEFAULTS.items():
-            value = saved.get(key)
-            if type(value) is type(default):
-                result[key] = value
+        return normalize_settings(saved)
     except (OSError, ValueError, TypeError):
-        pass
-    return result
+        return deepcopy(DEFAULTS)
 
 
 def save_settings(app_dir: str | Path, settings: Mapping[str, Any]) -> None:
     """Atomically persist known settings."""
     path = settings_path(app_dir)
-    value = {
-        key: settings.get(key, default)
-        if type(settings.get(key, default)) is type(default) else default
-        for key, default in DEFAULTS.items()
-    }
+    value = normalize_settings(settings)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)

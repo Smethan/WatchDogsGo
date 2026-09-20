@@ -1,5 +1,5 @@
 """Fresh host fixes and segmented local route storage. No map/pan coordinates."""
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict
 import json
 import math
@@ -39,6 +39,26 @@ class WardriveTrail:
         self.last = None
         self.last_stamp = None
         self.last_input = None
+        self._recent_radios = OrderedDict()
+
+    def note_observation(self, identity, now):
+        """Record one Wi-Fi/BLE identity for route-density coloring."""
+        key = str(identity).upper()
+        if not key:
+            return
+        self._recent_radios[key] = float(now)
+        self._recent_radios.move_to_end(key)
+        self.recent_unique_count(now)
+
+    def recent_unique_count(self, now, window=10.0):
+        """Return unique radio identities heard in the rolling window."""
+        cutoff = float(now) - float(window)
+        while self._recent_radios:
+            first = next(iter(self._recent_radios))
+            if self._recent_radios[first] >= cutoff:
+                break
+            self._recent_radios.popitem(last=False)
+        return len(self._recent_radios)
 
     def set_path(self, path, read_only=False):
         if path == self.path:
@@ -71,7 +91,7 @@ class WardriveTrail:
             self.last = None
         self.segment += 1
 
-    def sample(self, fix, now, enabled):
+    def sample(self, fix, now, enabled, density=None):
         if not enabled or fix is None:
             if self.last is not None:
                 self.break_segment()
@@ -83,8 +103,11 @@ class WardriveTrail:
             self.break_segment()
         self.last_input = now
         self.last_stamp = stamp
+        if density is None:
+            density = self.recent_unique_count(now)
         p = {"lat": fix["latitude"], "lon": fix["longitude"], "alt": fix["altitude"],
-             "hdop": fix["hdop"], "time": time.time(), "segment": self.segment}
+             "hdop": fix["hdop"], "time": time.time(), "segment": self.segment,
+             "density": max(0, int(density))}
         if self.last:
             old, old_now = self.last
             dt = now-old_now

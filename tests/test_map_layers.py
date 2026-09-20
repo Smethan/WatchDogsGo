@@ -100,10 +100,43 @@ def test_history_layer_queues_latest_view_while_build_is_running():
     subject, proj = layer(), projection()
     subject.request(points, proj)
     subject.step(max_ms=1000, max_records=1)
-    proj.center_lon += 0.001
+    proj.center_lon += 0.01
     subject.request(points, proj)
     assert subject._queued is not None
     assert subject._queued.center_lon == proj.center_lon
+
+
+def test_history_layer_never_publishes_a_completed_stale_request():
+    subject, proj, px = layer(), projection(), FakePyxel()
+    old = [{"lat": 40, "lon": -90, "type": "wifi"}]
+    new = [{"lat": 40, "lon": -89.999, "type": "wifi"}]
+    subject.request(old, proj, revision=1)
+    finish(subject)
+    assert subject._ready is not None
+
+    subject.request(new, proj, revision=2)
+    assert subject._ready is None and subject._job is not None
+    finish(subject)
+    subject.draw(px, proj)
+
+    assert subject.data_token[-1] == 2
+
+
+def test_history_layer_finishes_during_continuous_small_camera_motion():
+    points = [
+        {"lat": 40, "lon": -90 + index / 1_000_000, "type": "wifi"}
+        for index in range(512)
+    ]
+    subject, proj, px = layer(), projection(), FakePyxel()
+    for _frame in range(120):
+        proj.center_lon += 0.25 * proj.lon_span / W
+        subject.request(points, proj, revision=1)
+        subject.step(max_ms=1000, max_records=32)
+        subject.draw(px, proj)
+        if subject.image is not None:
+            break
+    assert subject.image is not None
+    assert subject._job is None and subject._queued is None
 
 
 def test_history_layer_keeps_cluster_members_for_popup_and_translates_nav():
@@ -189,6 +222,44 @@ def test_live_layer_coalesces_rapid_data_changes_between_publishes():
     assert subject.data_token[1] == 2
 
 
+def test_live_layer_discards_completed_stale_snapshot_before_draw():
+    old = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+              color=10, hacked=False)]
+    new = [NS(lat=40, lon=-89.999, bssid="00:11:22:33:44:66",
+              color=9, hacked=False)]
+    subject, proj, px = LiveNodeLayer(W, HUD_TOP, MAP_H), projection(), FakePyxel()
+    subject.request(old, [], 1, frozenset(), proj)
+    finish(subject)
+    assert subject._ready is not None
+
+    subject.request(new, [], 2, frozenset(), proj)
+    assert subject._ready is None and subject._job is not None
+    finish(subject)
+    subject.draw(px, proj)
+
+    assert subject.data_token[4] == 2
+
+
+def test_live_layer_finishes_during_continuous_small_camera_motion():
+    wifi = [
+        NS(lat=40, lon=-90 + index / 1_000_000,
+           bssid=f"00:11:22:33:{index // 256:02X}:{index % 256:02X}",
+           color=10, hacked=False)
+        for index in range(512)
+    ]
+    subject, proj, px = LiveNodeLayer(W, HUD_TOP, MAP_H), projection(), FakePyxel()
+    ble = []
+    for _frame in range(120):
+        proj.center_lon += 0.25 * proj.lon_span / W
+        subject.request(wifi, ble, 1, frozenset(), proj)
+        subject.step(max_ms=1000, max_records=32)
+        subject.draw(px, proj)
+        if subject.images[0] is not None:
+            break
+    assert subject.images[0] is not None
+    assert subject._job is None and subject._queued is None
+
+
 def test_radar_layer_deduplicates_pixels_and_translates_small_gps_moves():
     wifi = [
         NS(lat=40, lon=-90, bssid=f"00:11:22:33:44:{index:02X}",
@@ -231,3 +302,43 @@ def test_radar_layer_coalesces_rapid_node_updates():
     subject._last_publish_at -= 61
     subject.step(max_ms=1000)
     assert subject._ready is not None
+
+
+def test_radar_layer_discards_completed_stale_snapshot_before_draw():
+    old = [NS(lat=40, lon=-90, bssid="00:11:22:33:44:55",
+              color=10, hacked=False)]
+    new = [NS(lat=40, lon=-89.999, bssid="00:11:22:33:44:66",
+              color=9, hacked=False)]
+    subject, px = RadarNodeLayer(20), FakePyxel()
+    subject.request(old, [], [], 1, frozenset(), 40, -90, 1000)
+    finish(subject)
+    assert subject._ready is not None
+
+    subject.request(new, [], [], 2, frozenset(), 40, -90, 1000)
+    assert subject._ready is None and subject._job is not None
+    finish(subject)
+    subject.draw(px, 610, 40, 40, -90, 1000)
+
+    assert subject.data_token[6] == 2
+
+
+def test_radar_layer_finishes_during_continuous_small_gps_motion():
+    wifi = [
+        NS(lat=40, lon=-90 + index / 1_000_000,
+           bssid=f"00:11:22:33:{index // 256:02X}:{index % 256:02X}",
+           color=10, hacked=False)
+        for index in range(512)
+    ]
+    subject, px, center_lon = RadarNodeLayer(20), FakePyxel(), -90.0
+    ble, loot = [], []
+    scale = 1000
+    for _frame in range(120):
+        center_lon += 0.25 / scale
+        subject.request(
+            wifi, ble, loot, 1, frozenset(), 40, center_lon, scale)
+        subject.step(max_ms=1000, max_records=32)
+        subject.draw(px, 610, 40, 40, center_lon, scale)
+        if subject.image is not None:
+            break
+    assert subject.image is not None
+    assert subject._job is None and subject._queued is None
