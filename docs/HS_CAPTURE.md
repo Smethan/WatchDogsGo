@@ -106,6 +106,13 @@ capture bytes and a different WPA-sec API key are treated as new work. The
 receipt file is replaced atomically after each confirmed HTTP success so a
 crash cannot leave a partially written ledger.
 
+`.22000` files are local hashcat artifacts and are never uploaded. Before
+sending a pending PCAP/PCAPNG, WDG accepts a current nonempty companion
+`.22000` as prior hcxtools validation or runs
+`hcxpcapngtool` with WPA-sec-compatible options. Empty containers and captures
+that yield no crackable handshake or PMKID are reported as local skips rather
+than retried against the service on every upload.
+
 With older firmware, all-nearby capture still works when the Wi-Fi whitelist is
 empty. Firmware 1.7.11 advertises `hs_capture_exclusions_v1`; when one or more
 Wi-Fi BSSIDs are whitelisted, WDG sends them as an immutable all-nearby

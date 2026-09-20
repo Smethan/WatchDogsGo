@@ -8,13 +8,21 @@ import pytest
 from watchdogs import upload_manager
 
 
+@pytest.fixture
+def accept_test_captures(monkeypatch):
+    """Most upload-flow tests use tiny sentinels rather than real PCAP data."""
+    monkeypatch.setattr(
+        upload_manager, "_capture_uploadable", lambda path: (True, ""))
+
+
 def touch(path: Path, data=b"capture"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
 
 
-def test_wpasec_prefers_pcapng_twin_and_keeps_legacy_pcap(tmp_path, monkeypatch):
+def test_wpasec_prefers_pcapng_twin_and_keeps_legacy_pcap(
+        tmp_path, monkeypatch, accept_test_captures):
     session = tmp_path / "loot" / "session" / "handshakes"
     preferred_pcap = touch(session / "Lab_020000000001_120000.pcap")
     preferred_ng = touch(session / "Lab_020000000001_120000.pcapng")
@@ -31,7 +39,8 @@ def test_wpasec_prefers_pcapng_twin_and_keeps_legacy_pcap(tmp_path, monkeypatch)
     assert message == "2/2 uploaded"
 
 
-def test_wpasec_pcapng_whitelist_filter_and_empty_message(tmp_path, monkeypatch):
+def test_wpasec_pcapng_whitelist_filter_and_empty_message(
+        tmp_path, monkeypatch, accept_test_captures):
     session = tmp_path / "session" / "handshakes"
     blocked = touch(session / "Home_AABBCCDDEEFF_120000.pcapng")
     allowed = touch(session / "Lab_020000000003_120001.pcapng")
@@ -44,7 +53,7 @@ def test_wpasec_pcapng_whitelist_filter_and_empty_message(tmp_path, monkeypatch)
         tmp_path, {"AA:BB:CC:DD:EE:FF"})
     assert result[:2] == (1, 1)
     assert uploaded == [allowed] and blocked not in uploaded
-    assert "1 skipped" in result[2]
+    assert "1 skipped (whitelist)" in result[2]
     assert upload_manager.upload_wpasec_all(tmp_path / "missing") == (
         0, 0, "No PCAP/PCAPNG files found")
 
@@ -70,7 +79,8 @@ def test_wpasec_only_confirms_accepted_server_responses(
     assert expected_message in message
 
 
-def test_wpasec_uploads_once_and_persists_content_receipt(tmp_path, monkeypatch):
+def test_wpasec_uploads_once_and_persists_content_receipt(
+        tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     capture = touch(
         loot / "session" / "handshakes" / "Lab_020000000001_120000.pcapng",
@@ -97,7 +107,8 @@ def test_wpasec_uploads_once_and_persists_content_receipt(tmp_path, monkeypatch)
     assert calls == [capture]
 
 
-def test_wpasec_retries_failures_and_rejected_captures(tmp_path, monkeypatch):
+def test_wpasec_retries_failures_and_rejected_captures(
+        tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     capture = touch(
         loot / "session" / "handshakes" / "Lab_020000000001_120000.pcapng")
@@ -115,7 +126,8 @@ def test_wpasec_retries_failures_and_rejected_captures(tmp_path, monkeypatch):
     assert calls == [capture, capture]
 
 
-def test_wpasec_receipts_follow_content_and_account(tmp_path, monkeypatch):
+def test_wpasec_receipts_follow_content_and_account(
+        tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     original = touch(
         loot / "one" / "handshakes" / "Original_020000000001_120000.pcapng",
@@ -141,7 +153,7 @@ def test_wpasec_receipts_follow_content_and_account(tmp_path, monkeypatch):
 
 
 def test_wpasec_corrupt_receipts_fail_open_and_are_replaced(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     capture = touch(
         loot / "session" / "handshakes" / "Lab_020000000001_120000.pcapng")
@@ -159,7 +171,8 @@ def test_wpasec_corrupt_receipts_fail_open_and_are_replaced(
     assert json.loads(ledger_path.read_text(encoding="utf-8"))["version"] == 1
 
 
-def test_wpasec_receipt_write_failure_retries_next_run(tmp_path, monkeypatch):
+def test_wpasec_receipt_write_failure_retries_next_run(
+        tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     capture = touch(
         loot / "session" / "handshakes" / "Lab_020000000001_120000.pcapng")
@@ -180,3 +193,57 @@ def test_wpasec_receipt_write_failure_retries_next_run(tmp_path, monkeypatch):
     second = upload_manager.upload_wpasec_all(loot)
     assert second[:2] == (1, 1)
     assert calls == [capture, capture]
+
+
+def test_wpasec_candidates_never_include_22000(tmp_path):
+    session = tmp_path / "loot" / "session" / "handshakes"
+    pcapng = touch(session / "Lab_020000000001_120000.pcapng")
+    touch(session / "Lab_020000000001_120000.22000", b"WPA*02*hash")
+    assert upload_manager._capture_candidates(tmp_path / "loot") == [pcapng]
+
+
+def test_wpasec_local_preflight_magic_companion_and_no_hash(
+        tmp_path, monkeypatch):
+    invalid = touch(tmp_path / "invalid.pcap", b"\xd4\xc3\xb2\xa1" + b"\0" * 20)
+    assert upload_manager._capture_uploadable(invalid) == (
+        False, "invalid or empty PCAP/PCAPNG")
+
+    capture = touch(
+        tmp_path / "ready.pcapng", b"\x0a\x0d\x0d\x0a" + b"\0" * 100)
+    companion = touch(capture.with_suffix(".22000"), b"WPA*02*hash")
+    companion.touch()
+    assert upload_manager._capture_uploadable(capture) == (True, "")
+
+    companion.unlink()
+    monkeypatch.setattr(upload_manager.shutil, "which", lambda name: "/hcx")
+    calls = []
+    monkeypatch.setattr(
+        upload_manager.subprocess, "run",
+        lambda *args, **kwargs: (
+            calls.append((args, kwargs)),
+            NS(returncode=0, stdout="no hashes", stderr=""),
+        )[1])
+    assert upload_manager._capture_uploadable(capture) == (
+        False, "no crackable handshake or PMKID")
+    command = calls[0][0][0]
+    assert command[0] == "/hcx"
+    assert "--nonce-error-corrections=8" in command
+    assert "--eapoltimeout=30000" in command
+    assert "--max-essids=1" in command
+
+
+def test_wpasec_locally_skips_unusable_capture_without_upload(
+        tmp_path, monkeypatch):
+    loot = tmp_path / "loot"
+    capture = touch(
+        loot / "session" / "handshakes" / "Partial_020000000001_120000.pcapng")
+    monkeypatch.setattr(
+        upload_manager, "_capture_uploadable",
+        lambda path: (False, "no crackable handshake or PMKID"))
+    monkeypatch.setattr(
+        upload_manager, "upload_wpasec",
+        lambda path: pytest.fail("unusable capture was uploaded"))
+    result = upload_manager.upload_wpasec_all(loot)
+    assert result[:2] == (0, 0)
+    assert "1 skipped locally" in result[2]
+    assert "no crackable handshake or PMKID" in result[2]

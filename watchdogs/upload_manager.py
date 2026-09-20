@@ -6,6 +6,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import threading
 
 from .config import WPASEC_URL, WPASEC_DL_URL, WPASEC_KEY
@@ -106,16 +109,14 @@ def upload_wpasec(capture_path: Path) -> tuple[bool, str]:
 
 
 def _bssid_from_filename(name: str) -> str:
-    """Extract BSSID from a capture filename such as `SSID_AABB..._HHMMSS.pcapng`.
-
-    Returns MAC with colons (e.g. 'AA:BB:CC:DD:EE:FF') or empty string.
-    """
-    stem = name.rsplit(".", 1)[0]  # strip capture extension
-    parts = stem.split("_")
-    for part in parts:
+    """Extract an uppercase colon-delimited BSSID from a capture filename."""
+    stem = name.rsplit(".", 1)[0]
+    for part in stem.split("_"):
         clean = part.replace("-", "").replace(":", "")
-        if len(clean) == 12 and all(c in "0123456789ABCDEFabcdef" for c in clean):
-            return ":".join(clean[i:i+2] for i in range(0, 12, 2)).upper()
+        if (len(clean) == 12
+                and all(char in "0123456789ABCDEFabcdef" for char in clean)):
+            return ":".join(clean[index:index + 2]
+                            for index in range(0, 12, 2)).upper()
     return ""
 
 
@@ -129,6 +130,66 @@ def _capture_candidates(loot_dir: Path) -> list[Path]:
             if current is None or path.suffix.lower() == ".pcapng":
                 candidates[key] = path
     return sorted(candidates.values())
+
+
+_CAPTURE_MAGICS = {
+    b"\x0a\x0d\x0d\x0a",  # PCAPNG
+    b"\xa1\xb2\xc3\xd4",  # PCAP, big endian
+    b"\xd4\xc3\xb2\xa1",  # PCAP, little endian
+}
+
+
+def _capture_uploadable(path: Path) -> tuple[bool, str]:
+    """Match WPA-sec's capture checks before spending a network request."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError as exc:
+        return False, f"unreadable capture: {exc}"
+    if size <= 64 or magic not in _CAPTURE_MAGICS:
+        return False, "invalid or empty PCAP/PCAPNG"
+
+    # WDG generates this from a validated HCCAPX.  A nonempty companion newer
+    # than the immutable capture proves hcxtools already extracted a hash.
+    companion = path.with_suffix(".22000")
+    try:
+        if (companion.is_file() and companion.stat().st_size > 0
+                and companion.stat().st_mtime_ns >= path.stat().st_mtime_ns):
+            return True, ""
+    except OSError:
+        pass
+
+    tool = shutil.which("hcxpcapngtool")
+    if not tool:
+        # Preserve legacy behavior on systems where the optional local
+        # validator is unavailable; WPA-sec will perform its own validation.
+        return True, ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="wdg-wpasec-") as temp_dir:
+            output = Path(temp_dir) / "capture.22000"
+            probes = Path(temp_dir) / "probes.txt"
+            result = subprocess.run(
+                [
+                    tool,
+                    "--nonce-error-corrections=8",
+                    "--eapoltimeout=30000",
+                    "--max-essids=1",
+                    "-o", str(output),
+                    "-R", str(probes),
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if output.is_file() and output.stat().st_size > 0:
+                return True, ""
+            if result.returncode:
+                return False, f"hcxtools rejected capture (exit {result.returncode})"
+            return False, "no crackable handshake or PMKID"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"local hcxtools validation failed: {exc}"
 
 
 def _capture_sha256(path: Path) -> str:
@@ -215,11 +276,10 @@ def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
         if not captures:
             return 0, 0, "No PCAP/PCAPNG files found"
 
-        # Filter out whitelisted BSSIDs before hashing or receipt lookup.
         whitelist_skipped = 0
         if blocked_macs:
-            filtered = []
             blocked_macs = {mac.upper() for mac in blocked_macs}
+            filtered = []
             for path in captures:
                 bssid = _bssid_from_filename(path.name)
                 if bssid and bssid in blocked_macs:
@@ -247,9 +307,18 @@ def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
             else:
                 pending.append((path, digest, size))
 
-        attempted = len(pending) + hash_errors
         uploaded = 0
+        uploadable: list[tuple[Path, str, int]] = []
+        local_skips: dict[str, int] = {}
         for path, digest, size in pending:
+            ready, reason = _capture_uploadable(path)
+            if ready:
+                uploadable.append((path, digest, size))
+            else:
+                local_skips[reason] = local_skips.get(reason, 0) + 1
+
+        attempted = len(uploadable) + hash_errors
+        for path, digest, size in uploadable:
             ok, message = upload_wpasec(path)
             if not ok:
                 errors.append(f"{path.name}: {message}")
@@ -275,6 +344,11 @@ def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
             summary = f"{uploaded}/{attempted} uploaded"
             if already_uploaded:
                 summary += f" | {already_uploaded} already uploaded"
+        if local_skips:
+            skipped = sum(local_skips.values())
+            reasons = ", ".join(
+                f"{count} {reason}" for reason, count in sorted(local_skips.items()))
+            summary += f" | {skipped} skipped locally ({reasons})"
         if whitelist_skipped:
             summary += f" | {whitelist_skipped} skipped (whitelist)"
         if ledger_warning:
