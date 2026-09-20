@@ -518,6 +518,12 @@ An explicitly configured USB GPS through `WDG_GPS_DEVICE` is still honored.
 If LTE integration remains ON while the module is absent, WDG handles the
 missing ModemManager location provider and falls back to external GPS.
 
+On CM4, `/dev/ttyS0` must not also be the Linux serial console. The official
+HackerGadgets AIO package removes the serial-console entry from
+`/boot/firmware/cmdline.txt`, but that change takes effect only after a reboot.
+WDG detects the running-kernel conflict, leaves the occupied UART alone, and
+reports whether a reboot or a boot-command-line repair is required.
+
 Turn LTE integration ON after reinstalling the SIM7600. A working external GPS
 continues to be used; otherwise WDG reacquires ModemManager GNSS. The separate
 **Cell mast tracking** setting controls WiGLE cell observations without

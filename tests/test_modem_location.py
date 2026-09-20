@@ -233,6 +233,50 @@ def test_cm4_aio_uses_ttys0_without_probing_bluetooth_uart(monkeypatch):
                    for call in gps._probe_nmea.call_args_list)
 
 
+def test_cm4_aio_does_not_probe_uart_owned_by_kernel_console(monkeypatch):
+    monkeypatch.delenv("WDG_GPS_DEVICE", raising=False)
+    monkeypatch.delenv("JANOS_GPS_DEVICE", raising=False)
+    monkeypatch.setattr(GpsManager, "_platform_model",
+                        staticmethod(lambda: "Raspberry Pi Compute Module 4 Rev 1.1"))
+    monkeypatch.setattr(GpsManager, "_read_cmdline", staticmethod(
+        lambda path: (
+            "console=ttyS0,115200 console=tty1 root=/dev/mmcblk0p2"
+            if str(path) == "/proc/cmdline"
+            else "console=tty1 root=/dev/mmcblk0p2")))
+    monkeypatch.setattr("watchdogs.gps_manager.managed_port_names",
+                        Mock(side_effect=AssertionError("MM inventory must not be queried")))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.exists",
+                        lambda path: path in ("/dev/ttyS0", "/dev/serial0"))
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.realpath",
+                        lambda path: "/dev/ttyS0" if path == "/dev/serial0" else path)
+    broker = SimpleNamespace(acquire=Mock(), close=Mock(), error="")
+    gps = GpsManager(modem_broker=broker, modem_enabled=False)
+    gps._probe_nmea = Mock(side_effect=AssertionError("console UART must not be probed"))
+    gps._try_open = Mock(side_effect=AssertionError("console UART must not be opened"))
+
+    assert not gps.setup()
+    assert gps.status_reason == "/dev/ttyS0 is still the serial console; reboot required"
+    gps._probe_nmea.assert_not_called()
+    gps._try_open.assert_not_called()
+
+
+def test_serial_console_reason_requests_config_repair_when_still_persistent(monkeypatch):
+    monkeypatch.setattr(GpsManager, "_read_cmdline", staticmethod(
+        lambda _path: "console=serial0,115200 console=tty1"))
+    reason = GpsManager._serial_console_reason("/dev/ttyS0")
+    assert "remove its console= entry" in reason
+    assert "/boot/firmware/cmdline.txt" in reason
+
+
+def test_cmdline_console_matching_is_device_specific(monkeypatch):
+    monkeypatch.setattr("watchdogs.gps_manager.os.path.realpath", lambda path: path)
+    cmdline = "console=ttyS0,115200 console=tty1 root=/dev/mmcblk0p2"
+    assert GpsManager._cmdline_uses_device(cmdline, "/dev/ttyS0")
+    assert GpsManager._cmdline_uses_device(
+        "console=serial0,115200 root=/dev/mmcblk0p2", "/dev/ttyS0")
+    assert not GpsManager._cmdline_uses_device(cmdline, "/dev/ttyACM0")
+
+
 def test_cm5_aio_uses_ttyama0(monkeypatch):
     monkeypatch.setattr(GpsManager, "_platform_model",
                         staticmethod(lambda: "Raspberry Pi Compute Module 5 Rev 1.0"))

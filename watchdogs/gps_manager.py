@@ -106,6 +106,11 @@ class GpsManager:
                     f"{device} is owned by ModemManager; configure an external GPS")
                 log.warning(self.status_reason)
                 return False
+            console_reason = self._serial_console_reason(device)
+            if console_reason:
+                self.status_reason = console_reason
+                log.warning(console_reason)
+                return False
             if self._try_open(device):
                 return True
             log.info("GPS device %s (from env) not available — GPS disabled",
@@ -133,8 +138,14 @@ class GpsManager:
         # No usable internal GNSS — probe only the documented platform UART
         # for this Compute Module.  Avoid broad ttyAMA/ttyS discovery because
         # another UART may carry the onboard Bluetooth HCI transport.
+        console_reason = ""
         for candidate in self._platform_gps_candidates(device):
             if (self.modem_enabled and self._is_managed_port(candidate)):
+                continue
+            reason = self._serial_console_reason(candidate)
+            if reason:
+                console_reason = reason
+                log.warning(reason)
                 continue
             if (os.path.exists(candidate)
                     and self._probe_nmea(candidate, self._baud)
@@ -149,7 +160,9 @@ class GpsManager:
             self.device = detected
             if self._try_open(detected):
                 return True
-        if not self.modem_enabled:
+        if console_reason:
+            self.status_reason = console_reason
+        elif not self.modem_enabled:
             self.status_reason = "LTE modem disabled; no external GPS found"
         log.info("No GPS found — GPS disabled")
         return False
@@ -256,6 +269,65 @@ class GpsManager:
                 seen.add(resolved)
                 result.append(candidate)
         return result
+
+    @staticmethod
+    def _read_cmdline(path: Path) -> Optional[str]:
+        try:
+            return path.read_text(errors="replace").replace("\x00", " ").strip()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _cmdline_uses_device(cmdline: str, device: str) -> bool:
+        """Return whether a kernel command line reserves ``device`` as console."""
+        names = {Path(device).name}
+        try:
+            names.add(Path(os.path.realpath(device)).name)
+        except OSError:
+            pass
+        # Raspberry Pi firmware accepts serial0 in cmdline.txt and resolves it
+        # to the concrete tty name before exposing /proc/cmdline.
+        if names & {"ttyS0", "ttyAMA0"}:
+            names.add("serial0")
+        for token in cmdline.split():
+            if not token.startswith("console="):
+                continue
+            name = token.partition("=")[2].partition(",")[0]
+            if Path(name).name in names:
+                return True
+        return False
+
+    @classmethod
+    def _serial_console_reason(cls, device: str) -> str:
+        """Explain an AIO UART conflict without opening the occupied port.
+
+        The CM4 AIO GPS shares serial0.  When Linux was booted with that UART
+        as a console, systemd starts a getty which competes for NMEA bytes and
+        can make a powered receiver look absent.  If the persistent cmdline is
+        already corrected, only a reboot is needed; otherwise give the exact
+        configuration repair instead of reporting a missing GPS.
+        """
+        active = cls._read_cmdline(Path("/proc/cmdline"))
+        if active is None or not cls._cmdline_uses_device(active, device):
+            return ""
+
+        persistent_found = False
+        persistent_conflict = False
+        for path in (Path("/boot/firmware/cmdline.txt"),
+                     Path("/boot/cmdline.txt")):
+            saved = cls._read_cmdline(path)
+            if saved is None:
+                continue
+            persistent_found = True
+            persistent_conflict = (
+                persistent_conflict
+                or cls._cmdline_uses_device(saved, device))
+
+        if persistent_found and not persistent_conflict:
+            return f"{device} is still the serial console; reboot required"
+        return (
+            f"{device} is the serial console; remove its console= entry from "
+            "/boot/firmware/cmdline.txt and reboot")
 
     @staticmethod
     def _unsafe_acm(path: str) -> bool:

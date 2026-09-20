@@ -1,5 +1,12 @@
 # Smethan WatchDogsGo
 
+## Unreleased
+
+- Detect when the CM4 AIOv2 GPS UART is still reserved as the Linux serial
+  console. WDG no longer probes the occupied UART or misreports the powered GPS
+  receiver as absent; it distinguishes a pending reboot from a persistent
+  `/boot/firmware/cmdline.txt` conflict and displays the required repair.
+
 ## 0.9.39 — Optional LTE module and AIOv2-safe GPS fallback
 
 - Add a persistent **LTE modem integration** switch to Wardrive Settings. WDG
