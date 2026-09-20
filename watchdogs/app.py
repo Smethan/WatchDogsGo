@@ -2681,12 +2681,8 @@ class WatchDogsGame(OtaMixin):
         self.msg("[WPA-sec] Uploading capture files...", C_DIM)
         self._term_add("[WPA-sec] Starting handshake upload...", raw=True)
 
-        # Pass whitelisted MACs so their handshakes are NOT uploaded
-        blocked = {e.mac.upper() for e in self._whitelist.entries}
-
         def _bg():
-            up, total, msg = upload_manager.upload_wpasec_all(
-                loot_dir, blocked_macs=blocked)
+            up, total, msg = upload_manager.upload_wpasec_all(loot_dir)
             self._wpasec_result.put(("upload", up, total, msg))
 
         threading.Thread(target=_bg, daemon=True).start()

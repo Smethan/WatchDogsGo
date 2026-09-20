@@ -108,18 +108,6 @@ def upload_wpasec(capture_path: Path) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _bssid_from_filename(name: str) -> str:
-    """Extract an uppercase colon-delimited BSSID from a capture filename."""
-    stem = name.rsplit(".", 1)[0]
-    for part in stem.split("_"):
-        clean = part.replace("-", "").replace(":", "")
-        if (len(clean) == 12
-                and all(char in "0123456789ABCDEFabcdef" for char in clean)):
-            return ":".join(clean[index:index + 2]
-                            for index in range(0, 12, 2)).upper()
-    return ""
-
-
 def _capture_candidates(loot_dir: Path) -> list[Path]:
     """Prefer each capture's PCAPNG twin; retain legacy PCAP-only files."""
     candidates: dict[tuple[Path, str], Path] = {}
@@ -267,26 +255,13 @@ def _account_receipts(ledger: dict) -> dict:
     return captures
 
 
-def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
-                      ) -> tuple[int, int, str]:
+def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
     """Upload only captures without a durable success receipt."""
     loot_dir = Path(loot_dir)
     with _upload_lock:
         captures = _capture_candidates(loot_dir)
         if not captures:
             return 0, 0, "No PCAP/PCAPNG files found"
-
-        whitelist_skipped = 0
-        if blocked_macs:
-            blocked_macs = {mac.upper() for mac in blocked_macs}
-            filtered = []
-            for path in captures:
-                bssid = _bssid_from_filename(path.name)
-                if bssid and bssid in blocked_macs:
-                    whitelist_skipped += 1
-                else:
-                    filtered.append(path)
-            captures = filtered
 
         ledger, ledger_warning = _load_upload_ledger(loot_dir)
         receipts = _account_receipts(ledger)
@@ -349,8 +324,6 @@ def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
             reasons = ", ".join(
                 f"{count} {reason}" for reason, count in sorted(local_skips.items()))
             summary += f" | {skipped} skipped locally ({reasons})"
-        if whitelist_skipped:
-            summary += f" | {whitelist_skipped} skipped (whitelist)"
         if ledger_warning:
             summary += f" | Warning: {ledger_warning}"
         if errors:

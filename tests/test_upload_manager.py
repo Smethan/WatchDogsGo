@@ -39,21 +39,19 @@ def test_wpasec_prefers_pcapng_twin_and_keeps_legacy_pcap(
     assert message == "2/2 uploaded"
 
 
-def test_wpasec_pcapng_whitelist_filter_and_empty_message(
+def test_wpasec_upload_includes_every_network_and_empty_message(
         tmp_path, monkeypatch, accept_test_captures):
     session = tmp_path / "session" / "handshakes"
-    blocked = touch(session / "Home_AABBCCDDEEFF_120000.pcapng")
-    allowed = touch(session / "Lab_020000000003_120001.pcapng")
+    home = touch(session / "Home_AABBCCDDEEFF_120000.pcapng")
+    nearby = touch(session / "Lab_020000000003_120001.pcapng")
     uploaded = []
     monkeypatch.setattr(
         upload_manager, "upload_wpasec",
         lambda path: (uploaded.append(path) is None, "ok"),
     )
-    result = upload_manager.upload_wpasec_all(
-        tmp_path, {"AA:BB:CC:DD:EE:FF"})
-    assert result[:2] == (1, 1)
-    assert uploaded == [allowed] and blocked not in uploaded
-    assert "1 skipped (whitelist)" in result[2]
+    result = upload_manager.upload_wpasec_all(tmp_path)
+    assert result[:2] == (2, 2)
+    assert uploaded == [home, nearby]
     assert upload_manager.upload_wpasec_all(tmp_path / "missing") == (
         0, 0, "No PCAP/PCAPNG files found")
 

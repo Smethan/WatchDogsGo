@@ -323,7 +323,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
 | LoRa | — | Toggle LoRa module ON/OFF (AIO GPIO, auto-starts MeshCore) |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
-| Upload WPA-SEC | — | Incrementally upload crackable handshake `.pcapng` captures to wpa-sec.stanev.org; successful content hashes are remembered and invalid/empty captures are rejected locally (prompts for an API key if needed; old PCAP-only loot remains readable) |
+| Upload WPA-SEC | — | Incrementally upload every network's crackable handshake `.pcapng` to wpa-sec.stanev.org, regardless of the WDG whitelist; successful content hashes are remembered and invalid/empty captures are rejected locally (prompts for an API key if needed; old PCAP-only loot remains readable) |
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
 | Reboot ESP32 | `restart` | Restart ESP32 device |
 | Download Map | — | Download OSM tiles (~10 km radius around current position) for offline street-level map. Press again to cancel. |
