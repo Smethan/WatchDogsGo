@@ -1,5 +1,6 @@
 """Tab-menu hotkeys use the same activation path as Enter."""
 
+from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
@@ -128,3 +129,74 @@ def test_unrecognized_key_does_nothing(monkeypatch):
     app._update_menu()
     assert (app.menu_cat, app.menu_sel) == (2, 3)
     app._activate_menu_item.assert_not_called()
+
+
+def test_menu_availability_tracks_live_addon_switches():
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._lora_enabled = False
+    app._sdr_enabled = False
+    app._lora = NS(running=False, mode="")
+    app._watch = NS(connected=False)
+
+    assert "Enable LoRa" in app._menu_item_unavailable_reason(
+        "_meshcore", "meshcore")
+    assert "Enable SDR" in app._menu_item_unavailable_reason(
+        "_sdr_adsb", "_sdr_adsb")
+    assert "Enable SDR" in app._menu_item_unavailable_reason(
+        "_sdr_433", "_sdr_433")
+
+    app._lora_enabled = True
+    app._sdr_enabled = True
+    assert not app._menu_item_unavailable_reason("_meshcore", "meshcore")
+    assert not app._menu_item_unavailable_reason("_sdr_adsb", "_sdr_adsb")
+    assert not app._menu_item_unavailable_reason("_sdr_433", "_sdr_433")
+
+    app._lora.running = True
+    app._lora.mode = "meshtastic"
+    assert "busy" in app._menu_item_unavailable_reason(
+        "_meshcore", "meshcore")
+    app._watch.connected = True
+    assert not app._menu_item_unavailable_reason("_meshcore", "meshcore")
+
+
+@pytest.mark.parametrize("cmd,state_key", [
+    ("_wardrive_settings", "_wardrive_settings"),
+    ("_evil_twin", "evil_twin"),
+    ("_evil_portal", "portal"),
+    ("_meshcore_region", "_mc_region_screen"),
+    ("_flipper", "_flipper"),
+    ("_watch_connect", "_watch"),
+])
+def test_implemented_python_menu_items_are_not_permanently_grey(
+        cmd, state_key):
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._lora_enabled = False
+    app._sdr_enabled = False
+    app._lora = NS(running=False, mode="")
+    app._watch = NS(connected=False)
+    assert not app._menu_item_unavailable_reason(cmd, state_key)
+
+
+def test_disabled_menu_item_stays_open_until_requirement_is_enabled():
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app.menu_open = True
+    app._lora_enabled = False
+    app._lora = NS(running=False, mode="")
+    app._watch = NS(connected=False)
+    app.msg = Mock()
+    app._execute_item = Mock()
+    addons = next(i for i, (name, _) in enumerate(MENU_CATS)
+                  if name == "ADDONS")
+    meshcore = next(i for i, item in enumerate(MENU_CATS[addons][1])
+                    if item[2] == "_meshcore")
+
+    app._activate_menu_item(addons, meshcore)
+    assert app.menu_open
+    app._execute_item.assert_not_called()
+    assert "Enable LoRa" in app.msg.call_args.args[0]
+
+    app._lora_enabled = True
+    app._activate_menu_item(addons, meshcore)
+    assert not app.menu_open
+    app._execute_item.assert_called_once_with(
+        "_meshcore", "meshcore", "MeshCore Messenger", [])

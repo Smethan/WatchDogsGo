@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Make add-on menu availability follow the live hardware switches. MeshCore
+  Messenger becomes available when LoRa is powered or the PipBoy Watch is
+  connected, while ADS-B and 433 MHz become available as soon as SDR is
+  enabled. Implemented Python-side actions no longer remain permanently grey.
+- When LoRa power is already on but its MeshCore receiver has stopped, opening
+  Messenger now retries the receiver instead of asking to enable LoRa again.
+  SX1262 startup failures are drained from the background queue and shown in
+  the terminal/toast even after the receiver thread exits.
 - Add **Map dot layers** under Wardrive Settings. WiFi, BLE, cell, Flock,
   Axon, MeshCore (the positioned LoRa layer), ADS-B, 433 MHz sensors, and
   handshake markers each support `OFF`, `FADE`, and `KEEP`. `OFF` changes only

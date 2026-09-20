@@ -175,6 +175,7 @@ HACKER_QUIPS = [
 # Attacks that require an external WiFi adapter (monitor mode)
 _NEEDS_EXT_WIFI = {"dragon_drain"}
 _NEEDS_ESP_SD = {"start_handshake"}
+_MENU_WIP_STATES = {"_bt_hid_wip", "_bd_wip", "_race_wip"}
 
 MENU_CATS = [
     ("SCAN", [
@@ -1772,9 +1773,40 @@ class WatchDogsGame(OtaMixin):
                 self._activate_menu_item(self.menu_cat, item_idx)
                 return
 
+    def _menu_item_unavailable_reason(self, cmd: str, state_key: str) -> str:
+        """Return a live reason an item cannot run, or an empty string.
+
+        Menu availability must be derived from the same runtime switches used
+        by the action itself.  The old renderer treated most Python-side
+        commands as unavailable solely because their command began with ``_``;
+        that left completed add-ons permanently grey even after their hardware
+        was enabled.
+        """
+        if state_key in _MENU_WIP_STATES:
+            return "Work in progress"
+        if state_key in ("_sdr_adsb", "_sdr_433"):
+            if not getattr(self, "_sdr_enabled", False):
+                return "[SDR] Enable SDR first (SYSTEM > SDR)"
+        if cmd == "_meshcore":
+            watch = getattr(self, "_watch", None)
+            if bool(getattr(watch, "connected", False)):
+                return ""
+            if not getattr(self, "_lora_enabled", False):
+                return "[MC] Enable LoRa or connect PipBoy Watch"
+            lora = getattr(self, "_lora", None)
+            if (bool(getattr(lora, "running", False))
+                    and getattr(lora, "mode", "") != "meshcore"):
+                mode = getattr(lora, "mode", "") or "another mode"
+                return f"[MC] LoRa busy in {mode}; stop it first"
+        return ""
+
     def _activate_menu_item(self, cat_idx: int, item_idx: int):
         _, items = MENU_CATS[cat_idx]
         _hotkey, name, cmd, state_key, input_type = items[item_idx]
+        unavailable = self._menu_item_unavailable_reason(cmd, state_key)
+        if unavailable:
+            self.msg(unavailable, C_WARNING)
+            return
         if input_type:
             self.menu_open = False
             self._start_input_dialog(cat_idx, item_idx, input_type)
@@ -2205,10 +2237,33 @@ class WatchDogsGame(OtaMixin):
 
         # ── MeshCore Messenger ──
         if cmd == "_meshcore":
-            aio_lora = self._lora_enabled and self._lora.running
-            watch_lora = self._watch.connected
+            watch_lora = bool(self._watch.connected)
+            # GPIO power and the receiver thread are separate states.  If the
+            # radio is powered but its thread stopped (for example after a
+            # transient init failure), selecting Messenger retries MeshCore
+            # instead of incorrectly telling the user to enable LoRa again.
+            if self._lora_enabled and not self._lora.running:
+                try:
+                    self._lora.set_mc_channels(self._mc_channels_list)
+                    self._lora.start_meshcore(self._mc_region)
+                    self._term_add("[MC] Restarting MeshCore receiver", raw=True)
+                except Exception as exc:
+                    self._term_add(f"[MC] MeshCore start failed: {exc}", raw=True)
+            aio_lora = (
+                self._lora_enabled and self._lora.running
+                and self._lora.mode == "meshcore")
+            if (self._lora_enabled and self._lora.running and not aio_lora
+                    and not watch_lora):
+                mode = self._lora.mode or "another mode"
+                self.msg(f"[MC] LoRa busy in {mode}; stop it first", C_WARNING)
+                return
             if not aio_lora and not watch_lora:
-                self.msg("[MC] Enable LoRa or connect PipBoy Watch", C_WARNING)
+                if self._lora_enabled:
+                    self.msg("[MC] MeshCore receiver failed; check LoRa log",
+                             C_ERROR)
+                else:
+                    self.msg("[MC] Enable LoRa or connect PipBoy Watch",
+                             C_WARNING)
                 return
             if watch_lora and not aio_lora:
                 # Start watch LoRa if not AIO
@@ -4003,13 +4058,13 @@ class WatchDogsGame(OtaMixin):
     # ------------------------------------------------------------------
 
     def _poll_lora(self):
-        if not self._lora.running:
-            return
         try:
             while not self._lora.queue.empty():
                 text, attr = self._lora.queue.get_nowait()
                 # Telemetry goes to terminal only, not chat
                 self._term_add(f"[LoRa] {text}", raw=True)
+                if attr == "error":
+                    self.msg(f"[LoRa] {text}", C_ERROR)
         except Exception:
             pass
         # Process thread-safe event queue from callbacks
@@ -5738,21 +5793,20 @@ class WatchDogsGame(OtaMixin):
             sel = (i == self.menu_sel)
             running = self._is_running(state_key)
             is_stop = (state_key == "_stop_all")
-            is_na = cmd.startswith("_") and state_key not in (
-                "_stop_all", "_reboot", "_dl_map", "_gps_toggle",
-                "_lora_toggle", "_sdr_toggle", "_usb_toggle",
-                "_wl_screen", "_wpasec_up", "_wpasec_dl", "_flash_esp", "_ota_esp", "_update_app",
-                "_bt_hid_wip", "_bd_wip", "_race_wip", "_hs_sniff_menu"
-            ) and not state_key.startswith("_p_")
+            unavailable = bool(
+                self._menu_item_unavailable_reason(cmd, state_key))
             if sel:
-                bg = C_ERROR if is_stop else C_HACK_CYAN
+                bg = (C_ERROR if is_stop else
+                      (C_COAST if unavailable else C_HACK_CYAN))
                 pyxel.rect(PX, ty - 1, PW, IH, bg)
                 pyxel.rectb(PX, ty - 1, PW, IH, C_TEXT)
                 tc = 0
             else:
-                bc = C_ERROR if is_stop else (C_COAST if is_na else C_MENU_BORDER)
+                bc = (C_ERROR if is_stop else
+                      (C_COAST if unavailable else C_MENU_BORDER))
                 pyxel.rectb(PX, ty - 1, PW, IH, bc)
-                tc = C_ERROR if is_stop else (C_DIM if is_na else C_TEXT)
+                tc = (C_ERROR if is_stop else
+                      (C_DIM if unavailable else C_TEXT))
             pyxel.text(PX + 4, ty + 2, f"[{hotkey}] {label}", tc)
             needs_warning = state_key in _NEEDS_EXT_WIFI or cmd in _NEEDS_ESP_SD
             if needs_warning:
@@ -5772,7 +5826,11 @@ class WatchDogsGame(OtaMixin):
         if self.menu_sel < len(sel_items):
             _sk = sel_items[self.menu_sel][3]
             _cmd = sel_items[self.menu_sel][2]
-            if _sk in _NEEDS_EXT_WIFI:
+            unavailable = self._menu_item_unavailable_reason(_cmd, _sk)
+            if unavailable:
+                pyxel.text(PX + 3, TERM_Y - 22,
+                           unavailable, C_WARNING)
+            elif _sk in _NEEDS_EXT_WIFI:
                 pyxel.text(PX + 3, TERM_Y - 22,
                            "\x17 Requires external WiFi adapter", C_WARNING)
             elif _cmd in _NEEDS_ESP_SD:

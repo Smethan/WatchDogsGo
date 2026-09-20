@@ -35,6 +35,10 @@ minor versions.
 
 ### Fixed
 
+- Refresh menu availability from the live LoRa, SDR, and watch state instead
+  of leaving implemented Python-side actions permanently grey. MeshCore
+  Messenger now retries a powered but stopped receiver and reports queued
+  SX1262 initialization errors even after the receiver thread exits.
 - Send ADS-B and MeshCore records with Wi-Fi/BLE through WDGWARS' signed JSON
   endpoint, including the current MeshCore network discriminator, normalized
   timestamps, validated MeshCore public keys, canonical node IDs, and relay

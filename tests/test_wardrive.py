@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from queue import Queue
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 import pytest
@@ -973,6 +974,51 @@ def test_all_wardrive_reuses_running_aux_collectors(game):
     lines = [call.args[0] for call in game._term_add.call_args_list]
     assert "[ALL] MeshCore collection active" in lines
     assert "[ALL] ADS-B collection active" in lines
+
+
+def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
+    lora = NS(running=False, mode="", queue=Queue())
+    lora.set_mc_channels = Mock()
+
+    def start_meshcore(_region):
+        lora.running = True
+        lora.mode = "meshcore"
+
+    lora.start_meshcore = Mock(side_effect=start_meshcore)
+    game._lora = lora
+    game._lora_enabled = True
+    game._watch = NS(connected=False)
+    game._mc_channels_list = [{"name": "public"}]
+    game._mc_region = "us_ca_narrow"
+    game._mc_screen = False
+    game._mc_scroll = 99
+    game._mc_help_shown = True
+    game.menu_open = True
+
+    game._execute_item("_meshcore", "meshcore", "MeshCore Messenger", [])
+
+    lora.set_mc_channels.assert_called_once_with(game._mc_channels_list)
+    lora.start_meshcore.assert_called_once_with("us_ca_narrow")
+    assert game._mc_screen and game._mc_scroll == 0
+    assert not any("Enable LoRa" in call.args[0]
+                   for call in game.msg.call_args_list)
+
+
+def test_lora_init_error_is_reported_after_receiver_stops(game):
+    radio_events = Queue()
+    radio_events.put(("SX1262 not detected on SPI bus", "error"))
+    game._lora = NS(running=False, mode="meshcore", queue=radio_events)
+    game._mc_event_queue = Queue()
+    game._mc_bubbles = []
+    game._term_add.reset_mock()
+    game.msg.reset_mock()
+
+    game._poll_lora()
+
+    game._term_add.assert_called_once_with(
+        "[LoRa] SX1262 not detected on SPI bus", raw=True)
+    game.msg.assert_called_once()
+    assert "SX1262 not detected" in game.msg.call_args.args[0]
 
 
 def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
