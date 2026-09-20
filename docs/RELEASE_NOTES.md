@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Start the host ADS-B and MeshCore collectors after either real All Wardrive
+  mode receives its ESP32 start acknowledgement, when the corresponding
+  **SYSTEM > SDR** or **SYSTEM > LoRa** hardware toggle is enabled. Existing
+  collectors are reused, diagnostic mode does not start them, and ADS-B does
+  not take the RTL-SDR away from an active 433 MHz scan.
+- Keep the add-on collectors independent of the ESP serial lifecycle so the map
+  and menus can be opened without interrupting them. Turning off the hardware
+  toggle remains the explicit stop control.
+- Upload Wi-Fi/BLE, ADS-B aircraft and MeshCore nodes in the same HMAC-signed
+  WDGWARS `/api/upload/` payload. MeshCore records now carry the required
+  `network: "meshcore"` discriminator and include a validated full public key
+  when the radio supplied one. Their upload identity uses the server's
+  collision-resistant 16-hex public-key prefix, and relayed adverts carry their
+  hop count so the server can weight their position appropriately. ADS-B and
+  MeshCore timestamps are normalized to `YYYY-MM-DD HH:MM:SS`, while legacy
+  session files remain readable.
+
 - Detect when the CM4 AIOv2 GPS UART is still reserved as the Linux serial
   console. WDG no longer probes the occupied UART or misreports the powered GPS
   receiver as absent; it distinguishes a pending reboot from a persistent

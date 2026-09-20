@@ -256,7 +256,7 @@ class LoRaManager:
         self.mode = ""  # "sniffer", "scanner", "tracker"
         self.packets_received = 0
         self._seen_packets: dict[bytes, float] = {}  # hash→timestamp
-        self._on_node = None   # callback(node_id, type, name, lat, lon, rssi, snr)
+        self._on_node = None   # callback(id, type, name, lat, lon, rssi, snr, key, hops)
         self._on_message = None  # callback(channel, message, rssi, hops)
         self._on_dm = None       # callback(from_id, message, rssi, hops)
         self._on_dm_ack = None   # callback(ack_hash) — DM delivery confirmed
@@ -932,7 +932,7 @@ class LoRaManager:
 
         # Decode by type
         if payload_type == 0x04:
-            self._decode_mc_advert(payload, rssi, snr)
+            self._decode_mc_advert(payload, rssi, snr, hops)
         elif payload_type == 0x05:
             self._decode_mc_group_text(payload, rssi, hops)
         elif payload_type == 0x03:
@@ -960,7 +960,8 @@ class LoRaManager:
             if payload:
                 self._emit(f"  type=0x{payload_type:02x} {payload[:32].hex()}", "dim")
 
-    def _decode_mc_advert(self, payload: bytearray, lora_rssi: float = 0, lora_snr: float = 0) -> None:
+    def _decode_mc_advert(self, payload: bytearray, lora_rssi: float = 0,
+                          lora_snr: float = 0, hops: int = 0) -> None:
         """Decode MeshCore Advertisement (type 0x04) — plaintext."""
         if len(payload) < 100:  # 32 pubkey + 4 timestamp + 64 sig = 100
             self._emit(f"  Advert: {payload.hex()}", "dim")
@@ -1025,7 +1026,7 @@ class LoRaManager:
                 lon_val = lon if (flags & 0x10) else 0.0
                 try:
                     self._on_node(node_id, ntype, name, lat_val, lon_val,
-                                  lora_rssi, lora_snr, bytes(pubkey))
+                                  lora_rssi, lora_snr, bytes(pubkey), hops)
                 except Exception:
                     pass
 

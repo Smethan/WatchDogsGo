@@ -813,6 +813,94 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert not w.cell.active
 
 
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only):
+    w = game.wardrive
+    w.settings["lte_modem"] = False
+    lora = NS(running=False, mode="")
+    lora.set_mc_channels = Mock()
+
+    def start_meshcore(region):
+        lora.running = True
+        lora.mode = "meshcore"
+
+    lora.start_meshcore = Mock(side_effect=start_meshcore)
+    sdr = NS(running=False, mode="")
+    sdr.start_adsb = Mock(return_value=True)
+    sdr.poll_events = Mock(return_value=[])
+    game._lora_enabled = game._sdr_enabled = True
+    game._lora = lora
+    game._sdr = sdr
+    game._mc_region = "US_NARROW"
+    game._mc_channels_list = [{"name": "public"}]
+    w.scan.supported = True
+    w.scan.wifi_supported = True
+    if wifi_only:
+        w.host_ble = Mock(state="idle", drops=0)
+        w.host_ble.start.return_value = True
+        w.host_ble.poll.return_value = []
+
+    assert w.scan.start(wifi_only=wifi_only)
+    token = w.scan.session
+    lora.start_meshcore.assert_not_called()
+    sdr.start_adsb.assert_not_called()
+    w.handle_line(wire(record("started", session=token, seq=1)))
+
+    lora.set_mc_channels.assert_called_once_with(game._mc_channels_list)
+    lora.start_meshcore.assert_called_once_with("US_NARROW")
+    sdr.start_adsb.assert_called_once_with(str(game.loot.session_path))
+    assert w.scan.state == "running"
+    if wifi_only:
+        w.host_ble.start.assert_called_once_with(token)
+
+
+def test_all_wardrive_aux_collectors_skip_diagnostic_and_busy_radios(game):
+    w = game.wardrive
+    w.settings["lte_modem"] = False
+    game._lora_enabled = game._sdr_enabled = True
+    game._lora = NS(
+        running=True, mode="meshtastic", start_meshcore=Mock(),
+        set_mc_channels=Mock())
+    game._sdr = NS(
+        running=True, mode="433", start_adsb=Mock(),
+        poll_events=Mock(return_value=[]))
+    w.scan.supported = True
+    assert w.scan.start(diagnostic=True)
+    w.handle_line(wire(record(
+        "started", session=w.scan.session, seq=1)))
+    game._lora.start_meshcore.assert_not_called()
+    game._sdr.start_adsb.assert_not_called()
+
+    w.scan.diagnostic = False
+    assert not w.start_auxiliary_collectors()
+    game._lora.start_meshcore.assert_not_called()
+    game._sdr.start_adsb.assert_not_called()
+    lines = [call.args[0] for call in game._term_add.call_args_list]
+    assert any("MeshCore skipped: LoRa busy" in line for line in lines)
+    assert any("ADS-B skipped: SDR busy" in line for line in lines)
+
+
+def test_all_wardrive_reuses_running_aux_collectors(game):
+    w = game.wardrive
+    game._lora_enabled = game._sdr_enabled = True
+    game._lora = NS(
+        running=True, mode="meshcore", start_meshcore=Mock(),
+        set_mc_channels=Mock())
+    game._sdr = NS(
+        running=True, mode="adsb", start_adsb=Mock(),
+        poll_events=Mock(return_value=[]))
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.diagnostic = False
+
+    assert not w.start_auxiliary_collectors()
+    game._lora.start_meshcore.assert_not_called()
+    game._sdr.start_adsb.assert_not_called()
+    lines = [call.args[0] for call in game._term_add.call_args_list]
+    assert "[ALL] MeshCore collection active" in lines
+    assert "[ALL] ADS-B collection active" in lines
+
+
 def test_all_wardrive_prefers_batches_and_prints_scan_boundaries(game):
     w=game.wardrive
     caps=dict(v=1,kind="capabilities",wardrive_serial_v1=True,

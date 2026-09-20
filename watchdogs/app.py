@@ -3984,11 +3984,13 @@ class WatchDogsGame(OtaMixin):
                         self._mc_log[idx] = (entry[0], entry[1],
                                              f"{old_tag} \u221a")
                 elif evt[0] == "node":
-                    _, node_id, ntype, name, lat, lon, rssi, snr, pubkey = evt
+                    (_, node_id, ntype, name, lat, lon, rssi, snr, pubkey,
+                     hops) = evt
                     node_data = {
                         "id": node_id, "type": ntype, "name": name or "?",
                         "lat": lat, "lon": lon, "rssi": rssi,
-                        "snr": snr or 0, "last_seen": time.time()}
+                        "snr": snr or 0, "hops": hops,
+                        "last_seen": time.time()}
                     if pubkey:
                         node_data["pubkey"] = pubkey.hex()
                     # Dedup by node_id
@@ -4023,14 +4025,16 @@ class WatchDogsGame(OtaMixin):
         self._mc_bubbles = [(t, e) for t, e in self._mc_bubbles if e > frame]
 
     def _on_mc_node(self, node_id, ntype, name, lat, lon, rssi, snr,
-                    pubkey=None):
+                    pubkey=None, hops=0):
         """Callback from LoRaManager background thread — enqueue for main."""
         self._mc_event_queue.put(
-            ("node", node_id, ntype, name, lat, lon, rssi, snr, pubkey))
+            ("node", node_id, ntype, name, lat, lon, rssi, snr, pubkey,
+             hops))
         if self.loot:
             try:
                 self.loot.save_meshcore_node(
-                    node_id, ntype, name or "", lat, lon, rssi, snr)
+                    node_id, ntype, name or "", lat, lon, rssi, snr,
+                    pubkey.hex() if pubkey else "", hops)
             except Exception:
                 pass
 

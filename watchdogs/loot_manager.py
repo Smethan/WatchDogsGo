@@ -1464,24 +1464,42 @@ class LootManager:
     # ------------------------------------------------------------------
 
     def save_meshcore_node(self, node_id: str, node_type: str, name: str,
-                           lat: float, lon: float, rssi: float, snr: float) -> None:
+                           lat: float, lon: float, rssi: float, snr: float,
+                           public_key: str = "", path_hops: int = 0) -> None:
         """Append node to meshcore_nodes.csv (dedup by node_id). fsync'd."""
         if not self._session_active:
             return
         path = self._session / "meshcore_nodes.csv"
         try:
+            columns = [
+                "timestamp", "node_id", "type", "name", "lat", "lon",
+                "rssi", "snr", "public_key", "path_hops"]
             if path.is_file():
                 existing = path.read_text(encoding="utf-8")
                 if f",{node_id}," in existing:
                     return  # already known
+                # Match an older session's existing columns rather than
+                # appending extra values under its shorter header.
+                header = existing.splitlines()[0] if existing else ""
+                columns = header.split(",") if header else columns
             else:
                 with open(path, "w", encoding="utf-8") as fh:
-                    fh.write("timestamp,node_id,type,name,lat,lon,rssi,snr\n")
+                    fh.write(",".join(columns) + "\n")
                     _fsync_file(fh)
-            ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             with open(path, "a", encoding="utf-8", newline="") as fh:
-                csv.writer(fh).writerow(
-                    [ts, node_id, node_type, name, lat, lon, rssi, snr])
+                try:
+                    hops = max(0, int(path_hops or 0))
+                except (TypeError, ValueError):
+                    hops = 0
+                values = {
+                    "timestamp": ts, "node_id": node_id, "type": node_type,
+                    "name": name, "lat": lat, "lon": lon, "rssi": rssi,
+                    "snr": snr, "public_key": public_key,
+                    "path_hops": hops,
+                }
+                csv.writer(fh).writerow([values.get(column, "")
+                                         for column in columns])
                 _fsync_file(fh)
             self.update_session_loot()
         except OSError:
@@ -1558,7 +1576,7 @@ class LootManager:
                 return  # already recorded this session
         else:
             _sync_write(path, "timestamp,icao,callsign,lat,lon,alt_ft,speed_kt,heading\n")
-        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         _sync_append(
             path,
             f"{ts},{icao},{callsign or ''},"

@@ -242,6 +242,7 @@ class WardriveUI:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
             if previous == "starting" and self.scan.state == "running":
                 self.start_cell()
+                self.start_auxiliary_collectors()
             if d["kind"] == "stopped" and not self.scan.active:
                 self.host_ble.stop()
                 self.cell.stop()
@@ -387,6 +388,109 @@ class WardriveUI:
         else:
             self.app._term_add("[CELL] " + (self.cell.error or "Cell tracking unavailable"), raw=True)
             self.app.msg("[CELL] Unavailable; WiFi/BLE still running", 8)
+        return started
+
+    def start_auxiliary_collectors(self):
+        """Ensure enabled host radios are collecting for All Wardrive.
+
+        LoRa and SDR are host-side add-ons, so they are deliberately started
+        only after the ESP32 acknowledges a real wardrive session.  Their
+        hardware toggles own their lifetime: the collectors keep running in
+        the background when the map/menu is opened or the ESP scan is stopped,
+        and switching the corresponding SYSTEM toggle off stops them.
+        """
+        app = self.app
+        if (self.scan.mode != "wardrive" or self.scan.diagnostic
+                or self.scan.state != "running"):
+            return False
+
+        started = False
+        lora = getattr(app, "_lora", None)
+        if getattr(app, "_lora_enabled", False):
+            if lora is None:
+                app._term_add("[ALL] MeshCore unavailable: LoRa manager missing",
+                              raw=True)
+            elif lora.running and lora.mode == "meshcore":
+                app._term_add("[ALL] MeshCore collection active", raw=True)
+            elif lora.running:
+                app._term_add(
+                    f"[ALL] MeshCore skipped: LoRa busy in {lora.mode or 'another'} mode",
+                    raw=True)
+                app.msg("[ALL] MeshCore skipped; LoRa is busy", ORANGE)
+            else:
+                try:
+                    channels = getattr(app, "_mc_channels_list", None)
+                    if channels:
+                        lora.set_mc_channels(channels)
+                    lora.start_meshcore(getattr(app, "_mc_region", None))
+                except Exception as exc:
+                    app._term_add(
+                        "[ALL] MeshCore start failed: " + str(exc)[:100],
+                        raw=True)
+                    app.msg("[ALL] MeshCore unavailable; WiFi/BLE continue", ORANGE)
+                else:
+                    if lora.running and lora.mode == "meshcore":
+                        started = True
+                        app._term_add(
+                            "[ALL] MeshCore collection starting (LoRa enabled)",
+                            raw=True)
+                    else:
+                        app._term_add(
+                            "[ALL] MeshCore start failed; check LoRa status",
+                            raw=True)
+                        app.msg(
+                            "[ALL] MeshCore unavailable; WiFi/BLE continue",
+                            ORANGE)
+        else:
+            app._term_add("[ALL] MeshCore disabled (SYSTEM > LoRa)", raw=True)
+
+        sdr = getattr(app, "_sdr", None)
+        if getattr(app, "_sdr_enabled", False):
+            if sdr is None:
+                app._term_add("[ALL] ADS-B unavailable: SDR manager missing",
+                              raw=True)
+            elif sdr.running and "adsb" in sdr.mode:
+                app._term_add("[ALL] ADS-B collection active", raw=True)
+            elif sdr.running:
+                # The AIO has one RTL-SDR.  Taking it away from an active 433
+                # scan would silently break that add-on, so leave it alone.
+                app._term_add(
+                    f"[ALL] ADS-B skipped: SDR busy in {sdr.mode or 'another'} mode",
+                    raw=True)
+                app.msg("[ALL] ADS-B skipped; SDR is busy", ORANGE)
+            elif not app.loot or not app.loot.active:
+                app._term_add(
+                    "[ALL] ADS-B skipped: no writable loot session", raw=True)
+                app.msg("[ALL] ADS-B needs a writable loot session", ORANGE)
+            else:
+                try:
+                    ok = sdr.start_adsb(str(Path(app.loot.session_path)))
+                except Exception as exc:
+                    ok = False
+                    app._term_add(
+                        "[ALL] ADS-B start failed: " + str(exc)[:100], raw=True)
+                if ok:
+                    started = True
+                    app._term_add(
+                        "[ALL] ADS-B collection started (SDR enabled)", raw=True)
+                    try:
+                        app._earn_badge("skywatch")
+                    except Exception:
+                        pass
+                else:
+                    reason = "ADS-B decoder unavailable"
+                    try:
+                        for event, value in sdr.poll_events():
+                            if event == "error":
+                                reason = str(value)
+                            app._term_add(f"[SDR] {value}", raw=True)
+                    except Exception:
+                        pass
+                    app._term_add("[ALL] ADS-B unavailable: " + reason[:100],
+                                  raw=True)
+                    app.msg("[ALL] ADS-B unavailable; WiFi/BLE continue", ORANGE)
+        else:
+            app._term_add("[ALL] ADS-B disabled (SYSTEM > SDR)", raw=True)
         return started
 
     def poll_cell(self, now):

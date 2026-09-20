@@ -281,8 +281,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
-| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, and optional serving-cell tracking |
-| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same independent GPS/optional-cell path |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and enabled ADS-B/MeshCore collectors |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and optional cell/ADS-B/MeshCore paths |
 | ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
@@ -322,6 +322,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 | STOP ALL | `stop` | Emergency stop all operations |
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
 | LoRa | — | Toggle LoRa module ON/OFF (AIO GPIO, auto-starts MeshCore) |
+| SDR | — | Toggle the AIO SDR ON/OFF; All Wardrive starts ADS-B collection when this is ON |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
 | Upload WPA-SEC | — | Incrementally upload every network's crackable handshake `.pcapng` to wpa-sec.stanev.org, regardless of the WDG whitelist; successful content hashes are remembered and invalid/empty captures are rejected locally (prompts for an API key if needed; old PCAP-only loot remains readable) |
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
@@ -563,7 +564,8 @@ Saved to `loot/<session>/`:
 | `handshakes/` | PCAPNG with radiotap metadata, HCCAPX, .22000 (hashcat-ready) |
 | `mitm/` | MITM pcap captures |
 | `attack_events.log` | Attack start/stop/credential log |
-| `meshcore_nodes.csv` | Discovered MeshCore nodes with GPS |
+| `adsb_aircraft.csv` | ADS-B aircraft positions decoded during an enabled All Wardrive/add-on session |
+| `meshcore_nodes.csv` | Discovered MeshCore nodes with GPS and, for new sessions, their public key and relay-hop count |
 | `meshcore_messages.log` | MeshCore chat message history |
 | `nfc/` | NFC tag dumps from Flipper Zero |
 | `whitelist.json` | MAC address whitelist |

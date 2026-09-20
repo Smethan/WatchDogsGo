@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from queue import Queue
 from typing import Callable, Optional
 
@@ -398,8 +399,10 @@ class SDRManager:
         # Log to CSV
         if ac.has_position and self._adsb_log:
             try:
+                observed = datetime.fromtimestamp(
+                    now, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 self._adsb_log.write(
-                    f"{int(now)},{icao},{ac.callsign},{ac.lat:.6f},"
+                    f"{observed},{icao},{ac.callsign},{ac.lat:.6f},"
                     f"{ac.lon:.6f},{ac.altitude},{ac.speed},"
                     f"{ac.heading},{ac.squawk}\n")
                 self._adsb_log.flush()

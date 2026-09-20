@@ -19,6 +19,7 @@ import json
 import logging
 import secrets
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -104,6 +105,35 @@ def _map_auth(wigle_auth: str) -> str:
 DEFAULT_API_URL = "https://wdgwars.pl/api/upload/"
 
 
+def _wdgwars_timestamp(value) -> str:
+    """Return WDGWars' UTC-like ``YYYY-MM-DD HH:MM:SS`` timestamp.
+
+    Older WDG ADS-B files used Unix seconds while newer captures and
+    MeshCore rows use ISO text.  The signed endpoint accepts one common text
+    representation, so normalize both without discarding legacy sessions.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        epoch = float(text)
+    except ValueError:
+        epoch = None
+    if epoch is not None:
+        try:
+            return datetime.fromtimestamp(
+                epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text.replace("T", " ", 1).removesuffix("Z")
+
+
 def _default_endpoint() -> str:
     """Resolve default server endpoint. Override in secrets.conf with
     WARDRIVE_API_URL=... if you run your own wardrive server."""
@@ -130,7 +160,7 @@ def _load_secrets_conf() -> dict:
 
 class WardriveUpload(PluginBase):
     NAME = "Watch Dogs Go Wars Sync"
-    VERSION = "2.1"
+    VERSION = "2.2"
     AUTHOR = "LOCOSP"
 
     def __init__(self):
@@ -488,42 +518,42 @@ class WardriveUpload(PluginBase):
         try:
             import csv as _csv
             with open(csv_path, "r", encoding="utf-8", newline="") as f:
-                reader = _csv.reader(f)
-                header = next(reader, None)
-                if not header:
-                    return []
-                for parts in reader:
-                    if len(parts) < 8:
-                        continue
+                reader = _csv.DictReader(f)
+                for row in reader:
                     try:
-                        lat = float(parts[3]) if parts[3] else 0.0
-                        lon = float(parts[4]) if parts[4] else 0.0
-                    except ValueError:
+                        lat = float(row.get("lat") or 0.0)
+                        lon = float(row.get("lon") or 0.0)
+                    except (TypeError, ValueError):
                         continue
                     if lat == 0.0 and lon == 0.0:
                         continue
                     if lat < -90 or lat > 90 or lon < -180 or lon > 180:
                         continue
-                    icao = parts[1]
-                    if not icao or icao in aircraft:
+                    icao = (row.get("icao") or "").strip().upper()
+                    if not icao:
                         continue
                     try:
-                        alt = int(float(parts[5])) if parts[5] else 0
-                        spd = int(float(parts[6])) if parts[6] else 0
-                        hdg = int(float(parts[7])) if parts[7] else 0
-                    except ValueError:
+                        alt = int(float(row.get("alt_ft") or 0))
+                        spd = int(float(row.get("speed_kt") or 0))
+                        hdg = int(float(row.get("heading") or 0))
+                    except (TypeError, ValueError):
                         alt = spd = hdg = 0
-                    aircraft[icao] = {
+                    previous = aircraft.get(icao, {})
+                    item = {
                         "icao": icao,
-                        "callsign": parts[2],
+                        "callsign": ((row.get("callsign") or "").strip()
+                                     or previous.get("callsign", "")),
                         "lat": lat,
                         "lon": lon,
                         "alt_ft": alt,
                         "speed_kt": spd,
                         "heading": hdg,
-                        "first_seen": parts[0],
+                        "first_seen": (previous.get("first_seen")
+                                       or _wdgwars_timestamp(
+                                           row.get("timestamp"))),
                         "type": "ADSB",
                     }
+                    aircraft[icao] = item
         except Exception as e:
             self._log_add(f"ADS-B parse error: {e}", 8)
         return list(aircraft.values())
@@ -536,39 +566,67 @@ class WardriveUpload(PluginBase):
         try:
             import csv as _csv
             with open(csv_path, "r", encoding="utf-8", newline="") as f:
-                reader = _csv.reader(f)
-                header = next(reader, None)
-                if not header:
-                    return []
-                for parts in reader:
-                    if len(parts) < 6:
-                        continue
+                reader = _csv.DictReader(f)
+                for row in reader:
                     try:
-                        lat = float(parts[4]) if parts[4] else 0.0
-                        lon = float(parts[5]) if parts[5] else 0.0
-                    except ValueError:
+                        lat = float(row.get("lat") or 0.0)
+                        lon = float(row.get("lon") or 0.0)
+                    except (TypeError, ValueError):
                         continue
                     if lat == 0.0 and lon == 0.0:
                         continue
                     if lat < -90 or lat > 90 or lon < -180 or lon > 180:
                         continue
-                    node_id = parts[1]
-                    if not node_id or node_id in nodes:
+                    captured_id = (row.get("node_id") or "").strip().lower()
+                    if (not 8 <= len(captured_id) <= 16
+                            or any(ch not in "0123456789abcdef"
+                                   for ch in captured_id)):
                         continue
+                    public_key = (row.get("public_key") or "").strip().lower()
+                    valid_key = (len(public_key) == 64
+                                 and all(ch in "0123456789abcdef"
+                                         for ch in public_key)
+                                 and public_key.startswith(captured_id))
+                    # WDGWars accepts 8-16 hex node IDs and uses the first
+                    # 16 hex characters of a known public key as its canonical
+                    # collision-resistant identity.
+                    node_id = public_key[:16] if valid_key else captured_id
                     try:
-                        rssi = float(parts[6]) if len(parts) > 6 and parts[6] else 0
-                    except ValueError:
+                        rssi = float(row.get("rssi") or 0)
+                    except (TypeError, ValueError):
                         rssi = 0
-                    nodes[node_id] = {
+                    previous = nodes.get(node_id, {})
+                    item = {
                         "node_id": node_id,
-                        "node_type": parts[2],
-                        "name": parts[3],
+                        "node_type": ((row.get("type")
+                                       or row.get("node_type") or "").strip()
+                                      or previous.get("node_type", "")),
+                        "name": ((row.get("name") or "").strip()
+                                 or previous.get("name") or captured_id),
                         "lat": lat,
                         "lon": lon,
                         "rssi": rssi,
-                        "first_seen": parts[0],
+                        "first_seen": (previous.get("first_seen")
+                                       or _wdgwars_timestamp(
+                                           row.get("timestamp"))),
                         "type": "MESHCORE",
+                        "network": "meshcore",
                     }
+                    if valid_key:
+                        item["public_key"] = public_key
+                    elif previous.get("public_key"):
+                        item["public_key"] = previous["public_key"]
+                    hop_value = row.get("path_hops")
+                    if hop_value in (None, ""):
+                        hop_value = row.get("path_length")
+                    if hop_value not in (None, ""):
+                        try:
+                            item["path_hops"] = max(0, int(hop_value))
+                        except (TypeError, ValueError):
+                            pass
+                    elif "path_hops" in previous:
+                        item["path_hops"] = previous["path_hops"]
+                    nodes[node_id] = item
         except Exception as e:
             self._log_add(f"MeshCore parse error: {e}", 8)
         return list(nodes.values())

@@ -8,6 +8,22 @@ minor versions.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Extend both All Wardrive radio modes with enabled host-side ADS-B and
+  MeshCore collection after the ESP32 acknowledges the scan.
+
+### Fixed
+
+- Send ADS-B and MeshCore records with Wi-Fi/BLE through WDGWARS' signed JSON
+  endpoint, including the current MeshCore network discriminator, normalized
+  timestamps, validated MeshCore public keys, canonical node IDs, and relay
+  hop counts.
+
+---
+
 ## [0.9.39] — 2026-09-19
 
 ### Added
