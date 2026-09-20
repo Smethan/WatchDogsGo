@@ -133,7 +133,7 @@ module plugged into your uConsole, the game can toggle GPS / LoRa / SDR / USB
 power rails on demand from the SYSTEM menu. This is what makes the "GPS [g]",
 "LoRa [l]", "SDR [d]" and "USB [b]" entries actually do something.
 
-To enable AIO v2 control you need **two** things on the system:
+To enable AIO v2 control and LoRa you need **three** things on the system:
 
 1. **`pinctrl`** — already present on Raspberry Pi OS (provided by the `raspi-utils`
    package). Verify with `command -v pinctrl`. The game uses `pinctrl set/get`
@@ -156,6 +156,20 @@ To enable AIO v2 control you need **two** things on the system:
    The game's `setup.sh` will run these steps automatically on uConsole-class
    hardware (when `pinctrl` is present), and the in-game SYSTEM menu also
    offers an "Install aiov2_ctl" action if it isn't found.
+
+3. **SPI1 boot configuration** — the LoRa power switch does not create its SPI
+   transport. The SX1262 requires `/dev/spidev1.0`. On a CM4, the boot config
+   needs `dtparam=spi=on` and `dtoverlay=spi1-1cs`; CM5 needs the overlay. WDG
+   keeps this boot-file change explicit because SPI1 may belong to another
+   accessory on uConsoles without an AIO v2. Configure it with:
+   ```bash
+   cd /path/to/WatchDogsGo
+   sudo WDG_ENABLE_AIO_LORA=1 bash setup.sh
+   sudo reboot
+   ```
+   Setup makes a one-time `.wdg-before-aio-lora` backup beside the boot config
+   before appending any missing lines. If `/dev/spidev1.0` remains absent after
+   reboot, check whether `devterm-printer.service` is reserving SPI1.
 
 Without these the game still runs fine, the AIO toggles just become no-ops
 and their state always shows `OFF` in the SYSTEM tab.
@@ -482,7 +496,9 @@ Background mesh chat over LoRa SX1262 (869.618 MHz). Auto-starts with LoRa toggl
 
 ## LoRa Features
 
-Requires SX1262 module on AIO v2 (`/dev/spidev1.0`).
+Requires the SX1262 module on AIO v2 and `/dev/spidev1.0`. If LoRa reports that
+the device is missing, run `sudo WDG_ENABLE_AIO_LORA=1 bash setup.sh` from the
+WDG checkout and reboot once.
 
 | Feature | Frequencies | Description |
 |---------|-------------|-------------|

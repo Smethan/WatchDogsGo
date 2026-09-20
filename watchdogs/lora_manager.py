@@ -17,6 +17,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Queue
 from typing import Optional
 
@@ -245,6 +246,19 @@ PIN_BUSY = 24
 PIN_IRQ = 26  # DIO1
 
 
+def lora_spi_device() -> Path:
+    """Return the configured AIO SX1262 SPI device path."""
+    override = os.environ.get("WDG_LORA_SPI_DEVICE", "").strip()
+    return Path(override or f"/dev/spidev{SPI_BUS}.{SPI_CS}")
+
+
+def missing_spi_message(device: Path | str) -> str:
+    """Actionable recovery text for an absent AIO SPI1 device."""
+    return (
+        f"LoRa SPI device {device} is missing; run sudo "
+        "WDG_ENABLE_AIO_LORA=1 bash setup.sh, reboot, then enable LoRa")
+
+
 class LoRaManager:
     """Background LoRa operations with queue-based output."""
 
@@ -294,6 +308,11 @@ class LoRaManager:
             )
             return None
 
+        spi_device = lora_spi_device()
+        if not spi_device.exists():
+            self._emit(missing_spi_message(spi_device), "error")
+            return None
+
         # Release leftover GPIO allocations from crashed/killed previous run
         try:
             import lgpio
@@ -335,6 +354,11 @@ class LoRaManager:
                     pass
             self._emit("SX1262 radio initialized", "dim")
             return lora
+        except FileNotFoundError as exc:
+            missing = exc.filename or spi_device
+            self._emit(missing_spi_message(missing), "error")
+            log.warning("SX1262 device path missing: %s", missing)
+            return None
         except Exception as exc:
             self._emit(f"Radio init failed: {exc}", "error")
             log.warning("SX1262 init failed: %s", exc)

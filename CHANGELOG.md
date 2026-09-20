@@ -35,6 +35,10 @@ minor versions.
 
 ### Fixed
 
+- Detect an absent AIO v2 `/dev/spidev1.0` before LoRaRF initialization and
+  show the exact opt-in setup/reboot command instead of raw `[Errno 2]` output.
+  Setup can now add the documented CM4/CM5 SPI1 boot settings idempotently while
+  preserving a one-time backup of the existing boot configuration.
 - Refresh menu availability from the live LoRa, SDR, and watch state instead
   of leaving implemented Python-side actions permanently grey. MeshCore
   Messenger now retries a powered but stopped receiver and reports queued

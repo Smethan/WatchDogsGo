@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Diagnose missing AIO v2 LoRa SPI transport before starting LoRaRF. A missing
+  `/dev/spidev1.0` now reports the exact `setup.sh` opt-in and reboot sequence
+  instead of a raw `[Errno 2]`. `sudo WDG_ENABLE_AIO_LORA=1 bash setup.sh`
+  idempotently adds the HackerGadgets-documented CM4/CM5 SPI1 boot settings,
+  preserving a one-time backup and warning about `devterm-printer.service`.
 - Make add-on menu availability follow the live hardware switches. MeshCore
   Messenger becomes available when LoRa is powered or the PipBoy Watch is
   connected, while ADS-B and 433 MHz become available as soon as SDR is

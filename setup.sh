@@ -12,6 +12,8 @@ cd "$SCRIPT_DIR"
 
 # shellcheck source=scripts/setup_packages.sh
 source "$SCRIPT_DIR/scripts/setup_packages.sh"
+# shellcheck source=scripts/setup_aio_spi.sh
+source "$SCRIPT_DIR/scripts/setup_aio_spi.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -369,6 +371,49 @@ if command -v pinctrl &>/dev/null && [ -f /sys/firmware/devicetree/base/model ];
         rm -rf "$TMP"
     else
         ok "aiov2_ctl present"
+    fi
+
+    # The LoRa power rail and its SPI transport are separate.  aiov2_ctl only
+    # controls GPIO16; the kernel exposes the SX1262 after SPI1 is configured
+    # in the boot file and the machine reboots.  Boot files are changed only
+    # with an explicit opt-in because SPI1 pins may be used by another uConsole
+    # accessory on systems without the AIO v2 board.
+    if [ -e /dev/spidev1.0 ]; then
+        ok "AIO LoRa SPI available (/dev/spidev1.0)"
+    else
+        AIO_SPI_CONFIG="$(wdg_aio_spi_config_path || true)"
+        if [ "${WDG_ENABLE_AIO_LORA:-0}" = "1" ]; then
+            if [ -z "$AIO_SPI_CONFIG" ] || [ ! -f "$AIO_SPI_CONFIG" ]; then
+                warn "AIO LoRa requested, but no Raspberry Pi boot config was found"
+                warn "Expected /boot/firmware/config.txt or /boot/config.txt"
+            else
+                AIO_MODEL="$(tr -d '\000' </sys/firmware/devicetree/base/model 2>/dev/null || true)"
+                mapfile -t AIO_SPI_LINES < <(
+                    wdg_aio_spi_missing_lines "$AIO_SPI_CONFIG" "$AIO_MODEL")
+                if [ ${#AIO_SPI_LINES[@]} -gt 0 ]; then
+                    AIO_SPI_BACKUP="${AIO_SPI_CONFIG}.wdg-before-aio-lora"
+                    sudo test -e "$AIO_SPI_BACKUP" || \
+                        sudo cp -a "$AIO_SPI_CONFIG" "$AIO_SPI_BACKUP"
+                    {
+                        printf '\n# WatchDogsGo: HackerGadgets AIO v2 LoRa (SPI1 CE0)\n'
+                        printf '%s\n' "${AIO_SPI_LINES[@]}"
+                    } | sudo tee -a "$AIO_SPI_CONFIG" >/dev/null
+                    ok "Configured AIO LoRa SPI in $AIO_SPI_CONFIG"
+                    warn "Reboot required before /dev/spidev1.0 and MeshCore are available"
+                else
+                    warn "AIO LoRa SPI boot settings are present, but /dev/spidev1.0 is missing"
+                    warn "Reboot first; if it remains absent, verify the spi1-1cs overlay"
+                fi
+            fi
+        else
+            warn "AIO LoRa SPI device /dev/spidev1.0 is missing"
+            warn "For an installed AIO v2, run: sudo WDG_ENABLE_AIO_LORA=1 bash setup.sh"
+            warn "Then reboot the uConsole before enabling LoRa in WDG"
+        fi
+        if command -v systemctl >/dev/null 2>&1 && \
+           systemctl is-enabled --quiet devterm-printer.service 2>/dev/null; then
+            warn "devterm-printer.service may reserve SPI1; disable it if LoRa remains unavailable"
+        fi
     fi
 fi
 
