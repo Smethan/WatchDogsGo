@@ -22,6 +22,30 @@ _UPLOAD_LEDGER_NAME = ".wpasec_uploads.json"
 _UPLOAD_LEDGER_VERSION = 1
 _upload_lock = threading.Lock()
 
+# These responses describe the capture itself, so retrying identical bytes can
+# never make the upload succeed.  Keep the matching deliberately narrow: HTTP
+# failures, authentication errors, rate limits, and timeouts must remain
+# retryable.
+_PERMANENT_CAPTURE_REJECTION_PATTERNS = (
+    "unsupported format",
+    "unsupported capture format",
+    "unsupported file format",
+    "invalid capture format",
+    "not a valid capture",
+    "invalid or empty pcap",
+    "we support pcap and pcapng",
+    "no valid handshake",
+    "no valid pmkid",
+    "no valid handshakes/pmkids",
+    "no crackable handshake",
+    "no usable handshake",
+    "no usable pmkid",
+    "no usable password",
+    "no valid password",
+    "no passwords",
+    "contains no password",
+)
+
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default) or ""
@@ -188,6 +212,20 @@ def _capture_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _permanent_capture_rejection(message: str) -> str:
+    """Return a stable rejection category, or empty for retryable failures."""
+    normalized = " ".join(message.lower().split())
+    if not any(
+            pattern in normalized
+            for pattern in _PERMANENT_CAPTURE_REJECTION_PATTERNS):
+        return ""
+    if any(token in normalized for token in (
+            "format", "not a valid capture", "invalid or empty pcap",
+            "we support pcap")):
+        return "unsupported capture format"
+    return "no usable handshake, PMKID, or password data"
+
+
 def _empty_upload_ledger() -> dict:
     return {"version": _UPLOAD_LEDGER_VERSION, "accounts": {}}
 
@@ -255,6 +293,22 @@ def _account_receipts(ledger: dict) -> dict:
     return captures
 
 
+def _store_rejection(
+    receipts: dict, digest: str, path: Path, size: int,
+    reason: str, detail: str,
+) -> None:
+    """Record a content-addressed permanent rejection without API secrets."""
+    receipts[digest] = {
+        "filename": path.name,
+        "size": size,
+        "status": "permanent_rejection",
+        "reason": reason,
+        "detail": detail[:300],
+        "rejected_at": datetime.now(timezone.utc).isoformat(
+            timespec="seconds"),
+    }
+
+
 def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
     """Upload only captures without a durable success receipt."""
     loot_dir = Path(loot_dir)
@@ -267,6 +321,7 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
         receipts = _account_receipts(ledger)
         pending: list[tuple[Path, str, int]] = []
         already_uploaded = 0
+        previously_rejected = 0
         hash_errors = 0
         errors: list[str] = []
         for path in captures:
@@ -277,31 +332,73 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
                 hash_errors += 1
                 errors.append(f"{path.name}: cannot hash: {exc}")
                 continue
-            if digest in receipts:
-                already_uploaded += 1
+            receipt = receipts.get(digest)
+            if receipt is not None:
+                status = (
+                    receipt.get("status", "accepted")
+                    if isinstance(receipt, dict) else "accepted"
+                )
+                if status == "permanent_rejection":
+                    previously_rejected += 1
+                else:
+                    already_uploaded += 1
             else:
                 pending.append((path, digest, size))
 
         uploaded = 0
         uploadable: list[tuple[Path, str, int]] = []
         local_skips: dict[str, int] = {}
+        permanent_skips: dict[str, int] = {}
+        local_rejections_changed = False
         for path, digest, size in pending:
             ready, reason = _capture_uploadable(path)
             if ready:
                 uploadable.append((path, digest, size))
             else:
-                local_skips[reason] = local_skips.get(reason, 0) + 1
+                permanent_reason = _permanent_capture_rejection(reason)
+                if permanent_reason:
+                    _store_rejection(
+                        receipts, digest, path, size,
+                        permanent_reason, reason,
+                    )
+                    permanent_skips[permanent_reason] = (
+                        permanent_skips.get(permanent_reason, 0) + 1)
+                    local_rejections_changed = True
+                else:
+                    local_skips[reason] = local_skips.get(reason, 0) + 1
+
+        if local_rejections_changed:
+            try:
+                _save_upload_ledger(loot_dir, ledger)
+            except OSError as exc:
+                errors.append(
+                    "permanent local rejections were not saved: " + str(exc))
 
         attempted = len(uploadable) + hash_errors
         for path, digest, size in uploadable:
             ok, message = upload_wpasec(path)
             if not ok:
-                errors.append(f"{path.name}: {message}")
+                permanent_reason = _permanent_capture_rejection(message)
+                if not permanent_reason:
+                    errors.append(f"{path.name}: {message}")
+                    continue
+                _store_rejection(
+                    receipts, digest, path, size,
+                    permanent_reason, message,
+                )
+                permanent_skips[permanent_reason] = (
+                    permanent_skips.get(permanent_reason, 0) + 1)
+                try:
+                    _save_upload_ledger(loot_dir, ledger)
+                except OSError as exc:
+                    errors.append(
+                        f"{path.name}: permanent rejection was not saved: {exc}")
                 continue
             uploaded += 1
             receipts[digest] = {
                 "filename": path.name,
                 "size": size,
+                "status": "accepted",
                 "uploaded_at": datetime.now(timezone.utc).isoformat(
                     timespec="seconds"),
             }
@@ -311,14 +408,26 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
                 errors.append(
                     f"{path.name}: uploaded but receipt was not saved: {exc}")
 
-        if attempted == 0 and already_uploaded:
-            summary = f"No new captures | {already_uploaded} already uploaded"
+        if attempted == 0 and (already_uploaded or previously_rejected):
+            summary = "No new captures"
+            if already_uploaded:
+                summary += f" | {already_uploaded} already uploaded"
+            if previously_rejected:
+                summary += f" | {previously_rejected} permanently rejected"
         elif attempted == 0:
             summary = "No eligible captures"
         else:
             summary = f"{uploaded}/{attempted} uploaded"
             if already_uploaded:
                 summary += f" | {already_uploaded} already uploaded"
+            if previously_rejected:
+                summary += f" | {previously_rejected} permanently rejected"
+        if permanent_skips:
+            skipped = sum(permanent_skips.values())
+            reasons = ", ".join(
+                f"{count} {reason}"
+                for reason, count in sorted(permanent_skips.items()))
+            summary += f" | {skipped} newly rejected ({reasons})"
         if local_skips:
             skipped = sum(local_skips.values())
             reasons = ", ".join(

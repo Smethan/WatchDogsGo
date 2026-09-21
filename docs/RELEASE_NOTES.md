@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix AIO v2 MeshCore transmission by using LoRaRF's documented asynchronous
+  `endPacket()` plus `wait()` flow in polling mode, then resuming continuous RX
+  through the library API. WPA-sec uploads now remember permanent capture
+  rejections by content hash; unsupported formats and captures containing no
+  usable handshake, PMKID, or password data are skipped on later runs, while
+  network, rate-limit, authentication, and server failures remain retryable.
 - Diagnose missing AIO v2 LoRa SPI transport before starting LoRaRF. A missing
   `/dev/spidev1.0` now reports the exact `setup.sh` opt-in and reboot sequence
   instead of a raw `[Errno 2]`. `sudo WDG_ENABLE_AIO_LORA=1 bash setup.sh`

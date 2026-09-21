@@ -100,12 +100,17 @@ def test_wpasec_uploads_once_and_persists_content_receipt(
     assert "account-a" not in ledger_text
     assert not ledger_path.with_name(ledger_path.name + ".tmp").exists()
 
+    # Version-1 ledgers written before rejection tracking have no status.
+    # They remain accepted receipts and must not be uploaded again.
+    ledger["accounts"][account]["captures"][digest].pop("status")
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
     assert upload_manager.upload_wpasec_all(loot) == (
         0, 0, "No new captures | 1 already uploaded")
     assert calls == [capture]
 
 
-def test_wpasec_retries_failures_and_rejected_captures(
+def test_wpasec_retries_transient_failures(
         tmp_path, monkeypatch, accept_test_captures):
     loot = tmp_path / "loot"
     capture = touch(
@@ -122,6 +127,56 @@ def test_wpasec_retries_failures_and_rejected_captures(
     second = upload_manager.upload_wpasec_all(loot)
     assert second[:2] == (1, 1)
     assert calls == [capture, capture]
+
+
+@pytest.mark.parametrize("rejection", [
+    "WPA-sec rejected capture: Not a valid capture file. We support pcap and pcapng.",
+    "WPA-sec rejected capture: No valid handshakes/PMKIDs found.",
+    "WPA-sec rejected capture: No passwords found.",
+])
+def test_wpasec_persists_permanent_server_rejections(
+        tmp_path, monkeypatch, accept_test_captures, rejection):
+    loot = tmp_path / "loot"
+    capture = touch(
+        loot / "session" / "handshakes" / "Bad_020000000001_120000.pcapng",
+        rejection.encode("utf-8"))
+    calls = []
+    monkeypatch.setattr(upload_manager, "get_wpasec_key", lambda: "account-a")
+    monkeypatch.setattr(
+        upload_manager, "upload_wpasec",
+        lambda path: (calls.append(path), (False, rejection))[1])
+
+    first = upload_manager.upload_wpasec_all(loot)
+    assert first[:2] == (0, 1)
+    assert "1 newly rejected" in first[2]
+    assert calls == [capture]
+
+    second = upload_manager.upload_wpasec_all(loot)
+    assert second[:2] == (0, 0)
+    assert "1 permanently rejected" in second[2]
+    assert calls == [capture]
+
+    ledger = json.loads(
+        (loot / upload_manager._UPLOAD_LEDGER_NAME).read_text())
+    account = hashlib.sha256(b"account-a").hexdigest()
+    digest = hashlib.sha256(rejection.encode("utf-8")).hexdigest()
+    receipt = ledger["accounts"][account]["captures"][digest]
+    assert receipt["status"] == "permanent_rejection"
+    assert receipt["reason"] in {
+        "unsupported capture format",
+        "no usable handshake, PMKID, or password data",
+    }
+
+
+@pytest.mark.parametrize("failure", [
+    "timeout",
+    "connection reset by peer",
+    "HTTP 429: rate limited",
+    "HTTP 500: temporary server failure",
+    "WPA-sec key not configured",
+])
+def test_wpasec_transport_and_service_failures_remain_retryable(failure):
+    assert upload_manager._permanent_capture_rejection(failure) == ""
 
 
 def test_wpasec_receipts_follow_content_and_account(
@@ -235,13 +290,20 @@ def test_wpasec_locally_skips_unusable_capture_without_upload(
     loot = tmp_path / "loot"
     capture = touch(
         loot / "session" / "handshakes" / "Partial_020000000001_120000.pcapng")
+    checks = []
     monkeypatch.setattr(
         upload_manager, "_capture_uploadable",
-        lambda path: (False, "no crackable handshake or PMKID"))
+        lambda path: (checks.append(path), (
+            False, "no crackable handshake or PMKID"))[1])
     monkeypatch.setattr(
         upload_manager, "upload_wpasec",
         lambda path: pytest.fail("unusable capture was uploaded"))
     result = upload_manager.upload_wpasec_all(loot)
     assert result[:2] == (0, 0)
-    assert "1 skipped locally" in result[2]
-    assert "no crackable handshake or PMKID" in result[2]
+    assert "1 newly rejected" in result[2]
+    assert "no usable handshake, PMKID, or password data" in result[2]
+
+    second = upload_manager.upload_wpasec_all(loot)
+    assert second[:2] == (0, 0)
+    assert "1 permanently rejected" in second[2]
+    assert checks == [capture]

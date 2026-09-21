@@ -35,6 +35,11 @@ minor versions.
 
 ### Fixed
 
+- Run AIO v2 SX1262 transmit/receive in LoRaRF's supported SPI-polling mode,
+  eliminating the competing GPIO callback that caused MeshCore `TX error`
+  failures on the uConsole. WPA-sec export now stores content-hash receipts for
+  permanent unsupported-format and no-usable-handshake/password rejections, so
+  unchanged captures are not submitted again while temporary failures retry.
 - Detect an absent AIO v2 `/dev/spidev1.0` before LoRaRF initialization and
   show the exact opt-in setup/reboot command instead of raw `[Errno 2]` output.
   Setup can now add the documented CM4/CM5 SPI1 boot settings idempotently while

@@ -622,7 +622,7 @@ watchdogs/
 | `.watchdogs_meshcore.json` | `~/` | MeshCore node name + channels |
 | `.watchdogs_meshcore_key` | `~/` | Ed25519 keypair for MeshCore signing |
 | `loot_db.json` | `loot/` | Aggregate stats, XP, badges |
-| `.wpasec_uploads.json` | `loot/` | Per-account SHA-256 receipts for successful WPA-sec uploads |
+| `.wpasec_uploads.json` | `loot/` | Per-account SHA-256 receipts for accepted or permanently rejected WPA-sec captures |
 | `last_run.log` | `~/.watchdogs/` | Game log (rotated to `previous_run.log`) |
 
 ## Troubleshooting & Bug Reports

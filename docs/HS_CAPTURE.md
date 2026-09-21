@@ -99,20 +99,23 @@ captures. PCAPNG supplies useful capture context to WPA-Sec/hcxtools; it cannot
 reconstruct authentication, association, probe or EAPOL packets that were not
 heard over the air.
 
-Successful uploads are recorded by SHA-256 in `loot/.wpasec_uploads.json`.
-Later uploads skip matching content for the same WPA-sec account while retrying
-failed or interrupted transfers. A renamed capture remains skipped; changed
-capture bytes and a different WPA-sec API key are treated as new work. The
-receipt file is replaced atomically after each confirmed HTTP success so a
-crash cannot leave a partially written ledger.
+Successful uploads and permanent capture rejections are recorded by SHA-256 in
+`loot/.wpasec_uploads.json`. Later uploads skip matching content for the same
+WPA-sec account. Unsupported formats and captures with no usable handshake,
+PMKID, or password data are permanent; network errors, rate limits,
+authentication failures, server errors, and interrupted transfers remain
+retryable. A renamed capture remains skipped; changed capture bytes and a
+different WPA-sec API key are treated as new work. The receipt file is replaced
+atomically after each decision so a crash cannot leave a partially written
+ledger. Existing version-1 success receipts remain valid.
 
 WPA-sec upload considers every captured network; the WDG whitelist does not
 filter this explicit export action. `.22000` files are local hashcat artifacts
 and are never uploaded. Before sending a pending PCAP/PCAPNG, WDG accepts a
 current nonempty companion `.22000` as prior hcxtools validation or runs
 `hcxpcapngtool` with WPA-sec-compatible options. Empty containers and captures
-that yield no crackable handshake or PMKID are reported as local skips rather
-than retried against the service on every upload.
+that yield no crackable handshake or PMKID receive permanent local rejection
+receipts rather than being revalidated or retried on every upload.
 
 With older firmware, all-nearby capture still works when the Wi-Fi whitelist is
 empty. Firmware 1.7.11 advertises `hs_capture_exclusions_v1`; when one or more
