@@ -244,6 +244,11 @@ SPI_SPEED = 7_800_000
 PIN_RESET = 25
 PIN_BUSY = 24
 PIN_IRQ = 26  # DIO1
+# WDG reads the SX1262 IRQ status over SPI in every receive/transmit loop.
+# Passing the physical DIO1 pin to LoRaRF also installs RPi.GPIO callbacks,
+# which race those SPI polls and can fail on kernels without sysfs GPIO edge
+# support.  LoRaRF explicitly supports -1 for polling-only operation.
+LORARF_IRQ_POLLING = -1
 
 
 def lora_spi_device() -> Path:
@@ -335,7 +340,7 @@ class LoRaManager:
                 cs=SPI_CS,
                 reset=PIN_RESET,
                 busy=PIN_BUSY,
-                irq=PIN_IRQ,
+                irq=LORARF_IRQ_POLLING,
             ):
                 self._emit("SX1262 not detected on SPI bus", "error")
                 return None
@@ -451,19 +456,9 @@ class LoRaManager:
             # afford gaps between RX_SINGLE cycles)
             use_continuous = self.mode == "meshcore"
             if use_continuous:
-                # Set IRQ mask explicitly (same as nuclear RX resume)
-                lora._irqSetup(
-                    lora.IRQ_RX_DONE | lora.IRQ_TIMEOUT
-                    | lora.IRQ_HEADER_ERR | lora.IRQ_CRC_ERR,
-                )
-                lora.setRx(lora.RX_CONTINUOUS)
-                # Remove GPIO callback — it races with our SPI poll
-                # (callback clears IRQ before poll can read it)
-                try:
-                    import RPi.GPIO as _gpio
-                    _gpio.remove_event_detect(lora._irq)
-                except Exception:
-                    pass
+                if not lora.request(lora.RX_CONTINUOUS):
+                    raise RuntimeError(
+                        "radio refused initial continuous RX")
 
             errors = 0
             while not self._stop_event.is_set():
@@ -511,12 +506,9 @@ class LoRaManager:
                             lora, freq, sf, cr, bw, sync_word, preamble,
                         )
                         if use_continuous:
-                            lora.request(lora.RX_CONTINUOUS)
-                            try:
-                                import RPi.GPIO as _gpio
-                                _gpio.remove_event_detect(lora._irq)
-                            except Exception:
-                                pass
+                            if not lora.request(lora.RX_CONTINUOUS):
+                                raise RuntimeError(
+                                    "radio refused continuous RX after restart")
                         errors = 0
         except Exception as exc:
             self._emit(f"Sniffer error: {exc}", "error")
@@ -1508,13 +1500,7 @@ class LoRaManager:
         return self._mc_keypair
 
     def _do_tx(self, lora) -> None:
-        """Transmit queued packets, then resume RX_CONTINUOUS.
-
-        Nuclear approach: after TX, do FULL radio reconfiguration
-        (frequency, modulation, sync word, packet params) because
-        beginPacket()/endPacket() corrupt multiple internal states
-        in LoRaRF that surgical fixes cannot fully restore.
-        """
+        """Transmit queued packets, then resume polling RX_CONTINUOUS."""
         while not self._tx_queue.empty():
             try:
                 packet = self._tx_queue.get_nowait()
@@ -1523,77 +1509,47 @@ class LoRaManager:
             try:
                 lora.beginPacket()
                 lora.write(list(packet), len(packet))
-                lora.endPacket(5000)  # non-blocking! just initiates TX
+                if not lora.endPacket(5000):
+                    raise RuntimeError("radio refused TX while busy")
 
-                # Wait for actual TX_DONE (endPacket returns immediately)
-                deadline = time.time() + 5.0
-                tx_ok = False
-                while time.time() < deadline:
-                    irq = lora.getIrqStatus()
-                    if irq & lora.IRQ_TX_DONE:
-                        tx_ok = True
-                        break
-                    if irq & lora.IRQ_TIMEOUT:
-                        break
-                    time.sleep(0.01)
+                # LoRaRF 1.3+ is asynchronous: endPacket() starts TX and
+                # wait() completes its state transition.  With irq=-1,
+                # wait() polls IRQ status over SPI and installs no GPIO edge
+                # callback, matching the rest of WDG's radio loop.
+                waited = lora.wait(5.5)
+                irq = lora.getIrqStatus()
+                tx_ok = bool(waited and irq & lora.IRQ_TX_DONE)
 
                 if tx_ok:
                     self._emit(
                         f"  TX: {len(packet)}B sent", "success")
                 else:
+                    detail = (
+                        "radio timeout" if irq & lora.IRQ_TIMEOUT
+                        else f"no TX_DONE (IRQ 0x{irq:04x})"
+                    )
                     self._emit(
-                        f"  TX: {len(packet)}B timeout!", "error")
+                        f"  TX: {len(packet)}B failed: {detail}", "error")
             except Exception as exc:
                 self._emit(f"  TX error: {exc}", "error")
+                log.exception("LoRa TX failed for %d-byte packet", len(packet))
 
-        # ── Nuclear RX resume: full radio reconfiguration ──
-        # beginPacket() corrupts: _bufferIndex, buffer base address,
-        #   _fixLoRaBw500() may alter BW registers, _statusWait
-        # endPacket() corrupts: payloadLength, IRQ mask, adds GPIO callback
-        # Surgical fixes failed — reconfigure everything from scratch.
+        # A TX changes the packet length and IRQ mask.  Restore the complete
+        # receive configuration, then let LoRaRF enter continuous receive via
+        # its public request() method.  request() resets the library's wait and
+        # IRQ state without WDG mutating LoRaRF private fields.
         lora.setStandby(lora.STANDBY_RC)
-        time.sleep(0.01)  # let chip settle in standby
+        time.sleep(0.01)
         lora.clearIrqStatus(0x03FF)
-
-        # Reset internal LoRaRF state that beginPacket/endPacket corrupted
-        lora._bufferIndex = 0
-        lora._payloadTxRx = 0
-        lora._statusWait = 0  # clear TX_DONE wait state
         lora.setBufferBaseAddress(0x00, 0x00)
 
-        # Full reconfigure: freq, modulation, sync word, packet params
         if self._radio_cfg:
             freq, sf, cr, bw, sync_word, preamble = self._radio_cfg
-            lora.setFrequency(freq)
-            lora.setLoRaModulation(sf, bw, cr, False)
-            if sync_word:
-                lora.setSyncWord(sync_word)
-            if preamble:
-                lora.setLoRaPacket(0x00, preamble, 255, True)
-            else:
-                lora.setPacketParamsLoRa(
-                    lora._preambleLength, lora._headerType,
-                    255, lora._crcType, False,
-                )
-        else:
-            # Fallback: at least restore packet params
-            lora.setPacketParamsLoRa(
-                lora._preambleLength, lora._headerType,
-                255, lora._crcType, False,
+            self._configure_radio(
+                lora, freq, sf, cr, bw, sync_word, preamble,
             )
-
-        # Re-arm RX with proper IRQ mask
-        lora._irqSetup(
-            lora.IRQ_RX_DONE | lora.IRQ_TIMEOUT
-            | lora.IRQ_HEADER_ERR | lora.IRQ_CRC_ERR,
-        )
-        lora.setRx(lora.RX_CONTINUOUS)
-        # Remove GPIO callback — we use SPI polling
-        try:
-            import RPi.GPIO as _gpio
-            _gpio.remove_event_detect(lora._irq)
-        except Exception:
-            pass
+        if not lora.request(lora.RX_CONTINUOUS):
+            raise RuntimeError("radio refused to resume continuous RX")
 
     def _cleanup_radio(self, lora) -> None:
         """Release SPI without GPIO.cleanup() (preserves pin mode for reuse).
