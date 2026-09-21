@@ -100,14 +100,17 @@ reconstruct authentication, association, probe or EAPOL packets that were not
 heard over the air.
 
 Successful uploads and permanent capture rejections are recorded by SHA-256 in
-`loot/.wpasec_uploads.json`. Later uploads skip matching content for the same
-WPA-sec account. Unsupported formats and captures with no usable handshake,
-PMKID, or password data are permanent; network errors, rate limits,
+`loot/.wpasec_uploads.json`. Successful receipts remain per-account. Permanent
+capture rejections apply across accounts because identical unsupported or empty
+capture bytes cannot become useful with a different key. Unsupported formats
+and captures with no usable handshake, PMKID, or password data are permanent;
+network errors, rate limits,
 authentication failures, server errors, and interrupted transfers remain
 retryable. A renamed capture remains skipped; changed capture bytes and a
-different WPA-sec API key are treated as new work. The receipt file is replaced
-atomically after each decision so a crash cannot leave a partially written
-ledger. Existing version-1 success receipts remain valid.
+different WPA-sec API key cause accepted captures to be considered for the new
+account. The receipt file is replaced atomically after each decision so a crash
+cannot leave a partially written ledger. Existing version-1 success receipts
+remain valid.
 
 WPA-sec upload considers every captured network; the WDG whitelist does not
 filter this explicit export action. `.22000` files are local hashcat artifacts

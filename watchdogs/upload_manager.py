@@ -227,7 +227,11 @@ def _permanent_capture_rejection(message: str) -> str:
 
 
 def _empty_upload_ledger() -> dict:
-    return {"version": _UPLOAD_LEDGER_VERSION, "accounts": {}}
+    return {
+        "version": _UPLOAD_LEDGER_VERSION,
+        "accounts": {},
+        "permanent_rejections": {},
+    }
 
 
 def _load_upload_ledger(loot_dir: Path) -> tuple[dict, str]:
@@ -293,12 +297,21 @@ def _account_receipts(ledger: dict) -> dict:
     return captures
 
 
+def _permanent_rejections(ledger: dict) -> dict:
+    """Return account-independent rejection receipts, migrating in place."""
+    rejections = ledger.get("permanent_rejections")
+    if not isinstance(rejections, dict):
+        rejections = {}
+        ledger["permanent_rejections"] = rejections
+    return rejections
+
+
 def _store_rejection(
-    receipts: dict, digest: str, path: Path, size: int,
+    rejections: dict, digest: str, path: Path, size: int,
     reason: str, detail: str,
 ) -> None:
     """Record a content-addressed permanent rejection without API secrets."""
-    receipts[digest] = {
+    rejections[digest] = {
         "filename": path.name,
         "size": size,
         "status": "permanent_rejection",
@@ -319,11 +332,13 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
 
         ledger, ledger_warning = _load_upload_ledger(loot_dir)
         receipts = _account_receipts(ledger)
+        rejections = _permanent_rejections(ledger)
         pending: list[tuple[Path, str, int]] = []
         already_uploaded = 0
         previously_rejected = 0
         hash_errors = 0
         errors: list[str] = []
+        rejection_ledger_changed = False
         for path in captures:
             try:
                 digest = _capture_sha256(path)
@@ -332,13 +347,22 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
                 hash_errors += 1
                 errors.append(f"{path.name}: cannot hash: {exc}")
                 continue
+            if digest in rejections:
+                previously_rejected += 1
+                continue
             receipt = receipts.get(digest)
             if receipt is not None:
                 status = (
                     receipt.get("status", "accepted")
                     if isinstance(receipt, dict) else "accepted"
                 )
+                # Compatibility with the briefly used account-scoped
+                # rejection shape: accepted receipts either have no status or
+                # explicitly say accepted.
                 if status == "permanent_rejection":
+                    rejections[digest] = receipt
+                    del receipts[digest]
+                    rejection_ledger_changed = True
                     previously_rejected += 1
                 else:
                     already_uploaded += 1
@@ -349,7 +373,6 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
         uploadable: list[tuple[Path, str, int]] = []
         local_skips: dict[str, int] = {}
         permanent_skips: dict[str, int] = {}
-        local_rejections_changed = False
         for path, digest, size in pending:
             ready, reason = _capture_uploadable(path)
             if ready:
@@ -358,21 +381,21 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
                 permanent_reason = _permanent_capture_rejection(reason)
                 if permanent_reason:
                     _store_rejection(
-                        receipts, digest, path, size,
+                        rejections, digest, path, size,
                         permanent_reason, reason,
                     )
                     permanent_skips[permanent_reason] = (
                         permanent_skips.get(permanent_reason, 0) + 1)
-                    local_rejections_changed = True
+                    rejection_ledger_changed = True
                 else:
                     local_skips[reason] = local_skips.get(reason, 0) + 1
 
-        if local_rejections_changed:
+        if rejection_ledger_changed:
             try:
                 _save_upload_ledger(loot_dir, ledger)
             except OSError as exc:
                 errors.append(
-                    "permanent local rejections were not saved: " + str(exc))
+                    "permanent rejection receipts were not saved: " + str(exc))
 
         attempted = len(uploadable) + hash_errors
         for path, digest, size in uploadable:
@@ -383,7 +406,7 @@ def upload_wpasec_all(loot_dir: Path) -> tuple[int, int, str]:
                     errors.append(f"{path.name}: {message}")
                     continue
                 _store_rejection(
-                    receipts, digest, path, size,
+                    rejections, digest, path, size,
                     permanent_reason, message,
                 )
                 permanent_skips[permanent_reason] = (

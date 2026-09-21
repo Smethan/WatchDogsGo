@@ -141,7 +141,9 @@ def test_wpasec_persists_permanent_server_rejections(
         loot / "session" / "handshakes" / "Bad_020000000001_120000.pcapng",
         rejection.encode("utf-8"))
     calls = []
-    monkeypatch.setattr(upload_manager, "get_wpasec_key", lambda: "account-a")
+    account_key = ["account-a"]
+    monkeypatch.setattr(
+        upload_manager, "get_wpasec_key", lambda: account_key[0])
     monkeypatch.setattr(
         upload_manager, "upload_wpasec",
         lambda path: (calls.append(path), (False, rejection))[1])
@@ -151,6 +153,9 @@ def test_wpasec_persists_permanent_server_rejections(
     assert "1 newly rejected" in first[2]
     assert calls == [capture]
 
+    # Capture validity is independent of the WPA-sec account. A key change
+    # must not cause identical unsupported bytes to be submitted again.
+    account_key[0] = "account-b"
     second = upload_manager.upload_wpasec_all(loot)
     assert second[:2] == (0, 0)
     assert "1 permanently rejected" in second[2]
@@ -158,9 +163,8 @@ def test_wpasec_persists_permanent_server_rejections(
 
     ledger = json.loads(
         (loot / upload_manager._UPLOAD_LEDGER_NAME).read_text())
-    account = hashlib.sha256(b"account-a").hexdigest()
     digest = hashlib.sha256(rejection.encode("utf-8")).hexdigest()
-    receipt = ledger["accounts"][account]["captures"][digest]
+    receipt = ledger["permanent_rejections"][digest]
     assert receipt["status"] == "permanent_rejection"
     assert receipt["reason"] in {
         "unsupported capture format",
