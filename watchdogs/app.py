@@ -7808,8 +7808,9 @@ class WatchDogsGame(OtaMixin):
             return
 
         # Overlay inputs take priority over everything
-        # Nodes panel input (when open and has nodes)
-        if self._mc_nodes_panel and self._mc_nodes:
+        # The panel remains modal even with no contacts, so its empty state
+        # can be dismissed without accidentally closing Messenger.
+        if self._mc_nodes_panel:
             self._update_mc_nodes_panel()
             return
 
@@ -7952,6 +7953,13 @@ class WatchDogsGame(OtaMixin):
 
     def _update_mc_nodes_panel(self):
         """Handle input for the contacts panel overlay."""
+        if not self._mc_nodes:
+            self._mc_node_action = False
+            self._mc_note_editing = False
+            if pyxel.btnp(pyxel.KEY_ESCAPE):
+                self._mc_nodes_panel = False
+            return
+
         # Note editing mode
         if self._mc_note_editing:
             if pyxel.btnp(pyxel.KEY_ESCAPE):
@@ -8157,7 +8165,7 @@ class WatchDogsGame(OtaMixin):
                            chat_bot - line_h, "MAX", C_ERROR)
 
         # Contacts panel overlay — 12px rows for 5x8 font
-        if self._mc_nodes_panel and self._mc_nodes:
+        if self._mc_nodes_panel:
             pw = 280
             px_x = W - pw - 2
             panel_top = BAR_H + 2
@@ -8168,9 +8176,18 @@ class WatchDogsGame(OtaMixin):
             pyxel.rectb(px_x, panel_top, pw, panel_bot, 2)
             pyxel.text(px_x + 4, panel_top + 4,
                        f"CONTACTS ({len(self._mc_nodes)})", 2)
-            pyxel.text(px_x + pw - 90, panel_top + 4, "ENTER=action", C_DIM)
+            pyxel.text(px_x + pw - 90, panel_top + 4,
+                       "ENTER=action" if self._mc_nodes else "ESC=back", C_DIM)
             pyxel.line(px_x + 2, panel_top + 14,
                        px_x + pw - 3, panel_top + 14, 1)
+            if not self._mc_nodes:
+                pyxel.text(px_x + 8, panel_top + 30,
+                           "No MeshCore nodes heard yet.", C_TEXT)
+                pyxel.text(px_x + 8, panel_top + 44,
+                           "Waiting for nearby node adverts..." if self._lora.running
+                           else "LoRa is off; enable it to hear nodes.", C_DIM)
+                pyxel.text(px_x + 8, panel_top + 64,
+                           "ESC or Ctrl+H: return to chat", C_HACK_CYAN)
             _type_icons = {0: "C", 1: "C", 2: "R", 3: "M", 4: "S",
                            "Client": "C", "Repeater": "R",
                            "Room": "M", "Sensor": "S"}
