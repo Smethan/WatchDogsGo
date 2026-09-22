@@ -4145,7 +4145,8 @@ class WatchDogsGame(OtaMixin):
                     # Node adverts go to terminal only, not chat
                     _type_names = {0: "Client", 1: "Client",
                                    2: "Repeater", 3: "Room", 4: "Sensor"}
-                    tname = _type_names.get(ntype, f"T{ntype}")
+                    tname = (ntype if isinstance(ntype, str)
+                             else _type_names.get(ntype, f"T{ntype}"))
                     self.msg(f"[MC] {name or '?'} [{tname}] "
                              f"RSSI:{rssi:.0f}", C_HACK_CYAN)
         except Exception:

@@ -9,7 +9,10 @@ from .app_state import Network
 from .wardrive_protocol import parse_record, display_bytes
 from .scan_controller import ScanController
 from .notable_detector import NotableDetector, ble_name
-from .wardrive_trail import FixHistory, WardriveTrail
+from .wardrive_trail import FixHistory, WardriveTrail, distance
+from .lora_manager import (
+    MC_DISCOVERY_INTERVAL, MC_DISCOVERY_MIN_DISTANCE_M,
+)
 from .trail_layer import TrailLayer, heat_color
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
@@ -80,6 +83,9 @@ class WardriveUI:
         self.diagnostic_state = ""
         self.reported_false_timeouts = 0
         self.host_ble_batch_lines = deque(maxlen=256)
+        self.mc_discovery_session = None
+        self.mc_discovery_next = 0.0
+        self.mc_discovery_last_fix = None
 
     def on_stop(self):
         self.targets.cancel()
@@ -96,6 +102,9 @@ class WardriveUI:
         self.app._gps_wait_dialog = False
         self.trail.break_segment()
         self.detector.clear()
+        self.mc_discovery_session = None
+        self.mc_discovery_next = 0.0
+        self.mc_discovery_last_fix = None
 
     def tick(self):
         app = self.app
@@ -140,6 +149,7 @@ class WardriveUI:
             app._send("stop")
         self.poll_host_ble(now)
         self.poll_cell(now)
+        self.poll_meshcore_discovery(now)
         self.write_diagnostics(now)
         if self.scan.false_timeouts > self.reported_false_timeouts:
             self.reported_false_timeouts = self.scan.false_timeouts
@@ -508,6 +518,69 @@ class WardriveUI:
         else:
             app._term_add("[ALL] ADS-B disabled (SYSTEM > SDR)", raw=True)
         return started
+
+    def poll_meshcore_discovery(self, now):
+        """Actively probe direct MeshCore repeaters during real wardrives.
+
+        This follows MeshMapper's passive wardriving lane: one zero-hop
+        DISCOVER_REQ every 30 seconds, provided a fresh host GPS fix moved at
+        least 25 metres since the last request.  Both ESP BLE and host BLE All
+        Wardrive modes share this scan state and therefore get the same probes.
+        """
+        active = (self.scan.state == "running"
+                  and self.scan.mode == "wardrive"
+                  and not self.scan.diagnostic)
+        if not active:
+            self.mc_discovery_session = None
+            self.mc_discovery_next = 0.0
+            self.mc_discovery_last_fix = None
+            return False
+
+        if self.mc_discovery_session != self.scan.session:
+            self.mc_discovery_session = self.scan.session
+            self.mc_discovery_next = float(now)
+            self.mc_discovery_last_fix = None
+
+        if now < self.mc_discovery_next:
+            return False
+
+        app = self.app
+        lora = getattr(app, "_lora", None)
+        if (not getattr(app, "_lora_enabled", False) or lora is None
+                or not lora.running or lora.mode != "meshcore"):
+            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+            return False
+        fix = self.fixes.at(now) if app.gps.available else None
+        if not fix:
+            # A receiver can become ready before gpsd/AIO has produced its
+            # first fresh fix.  Retry promptly rather than losing 30 seconds.
+            self.mc_discovery_next = float(now) + 1.0
+            return False
+        point = (fix["latitude"], fix["longitude"])
+        if (self.mc_discovery_last_fix is not None
+                and distance(self.mc_discovery_last_fix, point)
+                < MC_DISCOVERY_MIN_DISTANCE_M):
+            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+            return False
+        try:
+            tag = lora.send_meshcore_discovery(point[0], point[1], now=now)
+        except Exception as exc:
+            app._term_add(
+                "[ALL] MeshCore discovery failed: " + str(exc)[:100],
+                raw=True,
+            )
+            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+            return False
+        if not tag:
+            self.mc_discovery_next = float(now) + 1.0
+            return False
+        self.mc_discovery_last_fix = point
+        self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+        app._term_add(
+            "[ALL] MeshCore DISC queued at current GPS; listening after TX",
+            raw=True,
+        )
+        return True
 
     def poll_cell(self, now):
         active = (self.scan.state == "running" and self.scan.mode == "wardrive"

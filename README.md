@@ -295,8 +295,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
-| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and enabled ADS-B/MeshCore collectors |
-| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and optional cell/ADS-B/MeshCore paths |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, enabled ADS-B, and active MeshCore discovery |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and cell/ADS-B/active MeshCore paths |
 | ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
@@ -467,6 +467,13 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 ## MeshCore Messenger
 
 Background mesh chat over LoRa SX1262 (869.618 MHz). Auto-starts with LoRa toggle in SYSTEM — sends advert to mesh network so messages can be received immediately. Closing the chat (ESC) keeps MeshCore running in background.
+
+When LoRa is enabled, both **All Wardrive** modes also send MeshCore
+`DISCOVER_REQ` control packets.  These are direct zero-hop probes rather than
+flooded chat traffic.  WDG sends at most one every 30 seconds after a fresh GPS
+fix has moved at least 25 metres, listens seven seconds for tagged repeater/room
+responses, and records the strongest reply at the probe location.  Ordinary
+MeshCore listening and adverts continue to work as before.
 
 - **Fullscreen chat** with scrollable message history
 - **Multi-channel support** — public, hashtag (#name), and private channels

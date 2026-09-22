@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Make the LoRa portion of both All Wardrive modes actively discover nearby
+  MeshCore infrastructure. WDG now transmits a direct, zero-hop `DISCOVER_REQ`
+  at MeshMapper's 30-second/25-metre cadence, matches repeater/room responses to
+  the request's random tag during a seven-second window, retains the strongest
+  response, and records its full public key at the host GPS observation point.
+  The official MeshCore advert-type bit mask (`0x0C`) is used; probes are not
+  flooded and do not transmit wardriving channel messages.
 - Fix AIO v2 MeshCore transmission by using LoRaRF's documented asynchronous
   `endPacket()` plus `wait()` flow in polling mode, then resuming continuous RX
   through the library API. WPA-sec uploads now remember permanent capture

@@ -103,6 +103,18 @@ MESHCORE_PUBLIC_HASH = 0x11
 MESHCORE_SYNC_WORD = 0x1424  # private LoRa sync word
 MESHCORE_PREAMBLE = 16
 
+# MeshCore zero-hop node discovery.  The request is deliberately direct rather
+# than flooded: nearby repeater/room firmware answers with a tagged public key
+# and signal report.  Repeater firmware limits replies to four per two minutes,
+# so All Wardrive follows MeshMapper's 30-second cadence and 7-second window.
+MC_DISCOVERY_INTERVAL = 30.0
+MC_DISCOVERY_WINDOW = 7.0
+MC_DISCOVERY_MIN_DISTANCE_M = 25.0
+MC_DISCOVERY_REQ = 0x80
+MC_DISCOVERY_RESP = 0x90
+MC_DISCOVERY_TYPE_FILTER = (1 << 2) | (1 << 3)  # repeater + room = 0x0C
+MC_DISCOVERY_NODE_TYPES = {2: "Repeater", 3: "Room"}
+
 
 @dataclass
 class MeshCoreChannel:
@@ -288,6 +300,9 @@ class LoRaManager:
         self._mc_channels: list[MeshCoreChannel] = [PUBLIC_CHANNEL]
         self._mc_active_ch: int = 0  # index for TX
         self._known_pubkeys: dict[str, bytes] = {}  # node_id → pubkey
+        self._mc_discovery_lock = threading.Lock()
+        self._mc_discovery: dict | None = None
+        self._mc_discovery_last_tx = 0.0
 
     def set_mc_channels(self, channels: list) -> None:
         """Set channel list (thread-safe snapshot)."""
@@ -463,6 +478,7 @@ class LoRaManager:
             errors = 0
             while not self._stop_event.is_set():
                 try:
+                    self._finish_meshcore_discovery()
                     if use_continuous:
                         # Poll IRQ register directly — GPIO callback
                         # with bouncetime is unreliable, misses packets
@@ -478,7 +494,8 @@ class LoRaManager:
                         elif irq & (lora.IRQ_CRC_ERR | lora.IRQ_HEADER_ERR):
                             lora.clearIrqStatus(0x03FF)
                         # Check TX queue between RX polls
-                        if not self._tx_queue.empty():
+                        if (not self._tx_queue.empty()
+                                and not self._meshcore_discovery_listening()):
                             self._do_tx(lora)
                         errors = 0
                         continue
@@ -514,6 +531,7 @@ class LoRaManager:
             self._emit(f"Sniffer error: {exc}", "error")
             log.error("LoRa sniffer error: %s", exc)
         finally:
+            self.cancel_meshcore_discovery()
             self._cleanup_radio(lora)
             self._emit("Sniffer stopped.", "dim")
 
@@ -970,11 +988,80 @@ class LoRaManager:
             #   [dest_hash(1)][src_hash(1)][MAC(2)][ciphertext]
             # Decrypted: [path_len(1)][embedded_type(1)][embedded_data...]
             self._decode_mc_pathreturn(payload)
+        elif payload_type == 0x0B:
+            self._decode_mc_control(payload, rssi, snr, hops)
         elif payload_type in (0x00, 0x01):
             self._emit(f"  [Encrypted peer msg] {len(payload)}B", "dim")
         else:
             if payload:
                 self._emit(f"  type=0x{payload_type:02x} {payload[:32].hex()}", "dim")
+
+    def _decode_mc_control(self, payload: bytearray, lora_rssi: float = 0,
+                           lora_snr: float = 0, hops: int = 0) -> None:
+        """Collect a tagged MeshCore DISCOVER_RESP for the active window."""
+        if not payload:
+            return
+        subtype = payload[0] & 0xF0
+        if subtype == MC_DISCOVERY_REQ:
+            self._emit("  DISC request heard", "dim")
+            return
+        if subtype != MC_DISCOVERY_RESP:
+            self._emit(f"  Control: {payload[:32].hex()}", "dim")
+            return
+
+        # Full-key responses are 38 bytes.  All Wardrive requests full keys so
+        # that uploads can use a collision-resistant identity; an 8-byte prefix
+        # response is not enough to satisfy that contract.
+        if len(payload) < 38:
+            self._emit(
+                f"  DISC response too short ({len(payload)}B; need 38)",
+                "warning",
+            )
+            return
+        node_type = payload[0] & 0x0F
+        type_name = MC_DISCOVERY_NODE_TYPES.get(node_type)
+        if type_name is None:
+            self._emit(
+                f"  DISC ignored unsupported node type {node_type}", "dim")
+            return
+        remote_snr = struct.unpack("b", bytes(payload[1:2]))[0] / 4.0
+        response_tag = bytes(payload[2:6])
+        pubkey = bytes(payload[6:38])
+
+        with self._mc_discovery_lock:
+            window = self._mc_discovery
+            if (not window or response_tag != window["tag"]
+                    or window["state"] not in ("queued", "listening")):
+                return
+            if (window["state"] == "listening"
+                    and time.monotonic() > window["deadline"]):
+                return
+            node_id = pubkey[:4].hex()
+            previous = window["nodes"].get(pubkey)
+            observation = {
+                "node_id": node_id,
+                "node_type": node_type,
+                "type_name": type_name,
+                "pubkey": pubkey,
+                "rssi": float(lora_rssi),
+                "snr": float(lora_snr),
+                "remote_snr": remote_snr,
+                "hops": max(0, int(hops)),
+                "lat": window["lat"],
+                "lon": window["lon"],
+            }
+            # MeshMapper retains the best local SNR when a node answers more
+            # than once in one window.  Keep the matching RSSI with that sample.
+            if previous is None or observation["snr"] > previous["snr"]:
+                window["nodes"][pubkey] = observation
+
+        self._known_pubkeys[node_id] = pubkey
+        self._emit(
+            f"  DISC {type_name} {node_id} "
+            f"RSSI:{lora_rssi:.0f} SNR:{lora_snr:.1f}/"
+            f"{remote_snr:.1f}dB",
+            "attack_active",
+        )
 
     def _decode_mc_advert(self, payload: bytearray, lora_rssi: float = 0,
                           lora_snr: float = 0, hops: int = 0) -> None:
@@ -1116,7 +1203,7 @@ class LoRaManager:
             self._emit(f"  [{ch_label}] decrypt err: {exc}", "warning")
 
     # ------------------------------------------------------------------
-    # MeshCore TX — send group text and advertisements
+    # MeshCore TX — messages, advertisements and zero-hop discovery
     # ------------------------------------------------------------------
 
     def _preseed_dedup(self, packet: bytes) -> bytes:
@@ -1159,6 +1246,113 @@ class LoRaManager:
         packet = self._build_mc_advert(node_name, lat, lon)
         self._preseed_dedup(packet)
         self._tx_queue.put(packet)
+
+    @staticmethod
+    def _build_mc_discovery_request(tag: bytes, since: int = 0) -> bytes:
+        """Build an on-air zero-hop DISCOVER_REQ (not companion command 0x37)."""
+        if len(tag) != 4:
+            raise ValueError("MeshCore discovery tag must be exactly 4 bytes")
+        if not 0 <= int(since) <= 0xFFFFFFFF:
+            raise ValueError("MeshCore discovery timestamp is out of range")
+        # header = CONTROL payload (0x0B) + DIRECT route (0x02); zero path.
+        control = (bytes([MC_DISCOVERY_REQ, MC_DISCOVERY_TYPE_FILTER])
+                   + bytes(tag) + struct.pack("<I", int(since)))
+        return bytes([(0x0B << 2) | 0x02, 0x00]) + control
+
+    def send_meshcore_discovery(self, lat: float, lon: float,
+                                now: float | None = None) -> bytes | None:
+        """Queue one paced zero-hop discovery and remember its GPS position."""
+        if not self.running or self.mode != "meshcore":
+            return None
+        current = time.monotonic() if now is None else float(now)
+        with self._mc_discovery_lock:
+            if self._mc_discovery is not None:
+                return None
+            if (self._mc_discovery_last_tx
+                    and current - self._mc_discovery_last_tx
+                    < MC_DISCOVERY_INTERVAL):
+                return None
+            tag = os.urandom(4)
+            packet = self._build_mc_discovery_request(tag)
+            self._mc_discovery = {
+                "tag": tag,
+                "packet": packet,
+                "state": "queued",
+                "queued_at": current,
+                "deadline": 0.0,
+                "lat": float(lat),
+                "lon": float(lon),
+                "nodes": {},
+            }
+        self._tx_queue.put(packet)
+        self._emit("  DISC request queued (direct, zero-hop)", "dim")
+        return tag
+
+    def _mark_meshcore_discovery_tx(self, packet: bytes,
+                                    success: bool) -> bool:
+        """Start the response window when the matching packet reaches air."""
+        current = time.monotonic()
+        with self._mc_discovery_lock:
+            window = self._mc_discovery
+            if not window or window["packet"] != packet:
+                return False
+            if not success:
+                self._mc_discovery = None
+                message = "  DISC request failed; response window cancelled"
+            else:
+                window["state"] = "listening"
+                window["deadline"] = current + MC_DISCOVERY_WINDOW
+                self._mc_discovery_last_tx = current
+                message = "  DISC request sent; listening 7s"
+        self._emit(message, "success" if success else "warning")
+        return True
+
+    def _meshcore_discovery_listening(self) -> bool:
+        """Return true while discovery owns the radio's RX window."""
+        with self._mc_discovery_lock:
+            window = self._mc_discovery
+            return bool(window and window["state"] == "listening"
+                        and time.monotonic() <= window["deadline"])
+
+    def _finish_meshcore_discovery(self, now: float | None = None,
+                                   force: bool = False) -> int | None:
+        """Close an expired discovery window and publish its best responses."""
+        current = time.monotonic() if now is None else float(now)
+        with self._mc_discovery_lock:
+            window = self._mc_discovery
+            if window is None:
+                return None
+            if not force:
+                if window["state"] == "queued":
+                    # A stopped/failed radio must not retain a request forever.
+                    if current - window["queued_at"] <= 15.0:
+                        return None
+                elif current <= window["deadline"]:
+                    return None
+            nodes = list(window["nodes"].values())
+            self._mc_discovery = None
+
+        for node in nodes:
+            if self._on_node:
+                try:
+                    self._on_node(
+                        node["node_id"], node["type_name"], node["node_id"],
+                        node["lat"], node["lon"], node["rssi"], node["snr"],
+                        node["pubkey"], 0,
+                    )
+                except Exception:
+                    pass
+        self._emit(
+            f"  DISC window complete: {len(nodes)} nearby node"
+            + ("s" if len(nodes) != 1 else ""),
+            "success" if nodes else "dim",
+        )
+        return len(nodes)
+
+    def cancel_meshcore_discovery(self) -> None:
+        """Forget a pending window when the radio itself is stopping."""
+        with self._mc_discovery_lock:
+            self._mc_discovery = None
 
     def _build_mc_group_text(self, text: str, node_name: str) -> bytes:
         """Build MeshCore Group Text packet on active channel."""
@@ -1530,9 +1724,15 @@ class LoRaManager:
                     )
                     self._emit(
                         f"  TX: {len(packet)}B failed: {detail}", "error")
+                discovery_tx = self._mark_meshcore_discovery_tx(packet, tx_ok)
+                if discovery_tx and tx_ok:
+                    # Preserve the full response window.  Any chat/advert
+                    # queued behind this request is sent after the window.
+                    break
             except Exception as exc:
                 self._emit(f"  TX error: {exc}", "error")
                 log.exception("LoRa TX failed for %d-byte packet", len(packet))
+                self._mark_meshcore_discovery_tx(packet, False)
 
         # A TX changes the packet length and IRQ mask.  Restore the complete
         # receive configuration, then let LoRaRF enter continuous receive via
@@ -1577,3 +1777,4 @@ class LoRaManager:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._thread = None
+        self.cancel_meshcore_discovery()

@@ -976,6 +976,44 @@ def test_all_wardrive_reuses_running_aux_collectors(game):
     assert "[ALL] ADS-B collection active" in lines
 
 
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_all_wardrive_meshcore_discovery_uses_fresh_moving_gps(
+        game, wifi_only):
+    send = Mock(return_value=b"tag!")
+    game._lora_enabled = True
+    game._lora = NS(
+        running=True, mode="meshcore", send_meshcore_discovery=send)
+    w = game.wardrive
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.session = "disc-session"
+    w.scan.wifi_only = wifi_only
+    w.scan.diagnostic = False
+
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.0, longitude=-90.0, received_at=10), 10)
+    assert w.poll_meshcore_discovery(10)
+    send.assert_called_once_with(40.0, -90.0, now=10)
+
+    # A fresh fix at the next interval is still skipped until the wardriver
+    # has moved the same 25 metres MeshMapper requires.
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.0, longitude=-90.0, received_at=40), 40)
+    assert not w.poll_meshcore_discovery(40)
+    assert send.call_count == 1
+
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.001, longitude=-90.0, received_at=70), 70)
+    assert w.poll_meshcore_discovery(70)
+    assert send.call_count == 2
+
+    w.scan.diagnostic = True
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.002, longitude=-90.0, received_at=100), 100)
+    assert not w.poll_meshcore_discovery(100)
+    assert send.call_count == 2
+
+
 def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
     lora = NS(running=False, mode="", queue=Queue())
     lora.set_mc_channels = Mock()
