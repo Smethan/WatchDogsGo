@@ -295,8 +295,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
-| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, enabled ADS-B, and active MeshCore discovery |
-| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and cell/ADS-B/active MeshCore paths |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and the selected LoRa/ADS-B/433 collectors |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and selected host collectors |
 | ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
@@ -335,8 +335,8 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 |------|---------|-------------|
 | STOP ALL | `stop` | Emergency stop all operations |
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
-| LoRa | — | Toggle LoRa module ON/OFF (AIO GPIO, auto-starts MeshCore) |
-| SDR | — | Toggle the AIO SDR ON/OFF; All Wardrive starts ADS-B collection when this is ON |
+| LoRa | — | Toggle LoRa module power; automatic MeshCore ownership follows Wardrive Settings |
+| SDR | — | Toggle AIO SDR power; Wardrive Settings selects ADS-B, 433 MHz, or neither |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
 | Upload WPA-SEC | — | Incrementally upload every network's crackable handshake `.pcapng` to wpa-sec.stanev.org, regardless of the WDG whitelist; successful content hashes are remembered and invalid/empty captures are rejected locally (prompts for an API key if needed; old PCAP-only loot remains readable) |
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
@@ -466,14 +466,26 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 
 ## MeshCore Messenger
 
-Background mesh chat over LoRa SX1262 (869.618 MHz). Auto-starts with LoRa toggle in SYSTEM — sends advert to mesh network so messages can be received immediately. Closing the chat (ESC) keeps MeshCore running in background.
+Background mesh chat over LoRa SX1262 (869.618 MHz). When automatic MeshCore
+ownership is enabled, the SYSTEM LoRa toggle starts it and sends an advert so
+messages can be received immediately. With automatic ownership off, the radio
+is only powered and remains available to `meshtasticd`; opening MeshCore
+Messenger is the explicit way to claim it. Closing chat (ESC) keeps a manually
+started MeshCore receiver running in the background.
 
-When LoRa is enabled, both **All Wardrive** modes also send MeshCore
+When **Automatic MeshCore LoRa** is enabled in Wardrive Settings, both
+**All Wardrive** modes also send MeshCore
 `DISCOVER_REQ` control packets.  These are direct zero-hop probes rather than
 flooded chat traffic.  WDG sends at most one every 30 seconds after a fresh GPS
 fix has moved at least 25 metres, listens seven seconds for tagged repeater/room
 responses, and records the strongest reply at the probe location.  Ordinary
 MeshCore listening and adverts continue to work as before.
+
+**SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
+may automatically claim the powered LoRa and SDR devices. LoRa OFF leaves the
+radio free for `meshtasticd`; MeshCore Messenger can still be started manually.
+ADS-B and 433 MHz are mutually exclusive because they share the AIO RTL-SDR.
+Enabling either one disables the other, and both may be left off.
 
 - **Fullscreen chat** with scrollable message history
 - **Multi-channel support** — public, hashtag (#name), and private channels

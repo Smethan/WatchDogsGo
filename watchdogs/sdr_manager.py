@@ -37,10 +37,6 @@ RTL433_CMD = [
     "-M", "level",               # include signal level
 ]
 
-# Device index: dump1090 uses device 0, rtl_433 uses device 1
-# (or run them sequentially, not simultaneously)
-RTL433_CMD_DEV1 = RTL433_CMD + ["-d", "1"]
-
 ADSB_TIMEOUT = 60  # remove aircraft not seen for 60s
 SENSOR_TIMEOUT = 300  # remove sensors not seen for 5min
 
@@ -81,7 +77,7 @@ class SDRManager:
 
     def __init__(self):
         self.running = False
-        self.mode: str = ""  # "adsb", "433", "adsb+433"
+        self.mode: str = ""  # "adsb" or "433"; one AIO tuner, never both
 
         # ADS-B state
         self.aircraft: dict[str, Aircraft] = {}  # icao -> Aircraft
@@ -118,6 +114,10 @@ class SDRManager:
 
     def start_adsb(self, loot_dir: str = "") -> bool:
         """Start ADS-B tracking via dump1090."""
+        if self._rtl433_proc:
+            self._events.put((
+                "error", "433 MHz is active; stop it before starting ADS-B"))
+            return False
         executable = find_dump1090()
         if not executable:
             self._events.put(("error", "dump1090 not installed"))
@@ -181,6 +181,10 @@ class SDRManager:
     def start_433(self, loot_dir: str = "", gps_lat: float = 0.0,
                   gps_lon: float = 0.0) -> bool:
         """Start 433 MHz sensor decoding via rtl_433."""
+        if self._dump1090_proc:
+            self._events.put((
+                "error", "ADS-B is active; stop it before starting 433 MHz"))
+            return False
         if not self.has_rtl433():
             self._events.put(("error", "rtl_433 not installed"))
             return False
@@ -191,11 +195,9 @@ class SDRManager:
         self._gps_lat = gps_lat
         self._gps_lon = gps_lon
 
-        # Use device 1 if dump1090 is already using device 0
-        cmd = RTL433_CMD_DEV1 if self._dump1090_proc else RTL433_CMD
         try:
             self._rtl433_proc = subprocess.Popen(
-                cmd,
+                RTL433_CMD,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
@@ -220,10 +222,7 @@ class SDRManager:
         self._threads.append(t)
 
         self.running = True
-        if self.mode == "adsb":
-            self.mode = "adsb+433"
-        else:
-            self.mode = "433"
+        self.mode = "433"
         self._events.put(("status", "433 MHz scanner started (rtl_433)"))
         return True
 

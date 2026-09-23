@@ -35,6 +35,12 @@ DEFAULTS = {
     "lte_modem": True,
     "cell_tracking": True,
     "cell_neighbors": False,
+    # Automatic host collectors used by All Wardrive. These do not power the
+    # hardware; they decide whether WDG may claim it for a collector. Defaults
+    # preserve the behavior from before these controls existed.
+    "wardrive_lora": True,
+    "wardrive_adsb": True,
+    "wardrive_433": False,
     "realert_seconds": 60,
     "suppressed_rules": [],
     "suppressed_devices": [],
@@ -89,6 +95,11 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
     result["network_dots"] = any(
         result[f"dot_{layer}_mode"] != MODE_OFF
         for layer in ("wifi", "ble"))
+    # One RTL-SDR cannot run dump1090 and rtl_433 at the same time. A hand-
+    # edited invalid file resolves to the historical ADS-B default; the UI
+    # toggle records the user's most recent choice explicitly.
+    if result["wardrive_adsb"] and result["wardrive_433"]:
+        result["wardrive_433"] = False
     return result
 
 

@@ -977,6 +977,75 @@ def test_all_wardrive_reuses_running_aux_collectors(game):
 
 
 @pytest.mark.parametrize("wifi_only", [False, True])
+def test_all_wardrive_collector_settings_leave_lora_free_and_start_433(
+        game, wifi_only):
+    w = game.wardrive
+    w.settings.update(
+        wardrive_lora=False, wardrive_adsb=False, wardrive_433=True,
+        lte_modem=False)
+    lora = NS(running=False, mode="", start_meshcore=Mock(),
+              set_mc_channels=Mock())
+    sdr = NS(running=False, mode="", start_adsb=Mock(),
+             start_433=Mock(return_value=True), poll_events=Mock(return_value=[]))
+    game._lora_enabled = game._sdr_enabled = True
+    game._lora = lora
+    game._sdr = sdr
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.wifi_only = wifi_only
+    w.scan.diagnostic = False
+
+    assert w.start_auxiliary_collectors()
+
+    lora.start_meshcore.assert_not_called()
+    sdr.start_adsb.assert_not_called()
+    sdr.start_433.assert_called_once_with(
+        str(game.loot.session_path), game.player_lat, game.player_lon)
+    assert w._wdg_owned_sdr is True
+    lines = [call.args[0] for call in game._term_add.call_args_list]
+    assert any("MeshCore disabled (Wardrive Settings" in line
+               for line in lines)
+    assert "[ALL] 433 MHz collection started (SDR enabled)" in lines
+
+
+def test_all_wardrive_can_disable_every_host_radio_collector(game):
+    w = game.wardrive
+    w.settings.update(
+        wardrive_lora=False, wardrive_adsb=False, wardrive_433=False,
+        lte_modem=False)
+    game._lora_enabled = game._sdr_enabled = True
+    game._lora = NS(running=False, mode="", start_meshcore=Mock())
+    game._sdr = NS(running=False, mode="", start_adsb=Mock(),
+                   start_433=Mock())
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.diagnostic = False
+
+    assert not w.start_auxiliary_collectors()
+    game._lora.start_meshcore.assert_not_called()
+    game._sdr.start_adsb.assert_not_called()
+    game._sdr.start_433.assert_not_called()
+
+
+def test_disabled_lora_collector_suppresses_active_meshcore_discovery(game):
+    w = game.wardrive
+    w.settings["wardrive_lora"] = False
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.diagnostic = False
+    game._lora_enabled = True
+    game._lora = NS(
+        running=True,
+        mode="meshcore",
+        send_meshcore_discovery=Mock(return_value=True),
+    )
+
+    assert not w.poll_meshcore_discovery(100.0)
+    game._lora.send_meshcore_discovery.assert_not_called()
+    assert w.mc_discovery_next > 100.0
+
+
+@pytest.mark.parametrize("wifi_only", [False, True])
 def test_all_wardrive_meshcore_discovery_uses_fresh_moving_gps(
         game, wifi_only):
     send = Mock(return_value=b"tag!")

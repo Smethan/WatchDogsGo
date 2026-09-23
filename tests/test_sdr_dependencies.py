@@ -74,3 +74,20 @@ def test_adsb_launches_resolved_binary_including_retry(monkeypatch, retry):
     if retry:
         expected.append([binary, "--net"])
     assert commands == expected
+
+
+def test_sdr_manager_rejects_adsb_and_433_concurrently(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager._rtl433_proc = object()
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", Mock())
+
+    assert not manager.start_adsb()
+    assert manager.poll_events() == [
+        ("error", "433 MHz is active; stop it before starting ADS-B")]
+    sdr_manager.subprocess.Popen.assert_not_called()
+
+    manager = sdr_manager.SDRManager()
+    manager._dump1090_proc = object()
+    assert not manager.start_433()
+    assert manager.poll_events() == [
+        ("error", "ADS-B is active; stop it before starting 433 MHz")]

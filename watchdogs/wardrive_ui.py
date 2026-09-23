@@ -67,6 +67,7 @@ class WardriveUI:
         self.settings_page = "main"
         self.selection = 0
         self.layer_selection = 0
+        self.collector_selection = 0
         self.details = False
         self.detail_selection = 0
         self.notables = OrderedDict()
@@ -86,6 +87,10 @@ class WardriveUI:
         self.mc_discovery_session = None
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
+        lora = getattr(app, "_lora", None)
+        self._wdg_owned_lora = bool(
+            lora is not None and lora.running and lora.mode == "meshcore")
+        self._wdg_owned_sdr = False
 
     def on_stop(self):
         self.targets.cancel()
@@ -420,10 +425,10 @@ class WardriveUI:
         """Ensure enabled host radios are collecting for All Wardrive.
 
         LoRa and SDR are host-side add-ons, so they are deliberately started
-        only after the ESP32 acknowledges a real wardrive session.  Their
-        hardware toggles own their lifetime: the collectors keep running in
-        the background when the map/menu is opened or the ESP scan is stopped,
-        and switching the corresponding SYSTEM toggle off stops them.
+        only after the ESP32 acknowledges a real wardrive session. Wardrive
+        Settings controls whether WDG may claim each radio automatically;
+        SYSTEM still controls hardware power. Collectors keep running when the
+        map/menu is opened or the ESP scan is stopped.
         """
         app = self.app
         if (self.scan.mode != "wardrive" or self.scan.diagnostic
@@ -432,7 +437,11 @@ class WardriveUI:
 
         started = False
         lora = getattr(app, "_lora", None)
-        if getattr(app, "_lora_enabled", False):
+        if not self.settings["wardrive_lora"]:
+            app._term_add(
+                "[ALL] MeshCore disabled (Wardrive Settings > Collectors)",
+                raw=True)
+        elif getattr(app, "_lora_enabled", False):
             if lora is None:
                 app._term_add("[ALL] MeshCore unavailable: LoRa manager missing",
                               raw=True)
@@ -457,6 +466,7 @@ class WardriveUI:
                 else:
                     if lora.running and lora.mode == "meshcore":
                         started = True
+                        self._wdg_owned_lora = True
                         app._term_add(
                             "[ALL] MeshCore collection starting (LoRa enabled)",
                             raw=True)
@@ -468,56 +478,89 @@ class WardriveUI:
                             "[ALL] MeshCore unavailable; WiFi/BLE continue",
                             ORANGE)
         else:
-            app._term_add("[ALL] MeshCore disabled (SYSTEM > LoRa)", raw=True)
+            app._term_add(
+                "[ALL] MeshCore selected but LoRa power is off (SYSTEM > LoRa)",
+                raw=True)
 
         sdr = getattr(app, "_sdr", None)
-        if getattr(app, "_sdr_enabled", False):
-            if sdr is None:
-                app._term_add("[ALL] ADS-B unavailable: SDR manager missing",
-                              raw=True)
-            elif sdr.running and "adsb" in sdr.mode:
-                app._term_add("[ALL] ADS-B collection active", raw=True)
-            elif sdr.running:
-                # The AIO has one RTL-SDR.  Taking it away from an active 433
-                # scan would silently break that add-on, so leave it alone.
-                app._term_add(
-                    f"[ALL] ADS-B skipped: SDR busy in {sdr.mode or 'another'} mode",
-                    raw=True)
-                app.msg("[ALL] ADS-B skipped; SDR is busy", ORANGE)
-            elif not app.loot or not app.loot.active:
-                app._term_add(
-                    "[ALL] ADS-B skipped: no writable loot session", raw=True)
-                app.msg("[ALL] ADS-B needs a writable loot session", ORANGE)
-            else:
-                try:
-                    ok = sdr.start_adsb(str(Path(app.loot.session_path)))
-                except Exception as exc:
-                    ok = False
-                    app._term_add(
-                        "[ALL] ADS-B start failed: " + str(exc)[:100], raw=True)
-                if ok:
-                    started = True
-                    app._term_add(
-                        "[ALL] ADS-B collection started (SDR enabled)", raw=True)
-                    try:
-                        app._earn_badge("skywatch")
-                    except Exception:
-                        pass
-                else:
-                    reason = "ADS-B decoder unavailable"
-                    try:
-                        for event, value in sdr.poll_events():
-                            if event == "error":
-                                reason = str(value)
-                            app._term_add(f"[SDR] {value}", raw=True)
-                    except Exception:
-                        pass
-                    app._term_add("[ALL] ADS-B unavailable: " + reason[:100],
-                                  raw=True)
-                    app.msg("[ALL] ADS-B unavailable; WiFi/BLE continue", ORANGE)
+        sdr_choice = self._selected_sdr_collector()
+        sdr_label = "ADS-B" if sdr_choice == "adsb" else "433 MHz"
+        if not sdr_choice:
+            app._term_add(
+                "[ALL] SDR collectors disabled (Wardrive Settings > Collectors)",
+                raw=True)
+        elif not getattr(app, "_sdr_enabled", False):
+            app._term_add(
+                f"[ALL] {sdr_label} selected but SDR power is off (SYSTEM > SDR)",
+                raw=True)
+        elif sdr is None:
+            app._term_add(
+                f"[ALL] {sdr_label} unavailable: SDR manager missing", raw=True)
+        elif sdr.running and sdr.mode == sdr_choice:
+            app._term_add(f"[ALL] {sdr_label} collection active", raw=True)
+        elif sdr.running:
+            # Respect an add-on the user started manually. All Wardrive never
+            # takes the single RTL-SDR away from its current owner.
+            app._term_add(
+                f"[ALL] {sdr_label} skipped: SDR busy in "
+                f"{sdr.mode or 'another'} mode",
+                raw=True)
+            app.msg(f"[ALL] {sdr_label} skipped; SDR is busy", ORANGE)
+        elif not app.loot or not app.loot.active:
+            app._term_add(
+                f"[ALL] {sdr_label} skipped: no writable loot session",
+                raw=True)
+            app.msg(
+                f"[ALL] {sdr_label} needs a writable loot session", ORANGE)
         else:
-            app._term_add("[ALL] ADS-B disabled (SYSTEM > SDR)", raw=True)
+            loot_path = str(Path(app.loot.session_path))
+            try:
+                if sdr_choice == "adsb":
+                    ok = sdr.start_adsb(loot_path)
+                else:
+                    lat = app.player_lat if app.gps_fix else 0.0
+                    lon = app.player_lon if app.gps_fix else 0.0
+                    ok = sdr.start_433(loot_path, lat, lon)
+            except Exception as exc:
+                ok = False
+                app._term_add(
+                    f"[ALL] {sdr_label} start failed: " + str(exc)[:100],
+                    raw=True)
+            if ok:
+                started = True
+                self._wdg_owned_sdr = True
+                app._term_add(
+                    f"[ALL] {sdr_label} collection started (SDR enabled)",
+                    raw=True)
+                try:
+                    app._earn_badge(
+                        "skywatch" if sdr_choice == "adsb" else "iot_hunter")
+                except Exception:
+                    pass
+            else:
+                reason = f"{sdr_label} decoder unavailable"
+                try:
+                    for event, value in sdr.poll_events():
+                        if event == "error":
+                            reason = str(value)
+                        app._term_add(f"[SDR] {value}", raw=True)
+                except Exception:
+                    pass
+                app._term_add(
+                    f"[ALL] {sdr_label} unavailable: " + reason[:100],
+                    raw=True)
+                app.msg(
+                    f"[ALL] {sdr_label} unavailable; WiFi/BLE continue",
+                    ORANGE)
         return started
+
+    def _selected_sdr_collector(self):
+        """Return the one automatic All Wardrive SDR collector, if any."""
+        if self.settings["wardrive_adsb"]:
+            return "adsb"
+        if self.settings["wardrive_433"]:
+            return "433"
+        return ""
 
     def poll_meshcore_discovery(self, now):
         """Actively probe direct MeshCore repeaters during real wardrives.
@@ -546,7 +589,8 @@ class WardriveUI:
 
         app = self.app
         lora = getattr(app, "_lora", None)
-        if (not getattr(app, "_lora_enabled", False) or lora is None
+        if (not self.settings["wardrive_lora"]
+                or not getattr(app, "_lora_enabled", False) or lora is None
                 or not lora.running or lora.mode != "meshcore"):
             self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
             return False
@@ -1015,6 +1059,27 @@ class WardriveUI:
                 else:
                     self.cycle_fade_seconds(direction)
             return
+        if self.settings_page == "collectors":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "main"
+                return
+            collector_keys = (
+                "wardrive_lora", "wardrive_adsb", "wardrive_433")
+            if px.btnp(px.KEY_UP):
+                self.collector_selection = max(
+                    0, self.collector_selection - 1)
+            if px.btnp(px.KEY_DOWN):
+                self.collector_selection = min(
+                    len(collector_keys) - 1,
+                    self.collector_selection + 1)
+            if px.btnp(px.KEY_RETURN):
+                self.toggle_setting(
+                    collector_keys[self.collector_selection])
+            return
         if px.btnp(px.KEY_ESCAPE) or px.btnp(px.KEY_TAB):
             self.settings_open = False
             return
@@ -1040,7 +1105,7 @@ class WardriveUI:
                 self.persist_settings()
             return
         keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                "lte_modem", "cell_tracking", "cell_neighbors")
+                "_collectors", "lte_modem", "cell_tracking", "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
@@ -1048,6 +1113,9 @@ class WardriveUI:
             if key == "_map_layers":
                 self.settings_page = "layers"
                 self.layer_selection = 0
+            elif key == "_collectors":
+                self.settings_page = "collectors"
+                self.collector_selection = 0
             elif key == "trail_mode":
                 self.cycle_trail_mode()
             else:
@@ -1105,6 +1173,10 @@ class WardriveUI:
         if key not in DEFAULTS or type(DEFAULTS[key]) is not bool:
             return
         self.settings[key] = not self.settings[key]
+        if key == "wardrive_adsb" and self.settings[key]:
+            self.settings["wardrive_433"] = False
+        elif key == "wardrive_433" and self.settings[key]:
+            self.settings["wardrive_adsb"] = False
         if key in ("flock", "axon"):
             self._refresh_notable_identities()
         if key == "lte_modem":
@@ -1127,7 +1199,43 @@ class WardriveUI:
             self.cell.stop()
         if key == "cell_neighbors" and self.cell.active:
             self.app.msg("[CELL] Neighbor setting applies to the next wardrive session", 13)
+        if key in ("wardrive_lora", "wardrive_adsb", "wardrive_433"):
+            self._apply_collector_setting_change(key)
         self.persist_settings()
+
+    def _apply_collector_setting_change(self, key):
+        """Release WDG-owned radios and apply enabled choices mid-session."""
+        app = self.app
+        if key == "wardrive_lora" and not self.settings[key]:
+            lora = getattr(app, "_lora", None)
+            if (self._wdg_owned_lora and lora is not None
+                    and lora.running and lora.mode == "meshcore"):
+                lora.stop()
+                app._term_add(
+                    "[ALL] WDG MeshCore stopped; LoRa released", raw=True)
+            self._wdg_owned_lora = False
+
+        sdr = getattr(app, "_sdr", None)
+        desired = self._selected_sdr_collector()
+        if (key in ("wardrive_adsb", "wardrive_433")
+                and self._wdg_owned_sdr and sdr is not None
+                and sdr.running and sdr.mode != desired):
+            sdr.stop()
+            self._wdg_owned_sdr = False
+            app._term_add(
+                "[ALL] WDG SDR collector stopped; tuner released", raw=True)
+        elif (key in ("wardrive_adsb", "wardrive_433")
+              and not desired):
+            self._wdg_owned_sdr = False
+
+        active = (self.scan.state == "running"
+                  and self.scan.mode == "wardrive"
+                  and not self.scan.diagnostic)
+        enabled = ((key == "wardrive_lora" and self.settings[key])
+                   or (key in ("wardrive_adsb", "wardrive_433")
+                       and bool(desired)))
+        if active and enabled:
+            self.start_auxiliary_collectors()
 
     def persist_settings(self):
         try:
@@ -1161,15 +1269,44 @@ class WardriveUI:
                 px.camera()
                 self.app._draw_mc_toast()
                 return
+            if self.settings_page == "collectors":
+                px.text(55,47,
+                        "ALL WARDRIVE COLLECTORS   arrows / ENTER / ESC",7)
+                keys = ("wardrive_lora", "wardrive_adsb", "wardrive_433")
+                labels = ("Automatic MeshCore LoRa", "ADS-B aircraft",
+                          "433 MHz sensors")
+                for i, (key, label) in enumerate(zip(keys, labels)):
+                    value = "ON" if self.settings[key] else "OFF"
+                    px.text(
+                        55, 72+i*22,
+                        ("> " if i == self.collector_selection else "  ")
+                        + label + ": " + value,
+                        11 if i == self.collector_selection else 7)
+                px.text(55,153,
+                        "These control automatic WDG radio ownership.",13)
+                px.text(55,169,
+                        "LoRa OFF leaves a powered radio free for meshtasticd.",13)
+                px.text(55,185,
+                        "ADS-B and 433 MHz share one RTL-SDR; enabling one",10)
+                px.text(55,197,
+                        "automatically disables the other.",10)
+                px.text(55,225,
+                        "SYSTEM LoRa/SDR still controls hardware power.",7)
+                px.text(55,241,
+                        "Manual ADDONS actions remain available when powered.",7)
+                px.text(55,291,"ESC returns   TAB closes settings",10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
             keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                    "lte_modem", "cell_tracking", "cell_neighbors")
+                    "_collectors", "lte_modem", "cell_tracking", "cell_neighbors")
             labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
-                      "Map dot layers", "Wardrive trail",
+                      "Map dot layers", "Wardrive trail", "All Wardrive collectors",
                       "LTE modem integration", "Cell mast tracking",
                       "Experimental QMI neighbors")
             for i,(key,label) in enumerate(zip(keys,labels)):
-                if key == "_map_layers":
+                if key in ("_map_layers", "_collectors"):
                     value = "OPEN..."
                 elif key == "trail_mode":
                     value = self.trail_mode().upper()
@@ -1178,19 +1315,19 @@ class WardriveUI:
                 if key in ("cell_tracking", "cell_neighbors") and not self.settings["lte_modem"]:
                     value += " (LTE OFF)"
                 px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
-            px.text(55,168,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
-            px.text(55,179,"Precise = where YOU heard it, not the camera location.",13)
-            px.text(55,190,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
+            px.text(55,180,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
+            px.text(55,191,"Precise = where YOU heard it, not the camera location.",13)
+            px.text(55,202,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
             route = self.history_trail.path.parent.name if self.history_trail else "current session"
-            px.text(55,202,"[H] Route history: " + route,13)
-            px.text(55,215,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
+            px.text(55,214,"[H] Route history: " + route,13)
+            px.text(55,227,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
             items = list(self.notables.values())
             offset = max(0,self.detail_selection-4) if self.details else max(0,len(items)-5)
             for i,item in enumerate(items[offset:offset+5]):
                 selected = self.details and i+offset == self.detail_selection
                 label = ("> " if selected else "  ")+item["label"]+" "+item["mac"]+" "+str(item["rssi"])+"dBm"
                 if item["identity"] in self.settings["suppressed_devices"]: label += " MUTED"
-                px.text(55,229+i*12,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
+                px.text(55,241+i*12,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
             if self.details and items:
                 item = items[min(self.detail_selection,len(items)-1)]
                 px.text(55,291,("Rules: "+", ".join(h["id"] for h in item["evidence"]))[:104],13)

@@ -926,8 +926,11 @@ class WatchDogsGame(OtaMixin):
         self._boot_serial_port = port
         self._build_boot_checks()
 
-        # Auto-start MeshCore if LoRa hardware is already powered on
-        if self._lora_enabled:
+        # Auto-start MeshCore only when the persisted collector preference
+        # allows WDG to claim LoRa. With it off, a powered radio remains free
+        # for meshtasticd or another owner; Messenger can still be opened
+        # manually from ADDONS.
+        if self._lora_enabled and _wardrive_settings["wardrive_lora"]:
             try:
                 self._lora.set_mc_channels(self._mc_channels_list)
                 self._lora.start_meshcore(self._mc_region)
@@ -940,6 +943,10 @@ class WatchDogsGame(OtaMixin):
                                raw=True)
             except Exception:
                 pass
+        elif self._lora_enabled:
+            self._term_add(
+                "[SYS] LoRa powered; automatic WDG MeshCore is disabled",
+                raw=True)
 
         self.wardrive = WardriveUI(self, initial_settings=_wardrive_settings)
         pyxel.run(self.update, self.draw)
@@ -2619,22 +2626,34 @@ class WatchDogsGame(OtaMixin):
                 return
         # Start/stop MeshCore
         if new_state:
-            self._lora.start_meshcore(self._mc_region)
             self._lora_enabled = True
+            auto_meshcore = self.wardrive.settings["wardrive_lora"]
+            if auto_meshcore:
+                self._lora.start_meshcore(self._mc_region)
             if self._lora.running:
+                if auto_meshcore:
+                    self.wardrive._wdg_owned_lora = True
                 self.msg("[LoRa] ON — MeshCore started", C_SUCCESS)
                 self._term_add("[SYS] LoRa enabled, MeshCore active", raw=True)
+            elif not auto_meshcore:
+                self.msg("[LoRa] ON — WDG auto-start disabled", C_SUCCESS)
+                self._term_add(
+                    "[SYS] LoRa powered; left free for meshtasticd/manual use",
+                    raw=True)
             else:
                 self.msg("[LoRa] GPIO ON but radio init failed", C_WARNING)
                 self._term_add("[SYS] LoRa GPIO on, SX1262 init failed — use Watch LoRa", raw=True)
-            # Announce presence to mesh network
-            lat = self.player_lat if self.gps_fix else 0.0
-            lon = self.player_lon if self.gps_fix else 0.0
-            self._lora.send_meshcore_advert(self._mc_node_name, lat, lon)
+            if auto_meshcore:
+                # Announce presence only when WDG actually owns MeshCore.
+                lat = self.player_lat if self.gps_fix else 0.0
+                lon = self.player_lon if self.gps_fix else 0.0
+                self._lora.send_meshcore_advert(
+                    self._mc_node_name, lat, lon)
         else:
             if self._lora.running:
                 self._lora.stop()
             self._lora_enabled = False
+            self.wardrive._wdg_owned_lora = False
             self._mc_screen = False
             self._mc_bubbles.clear()
             self.msg("[LoRa] OFF", C_WARNING)
@@ -2656,6 +2675,7 @@ class WatchDogsGame(OtaMixin):
             self._term_add("[SYS] SDR enabled", raw=True)
         else:
             self._sdr.stop()
+            self.wardrive._wdg_owned_sdr = False
             self.msg("[SDR] OFF", C_WARNING)
             self._term_add("[SYS] SDR disabled", raw=True)
         self.glitch_timer = 2
@@ -2666,6 +2686,7 @@ class WatchDogsGame(OtaMixin):
             return
         if self._sdr.running and "adsb" in self._sdr.mode:
             self._sdr.stop()
+            self.wardrive._wdg_owned_sdr = False
             self.msg("[ADS-B] Stopped", C_WARNING)
             self._term_add("[SDR] ADS-B radar stopped", raw=True)
             return
@@ -2700,6 +2721,7 @@ class WatchDogsGame(OtaMixin):
             return
         if self._sdr.running and "433" in self._sdr.mode:
             self._sdr.stop()
+            self.wardrive._wdg_owned_sdr = False
             self.msg("[433] Stopped", C_WARNING)
             self._term_add("[SDR] 433 MHz scanner stopped", raw=True)
             return

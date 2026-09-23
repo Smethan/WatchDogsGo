@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add persisted **All Wardrive collectors** controls for automatic MeshCore
+  LoRa, ADS-B aircraft, and 433 MHz sensors. Disabling automatic LoRa prevents
+  WDG from claiming a powered radio at startup or when a wardrive begins, so
+  `meshtasticd` can retain ownership; MeshCore Messenger remains available as
+  an explicit action. ADS-B and 433 MHz are mutually exclusive in settings and
+  at the SDR manager boundary, while either or both host radio families may be
+  disabled. Both ESP-BLE and host-BLE All Wardrive modes honor the same choices.
 - Make the LoRa portion of both All Wardrive modes actively discover nearby
   MeshCore infrastructure. WDG now transmits a direct, zero-hop `DISCOVER_REQ`
   at MeshMapper's 30-second/25-metre cadence, matches repeater/room responses to

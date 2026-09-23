@@ -77,6 +77,47 @@ def test_invalid_display_values_fall_back_and_round_trip(tmp_path):
     assert load_settings(tmp_path) == settings
 
 
+def test_collector_defaults_and_invalid_sdr_pair_are_exclusive():
+    defaults = normalize_settings({})
+    assert defaults["wardrive_lora"] is True
+    assert defaults["wardrive_adsb"] is True
+    assert defaults["wardrive_433"] is False
+
+    conflicted = normalize_settings({
+        "wardrive_adsb": True, "wardrive_433": True})
+    assert conflicted["wardrive_adsb"] is True
+    assert conflicted["wardrive_433"] is False
+
+
+def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    ui.persist_settings = Mock()
+    ui._wdg_owned_lora = True
+    ui._wdg_owned_sdr = True
+    lora = NS(running=True, mode="meshcore", stop=Mock())
+    sdr = NS(running=True, mode="adsb", stop=Mock())
+    ui.app = NS(_lora=lora, _sdr=sdr,
+                _term_add=Mock())
+    ui.scan = NS(state="idle", mode="", diagnostic=False)
+
+    ui.toggle_setting("wardrive_433")
+    assert ui.settings["wardrive_433"] is True
+    assert ui.settings["wardrive_adsb"] is False
+    sdr.stop.assert_called_once_with()
+    assert ui._wdg_owned_sdr is False
+
+    ui.toggle_setting("wardrive_adsb")
+    assert ui.settings["wardrive_adsb"] is True
+    assert ui.settings["wardrive_433"] is False
+
+    ui.toggle_setting("wardrive_lora")
+    assert ui.settings["wardrive_lora"] is False
+    lora.stop.assert_called_once_with()
+    assert ui._wdg_owned_lora is False
+    assert ui.persist_settings.call_count == 3
+
+
 def test_display_controls_persist_and_invalidate_the_right_cache():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
