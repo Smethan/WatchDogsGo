@@ -329,12 +329,13 @@ run_as_target .venv/bin/python3 -c "import dbus" 2>/dev/null || MISSING_OPT="$MI
 run_as_target .venv/bin/python3 -c "from gi.repository import GLib" 2>/dev/null || MISSING_OPT="$MISSING_OPT python3-gi"
 run_as_target .venv/bin/python3 -c "import LoRaRF" 2>/dev/null || MISSING_OPT="$MISSING_OPT LoRaRF"
 run_as_target .venv/bin/python3 -c "import nacl" 2>/dev/null || MISSING_OPT="$MISSING_OPT PyNaCl"
+run_as_target .venv/bin/python3 -c "import meshtastic" 2>/dev/null || MISSING_OPT="$MISSING_OPT meshtastic"
 
 if [ -z "$MISSING_OPT" ]; then
     ok "Optional Python imports verified (all attacks available)"
 else
     warn "Optional packages not available:$MISSING_OPT"
-    warn "Some attacks may not work (MITM, Dragon Drain, BlueDucky, RACE, LoRa)"
+    warn "Some attacks or mesh clients may not work (MITM, Dragon Drain, BlueDucky, RACE, LoRa)"
 fi
 
 # --- 7. dump1090 from source + aiov2_ctl (uConsole only) ---

@@ -473,7 +473,9 @@ class LootManager:
     def _scan_session_dir(self, session_path: Path) -> dict:
         """Count loot items in a single session directory."""
         counts = {"pcap": 0, "hccapx": 0, "hc22000": 0, "passwords": 0, "et_captures": 0,
-                  "mc_nodes": 0, "mc_messages": 0, "bt_devices": 0, "bt_airtags": 0,
+                  "mc_nodes": 0, "mc_messages": 0,
+                  "mt_nodes": 0, "mt_messages": 0,
+                  "bt_devices": 0, "bt_airtags": 0,
                   "bt_smarttags": 0, "bt_devices_gps": 0, "wardriving": 0, "adsb": 0,
                   "wardriving_wifi": 0, "wardriving_ble": 0,
                   "cell_observations": 0, "cell_cells": 0, "mitm_pcaps": 0}
@@ -526,6 +528,20 @@ class LootManager:
         if mc_msgs_file.is_file():
             try:
                 counts["mc_messages"] = sum(1 for _ in open(mc_msgs_file, encoding="utf-8"))
+            except OSError:
+                pass
+        mt_nodes_file = session_path / "meshtastic_nodes.csv"
+        if mt_nodes_file.is_file():
+            try:
+                lines = sum(1 for _ in open(mt_nodes_file, encoding="utf-8"))
+                counts["mt_nodes"] = max(0, lines - 1)
+            except OSError:
+                pass
+        mt_msgs_file = session_path / "meshtastic_messages.log"
+        if mt_msgs_file.is_file():
+            try:
+                counts["mt_messages"] = sum(
+                    1 for _ in open(mt_msgs_file, encoding="utf-8"))
             except OSError:
                 pass
         bt_dev_file = session_path / "bt_devices.csv"
@@ -607,7 +623,8 @@ class LootManager:
     def _recalc_totals(self, db: dict) -> None:
         """Recalculate totals from all session entries."""
         keys = ("pcap", "hccapx", "hc22000", "passwords", "et_captures",
-                "mc_nodes", "mc_messages", "bt_devices", "bt_airtags", "bt_smarttags",
+                "mc_nodes", "mc_messages", "mt_nodes", "mt_messages",
+                "bt_devices", "bt_airtags", "bt_smarttags",
                 "bt_devices_gps", "wardriving", "wardriving_wifi", "wardriving_ble",
                 "cell_observations", "cell_cells", "adsb")
         totals: dict = {k: 0 for k in keys}
@@ -700,11 +717,11 @@ class LootManager:
             self._save_db(self._db)
 
     # ------------------------------------------------------------------
-    # Persistent MeshCore contacts
+    # Persistent mesh contacts
     # ------------------------------------------------------------------
 
     def load_contacts(self) -> dict[str, dict]:
-        """Load MeshCore contacts from loot_db.json.
+        """Load MeshCore and Meshtastic contacts from loot_db.json.
 
         Returns dict keyed by node_id with fields:
         id, type, name, lat, lon, rssi, snr, last_seen, first_seen, note
@@ -712,7 +729,7 @@ class LootManager:
         return dict(self._db.get("mc_contacts", {}))
 
     def save_contact(self, node_id: str, data: dict) -> bool:
-        """Save or update a MeshCore contact. Returns True if new contact."""
+        """Save or update a mesh contact. Returns True if new contact."""
         contacts = self._db.setdefault("mc_contacts", {})
         is_new = node_id not in contacts
         if is_new:
@@ -727,14 +744,14 @@ class LootManager:
         return is_new
 
     def save_contact_note(self, node_id: str, note: str) -> None:
-        """Update note for a MeshCore contact."""
+        """Update a saved mesh contact note."""
         contacts = self._db.setdefault("mc_contacts", {})
         if node_id in contacts:
             contacts[node_id]["note"] = note
             self._save_db(self._db)
 
     def delete_contact(self, node_id: str) -> None:
-        """Remove a MeshCore contact from loot_db."""
+        """Remove a saved mesh contact from loot_db."""
         contacts = self._db.get("mc_contacts", {})
         if node_id in contacts:
             del contacts[node_id]
@@ -1512,6 +1529,48 @@ class LootManager:
         path = self._session / "meshcore_messages.log"
         ts = datetime.now().strftime("%H:%M:%S")
         _sync_append(path, f"[{ts}] [{channel}] {message} (RSSI:{rssi})\n")
+        self.update_session_loot()
+
+    def save_meshtastic_node(
+            self, node_id: str, name: str, node_lat: float, node_lon: float,
+            rssi: float, snr: float, path_hops: int,
+            observed_lat: float, observed_lon: float,
+            hardware: str = "") -> None:
+        """Append one Meshtastic node per session with node and heard GPS."""
+        if not self._session_active or not node_id:
+            return
+        path = self._session / "meshtastic_nodes.csv"
+        try:
+            if path.is_file():
+                existing = path.read_text(encoding="utf-8")
+                if f",{node_id}," in existing:
+                    return
+            else:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "timestamp,node_id,name,node_lat,node_lon,rssi,snr,"
+                        "path_hops,observed_lat,observed_lon,hardware\n")
+                    _fsync_file(fh)
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8", newline="") as fh:
+                csv.writer(fh).writerow([
+                    ts, node_id, name, node_lat, node_lon, rssi, snr,
+                    max(0, int(path_hops or 0)), observed_lat, observed_lon,
+                    hardware])
+                _fsync_file(fh)
+            self.update_session_loot()
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def save_meshtastic_message(self, channel: str, sender: str,
+                                message: str, rssi: float) -> None:
+        """Append a received Meshtastic text message to the active session."""
+        if not self._session_active:
+            return
+        path = self._session / "meshtastic_messages.log"
+        ts = datetime.now().strftime("%H:%M:%S")
+        _sync_append(
+            path, f"[{ts}] [ch:{channel}] {sender}: {message} (RSSI:{rssi})\n")
         self.update_session_loot()
 
     # ------------------------------------------------------------------

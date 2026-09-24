@@ -182,6 +182,7 @@ def test_disabled_menu_item_stays_open_until_requirement_is_enabled():
     app.menu_open = True
     app._lora_enabled = False
     app._lora = NS(running=False, mode="")
+    app._mc_region = "us_ca_narrow"
     app._watch = NS(connected=False)
     app.msg = Mock()
     app._execute_item = Mock()
@@ -199,4 +200,4 @@ def test_disabled_menu_item_stays_open_until_requirement_is_enabled():
     app._activate_menu_item(addons, meshcore)
     assert not app.menu_open
     app._execute_item.assert_called_once_with(
-        "_meshcore", "meshcore", "MeshCore Messenger", [])
+        "_meshcore", "meshcore", "Mesh Messenger", [])

@@ -31,12 +31,6 @@ RUN_UID="${SUDO_UID:-$(id -u)}"
 export XDG_RUNTIME_DIR="/run/user/${RUN_UID}"
 export PULSE_SERVER="unix:/run/user/${RUN_UID}/pulse/native"
 
-# Kill processes that hold SPI/GPIO for LoRa radio (SX1262) — only if installed
-if command -v meshtasticd >/dev/null 2>&1; then
-    sudo pkill -9 meshtasticd 2>/dev/null || true
-    sudo systemctl stop meshtasticd 2>/dev/null || true
-fi
-
 # Clear any leftover bytecode cache (root-owned from previous runs)
 sudo find "$SCRIPT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 

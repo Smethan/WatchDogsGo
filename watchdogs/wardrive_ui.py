@@ -13,6 +13,9 @@ from .wardrive_trail import FixHistory, WardriveTrail, distance
 from .lora_manager import (
     MC_DISCOVERY_INTERVAL, MC_DISCOVERY_MIN_DISTANCE_M,
 )
+from .meshtastic_manager import (
+    MT_DISCOVERY_INTERVAL, MT_DISCOVERY_MIN_DISTANCE_M,
+)
 from .trail_layer import TrailLayer, heat_color
 from .passive_capture import PassiveCapture
 from .passive_screen import PassiveScreen
@@ -26,7 +29,7 @@ from .map_display import (
     cycle_mode, display_state, layer_label, mode_label,
 )
 from .wardrive_settings import (
-    DEFAULTS, DOT_FADE_CHOICES, TRAIL_MODES, load_settings,
+    DEFAULTS, DOT_FADE_CHOICES, LORA_PROTOCOLS, TRAIL_MODES, load_settings,
     normalize_settings, save_settings, settings_path,
 )
 
@@ -88,8 +91,10 @@ class WardriveUI:
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
         lora = getattr(app, "_lora", None)
+        meshtastic = getattr(app, "_meshtastic", None)
         self._wdg_owned_lora = bool(
-            lora is not None and lora.running and lora.mode == "meshcore")
+            (lora is not None and lora.running and lora.mode == "meshcore")
+            or (meshtastic is not None and meshtastic.running))
         self._wdg_owned_sdr = False
 
     def on_stop(self):
@@ -154,7 +159,7 @@ class WardriveUI:
             app._send("stop")
         self.poll_host_ble(now)
         self.poll_cell(now)
-        self.poll_meshcore_discovery(now)
+        self.poll_lora_discovery(now)
         self.write_diagnostics(now)
         if self.scan.false_timeouts > self.reported_false_timeouts:
             self.reported_false_timeouts = self.scan.false_timeouts
@@ -436,50 +441,87 @@ class WardriveUI:
             return False
 
         started = False
+        protocol = self.settings["lora_protocol"]
+        protocol_label = "MeshCore" if protocol == "meshcore" else "Meshtastic"
         lora = getattr(app, "_lora", None)
+        meshtastic = getattr(app, "_meshtastic", None)
         if not self.settings["wardrive_lora"]:
             app._term_add(
-                "[ALL] MeshCore disabled (Wardrive Settings > Collectors)",
+                "[ALL] LoRa disabled (Wardrive Settings > Collectors)",
                 raw=True)
         elif getattr(app, "_lora_enabled", False):
-            if lora is None:
-                app._term_add("[ALL] MeshCore unavailable: LoRa manager missing",
-                              raw=True)
-            elif lora.running and lora.mode == "meshcore":
-                app._term_add("[ALL] MeshCore collection active", raw=True)
-            elif lora.running:
-                app._term_add(
-                    f"[ALL] MeshCore skipped: LoRa busy in {lora.mode or 'another'} mode",
-                    raw=True)
-                app.msg("[ALL] MeshCore skipped; LoRa is busy", ORANGE)
-            else:
-                try:
-                    channels = getattr(app, "_mc_channels_list", None)
-                    if channels:
-                        lora.set_mc_channels(channels)
-                    lora.start_meshcore(getattr(app, "_mc_region", None))
-                except Exception as exc:
+            if protocol == "meshtastic":
+                if meshtastic is None:
                     app._term_add(
-                        "[ALL] MeshCore start failed: " + str(exc)[:100],
+                        "[ALL] Meshtastic unavailable: client manager missing",
                         raw=True)
-                    app.msg("[ALL] MeshCore unavailable; WiFi/BLE continue", ORANGE)
+                elif meshtastic.running:
+                    app._term_add(
+                        "[ALL] Meshtastic collection active"
+                        if meshtastic.connected else
+                        "[ALL] Meshtastic connection starting", raw=True)
                 else:
-                    if lora.running and lora.mode == "meshcore":
-                        started = True
+                    try:
+                        switch = getattr(app, "_switch_lora_protocol", None)
+                        if switch:
+                            switch("meshtastic", start_if_enabled=True)
+                            started = bool(meshtastic.running) or started
+                        else:
+                            started = bool(meshtastic.start()) or started
                         self._wdg_owned_lora = True
                         app._term_add(
-                            "[ALL] MeshCore collection starting (LoRa enabled)",
+                            "[ALL] Meshtastic client starting via meshtasticd",
                             raw=True)
-                    else:
+                    except Exception as exc:
                         app._term_add(
-                            "[ALL] MeshCore start failed; check LoRa status",
+                            "[ALL] Meshtastic start failed: " + str(exc)[:100],
+                            raw=True)
+                        app.msg(
+                            "[ALL] Meshtastic unavailable; WiFi/BLE continue",
+                            ORANGE)
+            else:
+                if lora is None:
+                    app._term_add(
+                        "[ALL] MeshCore unavailable: LoRa manager missing",
+                        raw=True)
+                elif lora.running and lora.mode == "meshcore":
+                    app._term_add("[ALL] MeshCore collection active", raw=True)
+                elif lora.running:
+                    app._term_add(
+                        f"[ALL] MeshCore skipped: LoRa busy in "
+                        f"{lora.mode or 'another'} mode", raw=True)
+                    app.msg("[ALL] MeshCore skipped; LoRa is busy", ORANGE)
+                else:
+                    try:
+                        channels = getattr(app, "_mc_channels_list", None)
+                        if channels:
+                            lora.set_mc_channels(channels)
+                        lora.start_meshcore(getattr(app, "_mc_region", None))
+                    except Exception as exc:
+                        app._term_add(
+                            "[ALL] MeshCore start failed: " + str(exc)[:100],
                             raw=True)
                         app.msg(
                             "[ALL] MeshCore unavailable; WiFi/BLE continue",
                             ORANGE)
+                    else:
+                        if lora.running and lora.mode == "meshcore":
+                            started = True
+                            self._wdg_owned_lora = True
+                            app._term_add(
+                                "[ALL] MeshCore collection starting "
+                                "(LoRa enabled)", raw=True)
+                        else:
+                            app._term_add(
+                                "[ALL] MeshCore start failed; check LoRa status",
+                                raw=True)
+                            app.msg(
+                                "[ALL] MeshCore unavailable; WiFi/BLE continue",
+                                ORANGE)
         else:
             app._term_add(
-                "[ALL] MeshCore selected but LoRa power is off (SYSTEM > LoRa)",
+                f"[ALL] {protocol_label} selected but LoRa power is off "
+                "(SYSTEM > LoRa)",
                 raw=True)
 
         sdr = getattr(app, "_sdr", None)
@@ -562,13 +604,13 @@ class WardriveUI:
             return "433"
         return ""
 
-    def poll_meshcore_discovery(self, now):
-        """Actively probe direct MeshCore repeaters during real wardrives.
+    def poll_lora_discovery(self, now):
+        """Actively probe the selected mesh protocol during real wardrives.
 
-        This follows MeshMapper's passive wardriving lane: one zero-hop
-        DISCOVER_REQ every 30 seconds, provided a fresh host GPS fix moved at
-        least 25 metres since the last request.  Both ESP BLE and host BLE All
-        Wardrive modes share this scan state and therefore get the same probes.
+        MeshCore follows MeshMapper's 30-second/25-metre DISCOVER_REQ cadence.
+        Meshtastic uses a zero-hop NodeInfo request at a more conservative
+        60-second/50-metre cadence. Both ESP BLE and host BLE All Wardrive
+        modes share this scan state and therefore get the selected probe.
         """
         active = (self.scan.state == "running"
                   and self.scan.mode == "wardrive"
@@ -588,11 +630,24 @@ class WardriveUI:
             return False
 
         app = self.app
-        lora = getattr(app, "_lora", None)
+        protocol = self.settings["lora_protocol"]
+        interval = (MC_DISCOVERY_INTERVAL if protocol == "meshcore"
+                    else MT_DISCOVERY_INTERVAL)
+        min_distance = (MC_DISCOVERY_MIN_DISTANCE_M if protocol == "meshcore"
+                        else MT_DISCOVERY_MIN_DISTANCE_M)
         if (not self.settings["wardrive_lora"]
-                or not getattr(app, "_lora_enabled", False) or lora is None
-                or not lora.running or lora.mode != "meshcore"):
-            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+                or not getattr(app, "_lora_enabled", False)):
+            self.mc_discovery_next = float(now) + interval
+            return False
+        if protocol == "meshcore":
+            lora = getattr(app, "_lora", None)
+            ready = (lora is not None and lora.running
+                     and lora.mode == "meshcore")
+        else:
+            lora = getattr(app, "_meshtastic", None)
+            ready = bool(lora is not None and lora.connected)
+        if not ready:
+            self.mc_discovery_next = float(now) + interval
             return False
         fix = self.fixes.at(now) if app.gps.available else None
         if not fix:
@@ -603,28 +658,37 @@ class WardriveUI:
         point = (fix["latitude"], fix["longitude"])
         if (self.mc_discovery_last_fix is not None
                 and distance(self.mc_discovery_last_fix, point)
-                < MC_DISCOVERY_MIN_DISTANCE_M):
-            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+                < min_distance):
+            self.mc_discovery_next = float(now) + interval
             return False
         try:
-            tag = lora.send_meshcore_discovery(point[0], point[1], now=now)
+            if protocol == "meshcore":
+                queued = lora.send_meshcore_discovery(
+                    point[0], point[1], now=now)
+            else:
+                queued = lora.request_discovery()
         except Exception as exc:
             app._term_add(
-                "[ALL] MeshCore discovery failed: " + str(exc)[:100],
+                f"[ALL] {protocol.title()} discovery failed: "
+                + str(exc)[:100],
                 raw=True,
             )
-            self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
+            self.mc_discovery_next = float(now) + interval
             return False
-        if not tag:
+        if not queued:
             self.mc_discovery_next = float(now) + 1.0
             return False
         self.mc_discovery_last_fix = point
-        self.mc_discovery_next = float(now) + MC_DISCOVERY_INTERVAL
-        app._term_add(
-            "[ALL] MeshCore DISC queued at current GPS; listening after TX",
-            raw=True,
-        )
+        self.mc_discovery_next = float(now) + interval
+        if protocol == "meshcore":
+            message = "[ALL] MeshCore DISC queued at current GPS; listening after TX"
+        else:
+            message = "[ALL] Meshtastic zero-hop NodeInfo discovery queued"
+        app._term_add(message, raw=True)
         return True
+
+    # Kept for third-party callers and older tests.
+    poll_meshcore_discovery = poll_lora_discovery
 
     def poll_cell(self, now):
         active = (self.scan.state == "running" and self.scan.mode == "wardrive"
@@ -1068,7 +1132,8 @@ class WardriveUI:
                 self.settings_page = "main"
                 return
             collector_keys = (
-                "wardrive_lora", "wardrive_adsb", "wardrive_433")
+                "lora_protocol", "wardrive_lora",
+                "wardrive_adsb", "wardrive_433")
             if px.btnp(px.KEY_UP):
                 self.collector_selection = max(
                     0, self.collector_selection - 1)
@@ -1077,8 +1142,11 @@ class WardriveUI:
                     len(collector_keys) - 1,
                     self.collector_selection + 1)
             if px.btnp(px.KEY_RETURN):
-                self.toggle_setting(
-                    collector_keys[self.collector_selection])
+                key = collector_keys[self.collector_selection]
+                if key == "lora_protocol":
+                    self.cycle_lora_protocol()
+                else:
+                    self.toggle_setting(key)
             return
         if px.btnp(px.KEY_ESCAPE) or px.btnp(px.KEY_TAB):
             self.settings_open = False
@@ -1203,16 +1271,39 @@ class WardriveUI:
             self._apply_collector_setting_change(key)
         self.persist_settings()
 
+    def cycle_lora_protocol(self, direction=1):
+        """Select the one protocol allowed to own the AIO SX1262."""
+        previous = self.settings["lora_protocol"]
+        try:
+            index = LORA_PROTOCOLS.index(previous)
+        except ValueError:
+            index = 0
+        step = -1 if direction < 0 else 1
+        selected = LORA_PROTOCOLS[(index + step) % len(LORA_PROTOCOLS)]
+        if selected == previous:
+            return
+        self.settings["lora_protocol"] = selected
+        switch = getattr(self.app, "_switch_lora_protocol", None)
+        if switch:
+            switch(selected, start_if_enabled=self.settings["wardrive_lora"])
+        self._wdg_owned_lora = bool(
+            self.settings["wardrive_lora"]
+            and getattr(self.app, "_lora_enabled", False))
+        self.persist_settings()
+
     def _apply_collector_setting_change(self, key):
         """Release WDG-owned radios and apply enabled choices mid-session."""
         app = self.app
         if key == "wardrive_lora" and not self.settings[key]:
             lora = getattr(app, "_lora", None)
-            if (self._wdg_owned_lora and lora is not None
-                    and lora.running and lora.mode == "meshcore"):
-                lora.stop()
-                app._term_add(
-                    "[ALL] WDG MeshCore stopped; LoRa released", raw=True)
+            meshtastic = getattr(app, "_meshtastic", None)
+            if self._wdg_owned_lora:
+                if (lora is not None and lora.running
+                        and lora.mode == "meshcore"):
+                    lora.stop()
+                if meshtastic is not None and meshtastic.running:
+                    meshtastic.close()
+                app._term_add("[ALL] WDG LoRa client stopped", raw=True)
             self._wdg_owned_lora = False
 
         sdr = getattr(app, "_sdr", None)
@@ -1272,20 +1363,23 @@ class WardriveUI:
             if self.settings_page == "collectors":
                 px.text(55,47,
                         "ALL WARDRIVE COLLECTORS   arrows / ENTER / ESC",7)
-                keys = ("wardrive_lora", "wardrive_adsb", "wardrive_433")
-                labels = ("Automatic MeshCore LoRa", "ADS-B aircraft",
-                          "433 MHz sensors")
+                keys = ("lora_protocol", "wardrive_lora",
+                        "wardrive_adsb", "wardrive_433")
+                labels = ("LoRa protocol", "Automatic LoRa collector",
+                          "ADS-B aircraft", "433 MHz sensors")
                 for i, (key, label) in enumerate(zip(keys, labels)):
-                    value = "ON" if self.settings[key] else "OFF"
+                    value = (self.settings[key].upper()
+                             if key == "lora_protocol" else
+                             "ON" if self.settings[key] else "OFF")
                     px.text(
-                        55, 72+i*22,
+                        55, 64+i*20,
                         ("> " if i == self.collector_selection else "  ")
                         + label + ": " + value,
                         11 if i == self.collector_selection else 7)
                 px.text(55,153,
                         "These control automatic WDG radio ownership.",13)
                 px.text(55,169,
-                        "LoRa OFF leaves a powered radio free for meshtasticd.",13)
+                        "Meshtastic uses meshtasticd; MeshCore uses direct SPI.",13)
                 px.text(55,185,
                         "ADS-B and 433 MHz share one RTL-SDR; enabling one",10)
                 px.text(55,197,

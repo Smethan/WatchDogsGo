@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add a protocol selector for the AIO v2 SX1262 and a shared **Mesh
+  Messenger** screen. MeshCore keeps its direct-SPI implementation; Meshtastic
+  uses the official Python client over `meshtasticd` on localhost port 4403,
+  preserving the daemon as the sole radio owner. Both All Wardrive BLE modes
+  use the selected collector and Meshtastic performs rate-limited zero-hop
+  NodeInfo discovery. Nodes, received messages, channels, and direct/channel
+  sends are available in WDG, with Meshtastic observations saved separately.
+  Launchers no longer kill `meshtasticd`; explicit MeshCore use or LoRa power
+  off releases the daemon, while normal WDG exit leaves it available to other
+  clients.
 - Add persisted **All Wardrive collectors** controls for automatic MeshCore
   LoRa, ADS-B aircraft, and 433 MHz sensors. Disabling automatic LoRa prevents
   WDG from claiming a powered radio at startup or when a wardrive begins, so

@@ -73,3 +73,52 @@ def test_contacts_panel_accepts_node_that_arrives_after_opening(monkeypatch):
     pressed.add(appmod.pyxel.KEY_RETURN)
     app._update_mc_screen()
     assert app._mc_node_action and app._mc_nodes_panel
+
+
+def test_meshtastic_messenger_uses_daemon_channels_and_filters_contacts(
+        monkeypatch):
+    app = _messenger()
+    app.wardrive = NS(settings={"lora_protocol": "meshtastic"})
+    app._meshtastic = NS(
+        running=True, connected=True, packets_received=4,
+        local_name="WDG MT",
+        channels=[{"index": 0, "name": "Primary"},
+                  {"index": 2, "name": "Road"}],
+        send_text=Mock(return_value=True), request_discovery=Mock(return_value=True))
+    app._mc_nodes = [
+        {"id": "meshcore:1", "name": "MC", "protocol": "meshcore"},
+        {"id": "meshtastic:!00000002", "address": "!00000002",
+         "name": "Nearby", "protocol": "meshtastic", "type": "Meshtastic"},
+    ]
+    app._mc_active_ch = 1
+    app._mc_input = "hello"
+    pressed = {appmod.pyxel.KEY_RETURN}
+    monkeypatch.setattr(appmod.pyxel, "btn", lambda key: key in pressed)
+    monkeypatch.setattr(appmod.pyxel, "btnp", lambda key: key in pressed)
+
+    app._update_mc_screen()
+    app._meshtastic.send_text.assert_called_once_with("hello", channel=2)
+    assert app._mesh_nodes() == [app._mc_nodes[1]]
+
+
+def test_meshtastic_contact_action_opens_direct_message_without_meshcore_key(
+        monkeypatch):
+    app = _messenger()
+    app.wardrive = NS(settings={"lora_protocol": "meshtastic"})
+    app._meshtastic = NS(
+        running=True, connected=True, packets_received=0,
+        local_name="WDG MT", channels=[{"index": 0, "name": "Primary"}])
+    node = {"id": "meshtastic:!00000002", "address": "!00000002",
+            "name": "Nearby", "protocol": "meshtastic",
+            "type": "Meshtastic"}
+    app._mc_nodes = [node]
+    app._mc_nodes_panel = True
+    app._mc_node_action = True
+    app._mc_node_action_sel = 0
+    pressed = {appmod.pyxel.KEY_RETURN}
+    monkeypatch.setattr(appmod.pyxel, "btn", lambda key: key in pressed)
+    monkeypatch.setattr(appmod.pyxel, "btnp", lambda key: key in pressed)
+
+    app._update_mc_nodes_panel()
+    assert app._mc_dm_target is node
+    assert not app._mc_nodes_panel

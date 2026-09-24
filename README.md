@@ -326,7 +326,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 |------|---------|-------------|
 | BLE HID | `bt_hid` | Enable BLE HID keyboard mode on ESP32 |
 | HID Type | `bt_hid_type` | Type text via BLE HID |
-| MeshCore Messenger | Python-native | Fullscreen mesh chat with background reception |
+| Mesh Messenger | Python-native | MeshCore direct-SPI or Meshtastic daemon-backed chat and discovery |
 | Flipper Zero | USB serial | SubGHz RX/TX, NFC read/emulate, signal replay |
 
 ### SYSTEM
@@ -335,7 +335,7 @@ Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS
 |------|---------|-------------|
 | STOP ALL | `stop` | Emergency stop all operations |
 | GPS | — | Toggle GPS module ON/OFF (AIO GPIO) |
-| LoRa | — | Toggle LoRa module power; automatic MeshCore ownership follows Wardrive Settings |
+| LoRa | — | Toggle LoRa module power; the selected mesh protocol follows Wardrive Settings |
 | SDR | — | Toggle AIO SDR power; Wardrive Settings selects ADS-B, 433 MHz, or neither |
 | Whitelist | — | Manage MAC whitelist — whitelisted devices are hidden from scans, attacks, and wardriving |
 | Upload WPA-SEC | — | Incrementally upload every network's crackable handshake `.pcapng` to wpa-sec.stanev.org, regardless of the WDG whitelist; successful content hashes are remembered and invalid/empty captures are rejected locally (prompts for an API key if needed; old PCAP-only loot remains readable) |
@@ -464,26 +464,37 @@ Exploits CVE-2023-45866 for unauthenticated Bluetooth HID pairing. Scans for BLE
 
 Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Extracts link keys and device info via GATT debug interface.
 
-## MeshCore Messenger
+## Mesh Messenger
 
-Background mesh chat over LoRa SX1262 (869.618 MHz). When automatic MeshCore
-ownership is enabled, the SYSTEM LoRa toggle starts it and sends an advert so
-messages can be received immediately. With automatic ownership off, the radio
-is only powered and remains available to `meshtasticd`; opening MeshCore
-Messenger is the explicit way to claim it. Closing chat (ESC) keeps a manually
-started MeshCore receiver running in the background.
+The messenger supports two mutually exclusive owners for the AIO v2 SX1262.
+Choose **MeshCore** or **Meshtastic** under **SNIFF > Wardrive Settings > All
+Wardrive collectors**. MeshCore uses WDG's direct LoRaRF/SPI implementation.
+Meshtastic leaves the radio entirely under `meshtasticd` and connects to the
+official local Client API on `127.0.0.1:4403`; WDG never opens SPI while that
+protocol is selected. If the daemon is installed but stopped, WDG starts its
+systemd service. Closing WDG disconnects its client without stopping the
+daemon, so other Meshtastic clients can continue using it.
 
-When **Automatic MeshCore LoRa** is enabled in Wardrive Settings, both
-**All Wardrive** modes also send MeshCore
-`DISCOVER_REQ` control packets.  These are direct zero-hop probes rather than
-flooded chat traffic.  WDG sends at most one every 30 seconds after a fresh GPS
-fix has moved at least 25 metres, listens seven seconds for tagged repeater/room
-responses, and records the strongest reply at the probe location.  Ordinary
-MeshCore listening and adverts continue to work as before.
+Opening **ADDONS > Mesh Messenger** uses the selected protocol. Both backends
+provide channel messages, a heard-nodes panel, direct messages, background
+reception, map markers, and session loot. Meshtastic node observations are
+saved to `meshtastic_nodes.csv`, while received text is appended to
+`meshtastic_messages.log`. Node names and channel configuration come from the
+daemon; change them with a Meshtastic client.
+
+When **Automatic LoRa collector** is enabled, both **All Wardrive** modes use
+the selected protocol. MeshCore sends a direct zero-hop `DISCOVER_REQ` at most
+every 30 seconds after moving 25 metres and listens seven seconds for tagged
+repeater/room responses. Meshtastic sends a zero-hop NodeInfo request at most
+every 60 seconds after moving 50 metres. The zero hop limit discovers nodes in
+direct radio range without routing the request across the mesh.
 
 **SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
-may automatically claim the powered LoRa and SDR devices. LoRa OFF leaves the
-radio free for `meshtasticd`; MeshCore Messenger can still be started manually.
+may automatically use the powered LoRa and SDR devices. With automatic LoRa
+off, switching the preferred protocol does not stop `meshtasticd` or claim SPI.
+Opening Mesh Messenger remains an explicit request to start the selected
+backend. Switching to MeshCore or powering LoRa off stops `meshtasticd` so the
+direct driver or GPIO power control can safely own the hardware.
 ADS-B and 433 MHz are mutually exclusive because they share the AIO RTL-SDR.
 Enabling either one disables the other, and both may be left off.
 
@@ -494,8 +505,8 @@ Enabling either one disables the other, and both may be left off.
 - **Speech bubbles** on map with CB radio sprite when messages arrive
 - **Toast notifications** — always-on-top across all screens with sound
 - **Node discovery** with GPS coordinates saved to loot (dedup by node ID)
-- **Persistent config** — node name + channels saved to `~/.janos_meshcore.json`
-- **Random node name** — auto-generated `WatchDogs-XXXXXX` on first run
+- **Persistent MeshCore config** — node name + channels saved to `~/.janos_meshcore.json`
+- **Meshtastic config reuse** — identity, channels, and node database come from `meshtasticd`
 - **LoRa HUD status** in bottom bar (in line with GPS info)
 
 ### Messenger Controls
@@ -504,14 +515,14 @@ Enabling either one disables the other, and both may be left off.
 |-----|--------|
 | `A-Z`, `0-9` | Type message |
 | `ENTER` | Send message on active channel |
-| `A` | Send advert (broadcast presence) |
-| `N` | Change node name (persistent) |
-| `H` | Toggle Heard Nodes panel |
-| `C` | Open channel picker |
+| `Ctrl+A` | MeshCore advert or zero-hop Meshtastic NodeInfo discovery |
+| `Ctrl+N` | Change MeshCore name; Meshtastic points to its own settings |
+| `Ctrl+H` | Toggle Heard Nodes panel |
+| `Ctrl+C` | Open channel picker |
 | `[` / `]` | Quick-switch channels |
-| `X` | Clear chat log |
+| `Ctrl+X` | Clear chat log |
 | `PgUp` / `PgDn` | Scroll history |
-| `ESC` | Back to map (MeshCore stays active) |
+| `ESC` | Back to map (selected mesh client stays active) |
 
 ## LoRa Features
 
@@ -521,7 +532,8 @@ WDG checkout and reboot once.
 
 | Feature | Frequencies | Description |
 |---------|-------------|-------------|
-| MeshCore Messenger | 869.618 MHz | Background mesh chat with auto-advert, speech bubbles on map |
+| MeshCore Messenger | Regional preset | Direct-SPI mesh chat with adverts and speech bubbles |
+| Meshtastic Messenger | Daemon configuration | `meshtasticd` Client API chat, nodes, channels, and zero-hop discovery |
 
 ## Map
 
@@ -696,14 +708,21 @@ sudo usermod -a -G dialout $USER
 FTDI, or Espressif USB-JTAG. The game logs all USB serial devices it
 sees in the diagnostic block.
 
-**MeshCore radio stays "OFF"** — make sure `meshtasticd` is not
-holding the SPI bus:
+**MeshCore radio stays "OFF"** — MeshCore and `meshtasticd` cannot own the
+same SX1262 simultaneously. Select MeshCore in Wardrive Settings and open Mesh
+Messenger; WDG will stop the daemon before opening SPI. To release it manually:
 ```bash
 sudo systemctl stop meshtasticd
-sudo systemctl disable meshtasticd
 ```
-The launcher does this automatically on every start, but only if the
-service is installed.
+
+**Meshtastic Messenger does not connect** — verify the daemon exposes its
+local Client API and check its service log:
+```bash
+sudo systemctl status meshtasticd
+sudo journalctl -u meshtasticd -n 100 --no-pager
+```
+WDG connects to `127.0.0.1:4403` and starts an installed, stopped service. It
+does not install or configure `meshtasticd` itself.
 
 **HTTPS errors when uploading to wdgwars.pl** — check `~/.watchdogs/last_run.log`
 for SSL errors. Most often caused by an expired system CA bundle:

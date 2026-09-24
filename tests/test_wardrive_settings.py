@@ -80,6 +80,7 @@ def test_invalid_display_values_fall_back_and_round_trip(tmp_path):
 def test_collector_defaults_and_invalid_sdr_pair_are_exclusive():
     defaults = normalize_settings({})
     assert defaults["wardrive_lora"] is True
+    assert defaults["lora_protocol"] == "meshcore"
     assert defaults["wardrive_adsb"] is True
     assert defaults["wardrive_433"] is False
 
@@ -87,6 +88,8 @@ def test_collector_defaults_and_invalid_sdr_pair_are_exclusive():
         "wardrive_adsb": True, "wardrive_433": True})
     assert conflicted["wardrive_adsb"] is True
     assert conflicted["wardrive_433"] is False
+    assert normalize_settings({"lora_protocol": "invalid"})[
+        "lora_protocol"] == "meshcore"
 
 
 def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():
@@ -116,6 +119,21 @@ def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():
     lora.stop.assert_called_once_with()
     assert ui._wdg_owned_lora is False
     assert ui.persist_settings.call_count == 3
+
+
+def test_lora_protocol_switch_is_persisted_and_applied():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    ui.persist_settings = Mock()
+    ui._wdg_owned_lora = True
+    ui.app = NS(_lora_enabled=True, _switch_lora_protocol=Mock())
+
+    ui.cycle_lora_protocol()
+
+    assert ui.settings["lora_protocol"] == "meshtastic"
+    ui.app._switch_lora_protocol.assert_called_once_with(
+        "meshtastic", start_if_enabled=True)
+    ui.persist_settings.assert_called_once_with()
 
 
 def test_display_controls_persist_and_invalidate_the_right_cache():

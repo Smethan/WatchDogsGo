@@ -22,6 +22,7 @@ from .map_display import (
 
 DOT_FADE_CHOICES = (15, 30, 60, 120)
 TRAIL_MODES = ("off", "solid", "heat")
+LORA_PROTOCOLS = ("meshcore", "meshtastic")
 
 
 DEFAULTS = {
@@ -39,6 +40,7 @@ DEFAULTS = {
     # hardware; they decide whether WDG may claim it for a collector. Defaults
     # preserve the behavior from before these controls existed.
     "wardrive_lora": True,
+    "lora_protocol": "meshcore",
     "wardrive_adsb": True,
     "wardrive_433": False,
     "realert_seconds": 60,
@@ -100,6 +102,8 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
     # toggle records the user's most recent choice explicitly.
     if result["wardrive_adsb"] and result["wardrive_433"]:
         result["wardrive_433"] = False
+    if result["lora_protocol"] not in LORA_PROTOCOLS:
+        result["lora_protocol"] = DEFAULTS["lora_protocol"]
     return result
 
 

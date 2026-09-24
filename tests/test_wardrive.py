@@ -207,6 +207,29 @@ def test_csv_escaping_dedup_and_unknown_gps(loot):
         next(f);rows=list(csv.reader(f))
     assert len(rows)==2 and rows[1][1]=='a,"b\nline' and rows[1][-1]=="WIFI"
 
+
+def test_meshtastic_loot_records_nodes_once_and_received_messages(tmp_path):
+    loot = LootManager.__new__(LootManager)
+    loot._session = tmp_path
+    loot._session_active = True
+    loot.update_session_loot = Mock()
+
+    loot.save_meshtastic_node(
+        "!12345678", "Road Node", 40.1, -90.2, -91, 4.5, 1,
+        40.0, -90.0, "RAK4631")
+    loot.save_meshtastic_node(
+        "!12345678", "Road Node", 40.1, -90.2, -80, 5.0, 1,
+        40.01, -90.01, "RAK4631")
+    loot.save_meshtastic_message("0", "Road Node", "hello", -91)
+
+    with (tmp_path / "meshtastic_nodes.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["node_id"] == "!12345678"
+    assert rows[0]["observed_lat"] == "40.0"
+    assert "[ch:0] Road Node: hello" in (
+        tmp_path / "meshtastic_messages.log").read_text()
+
 def test_async_scan_loot_keeps_disk_writes_off_observation_path(tmp_path):
     loot=LootManager.__new__(LootManager);loot._session=tmp_path
     loot._session_active=True;loot._gps=None
@@ -1003,7 +1026,7 @@ def test_all_wardrive_collector_settings_leave_lora_free_and_start_433(
         str(game.loot.session_path), game.player_lat, game.player_lon)
     assert w._wdg_owned_sdr is True
     lines = [call.args[0] for call in game._term_add.call_args_list]
-    assert any("MeshCore disabled (Wardrive Settings" in line
+    assert any("LoRa disabled (Wardrive Settings" in line
                for line in lines)
     assert "[ALL] 433 MHz collection started (SDR enabled)" in lines
 
@@ -1025,6 +1048,38 @@ def test_all_wardrive_can_disable_every_host_radio_collector(game):
     game._lora.start_meshcore.assert_not_called()
     game._sdr.start_adsb.assert_not_called()
     game._sdr.start_433.assert_not_called()
+
+
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_all_wardrive_uses_selected_meshtastic_client(game, wifi_only):
+    w = game.wardrive
+    w.settings.update(
+        lora_protocol="meshtastic", wardrive_lora=True,
+        wardrive_adsb=False, wardrive_433=False, lte_modem=False)
+    meshtastic = NS(
+        running=False, connected=False, start=Mock(return_value=True))
+
+    def switch(protocol, *, start_if_enabled):
+        assert protocol == "meshtastic" and start_if_enabled
+        meshtastic.start()
+        meshtastic.running = True
+
+    game._switch_lora_protocol = Mock(side_effect=switch)
+    game._meshtastic = meshtastic
+    game._lora = NS(running=False, mode="", start_meshcore=Mock())
+    game._lora_enabled = True
+    game._sdr_enabled = False
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.wifi_only = wifi_only
+    w.scan.diagnostic = False
+
+    assert w.start_auxiliary_collectors()
+    game._switch_lora_protocol.assert_called_once_with(
+        "meshtastic", start_if_enabled=True)
+    meshtastic.start.assert_called_once()
+    game._lora.start_meshcore.assert_not_called()
+    assert w._wdg_owned_lora
 
 
 def test_disabled_lora_collector_suppresses_active_meshcore_discovery(game):
@@ -1083,6 +1138,38 @@ def test_all_wardrive_meshcore_discovery_uses_fresh_moving_gps(
     assert send.call_count == 2
 
 
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_all_wardrive_meshtastic_discovery_is_zero_hop_manager_request(
+        game, wifi_only):
+    request = Mock(return_value=True)
+    game._lora_enabled = True
+    game._meshtastic = NS(connected=True, request_discovery=request)
+    w = game.wardrive
+    w.settings["lora_protocol"] = "meshtastic"
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.session = "mt-disc-session"
+    w.scan.wifi_only = wifi_only
+    w.scan.diagnostic = False
+
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.0, longitude=-90.0, received_at=10), 10)
+    assert w.poll_lora_discovery(10)
+    request.assert_called_once_with()
+
+    # Meshtastic is intentionally less chatty than MeshCore: 60 seconds and
+    # at least 50 metres of movement between NodeInfo requests.
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.0, longitude=-90.0, received_at=70), 70)
+    assert not w.poll_lora_discovery(70)
+    assert request.call_count == 1
+
+    w.fixes.update(GpsFix(
+        valid=True, latitude=40.001, longitude=-90.0, received_at=130), 130)
+    assert w.poll_lora_discovery(130)
+    assert request.call_count == 2
+
+
 def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
     lora = NS(running=False, mode="", queue=Queue())
     lora.set_mc_channels = Mock()
@@ -1093,6 +1180,7 @@ def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
 
     lora.start_meshcore = Mock(side_effect=start_meshcore)
     game._lora = lora
+    game._meshtastic = NS(close=Mock())
     game._lora_enabled = True
     game._watch = NS(connected=False)
     game._mc_channels_list = [{"name": "public"}]
@@ -1106,9 +1194,21 @@ def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
 
     lora.set_mc_channels.assert_called_once_with(game._mc_channels_list)
     lora.start_meshcore.assert_called_once_with("us_ca_narrow")
+    game._meshtastic.close.assert_called_once_with(stop_daemon=True)
     assert game._mc_screen and game._mc_scroll == 0
     assert not any("Enable LoRa" in call.args[0]
                    for call in game.msg.call_args_list)
+
+
+def test_protocol_preference_change_does_not_stop_daemon_when_auto_is_off(game):
+    game._lora_enabled = True
+    game._lora = NS(running=False, mode="", stop=Mock())
+    game._meshtastic = NS(close=Mock())
+
+    game._switch_lora_protocol("meshcore", start_if_enabled=False)
+
+    game._meshtastic.close.assert_called_once_with()
+    game._lora.stop.assert_not_called()
 
 
 def test_lora_init_error_is_reported_after_receiver_stops(game):

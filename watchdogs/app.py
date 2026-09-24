@@ -45,6 +45,7 @@ from .race_attack import RACEAttack
 from .aio_manager import AioManager
 from .whitelist_manager import WhitelistManager
 from .lora_manager import LoRaManager
+from .meshtastic_manager import MeshtasticManager
 from .sdr_manager import SDRManager
 from .plugin_loader import discover_plugins
 from .watch_manager import WatchManager
@@ -212,7 +213,7 @@ MENU_CATS = [
     ("ADDONS", [
         ("h", "BLE HID (WIP)",   "_bt_hid_wip",            "_bt_hid_wip",  None),
         ("i", "HID Type (WIP)",  "_bt_hid_wip",            "_bt_hid_wip",  None),
-        ("9", "MeshCore Messenger", "_meshcore",            "meshcore",     None),
+        ("9", "Mesh Messenger",  "_meshcore",            "meshcore",     None),
         ("r", "MeshCore Region", "_meshcore_region",         "_mc_region_screen", None),
         ("f", "Flipper Zero",    "_flipper",               "_flipper",     None),
         ("a", "ADS-B Radar",     "_sdr_adsb",              "_sdr_adsb",    None),
@@ -603,6 +604,7 @@ class WatchDogsGame(OtaMixin):
 
         # MeshCore Messenger (runs in background when LoRa enabled)
         self._lora = LoRaManager()
+        self._meshtastic = MeshtasticManager()
         self._lora._on_node = self._on_mc_node
         self._lora._on_message = self._on_mc_message
         self._lora._on_dm = self._on_mc_dm
@@ -707,7 +709,8 @@ class WatchDogsGame(OtaMixin):
                     self._earn_badge("handshake_hunter")
                 if t.get("et_captures", 0) > 0:
                     self._earn_badge("evil_twin")
-                if t.get("mc_messages", 0) > 0:
+                if (t.get("mc_messages", 0) > 0
+                        or t.get("mt_messages", 0) > 0):
                     self._earn_badge("meshcore")
                 # Check if wpasec potfile exists
                 pwd_dir = self.loot.loot_root / "passwords"
@@ -777,9 +780,15 @@ class WatchDogsGame(OtaMixin):
         for node in self._mc_nodes:
             lat, lon = node.get("lat"), node.get("lon")
             if lat and lon:
+                protocol = node.get("protocol", "meshcore")
+                node_id = str(node.get("id", ""))
                 marker = MapMarker(
-                    lat, lon, node.get("name") or "MC", "meshcore",
-                    key="meshcore:" + str(node.get("id", "")), last_seen=0)
+                    lat, lon, node.get("name") or (
+                        "MT" if protocol == "meshtastic" else "MC"),
+                    "meshcore",
+                    key=(node_id if protocol == "meshtastic"
+                         else "meshcore:" + node_id),
+                    last_seen=0)
                 self.markers.append(marker)
                 self._marker_by_key[marker.key] = marker
         self._map_aircraft = OrderedDict()
@@ -926,26 +935,15 @@ class WatchDogsGame(OtaMixin):
         self._boot_serial_port = port
         self._build_boot_checks()
 
-        # Auto-start MeshCore only when the persisted collector preference
-        # allows WDG to claim LoRa. With it off, a powered radio remains free
-        # for meshtasticd or another owner; Messenger can still be opened
-        # manually from ADDONS.
+        # Start the selected mesh client only when automatic LoRa collection
+        # is enabled. MeshCore owns SPI directly; Meshtastic is a TCP client of
+        # meshtasticd, which remains the sole SX1262 owner.
         if self._lora_enabled and _wardrive_settings["wardrive_lora"]:
-            try:
-                self._lora.set_mc_channels(self._mc_channels_list)
-                self._lora.start_meshcore(self._mc_region)
-                self._term_add("[SYS] LoRa active — MeshCore auto-started",
-                               raw=True)
-                lat = self.player_lat if self.gps_fix else 0.0
-                lon = self.player_lon if self.gps_fix else 0.0
-                self._lora.send_meshcore_advert(self._mc_node_name, lat, lon)
-                self._term_add("[MC] Auto-advert sent to mesh network",
-                               raw=True)
-            except Exception:
-                pass
+            self._switch_lora_protocol(
+                _wardrive_settings["lora_protocol"], start_if_enabled=True)
         elif self._lora_enabled:
             self._term_add(
-                "[SYS] LoRa powered; automatic WDG MeshCore is disabled",
+                "[SYS] LoRa powered; automatic WDG mesh client is disabled",
                 raw=True)
 
         self.wardrive = WardriveUI(self, initial_settings=_wardrive_settings)
@@ -1493,6 +1491,7 @@ class WatchDogsGame(OtaMixin):
         self._poll_gps()
         self._poll_serial()
         self._poll_lora()
+        self._poll_meshtastic()
         self._poll_sdr()
         self._poll_watch()
         self._poll_wpasec_result()
@@ -1795,6 +1794,11 @@ class WatchDogsGame(OtaMixin):
             if not getattr(self, "_sdr_enabled", False):
                 return "[SDR] Enable SDR first (SYSTEM > SDR)"
         if cmd == "_meshcore":
+            protocol = self._mesh_protocol()
+            if protocol == "meshtastic":
+                if not self._lora_enabled:
+                    return "[MT] Enable LoRa first"
+                return ""
             watch = getattr(self, "_watch", None)
             if bool(getattr(watch, "connected", False)):
                 return ""
@@ -1805,6 +1809,9 @@ class WatchDogsGame(OtaMixin):
                     and getattr(lora, "mode", "") != "meshcore"):
                 mode = getattr(lora, "mode", "") or "another mode"
                 return f"[MC] LoRa busy in {mode}; stop it first"
+        if cmd == "_meshcore_region" and hasattr(self, "wardrive"):
+            if self.wardrive.settings.get("lora_protocol") != "meshcore":
+                return "[MC] Region applies only when LoRa protocol is MeshCore"
         return ""
 
     def _activate_menu_item(self, cat_idx: int, item_idx: int):
@@ -2089,7 +2096,11 @@ class WatchDogsGame(OtaMixin):
             "race":          self._race.running,
             "portal":        self.state.portal_running,
             "evil_twin":     self.state.evil_twin_running,
-            "meshcore":      self._lora.running and self._lora.mode == "meshcore",
+            "meshcore":      (
+                self._meshtastic.connected
+                if (hasattr(self, "wardrive") and
+                    self.wardrive.settings.get("lora_protocol") == "meshtastic")
+                else self._lora.running and self._lora.mode == "meshcore"),
             "_sdr_adsb":     self._sdr.running and "adsb" in self._sdr.mode,
             "_sdr_433":      self._sdr.running and "433" in self._sdr.mode,
             "_watch":        self._watch.connected,
@@ -2244,6 +2255,24 @@ class WatchDogsGame(OtaMixin):
 
         # ── MeshCore Messenger ──
         if cmd == "_meshcore":
+            protocol = self.wardrive.settings["lora_protocol"]
+            if protocol == "meshtastic":
+                if not self._lora_enabled:
+                    self.msg("[MT] Enable LoRa first", C_WARNING)
+                    return
+                self._switch_lora_protocol(
+                    "meshtastic", start_if_enabled=True)
+                self._mc_screen = True
+                self._mc_scroll = 0
+                self.menu_open = False
+                if not getattr(self, "_mt_help_shown", False):
+                    self._mc_log.append((
+                        "\x11 Meshtastic via local meshtasticd", C_HACK_CYAN))
+                    self._mc_log.append((
+                        "\x11 Shortcuts: Ctrl+A=discover  Ctrl+H=nodes  "
+                        "Ctrl+C=channel  Ctrl+X=clear", 13))
+                    self._mt_help_shown = True
+                return
             watch_lora = bool(self._watch.connected)
             # GPIO power and the receiver thread are separate states.  If the
             # radio is powered but its thread stopped (for example after a
@@ -2251,6 +2280,11 @@ class WatchDogsGame(OtaMixin):
             # instead of incorrectly telling the user to enable LoRa again.
             if self._lora_enabled and not self._lora.running:
                 try:
+                    # The explicit MeshCore action claims the SX1262 for
+                    # direct SPI, so meshtasticd must release it first.
+                    meshtastic = getattr(self, "_meshtastic", None)
+                    if meshtastic is not None:
+                        meshtastic.close(stop_daemon=True)
                     self._lora.set_mc_channels(self._mc_channels_list)
                     self._lora.start_meshcore(self._mc_region)
                     self._term_add("[MC] Restarting MeshCore receiver", raw=True)
@@ -2619,46 +2653,86 @@ class WatchDogsGame(OtaMixin):
 
     def _toggle_lora(self):
         new_state = not self._lora_enabled
-        if self._aio_available:
+        # Power-up must precede client startup. Power-down is the inverse:
+        # release daemon/SPI owners before cutting the SX1262 rail.
+        if new_state and self._aio_available:
             ok = AioManager.toggle("lora", new_state)
             if not ok:
                 self.msg("[LoRa] GPIO toggle failed", C_ERROR)
                 return
-        # Start/stop MeshCore
+        # Start/stop the selected mesh protocol.
         if new_state:
             self._lora_enabled = True
-            auto_meshcore = self.wardrive.settings["wardrive_lora"]
-            if auto_meshcore:
-                self._lora.start_meshcore(self._mc_region)
-            if self._lora.running:
-                if auto_meshcore:
-                    self.wardrive._wdg_owned_lora = True
-                self.msg("[LoRa] ON — MeshCore started", C_SUCCESS)
-                self._term_add("[SYS] LoRa enabled, MeshCore active", raw=True)
-            elif not auto_meshcore:
+            automatic = self.wardrive.settings["wardrive_lora"]
+            protocol = self.wardrive.settings["lora_protocol"]
+            if automatic:
+                self._switch_lora_protocol(protocol, start_if_enabled=True)
+                self.wardrive._wdg_owned_lora = True
+                self.msg(
+                    f"[LoRa] ON — {protocol.title()} starting", C_SUCCESS)
+            else:
                 self.msg("[LoRa] ON — WDG auto-start disabled", C_SUCCESS)
                 self._term_add(
-                    "[SYS] LoRa powered; left free for meshtasticd/manual use",
+                    "[SYS] LoRa powered; no WDG mesh client started",
                     raw=True)
-            else:
-                self.msg("[LoRa] GPIO ON but radio init failed", C_WARNING)
-                self._term_add("[SYS] LoRa GPIO on, SX1262 init failed — use Watch LoRa", raw=True)
-            if auto_meshcore:
-                # Announce presence only when WDG actually owns MeshCore.
-                lat = self.player_lat if self.gps_fix else 0.0
-                lon = self.player_lon if self.gps_fix else 0.0
-                self._lora.send_meshcore_advert(
-                    self._mc_node_name, lat, lon)
         else:
             if self._lora.running:
                 self._lora.stop()
+            # Powering the AIO LoRa rail off also requires meshtasticd to
+            # release SPI. This is an explicit hardware-off action.
+            self._meshtastic.close(stop_daemon=True)
+            if self._aio_available:
+                ok = AioManager.toggle("lora", False)
+                if not ok:
+                    self.msg("[LoRa] GPIO toggle failed", C_ERROR)
+                    self._term_add(
+                        "[SYS] Mesh clients stopped, but LoRa power-off failed",
+                        raw=True)
+                    return
             self._lora_enabled = False
             self.wardrive._wdg_owned_lora = False
             self._mc_screen = False
             self._mc_bubbles.clear()
             self.msg("[LoRa] OFF", C_WARNING)
-            self._term_add("[SYS] LoRa disabled, MeshCore stopped", raw=True)
+            self._term_add("[SYS] LoRa disabled, mesh clients stopped", raw=True)
         self.glitch_timer = 2
+
+    def _switch_lora_protocol(self, protocol: str,
+                              *, start_if_enabled: bool = True):
+        """Release the old radio owner and activate the selected protocol."""
+        if not start_if_enabled:
+            # Changing the preferred protocol while automatic ownership is
+            # disabled must not stop a daemon another app may be using.
+            if self._lora.running and self._lora.mode == "meshcore":
+                self._lora.stop()
+            self._meshtastic.close()
+            return
+        if protocol == "meshtastic":
+            if self._lora.running:
+                self._lora.stop()
+            if self._lora_enabled and start_if_enabled:
+                self._meshtastic.start()
+                self._term_add(
+                    "[SYS] Meshtastic client starting via meshtasticd",
+                    raw=True)
+            return
+
+        # Direct MeshCore access cannot coexist with meshtasticd. Selecting
+        # MeshCore is the explicit instruction to release the daemon's SPI
+        # ownership before LoRaRF starts.
+        self._meshtastic.close(stop_daemon=True)
+        if self._lora_enabled and start_if_enabled:
+            try:
+                self._lora.set_mc_channels(self._mc_channels_list)
+                self._lora.start_meshcore(self._mc_region)
+                lat = self.player_lat if self.gps_fix else 0.0
+                lon = self.player_lon if self.gps_fix else 0.0
+                self._lora.send_meshcore_advert(
+                    self._mc_node_name, lat, lon)
+                self._term_add("[SYS] MeshCore direct radio started", raw=True)
+            except Exception as exc:
+                self._term_add(
+                    "[MC] MeshCore start failed: " + str(exc)[:120], raw=True)
 
     def _toggle_sdr(self):
         new_state = not self._sdr_enabled
@@ -4177,6 +4251,98 @@ class WatchDogsGame(OtaMixin):
         frame = pyxel.frame_count
         self._mc_bubbles = [(t, e) for t, e in self._mc_bubbles if e > frame]
 
+    def _poll_meshtastic(self):
+        """Move meshtasticd callbacks onto the Pyxel/main thread."""
+        try:
+            events = self._meshtastic.poll_events()
+        except Exception:
+            return
+        for event, data in events:
+            if event in ("status", "discovery"):
+                self._term_add(f"[MT] {data}", raw=True)
+            elif event == "error":
+                self._term_add(f"[MT] {data}", raw=True)
+                self.msg(f"[MT] {str(data)[:70]}", C_ERROR)
+            elif event == "connected":
+                self._term_add(
+                    f"[MT] Connected as {data.get('name') or data.get('node_id')}",
+                    raw=True)
+                self.msg("[MT] meshtasticd connected", C_SUCCESS)
+            elif event == "disconnected":
+                self._term_add(f"[MT] {data}", raw=True)
+                self.msg("[MT] meshtasticd disconnected", C_WARNING)
+            elif event == "message":
+                sender = data.get("sender") or data.get("sender_id") or "?"
+                text = str(data.get("text") or "")
+                ts = time.strftime("%H:%M")
+                hops = int(data.get("hops") or 0)
+                self._mc_log.append((
+                    f"\x10 {sender}: {text}", C_SUCCESS,
+                    f"{ts} {hops}hop MT"))
+                self._mc_bubbles.append(
+                    (f"MT: {text[:36]}", pyxel.frame_count + 300))
+                self.msg(f"[MT] {sender}: {text[:25]}", C_SUCCESS)
+                self._play_mc_notify()
+                if self.loot:
+                    self.loot.save_meshtastic_message(
+                        str(data.get("channel", 0)), sender, text,
+                        float(data.get("rssi") or 0))
+            elif event == "node":
+                self._remember_meshtastic_node(data)
+
+    def _remember_meshtastic_node(self, data):
+        """Update the shared mesh contacts view and wardrive observations."""
+        address = str(data.get("id") or "")
+        if not address:
+            return
+        contact_id = "meshtastic:" + address
+        node_data = {
+            "id": contact_id,
+            "address": address,
+            "protocol": "meshtastic",
+            "type": "Meshtastic",
+            "name": data.get("name") or address,
+            "lat": float(data.get("lat") or 0),
+            "lon": float(data.get("lon") or 0),
+            "rssi": float(data.get("rssi") or 0),
+            "snr": float(data.get("snr") or 0),
+            "hops": int(data.get("hops") or 0),
+            "last_seen": float(data.get("last_heard") or time.time()),
+            "hardware": data.get("hardware") or "",
+        }
+        existing = next((n for n in self._mc_nodes
+                         if n.get("id") == contact_id), None)
+        if existing:
+            node_data["first_seen"] = existing.get("first_seen", time.time())
+            node_data["note"] = existing.get("note", "")
+            existing.update(node_data)
+        else:
+            node_data["first_seen"] = time.time()
+            node_data["note"] = ""
+            self._mc_nodes.append(node_data)
+            if not data.get("cached"):
+                self.gain_xp(20)
+
+        if self.loot:
+            self.loot.save_contact(contact_id, dict(node_data))
+        if data.get("cached"):
+            return
+
+        heard_lat = self.player_lat if self.gps_fix else 0.0
+        heard_lon = self.player_lon if self.gps_fix else 0.0
+        marker_lat = node_data["lat"] or heard_lat
+        marker_lon = node_data["lon"] or heard_lon
+        if marker_lat and marker_lon:
+            self._remember_marker(MapMarker(
+                marker_lat, marker_lon, node_data["name"], "meshcore",
+                key="meshtastic:" + address))
+        if self.loot:
+            self.loot.save_meshtastic_node(
+                address, node_data["name"], node_data["lat"],
+                node_data["lon"], node_data["rssi"], node_data["snr"],
+                node_data["hops"], heard_lat, heard_lon,
+                node_data["hardware"])
+
     def _on_mc_node(self, node_id, ntype, name, lat, lon, rssi, snr,
                     pubkey=None, hops=0):
         """Callback from LoRaManager background thread — enqueue for main."""
@@ -4280,8 +4446,8 @@ class WatchDogsGame(OtaMixin):
                 "pcap":        t.get("pcap", 0),
                 "passwords":   t.get("passwords", 0),
                 "et_captures": t.get("et_captures", 0),
-                "mc_nodes":    t.get("mc_nodes", 0),
-                "mc_msgs":     t.get("mc_messages", 0),
+                "mc_nodes":    t.get("mc_nodes", 0) + t.get("mt_nodes", 0),
+                "mc_msgs":     t.get("mc_messages", 0) + t.get("mt_messages", 0),
             }
         except Exception:
             pass
@@ -4344,8 +4510,8 @@ class WatchDogsGame(OtaMixin):
                 "pcap":        t.get("pcap", 0),
                 "passwords":   t.get("passwords", 0),
                 "et_captures": t.get("et_captures", 0),
-                "mc_nodes":    t.get("mc_nodes", 0),
-                "mc_msgs":     t.get("mc_messages", 0),
+                "mc_nodes":    t.get("mc_nodes", 0) + t.get("mt_nodes", 0),
+                "mc_msgs":     t.get("mc_messages", 0) + t.get("mt_messages", 0),
             }
         except Exception:
             pass
@@ -4491,6 +4657,9 @@ class WatchDogsGame(OtaMixin):
         self.gps.close()
         if self._lora.running:
             self._lora.stop()
+        # Disconnect only WDG. Keep meshtasticd alive for the user's other
+        # messaging clients after WDG exits.
+        self._meshtastic.close()
         if self._sdr.running:
             self._sdr.stop()
         if self._watch.connected:
@@ -7818,10 +7987,49 @@ class WatchDogsGame(OtaMixin):
                    "[ENTER]Add [W]WiFi [B]BLE [R]Refresh [ESC]Back", C_DIM)
 
     # ------------------------------------------------------------------
-    # MeshCore Messenger screen
+    # Mesh messenger screen
     # ------------------------------------------------------------------
 
+    def _mesh_protocol(self):
+        if hasattr(self, "wardrive"):
+            return self.wardrive.settings.get("lora_protocol", "meshcore")
+        return "meshcore"
+
+    def _mesh_nodes(self):
+        protocol = self._mesh_protocol()
+        return [node for node in self._mc_nodes
+                if node.get("protocol", "meshcore") == protocol]
+
+    def _mesh_channels(self):
+        if self._mesh_protocol() == "meshtastic":
+            return self._meshtastic.channels
+        return self._mc_channels_list
+
+    @staticmethod
+    def _mesh_channel_name(channel):
+        if isinstance(channel, dict):
+            return channel.get("name") or f"Channel {channel.get('index', 0)}"
+        return getattr(channel, "name", "?")
+
+    def _mesh_local_name(self):
+        if self._mesh_protocol() == "meshtastic":
+            return self._meshtastic.local_name
+        return self._mc_node_name
+
+    def _mesh_active_channel_index(self):
+        """Translate the visible channel row to its protocol channel index."""
+        channels = self._mesh_channels()
+        if not channels:
+            return 0
+        self._mc_active_ch = max(0, min(self._mc_active_ch,
+                                        len(channels) - 1))
+        channel = channels[self._mc_active_ch]
+        if isinstance(channel, dict):
+            return int(channel.get("index", self._mc_active_ch))
+        return self._mc_active_ch
+
     def _update_mc_screen(self):
+        protocol = self._mesh_protocol()
         # Ctrl+H toggles contacts panel (always, even when panel is open)
         ctrl = pyxel.btn(pyxel.KEY_LCTRL) or pyxel.btn(pyxel.KEY_RCTRL)
         if ctrl and pyxel.btnp(pyxel.KEY_H):
@@ -7857,16 +8065,19 @@ class WatchDogsGame(OtaMixin):
 
         # Channel picker overlay input
         if self._mc_chan_picker:
+            channels = self._mesh_channels()
             if pyxel.btnp(pyxel.KEY_UP):
                 self._mc_chan_sel = max(0, self._mc_chan_sel - 1)
             elif pyxel.btnp(pyxel.KEY_DOWN):
-                self._mc_chan_sel = min(len(self._mc_channels_list) - 1,
+                self._mc_chan_sel = min(len(channels) - 1,
                                         self._mc_chan_sel + 1)
             elif pyxel.btnp(pyxel.KEY_RETURN):
                 self._mc_active_ch = self._mc_chan_sel
-                self._lora.set_mc_active_channel(self._mc_active_ch)
-                ch = self._mc_channels_list[self._mc_active_ch]
-                self._mc_log.append((f"Channel: {ch.name}", C_HACK_CYAN))
+                if protocol == "meshcore":
+                    self._lora.set_mc_active_channel(self._mc_active_ch)
+                ch = channels[self._mc_active_ch]
+                self._mc_log.append((
+                    f"Channel: {self._mesh_channel_name(ch)}", C_HACK_CYAN))
                 self._mc_chan_picker = False
             elif pyxel.btnp(pyxel.KEY_ESCAPE):
                 self._mc_chan_picker = False
@@ -7878,9 +8089,25 @@ class WatchDogsGame(OtaMixin):
             if text:
                 ts = time.strftime("%H:%M")
                 if self._mc_dm_target:
-                    # Encrypted DM
-                    pk_hex = self._mc_dm_target.get("pubkey", "")
-                    if pk_hex:
+                    if protocol == "meshtastic":
+                        target = (self._mc_dm_target.get("address")
+                                  or self._mc_dm_target.get("id", "").removeprefix(
+                                      "meshtastic:"))
+                        sent = self._meshtastic.send_text(
+                            text, target, self._mesh_active_channel_index())
+                        tgt = self._mc_dm_target["name"]
+                        self._mc_log.append((
+                            f"\x11 [DM\u2192{tgt}] {text}",
+                            C_WARNING if sent else C_ERROR,
+                            ts if sent else f"{ts} NOT SENT"))
+                    else:
+                        # Encrypted MeshCore DM
+                        pk_hex = self._mc_dm_target.get("pubkey", "")
+                        if not pk_hex:
+                            self._mc_log.append(
+                                ("\x10 No pubkey — can't send DM", C_WARNING))
+                            self._mc_input = ""
+                            return
                         dest_pub = bytes.fromhex(pk_hex)
                         dedup_key = self._lora.send_meshcore_dm(
                             text, self._mc_node_name, dest_pub)
@@ -7893,12 +8120,16 @@ class WatchDogsGame(OtaMixin):
                             self._mc_dm_ack_map[ah] = idx
                         if dedup_key:
                             self._mc_tx_pending[dedup_key] = idx
-                    else:
-                        self._mc_log.append(
-                            ("\x10 No pubkey — can't send DM", C_WARNING))
                 else:
-                    # Channel message — AIO LoRa or watch fallback
-                    if self._lora.running and self._lora.mode == "meshcore":
+                    if protocol == "meshtastic":
+                        sent = self._meshtastic.send_text(
+                            text, channel=self._mesh_active_channel_index())
+                        self._mc_log.append((
+                            f"\x11 {self._mesh_local_name()}: {text}",
+                            C_WARNING if sent else C_ERROR,
+                            ts if sent else f"{ts} NOT SENT"))
+                    # MeshCore channel message — AIO LoRa or watch fallback
+                    elif self._lora.running and self._lora.mode == "meshcore":
                         dedup_key = self._lora.send_meshcore_message(
                             text, self._mc_node_name)
                         idx = len(self._mc_log)
@@ -7927,14 +8158,26 @@ class WatchDogsGame(OtaMixin):
         ctrl = pyxel.btn(pyxel.KEY_LCTRL) or pyxel.btn(pyxel.KEY_RCTRL)
         if ctrl:
             if pyxel.btnp(pyxel.KEY_A):
-                lat = self.player_lat if self.gps_fix else 0.0
-                lon = self.player_lon if self.gps_fix else 0.0
-                self._lora.send_meshcore_advert(
-                    self._mc_node_name, lat, lon)
-                self._mc_log.append(
-                    (f"\x11 Advert: {self._mc_node_name}", C_HACK_CYAN))
+                if protocol == "meshtastic":
+                    queued = self._meshtastic.request_discovery()
+                    self._mc_log.append((
+                        "\x11 Zero-hop NodeInfo discovery queued"
+                        if queued else "\x10 Meshtastic is not connected",
+                        C_HACK_CYAN if queued else C_WARNING))
+                else:
+                    lat = self.player_lat if self.gps_fix else 0.0
+                    lon = self.player_lon if self.gps_fix else 0.0
+                    self._lora.send_meshcore_advert(
+                        self._mc_node_name, lat, lon)
+                    self._mc_log.append((
+                        f"\x11 Advert: {self._mc_node_name}", C_HACK_CYAN))
                 return
             if pyxel.btnp(pyxel.KEY_N):
+                if protocol == "meshtastic":
+                    self._mc_log.append((
+                        "\x10 Change the node name in Meshtastic settings",
+                        C_WARNING))
+                    return
                 # Name change via input dialog
                 self.input_mode = True
                 self.input_fields = [{"label": "Node Name", "value":
@@ -7955,18 +8198,24 @@ class WatchDogsGame(OtaMixin):
 
         # Channel quick-switch with [ and ]
         if pyxel.btnp(pyxel.KEY_LEFTBRACKET):
-            if self._mc_channels_list:
-                self._mc_active_ch = (self._mc_active_ch - 1) % len(self._mc_channels_list)
-                self._lora.set_mc_active_channel(self._mc_active_ch)
-                ch = self._mc_channels_list[self._mc_active_ch]
-                self._mc_log.append((f"Channel: {ch.name}", C_HACK_CYAN))
+            channels = self._mesh_channels()
+            if channels:
+                self._mc_active_ch = (self._mc_active_ch - 1) % len(channels)
+                if protocol == "meshcore":
+                    self._lora.set_mc_active_channel(self._mc_active_ch)
+                ch = channels[self._mc_active_ch]
+                self._mc_log.append((
+                    f"Channel: {self._mesh_channel_name(ch)}", C_HACK_CYAN))
             return
         if pyxel.btnp(pyxel.KEY_RIGHTBRACKET):
-            if self._mc_channels_list:
-                self._mc_active_ch = (self._mc_active_ch + 1) % len(self._mc_channels_list)
-                self._lora.set_mc_active_channel(self._mc_active_ch)
-                ch = self._mc_channels_list[self._mc_active_ch]
-                self._mc_log.append((f"Channel: {ch.name}", C_HACK_CYAN))
+            channels = self._mesh_channels()
+            if channels:
+                self._mc_active_ch = (self._mc_active_ch + 1) % len(channels)
+                if protocol == "meshcore":
+                    self._lora.set_mc_active_channel(self._mc_active_ch)
+                ch = channels[self._mc_active_ch]
+                self._mc_log.append((
+                    f"Channel: {self._mesh_channel_name(ch)}", C_HACK_CYAN))
             return
 
         # Typing
@@ -7976,7 +8225,8 @@ class WatchDogsGame(OtaMixin):
 
     def _update_mc_nodes_panel(self):
         """Handle input for the contacts panel overlay."""
-        if not self._mc_nodes:
+        nodes = self._mesh_nodes()
+        if not nodes:
             self._mc_node_action = False
             self._mc_note_editing = False
             if pyxel.btnp(pyxel.KEY_ESCAPE):
@@ -7988,7 +8238,7 @@ class WatchDogsGame(OtaMixin):
             if pyxel.btnp(pyxel.KEY_ESCAPE):
                 self._mc_note_editing = False
             elif pyxel.btnp(pyxel.KEY_RETURN):
-                nd = self._mc_nodes[self._mc_node_sel]
+                nd = nodes[self._mc_node_sel]
                 nd["note"] = self._mc_note_buf
                 if self.loot:
                     self.loot.save_contact_note(nd["id"], self._mc_note_buf)
@@ -8012,28 +8262,35 @@ class WatchDogsGame(OtaMixin):
             elif pyxel.btnp(pyxel.KEY_ESCAPE):
                 self._mc_node_action = False
             elif pyxel.btnp(pyxel.KEY_RETURN):
-                nd = self._mc_nodes[self._mc_node_sel]
+                nd = nodes[self._mc_node_sel]
                 act = _actions[self._mc_node_action_sel]
                 if act == "DM":
-                    ntype = nd.get("type", 0)
-                    # Repeaters/Room/Sensor don't process DMs
-                    ntype_str = str(ntype)
-                    is_client = ntype in (0, 1, "Client")
-                    if not nd.get("pubkey"):
-                        self._mc_log.append(
-                            (f"\x10 No pubkey for {nd['name']} "
-                             f"— need advert first", C_WARNING))
-                    elif not is_client:
-                        self._mc_log.append(
-                            (f"\x10 {nd['name']} is {ntype_str} "
-                             f"— DM only works with Clients",
-                             C_WARNING))
-                    else:
+                    if self._mesh_protocol() == "meshtastic":
                         self._mc_dm_target = nd
                         self._mc_input = ""
                         self._mc_log.append(
                             (f"\x10 DM mode: {nd['name']} "
                              f"(ESC to exit)", 12))
+                    else:
+                        ntype = nd.get("type", 0)
+                        # Repeaters/Room/Sensor don't process MeshCore DMs.
+                        ntype_str = str(ntype)
+                        is_client = ntype in (0, 1, "Client")
+                        if not nd.get("pubkey"):
+                            self._mc_log.append(
+                                (f"\x10 No pubkey for {nd['name']} "
+                                 f"— need advert first", C_WARNING))
+                        elif not is_client:
+                            self._mc_log.append(
+                                (f"\x10 {nd['name']} is {ntype_str} "
+                                 f"— DM only works with Clients",
+                                 C_WARNING))
+                        else:
+                            self._mc_dm_target = nd
+                            self._mc_input = ""
+                            self._mc_log.append(
+                                (f"\x10 DM mode: {nd['name']} "
+                                 f"(ESC to exit)", 12))
                     self._mc_node_action = False
                     self._mc_nodes_panel = False
                 elif act == "Note":
@@ -8063,13 +8320,15 @@ class WatchDogsGame(OtaMixin):
                     self._mc_nodes.remove(nd)
                     if self.loot:
                         self.loot.delete_contact(nid)
-                    # Remove from LoRa known pubkeys
-                    self._lora._known_pubkeys.pop(nid, None)
+                    if self._mesh_protocol() == "meshcore":
+                        # Remove from LoRa known pubkeys.
+                        self._lora._known_pubkeys.pop(nid, None)
                     self._mc_log.append(
                         (f"\x10 Deleted contact: {name}", C_WARNING))
                     self._mc_node_action = False
+                    nodes = self._mesh_nodes()
                     self._mc_node_sel = min(self._mc_node_sel,
-                                            max(0, len(self._mc_nodes) - 1))
+                                            max(0, len(nodes) - 1))
                 else:
                     self._mc_node_action = False
             return
@@ -8078,7 +8337,7 @@ class WatchDogsGame(OtaMixin):
         if pyxel.btnp(pyxel.KEY_UP):
             self._mc_node_sel = max(0, self._mc_node_sel - 1)
         elif pyxel.btnp(pyxel.KEY_DOWN):
-            self._mc_node_sel = min(len(self._mc_nodes) - 1,
+            self._mc_node_sel = min(len(nodes) - 1,
                                     self._mc_node_sel + 1)
         elif pyxel.btnp(pyxel.KEY_RETURN):
             self._mc_node_action = True
@@ -8088,22 +8347,27 @@ class WatchDogsGame(OtaMixin):
 
     def _draw_mc_screen(self):
         pyxel.cls(0)
+        protocol = self._mesh_protocol()
+        protocol_name = "Meshtastic" if protocol == "meshtastic" else "MeshCore"
+        nodes = self._mesh_nodes()
+        channels = self._mesh_channels()
+        manager = self._meshtastic if protocol == "meshtastic" else self._lora
         # Title bar — 14px tall for 5x8 font + padding
         BAR_H = 14
         pyxel.rect(0, 0, W, BAR_H, 1)
-        status = "ACTIVE" if self._lora.running else "OFF"
-        pkts = self._lora.packets_received
+        status = "ACTIVE" if manager.running else "OFF"
+        pkts = getattr(manager, "packets_received", 0)
         ch_name = "?"
-        if self._mc_channels_list and self._mc_active_ch < len(self._mc_channels_list):
-            ch_name = self._mc_channels_list[self._mc_active_ch].name
+        if channels and self._mc_active_ch < len(channels):
+            ch_name = self._mesh_channel_name(channels[self._mc_active_ch])
         if self._mc_dm_target:
             dm_name = self._mc_dm_target.get("name", "?")
-            pyxel.text(4, 4, f"MESHCORE [DM: {dm_name}] [{status}] "
-                       f"pkts:{pkts} node:{self._mc_node_name}", 12)
+            pyxel.text(4, 4, f"{protocol_name.upper()} [DM: {dm_name}] "
+                       f"[{status}] pkts:{pkts} node:{self._mesh_local_name()}", 12)
         else:
-            pyxel.text(4, 4, f"MESHCORE [{ch_name}] [{status}] "
-                       f"pkts:{pkts} node:{self._mc_node_name} "
-                       f"nodes:{len(self._mc_nodes)}", C_HACK_CYAN)
+            pyxel.text(4, 4, f"{protocol_name.upper()} [{ch_name}] [{status}] "
+                       f"pkts:{pkts} node:{self._mesh_local_name()} "
+                       f"nodes:{len(nodes)}", C_HACK_CYAN)
 
         # Polish character transliteration (BDF/pyxel fonts are ASCII-only)
         _PL = str.maketrans(
@@ -8198,31 +8462,32 @@ class WatchDogsGame(OtaMixin):
             pyxel.rect(px_x, panel_top, pw, panel_bot, 0)
             pyxel.rectb(px_x, panel_top, pw, panel_bot, 2)
             pyxel.text(px_x + 4, panel_top + 4,
-                       f"CONTACTS ({len(self._mc_nodes)})", 2)
+                       f"CONTACTS ({len(nodes)})", 2)
             pyxel.text(px_x + pw - 90, panel_top + 4,
-                       "ENTER=action" if self._mc_nodes else "ESC=back", C_DIM)
+                       "ENTER=action" if nodes else "ESC=back", C_DIM)
             pyxel.line(px_x + 2, panel_top + 14,
                        px_x + pw - 3, panel_top + 14, 1)
-            if not self._mc_nodes:
+            if not nodes:
                 pyxel.text(px_x + 8, panel_top + 30,
-                           "No MeshCore nodes heard yet.", C_TEXT)
+                           f"No {protocol_name} nodes heard yet.", C_TEXT)
                 pyxel.text(px_x + 8, panel_top + 44,
-                           "Waiting for nearby node adverts..." if self._lora.running
+                           "Waiting for nearby node adverts..." if manager.running
                            else "LoRa is off; enable it to hear nodes.", C_DIM)
                 pyxel.text(px_x + 8, panel_top + 64,
                            "ESC or Ctrl+H: return to chat", C_HACK_CYAN)
             _type_icons = {0: "C", 1: "C", 2: "R", 3: "M", 4: "S",
                            "Client": "C", "Repeater": "R",
-                           "Room": "M", "Sensor": "S"}
+                           "Room": "M", "Sensor": "S",
+                           "Meshtastic": "T"}
             # Clamp selection
             self._mc_node_sel = max(0, min(
-                self._mc_node_sel, len(self._mc_nodes) - 1))
+                self._mc_node_sel, len(nodes) - 1))
             # Scroll to keep selection visible
             scroll_off = max(0, self._mc_node_sel - max_vis + 1)
             ny = panel_top + 18
             for idx in range(scroll_off,
-                             min(len(self._mc_nodes), scroll_off + max_vis)):
-                nd = self._mc_nodes[idx]
+                             min(len(nodes), scroll_off + max_vis)):
+                nd = nodes[idx]
                 raw_type = nd.get("type", 0)
                 try:
                     raw_type = int(raw_type)
@@ -8264,7 +8529,7 @@ class WatchDogsGame(OtaMixin):
                 ny += row_h
 
             # Action menu popup
-            if self._mc_node_action and self._mc_node_sel < len(self._mc_nodes):
+            if self._mc_node_action and self._mc_node_sel < len(nodes):
                 _actions = ["DM", "Note", "Info", "Delete", "Close"]
                 aw = 80
                 ah = len(_actions) * 12 + 8
@@ -8298,28 +8563,31 @@ class WatchDogsGame(OtaMixin):
             pw = 200
             px_x = (W - pw) // 2
             py_y = 40
-            ph = len(self._mc_channels_list) * 12 + 30
+            ph = len(channels) * 12 + 30
             pyxel.rect(px_x, py_y, pw, ph, 0)
             pyxel.rectb(px_x, py_y, pw, ph, C_HACK_CYAN)
             pyxel.text(px_x + 4, py_y + 3, "SELECT CHANNEL", C_HACK_CYAN)
             pyxel.line(px_x + 2, py_y + 11, px_x + pw - 3, py_y + 11, 1)
             cy = py_y + 15
-            for i, ch in enumerate(self._mc_channels_list):
+            for i, ch in enumerate(channels):
                 sel = (i == self._mc_chan_sel)
                 active = (i == self._mc_active_ch)
                 if sel:
                     pyxel.rect(px_x + 2, cy - 1, pw - 4, 11, C_HACK_CYAN)
                 c = 0 if sel else C_TEXT
                 marker = " <<<" if active else ""
-                pyxel.text(px_x + 6, cy + 1, f"{ch.name}{marker}", c)
+                pyxel.text(px_x + 6, cy + 1,
+                           f"{self._mesh_channel_name(ch)}{marker}", c)
                 cy += 12
             pyxel.text(px_x + 4, cy + 2, "ENTER=select  ESC=cancel", C_DIM)
 
         # Bottom hints
         pyxel.rect(0, H - 10, W, 10, 0)
-        pyxel.text(4, H - 8,
-                   "C-A Advert  C-N Name  C-H Nodes  C-C Chan  [/]Switch  C-X Clear  ESC Back",
-                   C_DIM)
+        if protocol == "meshtastic":
+            hints = "C-A Discover  C-H Nodes  C-C Chan  [/]Switch  C-X Clear  ESC Back"
+        else:
+            hints = "C-A Advert  C-N Name  C-H Nodes  C-C Chan  [/]Switch  C-X Clear  ESC Back"
+        pyxel.text(4, H - 8, hints, C_DIM)
 
     # ------------------------------------------------------------------
     # Loot screen search
@@ -8473,10 +8741,10 @@ class WatchDogsGame(OtaMixin):
         pyxel.text(col1, y, f"Passwords", C_DIM)
         pyxel.text(col1 + 80, y, f"{t_pwd_all}", 12)  # blue
         y += ROW_H
-        pyxel.text(col1, y, f"MC Nodes", C_DIM)
+        pyxel.text(col1, y, f"Mesh Nodes", C_DIM)
         pyxel.text(col1 + 80, y, f"{t.get('mc_nodes', 0)}", C_WARNING)
         y += ROW_H
-        pyxel.text(col1, y, f"MC Msgs", C_DIM)
+        pyxel.text(col1, y, f"Mesh Msgs", C_DIM)
         pyxel.text(col1 + 80, y, f"{t.get('mc_msgs', 0)}", C_WARNING)
         y += ROW_H
         n_contacts = len(self.loot.load_contacts()) if self.loot else 0

@@ -1,11 +1,6 @@
 #!/bin/bash
 cd "$(dirname "$0")"
 export PYTHONDONTWRITEBYTECODE=1
-# Kill meshtasticd which holds SPI/GPIO for LoRa SX1262
-if command -v meshtasticd >/dev/null 2>&1; then
-    sudo pkill -9 meshtasticd 2>/dev/null || true
-    sudo systemctl stop meshtasticd 2>/dev/null || true
-fi
 sudo find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # Stderr is captured to ~/.watchdogs/last_run.log by the game itself,
