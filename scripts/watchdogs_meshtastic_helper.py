@@ -476,9 +476,26 @@ def _install_tag(tag: str) -> dict[str, Any]:
         raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
     _secure_root_directory(CACHE_ROOT)
     validator = _load_validator()
-    prepared = validator.validate_prepared_release(
-        CACHE_ROOT / tag, expected_tag=tag, require_secure=True,
-        check_host=True)
+    release_dir = CACHE_ROOT / tag
+    if release_dir.exists():
+        prepared = validator.validate_prepared_release(
+            release_dir, expected_tag=tag, require_secure=True,
+            check_host=True)
+    else:
+        # The unprivileged UI passes only an immutable, strictly validated
+        # release tag.  Download and stage the corresponding assets inside the
+        # root-owned cache so no caller-controlled path or package bytes cross
+        # the sudo boundary.
+        releases = validator.meshtastic_releases()
+        release = next(
+            (candidate for candidate in releases
+             if candidate.get("tag_name") == tag), None)
+        if release is None:
+            raise HelperError(
+                "The requested Smethan Meshtastic release was not found")
+        prepared = validator.prepare_meshtastic_release(
+            cache_root=CACHE_ROOT, release=release, require_root=True,
+            check_host=True)
     with _lock_transaction():
         services = _service_snapshot()
         backup = None

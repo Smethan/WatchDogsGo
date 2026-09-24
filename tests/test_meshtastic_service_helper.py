@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 
@@ -170,6 +171,40 @@ def test_install_failure_runs_automatic_rollback(tmp_path, monkeypatch):
     with pytest.raises(helper.HelperError, match="was rolled back"):
         helper._install_tag("v2.8.1-wdg.1")
     assert rolled_back == [backup]
+
+
+def test_install_tag_downloads_only_the_matching_release_into_root_cache(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    cache = tmp_path / "cache"
+    cache.mkdir(mode=0o700)
+    requested = "v2.8.1-wdg.1"
+    release = {"tag_name": requested}
+    prepared = NS(
+        tag=requested, package_version="2.8.1+wdg1",
+        package_path=cache / "unused.deb", directory=cache / requested)
+    calls = []
+    validator = NS(
+        meshtastic_releases=lambda: [
+            {"tag_name": "v2.8.0-wdg.9"}, release],
+        prepare_meshtastic_release=lambda **kwargs: (
+            calls.append(kwargs) or prepared),
+    )
+    monkeypatch.setattr(helper, "CACHE_ROOT", cache)
+    monkeypatch.setattr(helper, "_secure_root_directory", lambda path: None)
+    monkeypatch.setattr(helper, "_load_validator", lambda: validator)
+    monkeypatch.setattr(helper, "_require_root", lambda: None)
+    monkeypatch.setattr(
+        helper, "_lock_transaction",
+        Mock(side_effect=RuntimeError("stop after preparation")))
+
+    with pytest.raises(RuntimeError, match="stop after preparation"):
+        helper._install_tag(requested)
+
+    assert calls == [{
+        "cache_root": cache, "release": release, "require_root": True,
+        "check_host": True,
+    }]
 
 
 class _Context:
