@@ -1,10 +1,26 @@
 """Background BlueZ BLE discovery for All Wardrive, with bounded UI handoff."""
 import asyncio
 from collections import OrderedDict
+from pathlib import Path
 from queue import Empty, Full, Queue
 import threading
 import time
 from uuid import UUID
+
+
+def resolve_ble_adapter(selection="auto", sysfs=Path("/sys/class/bluetooth")):
+    """Resolve a persisted controller MAC to the current BlueZ hci name."""
+    value = str(selection or "auto").strip()
+    if value.lower() == "auto":
+        return None
+    wanted = value.upper()
+    for address_file in sorted(Path(sysfs).glob("hci*/address")):
+        try:
+            if address_file.read_text(encoding="ascii").strip().upper() == wanted:
+                return address_file.parent.name
+        except OSError:
+            continue
+    raise RuntimeError(f"Bluetooth adapter {wanted} is not available")
 
 
 def advertisement_record(device, adv):
@@ -49,8 +65,14 @@ def advertisement_record(device, adv):
 
 
 class HostBleScanner:
-    def __init__(self, scanner_factory=None):
+    def __init__(self, scanner_factory=None, *, adapter="auto",
+                 adapter_resolver=resolve_ble_adapter,
+                 lease_acquire=None, lease_release=None):
         self.scanner_factory = scanner_factory
+        self.adapter = adapter
+        self.adapter_resolver = adapter_resolver
+        self.lease_acquire = lease_acquire
+        self.lease_release = lease_release
         self._thread = None
         self._stop = threading.Event()
         self._records = Queue(maxsize=256)
@@ -59,9 +81,11 @@ class HostBleScanner:
         self.state = "idle"
         self.drops = 0
 
-    def start(self, session):
+    def start(self, session, adapter=None):
         if self._thread and self._thread.is_alive():
             return False
+        if adapter is not None:
+            self.adapter = adapter
         self.session = session
         self._stop = threading.Event()
         self._records = Queue(maxsize=256)
@@ -84,39 +108,62 @@ class HostBleScanner:
                 self._status.put((session, "error", str(exc) or type(exc).__name__))
 
     async def _scan(self, session):
-        factory = self.scanner_factory
-        if factory is None:
-            from bleak import BleakScanner
-            factory = BleakScanner
-        seen = OrderedDict()
-
-        def received(device, adv):
-            if self._stop.is_set():
-                return
-            try:
-                record = advertisement_record(device, adv)
-                now = time.monotonic()
-                key = (record["data_hex"], record["addr_type"])
-                old = seen.pop(record["mac"], None)
-                if old and key == old[0] and now-old[1] < 1:
-                    seen[record["mac"]] = old
-                    return
-                seen[record["mac"]] = (key, now)
-                if len(seen) > 512:
-                    seen.popitem(last=False)
-                self._records.put_nowait((session, "ble", (now, record)))
-            except (ValueError, TypeError, OverflowError, Full):
-                self.drops += 1
-
-        scanner = factory(detection_callback=received, scanning_mode="active")
+        lease_held = False
+        scanner = None
         try:
+            if self.lease_acquire is not None:
+                result = self.lease_acquire(20)
+                allowed, reason = (
+                    (result, "Meshtastic phone has Bluetooth priority")
+                    if isinstance(result, bool) else result)
+                if not allowed:
+                    self.state = "paused"
+                    self._status.put((session, "paused", str(reason)))
+                    return
+                lease_held = True
+
+            factory = self.scanner_factory
+            if factory is None:
+                from bleak import BleakScanner
+                factory = BleakScanner
+            seen = OrderedDict()
+
+            def received(device, adv):
+                if self._stop.is_set():
+                    return
+                try:
+                    record = advertisement_record(device, adv)
+                    now = time.monotonic()
+                    key = (record["data_hex"], record["addr_type"])
+                    old = seen.pop(record["mac"], None)
+                    if old and key == old[0] and now-old[1] < 1:
+                        seen[record["mac"]] = old
+                        return
+                    seen[record["mac"]] = (key, now)
+                    if len(seen) > 512:
+                        seen.popitem(last=False)
+                    self._records.put_nowait((session, "ble", (now, record)))
+                except (ValueError, TypeError, OverflowError, Full):
+                    self.drops += 1
+
+            kwargs = dict(detection_callback=received, scanning_mode="active")
+            adapter = self.adapter_resolver(self.adapter)
+            if adapter:
+                kwargs["bluez"] = {"adapter": adapter}
+            scanner = factory(**kwargs)
             await asyncio.wait_for(scanner.start(), timeout=10)
             if not self._stop.is_set():
+                self.state = "running"
                 self._status.put((session, "started", None))
             while not self._stop.is_set():
                 await asyncio.sleep(0.1)
         finally:
-            await asyncio.wait_for(scanner.stop(), timeout=5)
+            try:
+                if scanner is not None:
+                    await asyncio.wait_for(scanner.stop(), timeout=5)
+            finally:
+                if lease_held and self.lease_release is not None:
+                    self.lease_release()
 
     def poll(self):
         events = []

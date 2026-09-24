@@ -2,7 +2,9 @@ import asyncio
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
-from watchdogs.host_ble import HostBleScanner, advertisement_record
+from watchdogs.host_ble import (
+    HostBleScanner, advertisement_record, resolve_ble_adapter,
+)
 from watchdogs.notable_detector import NotableDetector
 from watchdogs.scan_controller import ScanController
 
@@ -79,6 +81,75 @@ def test_bluetooth_start_failure_reports_error_and_cleans_up():
     worker._run("failed")
     assert worker.poll() == [("failed", "error", "Bluetooth adapter is powered off")]
     stopped.assert_called_once()
+
+
+def test_adapter_mac_resolves_to_current_hci_name(tmp_path):
+    controller = tmp_path / "hci7"
+    controller.mkdir()
+    (controller / "address").write_text("aa:bb:cc:dd:ee:ff\n")
+
+    assert resolve_ble_adapter("AA:BB:CC:DD:EE:FF", tmp_path) == "hci7"
+    assert resolve_ble_adapter("auto", tmp_path) is None
+
+
+def test_selected_adapter_and_scan_lease_are_used_and_released():
+    calls = []
+
+    class Scanner:
+        def __init__(self, **kwargs):
+            calls.append(("scanner", kwargs))
+
+        async def start(self):
+            worker.stop()
+
+        async def stop(self):
+            calls.append(("stop", None))
+
+    worker = HostBleScanner(
+        Scanner,
+        adapter="AA:BB:CC:DD:EE:FF",
+        adapter_resolver=lambda value: "hci7",
+        lease_acquire=lambda seconds: calls.append(("acquire", seconds)) or (True, ""),
+        lease_release=lambda: calls.append(("release", None)),
+    )
+
+    asyncio.run(worker._scan("session"))
+
+    assert calls[0] == ("acquire", 20)
+    assert calls[1][0] == "scanner"
+    assert calls[1][1]["bluez"] == {"adapter": "hci7"}
+    assert calls[-2:] == [("stop", None), ("release", None)]
+
+
+def test_phone_priority_denies_scan_without_constructing_scanner():
+    scanner = Mock()
+    released = Mock()
+    worker = HostBleScanner(
+        scanner,
+        lease_acquire=lambda seconds: (False, "phone connected"),
+        lease_release=released,
+    )
+
+    asyncio.run(worker._scan("session"))
+
+    assert worker.poll() == [("session", "paused", "phone connected")]
+    scanner.assert_not_called()
+    released.assert_not_called()
+
+
+def test_adapter_resolution_failure_still_releases_scan_lease():
+    released = Mock()
+    worker = HostBleScanner(
+        Mock(),
+        adapter_resolver=Mock(side_effect=RuntimeError("adapter disappeared")),
+        lease_acquire=lambda seconds: True,
+        lease_release=released,
+    )
+
+    worker._run("session")
+
+    assert worker.poll() == [("session", "error", "adapter disappeared")]
+    released.assert_called_once_with()
 
 
 def test_valid_records_prevent_false_heartbeat_but_silence_still_stops():

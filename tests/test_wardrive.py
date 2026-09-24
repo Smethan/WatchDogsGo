@@ -826,7 +826,7 @@ def test_split_wardrive_host_ble_detection_and_stop(game):
     assert w.scan.wifi_only
     assert game.serial.send_command.call_args.args[0] == "start_wardrive_wifi_serial " + token
     w.handle_line(wire(record("started", session=token, seq=1)))
-    w.host_ble.start.assert_called_once_with(token)
+    w.host_ble.start.assert_called_once_with(token, adapter="auto")
     device = NS(address="C2:00:00:00:00:01", details={"props":{"AddressType":"random"}})
     adv = NS(local_name="Penguin-123", rssi=-52, manufacturer_data={}, service_data={}, service_uuids=[])
     d = advertisement_record(device, adv)
@@ -848,7 +848,7 @@ def test_split_wardrive_host_ble_detection_and_stop(game):
     w.observation.assert_not_called()
 
 
-def test_host_ble_failure_stops_wifi_and_ignores_old_session(game):
+def test_host_ble_failure_keeps_wifi_running_and_ignores_old_session(game):
     w = game.wardrive
     w.scan.wifi_supported = True
     w.scan.start(wifi_only=True)
@@ -859,8 +859,8 @@ def test_host_ble_failure_stops_wifi_and_ignores_old_session(game):
     assert w.scan.state == "running"
     w.host_ble.poll.return_value = [(w.scan.session, "error", "No powered Bluetooth adapter")]
     w.poll_host_ble(10)
-    assert w.scan.state == "stopping" and "Bluetooth adapter" in w.scan.error
-    assert game.serial.send_command.call_args.args[0] == "stop"
+    assert w.scan.state == "running" and "Bluetooth adapter" in w.scan.error
+    assert "stop" not in [call.args[0] for call in game.serial.send_command.call_args_list]
 
 
 def test_dual_diagnostic_works_on_previous_firmware_and_saves_timing(game, monkeypatch):
@@ -949,7 +949,7 @@ def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only
     sdr.start_adsb.assert_called_once_with(str(game.loot.session_path))
     assert w.scan.state == "running"
     if wifi_only:
-        w.host_ble.start.assert_called_once_with(token)
+        w.host_ble.start.assert_called_once_with(token, adapter="auto")
 
 
 def test_all_wardrive_aux_collectors_skip_diagnostic_and_busy_radios(game):
@@ -1320,7 +1320,7 @@ def test_lte_off_never_starts_cell_and_does_not_block_all_wardrive(game, wifi_on
     assert w.scan.state == "running"
     w.cell.start.assert_not_called()
     if wifi_only:
-        w.host_ble.start.assert_called_once_with(token)
+        w.host_ble.start.assert_called_once_with(token, adapter="auto")
 
 
 def test_lte_toggle_stops_only_cell_and_reconfigures_gps(game):

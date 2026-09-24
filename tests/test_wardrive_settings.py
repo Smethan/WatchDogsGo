@@ -92,6 +92,34 @@ def test_collector_defaults_and_invalid_sdr_pair_are_exclusive():
         "lora_protocol"] == "meshcore"
 
 
+def test_meshtastic_backend_and_adapter_settings_are_normalized():
+    defaults = normalize_settings({})
+    assert defaults["meshtastic_backend"] == "auto"
+    assert defaults["meshtastic_phone_ble_enabled"] is True
+    assert defaults["meshtastic_phone_adapter"] == "auto"
+    assert defaults["host_ble_adapter"] == "auto"
+
+    settings = normalize_settings({
+        "meshtastic_backend": "fork_socket",
+        "meshtastic_phone_ble_enabled": False,
+        "meshtastic_phone_adapter": "aa:bb:cc:dd:ee:ff",
+        "host_ble_adapter": "11:22:33:44:55:66",
+    })
+    assert settings["meshtastic_backend"] == "fork_socket"
+    assert settings["meshtastic_phone_ble_enabled"] is False
+    assert settings["meshtastic_phone_adapter"] == "AA:BB:CC:DD:EE:FF"
+    assert settings["host_ble_adapter"] == "11:22:33:44:55:66"
+
+    invalid = normalize_settings({
+        "meshtastic_backend": "tcp_then_socket",
+        "meshtastic_phone_adapter": "hci0",
+        "host_ble_adapter": 7,
+    })
+    assert invalid["meshtastic_backend"] == "auto"
+    assert invalid["meshtastic_phone_adapter"] == "auto"
+    assert invalid["host_ble_adapter"] == "auto"
+
+
 def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})

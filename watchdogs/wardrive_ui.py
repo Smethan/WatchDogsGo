@@ -272,7 +272,9 @@ class WardriveUI:
                 if self.cell.active:
                     self.cell.observe_batch(self.fixes.at(time.monotonic()), d["batch"])
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
-                if not self.host_ble.start(self.scan.session):
+                if not self.host_ble.start(
+                        self.scan.session,
+                        adapter=self.settings.get("host_ble_adapter", "auto")):
                     self.host_ble_error("Previous Bluetooth scan is still closing; retry shortly")
                 else:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
@@ -348,7 +350,7 @@ class WardriveUI:
         self.scan.error = "uConsole BLE: " + message[:150]
         self.app._term_add("[ALL] " + self.scan.error, raw=True)
         self.app._term_add("[ALL] Enable Bluetooth in the OS and check that bleak is installed.", raw=True)
-        self.app._send("stop")
+        self.app.msg("[ALL] Host BLE unavailable; WiFi and other collectors continue", ORANGE)
 
     def write_diagnostics(self, now):
         scan = self.scan
@@ -388,6 +390,13 @@ class WardriveUI:
             if kind == "error":
                 self.host_ble_error(data)
                 active = False
+            elif kind == "paused":
+                self.host_ble.state = "paused"
+                self.app._term_add(
+                    "[ALL] Host BLE paused: " + str(data)[:120], raw=True)
+                self.app.msg(
+                    "[ALL] Host BLE paused; Meshtastic phone priority",
+                    ORANGE)
             elif kind == "started":
                 self.host_ble.state = "running"
                 self.app._term_add("[ALL] uConsole BLE scanning", raw=True)
