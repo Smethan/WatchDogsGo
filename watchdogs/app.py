@@ -603,8 +603,11 @@ class WatchDogsGame(OtaMixin):
         self._fw_update_available = False
 
         # MeshCore Messenger (runs in background when LoRa enabled)
-        self._lora = LoRaManager()
         self._meshtastic = MeshtasticManager()
+        self._lora = LoRaManager(service_handoff=self._meshtastic)
+        self._lora_transition_queue: Queue = Queue()
+        self._lora_transition_thread = None
+        self._lora_transition_thread_factory = threading.Thread
         self._lora._on_node = self._on_mc_node
         self._lora._on_message = self._on_mc_message
         self._lora._on_dm = self._on_mc_dm
@@ -2280,14 +2283,10 @@ class WatchDogsGame(OtaMixin):
             # instead of incorrectly telling the user to enable LoRa again.
             if self._lora_enabled and not self._lora.running:
                 try:
-                    # The explicit MeshCore action claims the SX1262 for
-                    # direct SPI, so meshtasticd must release it first.
-                    meshtastic = getattr(self, "_meshtastic", None)
-                    if meshtastic is not None:
-                        meshtastic.close(stop_daemon=True)
                     self._lora.set_mc_channels(self._mc_channels_list)
                     self._lora.start_meshcore(self._mc_region)
-                    self._term_add("[MC] Restarting MeshCore receiver", raw=True)
+                    self._term_add(
+                        "[MC] Starting MeshCore radio handoff", raw=True)
                 except Exception as exc:
                     self._term_add(f"[MC] MeshCore start failed: {exc}", raw=True)
             aio_lora = (
@@ -2676,8 +2675,25 @@ class WatchDogsGame(OtaMixin):
                     "[SYS] LoRa powered; no WDG mesh client started",
                     raw=True)
         else:
-            if self._lora.running:
-                self._lora.stop()
+            if self._lora_transition_active():
+                self.msg(
+                    "[LoRa] Radio handoff in progress; power remains ON",
+                    C_ERROR)
+                self._term_add(
+                    "[SYS] Refusing LoRa power-off during radio handoff",
+                    raw=True)
+                return
+            direct_active = (
+                self._lora.running or self._lora.worker_active
+                or self._lora.radio_owned)
+            if direct_active and not self._lora.stop():
+                self.msg(
+                    "[LoRa] Direct radio is still stopping; power remains ON",
+                    C_ERROR)
+                self._term_add(
+                    "[SYS] Refusing LoRa power-off while SX1262 ownership is "
+                    "still active", raw=True)
+                return
             # Powering the AIO LoRa rail off also requires meshtasticd to
             # release SPI. This is an explicit hardware-off action.
             self._meshtastic.close(stop_daemon=True)
@@ -2697,6 +2713,52 @@ class WatchDogsGame(OtaMixin):
             self._term_add("[SYS] LoRa disabled, mesh clients stopped", raw=True)
         self.glitch_timer = 2
 
+    def _lora_transition_active(self) -> bool:
+        thread = getattr(self, "_lora_transition_thread", None)
+        return bool(thread is not None and thread.is_alive())
+
+    def _run_meshtastic_handoff(self) -> None:
+        """Release direct SPI, then restore the selected daemon off-thread."""
+        ok = False
+        detail = ""
+        try:
+            if not self._lora.stop():
+                detail = (
+                    "direct radio worker did not release the SX1262; "
+                    "Meshtastic was not started")
+            elif self._lora.radio_owned:
+                detail = (
+                    "direct radio ownership remained held; Meshtastic was "
+                    "not started")
+            elif not self._meshtastic.resume_service(
+                    timeout=15.0, connect=True):
+                detail = "Meshtastic service did not become ready"
+            else:
+                ok = True
+                detail = "Meshtastic service ready"
+        except Exception as exc:
+            detail = "Meshtastic handoff failed: " + str(exc)[:140]
+        queue = getattr(self, "_lora_transition_queue", None)
+        if queue is not None:
+            queue.put((ok, detail))
+
+    def _start_meshtastic_handoff(self) -> bool:
+        """Start one nonblocking direct-radio to daemon transition."""
+        if self._lora_transition_active():
+            return False
+        if not hasattr(self, "_lora_transition_queue"):
+            self._lora_transition_queue = Queue()
+        factory = getattr(
+            self, "_lora_transition_thread_factory", threading.Thread)
+        thread = factory(
+            target=self._run_meshtastic_handoff,
+            name="wdg-lora-to-meshtastic",
+            daemon=True,
+        )
+        self._lora_transition_thread = thread
+        thread.start()
+        return True
+
     def _switch_lora_protocol(self, protocol: str,
                               *, start_if_enabled: bool = True):
         """Release the old radio owner and activate the selected protocol."""
@@ -2708,28 +2770,37 @@ class WatchDogsGame(OtaMixin):
             self._meshtastic.close()
             return
         if protocol == "meshtastic":
-            if self._lora.running:
-                self._lora.stop()
             if self._lora_enabled and start_if_enabled:
-                self._meshtastic.start()
-                self._term_add(
-                    "[SYS] Meshtastic client starting via meshtasticd",
-                    raw=True)
+                if self._start_meshtastic_handoff():
+                    self._term_add(
+                        "[SYS] Releasing direct radio before Meshtastic start",
+                        raw=True)
             return
 
-        # Direct MeshCore access cannot coexist with meshtasticd. Selecting
-        # MeshCore is the explicit instruction to release the daemon's SPI
-        # ownership before LoRaRF starts.
-        self._meshtastic.close(stop_daemon=True)
+        if self._lora_transition_active():
+            self._term_add(
+                "[MC] Waiting for the current radio handoff to finish",
+                raw=True)
+            return
+
+        # LoRaManager performs the daemon handoff in its worker before it
+        # acquires process ownership and touches SPI/GPIO.  This also covers
+        # direct starts initiated by All Wardrive.
         if self._lora_enabled and start_if_enabled:
             try:
                 self._lora.set_mc_channels(self._mc_channels_list)
-                self._lora.start_meshcore(self._mc_region)
+                started = self._lora.start_meshcore(self._mc_region)
+                if not started:
+                    self._term_add(
+                        "[MC] Direct radio is already starting or active",
+                        raw=True)
+                    return
                 lat = self.player_lat if self.gps_fix else 0.0
                 lon = self.player_lon if self.gps_fix else 0.0
                 self._lora.send_meshcore_advert(
                     self._mc_node_name, lat, lon)
-                self._term_add("[SYS] MeshCore direct radio started", raw=True)
+                self._term_add(
+                    "[SYS] MeshCore radio handoff starting", raw=True)
             except Exception as exc:
                 self._term_add(
                     "[MC] MeshCore start failed: " + str(exc)[:120], raw=True)
@@ -4154,6 +4225,20 @@ class WatchDogsGame(OtaMixin):
     # ------------------------------------------------------------------
 
     def _poll_lora(self):
+        transition_queue = getattr(self, "_lora_transition_queue", None)
+        if transition_queue is not None:
+            try:
+                while not transition_queue.empty():
+                    ok, detail = transition_queue.get_nowait()
+                    prefix = "[SYS]" if ok else "[LoRa]"
+                    self._term_add(f"{prefix} {detail}", raw=True)
+                    if not ok:
+                        self.msg(f"[LoRa] {detail}", C_ERROR)
+            except Exception:
+                pass
+        if (getattr(self, "_lora_transition_thread", None) is not None
+                and not self._lora_transition_active()):
+            self._lora_transition_thread = None
         try:
             while not self._lora.queue.empty():
                 text, attr = self._lora.queue.get_nowait()
@@ -4655,11 +4740,20 @@ class WatchDogsGame(OtaMixin):
                 pass
             self.serial.close()
         self.gps.close()
-        if self._lora.running:
-            self._lora.stop()
-        # Disconnect only WDG. Keep meshtasticd alive for the user's other
-        # messaging clients after WDG exits.
-        self._meshtastic.close()
+        transition = getattr(self, "_lora_transition_thread", None)
+        if transition is not None and transition.is_alive():
+            transition.join(timeout=22.0)
+        transition_pending = bool(
+            transition is not None and transition.is_alive())
+        if not transition_pending:
+            if self._lora.running or self._lora.worker_active:
+                self._lora.stop()
+            # Disconnect only WDG. Keep meshtasticd alive for the user's other
+            # messaging clients after WDG exits.
+            self._meshtastic.close()
+        else:
+            self._term_add(
+                "[LoRa] Radio handoff still active during shutdown", raw=True)
         if self._sdr.running:
             self._sdr.stop()
         if self._watch.connected:

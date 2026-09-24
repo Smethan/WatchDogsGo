@@ -10,6 +10,7 @@ Hardware: SX1262 on /dev/spidev1.0
 
 import hashlib
 import hmac
+import importlib
 import logging
 import os
 import re
@@ -20,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from typing import Optional
+
+from .radio_ownership import RadioOwnership, RadioOwnershipBusy
 
 log = logging.getLogger(__name__)
 
@@ -279,10 +282,19 @@ def missing_spi_message(device: Path | str) -> str:
 class LoRaManager:
     """Background LoRa operations with queue-based output."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, radio_ownership=None, service_handoff=None,
+                 thread_factory=None) -> None:
         self.queue: Queue = Queue()
         self._thread: Optional[threading.Thread] = None
+        self._thread_factory = thread_factory or threading.Thread
         self._stop_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._radio_ownership = (
+            radio_ownership if radio_ownership is not None
+            else RadioOwnership())
+        self._service_handoff = service_handoff
+        self._session_service_was_ready = False
+        self._resource_close_uncertain = False
         self.running = False
         self.mode = ""  # "sniffer", "scanner", "tracker"
         self.packets_received = 0
@@ -318,6 +330,178 @@ class LoRaManager:
     def _emit(self, line: str, attr: str = "default") -> None:
         self.queue.put((line, attr))
 
+    @property
+    def radio_owned(self) -> bool:
+        """Whether this manager currently holds the direct-radio lock."""
+        return bool(self._radio_ownership.held)
+
+    @property
+    def worker_active(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _start_worker(self, mode: str, target, args=()) -> bool:
+        """Start one direct-radio worker with its final mode set up front."""
+        with self._state_lock:
+            if self.running or self.worker_active:
+                return False
+            if self._radio_ownership.held:
+                self._emit(
+                    "SX1262 ownership is still held after an earlier cleanup "
+                    "failure; restart WatchDogsGo before retrying", "error")
+                return False
+            self._stop_event.clear()
+            self.running = True
+            self.mode = mode
+            self.packets_received = 0
+            thread = self._thread_factory(
+                target=target,
+                args=args,
+                name=f"wdg-lora-{mode}",
+                daemon=True,
+            )
+            self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._state_lock:
+                if self._thread is thread:
+                    self._thread = None
+                self.running = False
+            raise
+        return True
+
+    def _worker_finished(self) -> None:
+        with self._state_lock:
+            self.running = False
+            if self._thread is threading.current_thread():
+                self._thread = None
+
+    def _restore_service_after_failed_start(self, was_ready: bool) -> None:
+        """Restore a daemon displaced by a failed direct-radio startup."""
+        if not was_ready or self._service_handoff is None:
+            return
+        try:
+            if self._service_handoff.resume_service(
+                    timeout=15.0, connect=True):
+                self._emit(
+                    "Direct radio failed; Meshtastic service restored", "dim")
+            else:
+                self._emit(
+                    "Direct radio failed and Meshtastic service could not be "
+                    "restored", "error")
+        except Exception as exc:
+            self._emit(
+                "Direct radio failed and Meshtastic service restore failed: "
+                + str(exc)[:120], "error")
+
+    def _finish_radio_session(self, startup_complete: bool) -> None:
+        """Restore a displaced service only when direct startup itself failed."""
+        was_ready = self._session_service_was_ready
+        self._session_service_was_ready = False
+        if (startup_complete or self._stop_event.is_set()
+                or self._radio_ownership.held):
+            return
+        self._restore_service_after_failed_start(was_ready)
+
+    def _open_radio_session(self):
+        """Suspend the daemon, claim process ownership, then initialize SPI."""
+        self._session_service_was_ready = False
+        if self._stop_event.is_set():
+            return None
+        was_ready = False
+        handoff = self._service_handoff
+        if handoff is not None:
+            try:
+                was_ready = bool(handoff.service_ready())
+                if not handoff.suspend_service(timeout=10.0):
+                    self._emit(
+                        "Could not stop the selected Meshtastic service; "
+                        "direct SX1262 access was not started", "error")
+                    try:
+                        if was_ready and not handoff.service_ready():
+                            self._restore_service_after_failed_start(True)
+                    except Exception:
+                        pass
+                    return None
+            except Exception as exc:
+                self._emit(
+                    "Could not hand off the SX1262 from Meshtastic: "
+                    + str(exc)[:120], "error")
+                try:
+                    if was_ready and not handoff.service_ready():
+                        self._restore_service_after_failed_start(True)
+                except Exception:
+                    pass
+                return None
+
+        # stop() may have been requested while the bounded service handoff was
+        # waiting.  A cancelled worker must never claim GPIO/SPI afterward.
+        if self._stop_event.is_set():
+            return None
+
+        try:
+            self._radio_ownership.acquire(
+                f"WatchDogsGo {self.mode or 'direct radio'}")
+        except RadioOwnershipBusy as exc:
+            self._emit(
+                f"{exc}; stop the other radio user before retrying", "error")
+            return None
+        except Exception as exc:
+            self._emit(
+                "Could not acquire the AIO SX1262 ownership lock: "
+                + str(exc)[:120], "error")
+            self._restore_service_after_failed_start(was_ready)
+            return None
+
+        if self._stop_event.is_set():
+            self._cleanup_radio(None)
+            return None
+
+        self._resource_close_uncertain = False
+        lora = self._init_radio()
+        if lora is not None:
+            self._session_service_was_ready = was_ready
+            return lora
+
+        # _init_radio() closes a partially initialized SPI object.  Release
+        # process ownership before restarting any service that previously had
+        # the hardware.
+        self._cleanup_radio(None)
+        if not self._radio_ownership.held:
+            self._restore_service_after_failed_start(was_ready)
+        return None
+
+    def _close_radio_resources(self, lora) -> bool:
+        """Cold-sleep the radio and confirm SPI close without GPIO cleanup.
+
+        LoRaRF's ``end()`` also calls process-wide ``gpio.cleanup()``.  This
+        application intentionally retains the configured BCM pin mode so a
+        later direct session can initialize reliably.  The process ownership
+        lock is still retained whenever SPI close cannot be confirmed.
+        """
+        if lora is None:
+            return not self._resource_close_uncertain
+        try:
+            lora.sleep(lora.SLEEP_COLD_START)
+        except Exception:
+            pass
+        try:
+            module = importlib.import_module(type(lora).__module__)
+            spi = getattr(module, "spi", None)
+            if spi is None:
+                from LoRaRF import SX126x as _sx
+                spi = getattr(_sx, "spi", None)
+            if spi is None:
+                raise RuntimeError("LoRaRF SPI handle is unavailable")
+            spi.close()
+        except Exception as exc:
+            self._resource_close_uncertain = True
+            log.warning("Could not confirm LoRaRF SPI close: %s", exc)
+            return False
+        self._resource_close_uncertain = False
+        return True
+
     def _init_radio(self):
         """Initialize SX1262 via SPI. Returns LoRa object or None."""
         try:
@@ -346,6 +530,7 @@ class LoRaManager:
         except Exception:
             pass
 
+        lora = None
         try:
             lora = SX126x()
 
@@ -358,6 +543,7 @@ class LoRaManager:
                 irq=LORARF_IRQ_POLLING,
             ):
                 self._emit("SX1262 not detected on SPI bus", "error")
+                self._close_radio_resources(lora)
                 return None
 
             # SX1262-specific: DIO2 as RF switch, DIO3 as TCXO voltage
@@ -375,11 +561,13 @@ class LoRaManager:
             self._emit("SX1262 radio initialized", "dim")
             return lora
         except FileNotFoundError as exc:
+            self._close_radio_resources(lora)
             missing = exc.filename or spi_device
             self._emit(missing_spi_message(missing), "error")
             log.warning("SX1262 device path missing: %s", missing)
             return None
         except Exception as exc:
+            self._close_radio_resources(lora)
             self._emit(f"Radio init failed: {exc}", "error")
             log.warning("SX1262 init failed: %s", exc)
             return None
@@ -397,38 +585,39 @@ class LoRaManager:
         label: str = "",
         sync_word: int = 0,
         preamble: int = 0,
-    ) -> None:
+    ) -> bool:
         """Start LoRa sniffer on given frequency and spreading factor."""
-        if self.running:
-            return
-        self._stop_event.clear()
-        self.running = True
-        self.mode = "sniffer"
-        self.packets_received = 0
         self._seen_packets.clear()
-        self._thread = threading.Thread(
-            target=self._run_sniffer,
-            args=(freq, sf, cr, bw, label, sync_word, preamble),
-            daemon=True,
+        return self._start_sniffer_worker(
+            "sniffer", freq, sf, cr, bw, label, sync_word, preamble,
         )
-        self._thread.start()
 
-    def start_meshcore(self, region: str | None = None) -> None:
+    def _start_sniffer_worker(
+        self, mode: str, freq: int, sf: int, cr: int, bw: int, label: str,
+        sync_word: int = 0, preamble: int = 0,
+    ) -> bool:
+        return self._start_worker(
+            mode,
+            self._run_sniffer,
+            (freq, sf, cr, bw, label, sync_word, preamble),
+        )
+
+    def start_meshcore(self, region: str | None = None) -> bool:
         """Start sniffer on a MeshCore regional preset. If `region` is None,
         falls back to DEFAULT_MESHCORE_REGION (EU/UK Narrow)."""
         freq, sf, cr, bw, label = get_meshcore_preset(region)
-        self.start_sniffer(
-            freq, sf, cr, bw, label,
-            sync_word=MESHCORE_SYNC_WORD,
-            preamble=MESHCORE_PREAMBLE,
+        self._seen_packets.clear()
+        return self._start_sniffer_worker(
+            "meshcore", freq, sf, cr, bw, label,
+            MESHCORE_SYNC_WORD, MESHCORE_PREAMBLE,
         )
-        self.mode = "meshcore"
 
-    def start_meshtastic(self) -> None:
+    def start_meshtastic(self) -> bool:
         """Start sniffer on Meshtastic Medium Fast (869.525 MHz)."""
         freq, sf, cr, bw, label = PRESET_MESHTASTIC
-        self.start_sniffer(freq, sf, cr, bw, label)
-        self.mode = "meshtastic"
+        self._seen_packets.clear()
+        return self._start_sniffer_worker(
+            "meshtastic", freq, sf, cr, bw, label)
 
     def _configure_radio(
         self, lora, freq: int, sf: int, cr: int, bw: int,
@@ -449,16 +638,16 @@ class LoRaManager:
         self, freq: int, sf: int, cr: int, bw: int, label: str,
         sync_word: int = 0, preamble: int = 0,
     ) -> None:
-        lora = self._init_radio()
+        lora = self._open_radio_session()
         if not lora:
-            self.running = False
+            self._worker_finished()
             return
+        startup_complete = False
         try:
             self._configure_radio(
                 lora, freq, sf, cr, bw, sync_word, preamble,
             )
             tag = label or f"{freq / 1_000_000:.3f}MHz SF{sf}"
-            self._emit(f"Sniffer started: {tag}", "success")
 
             # Pick packet handler based on mode
             handler = (
@@ -474,6 +663,8 @@ class LoRaManager:
                 if not lora.request(lora.RX_CONTINUOUS):
                     raise RuntimeError(
                         "radio refused initial continuous RX")
+            startup_complete = True
+            self._emit(f"Sniffer started: {tag}", "success")
 
             errors = 0
             while not self._stop_event.is_set():
@@ -533,30 +724,24 @@ class LoRaManager:
         finally:
             self.cancel_meshcore_discovery()
             self._cleanup_radio(lora)
+            self._finish_radio_session(startup_complete)
+            self._worker_finished()
             self._emit("Sniffer stopped.", "dim")
 
     # ------------------------------------------------------------------
     # Scanner — cycle through EU868 + APRS 433 frequencies × SFs
     # ------------------------------------------------------------------
 
-    def start_scanner(self) -> None:
+    def start_scanner(self) -> bool:
         """Start scanning EU868 + APRS 433 frequencies × spreading factors."""
-        if self.running:
-            return
-        self._stop_event.clear()
-        self.running = True
-        self.mode = "scanner"
-        self.packets_received = 0
-        self._thread = threading.Thread(
-            target=self._run_scanner, daemon=True,
-        )
-        self._thread.start()
+        return self._start_worker("scanner", self._run_scanner)
 
     def _run_scanner(self) -> None:
-        lora = self._init_radio()
+        lora = self._open_radio_session()
         if not lora:
-            self.running = False
+            self._worker_finished()
             return
+        startup_complete = False
         try:
             total = len(SCAN_FREQUENCIES) * len(SPREADING_FACTORS)
             self._emit(
@@ -565,6 +750,7 @@ class LoRaManager:
                 f"{len(SPREADING_FACTORS)} SFs = {total} combos",
                 "success",
             )
+            startup_complete = True
             cycle = 0
             errors = 0
             while not self._stop_event.is_set():
@@ -607,30 +793,24 @@ class LoRaManager:
             log.error("LoRa scanner error: %s", exc)
         finally:
             self._cleanup_radio(lora)
+            self._finish_radio_session(startup_complete)
+            self._worker_finished()
             self._emit("Scanner stopped.", "dim")
 
     # ------------------------------------------------------------------
     # Balloon Tracker — APRS 433 + UKHAS 868 listener
     # ------------------------------------------------------------------
 
-    def start_tracker(self) -> None:
+    def start_tracker(self) -> bool:
         """Start balloon tracker cycling APRS 433 and UKHAS 868 frequencies."""
-        if self.running:
-            return
-        self._stop_event.clear()
-        self.running = True
-        self.mode = "tracker"
-        self.packets_received = 0
-        self._thread = threading.Thread(
-            target=self._run_tracker, daemon=True,
-        )
-        self._thread.start()
+        return self._start_worker("tracker", self._run_tracker)
 
     def _run_tracker(self) -> None:
-        lora = self._init_radio()
+        lora = self._open_radio_session()
         if not lora:
-            self.running = False
+            self._worker_finished()
             return
+        startup_complete = False
         try:
             # Tracker profiles: APRS 433 MHz + UKHAS 868 MHz
             profiles = [
@@ -644,6 +824,7 @@ class LoRaManager:
             self._emit(
                 "Listening for LoRa APRS + UKHAS payloads...", "dim",
             )
+            startup_complete = True
 
             errors = 0
             while not self._stop_event.is_set():
@@ -682,6 +863,8 @@ class LoRaManager:
             log.error("LoRa tracker error: %s", exc)
         finally:
             self._cleanup_radio(lora)
+            self._finish_radio_session(startup_complete)
+            self._worker_finished()
             self._emit("Tracker stopped.", "dim")
 
     def _parse_balloon(
@@ -1758,23 +1941,50 @@ class LoRaManager:
         Next begin() fails because setmode() only runs at module import time.
         We close SPI directly and skip gpio.cleanup().
         """
+        close_confirmed = self._close_radio_resources(lora)
         try:
-            if lora:
-                lora.sleep(lora.SLEEP_COLD_START)
-                from LoRaRF import SX126x as _sx
-                _sx.spi.close()
-        except Exception:
-            pass
-        self.running = False
+            # The process lock covers the complete direct-radio lifetime.  An
+            # uncertain SPI close keeps ownership held so a daemon cannot be
+            # started on top of hardware that this process may still own.
+            if not close_confirmed:
+                self._emit(
+                    "Could not confirm SX1262 SPI close; ownership lock "
+                    "retained", "error")
+                return
+            try:
+                self._radio_ownership.release()
+            except Exception as exc:
+                self._emit(
+                    "Failed to release the AIO SX1262 ownership lock: "
+                    + str(exc)[:120], "error")
+                log.exception("Failed to release SX1262 ownership")
+        finally:
+            self.running = False
 
     # ------------------------------------------------------------------
     # Stop
     # ------------------------------------------------------------------
 
-    def stop(self) -> None:
-        """Signal the background thread to stop and wait for cleanup."""
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Stop the worker and confirm that hardware ownership was released."""
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self._thread = None
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout))
+        if thread and thread.is_alive():
+            self._emit(
+                "Direct radio worker did not stop; SX1262 remains unavailable",
+                "error",
+            )
+            return False
+        with self._state_lock:
+            if self._thread is thread:
+                self._thread = None
+            self.running = False
         self.cancel_meshcore_discovery()
+        if self._radio_ownership.held:
+            self._emit(
+                "Direct radio stopped but the SX1262 ownership lock is still "
+                "held", "error")
+            return False
+        return True

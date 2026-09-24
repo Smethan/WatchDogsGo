@@ -1194,7 +1194,9 @@ def test_meshcore_messenger_restarts_powered_stopped_receiver(game):
 
     lora.set_mc_channels.assert_called_once_with(game._mc_channels_list)
     lora.start_meshcore.assert_called_once_with("us_ca_narrow")
-    game._meshtastic.close.assert_called_once_with(stop_daemon=True)
+    # LoRaManager owns the daemon-to-direct-radio handoff in its background
+    # worker; the Pyxel menu path must not synchronously mutate systemd state.
+    game._meshtastic.close.assert_not_called()
     assert game._mc_screen and game._mc_scroll == 0
     assert not any("Enable LoRa" in call.args[0]
                    for call in game.msg.call_args_list)
