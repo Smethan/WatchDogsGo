@@ -439,6 +439,20 @@ run_as_target mkdir -p loot maps plugins firmware_cache
 run_as_target chmod 755 loot maps plugins firmware_cache
 ok "Data directories ready (loot, maps, plugins, firmware_cache)"
 
+# Install only the root-owned, argument-allowlisted Meshtastic support helper.
+# Firmware packages remain an explicit in-app install/update action and are
+# revalidated by this helper before dpkg sees them.
+if [[ "$(uname)" == "Linux" ]]; then
+    info "Installing protected Meshtastic service/update helper..."
+    if sudo bash "$SCRIPT_DIR/scripts/setup_meshtastic.sh" \
+            --install-support "$TARGET_USER" "$TARGET_UID"; then
+        ok "Meshtastic helper and private cache installed"
+    else
+        fail "Meshtastic helper setup failed"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
 if [ ! -f "secrets.conf" ] && [ -f "secrets.conf.example" ]; then
     run_as_target cp secrets.conf.example secrets.conf
     ok "secrets.conf created from template (edit to add API keys)"

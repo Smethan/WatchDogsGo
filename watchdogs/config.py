@@ -123,6 +123,14 @@ FLASH_MODE = "dio"
 FLASH_FREQ = "80m"
 FIRMWARE_DIR = "/tmp/wdg-firmware"
 
+# Native Meshtastic daemon fork.  This is deliberately separate from the
+# projectZero ESP firmware updater and uses its own release/tag contract.
+MESHTASTIC_FIRMWARE_REPO = "Smethan/meshtastic-firmware"
+MESHTASTIC_RELEASES_URL = (
+    "https://api.github.com/repos/Smethan/meshtastic-firmware/releases")
+MESHTASTIC_CACHE_DIR = "/var/cache/watchdogs/meshtasticd-wdg"
+MESHTASTIC_HELPER = "/usr/local/libexec/watchdogs-meshtastic"
+
 # Board-specific flash profiles
 FLASH_BOARDS = {
     "wroom": {
