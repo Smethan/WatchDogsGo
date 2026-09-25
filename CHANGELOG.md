@@ -8,10 +8,20 @@ minor versions.
 
 ---
 
-## [Unreleased]
+## [0.9.40] — 2026-09-25
 
 ### Added
 
+- Add a native Meshtastic integration backed by the maintained
+  `Smethan/meshtastic-firmware` Portduino fork. WDG uses a restricted local
+  socket for nodes, messages, text sends, and zero-hop discovery while the
+  official phone app uses the standard Meshtastic BlueZ GATT service.
+- Add a Meshtastic Service settings screen for backend selection, stable phone
+  and Host BLE adapter MACs, phone BLE, bounded pairing windows, bond removal,
+  shared-adapter retry, and transactional service updates.
+- Add a protected side-by-side `meshtasticd-wdg` installation, adoption,
+  update, and rollback path with package, identity, channel, service-state,
+  and radio-readiness validation.
 - Extend both All Wardrive radio modes with enabled host-side ADS-B and
   MeshCore collection after the ESP32 acknowledges the scan.
 - Add independent `OFF`, `FADE`, and `KEEP` display policies for WiFi, BLE,
@@ -23,6 +33,9 @@ minor versions.
 
 ### Changed
 
+- Coordinate the stock daemon, WDG daemon, and direct MeshCore access through
+  one process-level SX1262 lock. Meshtastic phone BLE and Host BLE scanning use
+  bounded leases with phone priority on a shared controller.
 - Bound the combined recent WiFi/BLE display registry to 512 deduplicated
   identities with constant-time refresh and eviction. Map visibility remains
   independent of complete WiGLE, notable-detection, and route files.

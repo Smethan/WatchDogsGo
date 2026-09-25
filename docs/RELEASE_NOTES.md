@@ -1,6 +1,6 @@
 # Smethan WatchDogsGo
 
-## Unreleased
+## 0.9.40 — Native Meshtastic phone BLE and uConsole radio integration
 
 - Add a protocol selector for the AIO v2 SX1262 and a shared **Mesh
   Messenger** screen. MeshCore keeps its direct-SPI implementation. Meshtastic
@@ -19,8 +19,9 @@
   and seeds its rollback package; later tagged ARM64
   packages from `Smethan/meshtastic-firmware` are accepted only after exact
   package-content, service-policy, checksum, identity, channel, state, and
-  rollback validation. No compatible firmware-fork release is published by
-  these source changes, and physical Android/uConsole acceptance remains open.
+  rollback validation. The paired firmware candidate is
+  `v2.8.0-wdg.1`; physical Android/uConsole acceptance remains open until its
+  draft package is tested and explicitly published.
 - Coordinate the fork daemon, stock daemon, and direct MeshCore driver through
   a shared SX1262 lock and explicit service handoff. Normal WDG exit leaves the
   selected daemon supervised. Handoffs accept only stable, exactly restorable
