@@ -3,15 +3,34 @@
 ## Unreleased
 
 - Add a protocol selector for the AIO v2 SX1262 and a shared **Mesh
-  Messenger** screen. MeshCore keeps its direct-SPI implementation; Meshtastic
-  uses the official Python client over `meshtasticd` on localhost port 4403,
-  preserving the daemon as the sole radio owner. Both All Wardrive BLE modes
-  use the selected collector and Meshtastic performs rate-limited zero-hop
-  NodeInfo discovery. Nodes, received messages, channels, and direct/channel
-  sends are available in WDG, with Meshtastic observations saved separately.
-  Launchers no longer kill `meshtasticd`; explicit MeshCore use or LoRa power
-  off releases the daemon, while normal WDG exit leaves it available to other
-  clients.
+  Messenger** screen. MeshCore keeps its direct-SPI implementation. Meshtastic
+  prefers the restricted local socket from `Smethan/meshtastic-firmware`, with
+  stock `meshtasticd` on localhost port 4403 retained as an explicit legacy
+  fallback. The fork keeps the official mesh core authoritative, adds the
+  standard BlueZ phone GATT service, and lets WDG observe and send through a
+  separate bounded API without consuming the phone's queues. Both All Wardrive
+  BLE modes use the selected collector and perform rate-limited zero-hop
+  discovery. Nodes, received messages, channels, and direct/channel sends are
+  available in WDG, with Meshtastic observations saved separately.
+- Add a protected `meshtasticd-wdg` install/update/rollback path. `setup.sh`
+  installs only a root-owned allowlisted helper, policy, validator, and private
+  cache; it does not silently download or start a package. A one-time,
+  fail-closed adoption command validates a manually verified first fork install
+  and seeds its rollback package; later tagged ARM64
+  packages from `Smethan/meshtastic-firmware` are accepted only after exact
+  package-content, service-policy, checksum, identity, channel, state, and
+  rollback validation. No compatible firmware-fork release is published by
+  these source changes, and physical Android/uConsole acceptance remains open.
+- Coordinate the fork daemon, stock daemon, and direct MeshCore driver through
+  a shared SX1262 lock and explicit service handoff. Normal WDG exit leaves the
+  selected daemon supervised. Handoffs accept only stable, exactly restorable
+  active/enabled snapshots of both services, retain unresolved snapshots as an
+  ownership barrier, and wait for every displaced transition worker before a
+  power cut or shutdown. Package updates first resolve any retained handoff
+  snapshot, and shutdown waits for protected install/rollback work to finish.
+  Stable Bluetooth controller MACs, bounded host scan and pairing-agent leases,
+  timeout compensation, phone-priority degradation, and a second host adapter
+  keep phone BLE separate from Host BLE wardriving where hardware permits it.
 - Add persisted **All Wardrive collectors** controls for automatic MeshCore
   LoRa, ADS-B aircraft, and 433 MHz sensors. Disabling automatic LoRa prevents
   WDG from claiming a powered radio at startup or when a wardrive begins, so

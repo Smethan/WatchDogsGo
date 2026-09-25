@@ -469,11 +469,13 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 The messenger supports two mutually exclusive owners for the AIO v2 SX1262.
 Choose **MeshCore** or **Meshtastic** under **SNIFF > Wardrive Settings > All
 Wardrive collectors**. MeshCore uses WDG's direct LoRaRF/SPI implementation.
-Meshtastic leaves the radio entirely under `meshtasticd` and connects to the
-official local Client API on `127.0.0.1:4403`; WDG never opens SPI while that
-protocol is selected. If the daemon is installed but stopped, WDG starts its
-systemd service. Closing WDG disconnects its client without stopping the
-daemon, so other Meshtastic clients can continue using it.
+Meshtastic leaves the radio entirely under a daemon; WDG never opens SPI while
+that protocol is selected. The preferred `meshtasticd-wdg` fork exposes a
+restricted `/run/meshtasticd/wdg.sock` API, so WDG can receive nodes and
+messages while the official phone app uses the standard Meshtastic GATT
+service over BlueZ. An independently installed stock `meshtasticd` remains
+available through the legacy local Client API on `127.0.0.1:4403`. Closing WDG
+disconnects its client without stopping the selected daemon.
 
 Opening **ADDONS > Mesh Messenger** uses the selected protocol. Both backends
 provide channel messages, a heard-nodes panel, direct messages, background
@@ -497,6 +499,29 @@ backend. Switching to MeshCore or powering LoRa off stops `meshtasticd` so the
 direct driver or GPIO power control can safely own the hardware.
 ADS-B and 433 MHz are mutually exclusive because they share the AIO RTL-SDR.
 Enabling either one disables the other, and both may be left off.
+
+Radio-owner handoffs preserve the exact active and enabled state of both the
+fork and stock services. WDG refuses a handoff from an unknown, transitional,
+unsupported, or double-active service state. If restoration is interrupted,
+that original snapshot remains an ownership barrier until it is restored; a
+new handoff or package update cannot replace it with the partly changed state.
+On exit, WDG waits for every radio/service handoff and protected package
+transaction, and lets Host BLE/watch workers release their daemon leases before
+closing the restricted socket.
+
+Run `sudo bash setup.sh` to install the root-owned, argument-allowlisted
+Meshtastic service helper. Setup also grants the login account access to the
+shared radio-lock group; log out and back in if setup reports that it added the
+membership. Setup does not download or start a daemon package. After the first
+fork package has been installed, hardware-checked, and explicitly adopted,
+**Meshtastic Service > Update service** can install only validated tags from
+[`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware)
+and retains a transactional rollback. The helper deliberately refuses to use a
+new package as its own first semantic baseline; the one-time adoption procedure
+is documented below. No fork package release has been published as part of this
+source change. See
+[Meshtastic service integration](docs/MESHTASTIC_SERVICE.md) and the
+[restricted local API contract](docs/MESHTASTIC_WDG_API.md).
 
 - **Fullscreen chat** with scrollable message history
 - **Multi-channel support** — public, hashtag (#name), and private channels
@@ -708,21 +733,37 @@ sudo usermod -a -G dialout $USER
 FTDI, or Espressif USB-JTAG. The game logs all USB serial devices it
 sees in the diagnostic block.
 
-**MeshCore radio stays "OFF"** — MeshCore and `meshtasticd` cannot own the
+**MeshCore radio stays "OFF"** — MeshCore and a Meshtastic daemon cannot own the
 same SX1262 simultaneously. Select MeshCore in Wardrive Settings and open Mesh
-Messenger; WDG will stop the daemon before opening SPI. To release it manually:
+Messenger; WDG will stop the selected daemon before opening SPI. Inspect both
+possible owners before intervening:
 ```bash
-sudo systemctl stop meshtasticd
+systemctl status meshtasticd-wdg.service meshtasticd.service
 ```
 
-**Meshtastic Messenger does not connect** — verify the daemon exposes its
-local Client API and check its service log:
+**Meshtastic Messenger does not connect** — rerun setup if the protected helper
+or policy is missing, then inspect the selected service and fork socket:
 ```bash
-sudo systemctl status meshtasticd
-sudo journalctl -u meshtasticd -n 100 --no-pager
+sudo bash setup.sh
+systemctl status meshtasticd-wdg.service meshtasticd.service
+sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
+ls -l /run/meshtasticd/wdg.sock
 ```
-WDG connects to `127.0.0.1:4403` and starts an installed, stopped service. It
-does not install or configure `meshtasticd` itself.
+`AUTO` prefers the restricted fork socket. `LEGACY_TCP` is the explicit stock
+daemon fallback. Setup installs the helper and policy but leaves package
+installation to an explicit action after a compatible release exists. The
+first stock-to-fork migration must be installed from the exact successful
+tag-workflow Actions artifact and verified manually; do not install the
+mutable draft-release attachment. After testing, publish the draft with that
+artifact's workflow run ID and producer attempt, stop both services, and run:
+```bash
+sudo /usr/local/libexec/watchdogs-meshtastic adopt-installed vX.Y.Z-wdg.N
+```
+Use the exact tag whose validated package is installed. Later **Update
+service** operations are transactional because this adoption seeds the private
+rollback cache. If the current config has no stable `General.MACAddress`, the
+adoption check pins the candidate's verified effective MAC before recording the
+baseline; configurations it cannot edit conservatively require a manual pin.
 
 **HTTPS errors when uploading to wdgwars.pl** — check `~/.watchdogs/last_run.log`
 for SSL errors. Most often caused by an expired system CA bundle:
