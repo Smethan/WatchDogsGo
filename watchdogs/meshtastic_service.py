@@ -19,6 +19,8 @@ from typing import Any
 from .meshtastic_updates import TAG_RE, parse_meshtastic_tag
 
 MESHTASTIC_HELPER = Path("/usr/local/libexec/watchdogs-meshtastic")
+REQUIRED_HELPER_VERSION = 4
+TRANSACTION_TIMEOUT = 900
 SERVICE_TARGETS = ("wdg", "stock")
 SERVICE_ACTIONS = ("start", "stop", "enable", "disable")
 
@@ -42,7 +44,7 @@ class MeshtasticServiceStatus:
 
     @property
     def enabled(self) -> bool:
-        return self.unit_file_state == "enabled"
+        return self.unit_file_state in ("enabled", "enabled-runtime")
 
 
 class MeshtasticServiceController:
@@ -61,7 +63,8 @@ class MeshtasticServiceController:
         if operation == "version" or operation == "rollback":
             if argument is not None:
                 raise ValueError(operation + " does not take an argument")
-        elif operation == "status" or operation in SERVICE_ACTIONS:
+        elif (operation == "status" or operation == "select-service"
+              or operation in SERVICE_ACTIONS):
             if argument not in SERVICE_TARGETS:
                 raise ValueError("Unknown Meshtastic service target")
         elif operation == "install-tag":
@@ -99,8 +102,20 @@ class MeshtasticServiceController:
             raise RuntimeError("Meshtastic helper returned an invalid version")
         return value
 
+    def require_current(self) -> None:
+        version = self.version()
+        if version < REQUIRED_HELPER_VERSION:
+            raise RuntimeError(
+                "Meshtastic helper is outdated; rerun sudo bash setup.sh")
+
     def status(self, target: str) -> MeshtasticServiceStatus:
         payload = self._call("status", target, timeout=15)
+        return self._parse_status(payload, target)
+
+    @staticmethod
+    def _parse_status(
+            payload: dict[str, Any], target: str) -> MeshtasticServiceStatus:
+        """Validate one authoritative helper reply containing unit state."""
         if payload.get("target") != target:
             raise RuntimeError("Meshtastic helper returned the wrong service target")
         expected_service = (
@@ -129,7 +144,7 @@ class MeshtasticServiceController:
         payload = self._call(action, target, timeout=30)
         if payload.get("action") != action:
             raise RuntimeError("Meshtastic helper returned the wrong action")
-        return self.status(target)
+        return self._parse_status(payload, target)
 
     def start(self, target: str) -> MeshtasticServiceStatus:
         return self.set_state("start", target)
@@ -143,8 +158,16 @@ class MeshtasticServiceController:
     def disable(self, target: str) -> MeshtasticServiceStatus:
         return self.set_state("disable", target)
 
+    def select(self, target: str) -> MeshtasticServiceStatus:
+        payload = self._call("select-service", target, timeout=60)
+        if payload.get("action") != "select-service":
+            raise RuntimeError("Meshtastic helper returned the wrong action")
+        if payload.get("selected") != target:
+            raise RuntimeError("Meshtastic helper selected the wrong service")
+        return self._parse_status(payload, target)
+
     def install_tag(self, tag: str) -> dict[str, Any]:
-        return self._call("install-tag", tag, timeout=240)
+        return self._call("install-tag", tag, timeout=TRANSACTION_TIMEOUT)
 
     def rollback(self) -> dict[str, Any]:
-        return self._call("rollback", timeout=240)
+        return self._call("rollback", timeout=TRANSACTION_TIMEOUT)

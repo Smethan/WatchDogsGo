@@ -12,6 +12,13 @@ SUDOERS_TARGET="/etc/sudoers.d/watchdogs-meshtastic"
 CONFIG_TARGET="/etc/meshtasticd/wdg-portduino.yaml"
 CACHE_ROOT="/var/cache/watchdogs/meshtasticd-wdg"
 BACKUP_ROOT="/var/backups/meshtasticd-wdg"
+WATCHDOGS_GROUP="watchdogs"
+MESHTASTIC_GROUP="meshtasticd"
+RADIO_LOCK_DIR="/run/lock/watchdogs"
+RADIO_LOCK_PATH="$RADIO_LOCK_DIR/aio-sx1262.lock"
+TRANSACTION_LOCK_PATH="$RADIO_LOCK_DIR/meshtastic-update.lock"
+RADIO_TMPFILES_DIR="/etc/tmpfiles.d"
+RADIO_TMPFILES_TARGET="$RADIO_TMPFILES_DIR/watchdogs-radio-lock.conf"
 
 wdg_meshtastic_valid_user() {
     local user="$1" uid="$2"
@@ -37,7 +44,10 @@ Cmnd_Alias WDG_MESHTASTIC = \\
     $HELPER_TARGET enable stock, \\
     $HELPER_TARGET disable wdg, \\
     $HELPER_TARGET disable stock, \\
+    $HELPER_TARGET select-service wdg, \\
+    $HELPER_TARGET select-service stock, \\
     $HELPER_TARGET install-tag v*-wdg.*, \\
+    $HELPER_TARGET adopt-installed v*-wdg.*, \\
     $HELPER_TARGET rollback
 $user ALL=(root) NOPASSWD: WDG_MESHTASTIC
 EOF
@@ -61,6 +71,82 @@ full_client_policy:
 EOF
 }
 
+wdg_meshtastic_radio_tmpfiles_text() {
+    cat <<EOF
+d $RADIO_LOCK_DIR 2750 root $WATCHDOGS_GROUP -
+f $RADIO_LOCK_PATH 0660 root $WATCHDOGS_GROUP -
+f $TRANSACTION_LOCK_PATH 0600 root root -
+EOF
+}
+
+wdg_meshtastic_rewrite_allowed_uid() {
+    local source="$1" destination="$2" uid="$3"
+    awk -v uid="$uid" '
+        BEGIN {
+            in_wdg_api = 0
+            section_count = 0
+            allowed_count = 0
+            child_indent = 0
+            allowed_indent = 0
+            failed = 0
+        }
+        {
+            lines[NR] = $0
+            syntax = $0
+            sub(/[[:space:]]*#.*/, "", syntax)
+            if (syntax ~ /(^|[[:space:]])<<[[:space:]]*:/ ||
+                    syntax ~ /(^|[[:space:]])[&*][A-Za-z0-9_-]+/ ||
+                    syntax ~ /^[[:space:]]*-/ || syntax ~ /^[[:space:]]*\t/) {
+                failed = 1
+            }
+        }
+        /^wdg_api[[:space:]]*:/ {
+            if ($0 !~ /^wdg_api:[[:space:]]*($|#)/)
+                failed = 1
+            section_count++
+            in_wdg_api = 1
+            next
+        }
+        in_wdg_api && /^[^[:space:]#]/ {
+            in_wdg_api = 0
+        }
+        in_wdg_api && /^[[:space:]]*($|#)/ { next }
+        in_wdg_api {
+            match($0, /^[[:space:]]+/)
+            indent = RLENGTH
+            if (indent == 0) {
+                failed = 1
+                next
+            }
+            content = substr($0, indent + 1)
+            if (content ~ /^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*:/ &&
+                    (child_indent == 0 || indent < child_indent))
+                child_indent = indent
+            if (content ~ /^allowed_uid[[:space:]]*:/) {
+                allowed_count++
+                allowed_indent = indent
+                allowed_line = NR
+                if (content !~ /^allowed_uid:[[:space:]]*[0-9]+[[:space:]]*($|#)/)
+                    failed = 1
+            }
+        }
+        END {
+            if (failed || section_count != 1 || allowed_count != 1 ||
+                    child_indent == 0 || allowed_indent != child_indent) {
+                exit 42
+            }
+            comment = lines[allowed_line]
+            sub(/^[^#]*/, "", comment)
+            prefix = substr(lines[allowed_line], 1, allowed_indent)
+            lines[allowed_line] = prefix "allowed_uid: " uid
+            if (comment ~ /^#/)
+                lines[allowed_line] = lines[allowed_line] " " comment
+            for (line = 1; line <= NR; line++)
+                print lines[line]
+        }
+    ' "$source" >"$destination"
+}
+
 wdg_meshtastic_refuse_symlink() {
     local path="$1"
     if [ -L "$path" ]; then
@@ -69,8 +155,41 @@ wdg_meshtastic_refuse_symlink() {
     fi
 }
 
+wdg_meshtastic_warn_policy_restart() {
+    local changed="$1"
+    [ "$changed" -eq 1 ] || return 0
+    if command -v systemctl >/dev/null 2>&1 && \
+            systemctl is-active --quiet meshtasticd-wdg.service; then
+        echo "Meshtastic WDG policy changed while the service is active." >&2
+        echo "Apply it with: sudo systemctl restart meshtasticd-wdg.service" >&2
+    fi
+}
+
+wdg_meshtastic_prepare_radio_access() {
+    local user="$1" memberships membership_changed=0 tmpfiles_temp
+    if ! getent group "$WATCHDOGS_GROUP" >/dev/null; then
+        groupadd --system "$WATCHDOGS_GROUP"
+    fi
+    memberships=" $(id -nG "$user") "
+    if [[ "$memberships" != *" $WATCHDOGS_GROUP "* ]]; then
+        usermod --append --groups "$WATCHDOGS_GROUP" "$user"
+        membership_changed=1
+    fi
+    install -d -o root -g "$WATCHDOGS_GROUP" -m 2750 "$RADIO_LOCK_DIR"
+    install -d -o root -g root -m 0755 "$RADIO_TMPFILES_DIR"
+    tmpfiles_temp="$(mktemp)"
+    wdg_meshtastic_radio_tmpfiles_text >"$tmpfiles_temp"
+    install -o root -g root -m 0644 \
+        "$tmpfiles_temp" "$RADIO_TMPFILES_TARGET"
+    rm -f "$tmpfiles_temp"
+    systemd-tmpfiles --create "$RADIO_TMPFILES_TARGET"
+    if [ "$membership_changed" -eq 1 ]; then
+        echo "Added $user to $WATCHDOGS_GROUP; log out and back in before using the Meshtastic radio." >&2
+    fi
+}
+
 wdg_install_meshtastic_support() {
-    local user="$1" uid="$2"
+    local user="$1" uid="$2" policy_changed=0
     if [ "$(id -u)" -ne 0 ]; then
         echo "Run Meshtastic support setup with sudo." >&2
         return 1
@@ -85,9 +204,14 @@ wdg_install_meshtastic_support() {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
 
     for path in "$HELPER_TARGET" "$LIB_TARGET" "$SUDOERS_TARGET" \
-                "$CACHE_ROOT" "$BACKUP_ROOT" "$CONFIG_TARGET"; do
+                "$CACHE_ROOT" "$BACKUP_ROOT" "$CONFIG_TARGET" \
+                "$RADIO_LOCK_DIR" "$RADIO_LOCK_PATH" \
+                "$TRANSACTION_LOCK_PATH" \
+                "$RADIO_TMPFILES_DIR" "$RADIO_TMPFILES_TARGET"; do
         wdg_meshtastic_refuse_symlink "$path"
     done
+
+    wdg_meshtastic_prepare_radio_access "$user"
 
     install -d -o root -g root -m 0755 /usr/local/libexec
     install -d -o root -g root -m 0755 "$LIB_TARGET"
@@ -97,11 +221,18 @@ wdg_install_meshtastic_support() {
     install -d -o root -g root -m 0700 "$CACHE_ROOT" "$BACKUP_ROOT"
 
     install -d -o root -g root -m 0755 /etc/meshtasticd
+    local policy_group="root" policy_mode="0600"
+    if getent group "$MESHTASTIC_GROUP" >/dev/null; then
+        policy_group="$MESHTASTIC_GROUP"
+        policy_mode="0640"
+    fi
     if [ ! -e "$CONFIG_TARGET" ]; then
         local config_temp
         config_temp="$(mktemp)"
         wdg_meshtastic_config_text "$uid" >"$config_temp"
-        install -o root -g root -m 0600 "$config_temp" "$CONFIG_TARGET"
+        install -o root -g "$policy_group" -m "$policy_mode" \
+            "$config_temp" "$CONFIG_TARGET"
+        policy_changed=1
         rm -f "$config_temp"
     else
         [ -f "$CONFIG_TARGET" ] || {
@@ -115,7 +246,22 @@ wdg_install_meshtastic_support() {
             echo "Protected Meshtastic policy must not be group/other writable." >&2
             return 1
         fi
+        local config_temp
+        config_temp="$(mktemp)"
+        if ! wdg_meshtastic_rewrite_allowed_uid \
+                "$CONFIG_TARGET" "$config_temp" "$uid"; then
+            rm -f "$config_temp"
+            echo "Protected Meshtastic policy must contain exactly one wdg_api.allowed_uid entry." >&2
+            return 1
+        fi
+        if ! cmp -s "$config_temp" "$CONFIG_TARGET"; then
+            policy_changed=1
+        fi
+        install -o root -g "$policy_group" -m "$policy_mode" \
+            "$config_temp" "$CONFIG_TARGET"
+        rm -f "$config_temp"
     fi
+    wdg_meshtastic_warn_policy_restart "$policy_changed"
 
     local sudoers_temp
     sudoers_temp="$(mktemp)"
