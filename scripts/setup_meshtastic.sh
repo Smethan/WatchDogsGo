@@ -47,6 +47,7 @@ Cmnd_Alias WDG_MESHTASTIC = \\
     $HELPER_TARGET select-service wdg, \\
     $HELPER_TARGET select-service stock, \\
     $HELPER_TARGET install-tag v*-wdg.*, \\
+    $HELPER_TARGET prepare-first-tag v*-wdg.*, \\
     $HELPER_TARGET adopt-installed v*-wdg.*, \\
     $HELPER_TARGET rollback
 $user ALL=(root) NOPASSWD: WDG_MESHTASTIC

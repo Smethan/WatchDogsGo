@@ -28,8 +28,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 4
-TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-wdg\.(\d+)$")
+HELPER_VERSION = 5
+TAG_RE = re.compile(
+    r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
+    r"(0|[1-9][0-9]*)-wdg\.(0|[1-9][0-9]*)$")
 TARGET_SERVICES = {
     "wdg": "meshtasticd-wdg.service",
     "stock": "meshtasticd.service",
@@ -38,6 +40,7 @@ SERVICE_ACTIONS = frozenset({"start", "stop", "enable", "disable"})
 PACKAGE_NAME = "meshtasticd-wdg"
 CACHE_ROOT = Path("/var/cache/watchdogs/meshtasticd-wdg")
 INSTALLED_CACHE = CACHE_ROOT / "installed"
+FIRST_INSTALL_INBOX = CACHE_ROOT / "first-install-inbox"
 BACKUP_ROOT = Path("/var/backups/meshtasticd-wdg")
 LAST_BACKUP = BACKUP_ROOT / "LAST_TRANSACTION"
 LOCK_DIRECTORY = Path("/run/lock/watchdogs")
@@ -81,6 +84,10 @@ SERVICE_SUPPLEMENTARY_GROUPS = ("spi", "gpio", "watchdogs")
 RESTORABLE_LOAD_STATES = frozenset({"loaded", "not-found"})
 RESTORABLE_ACTIVE_STATES = frozenset({"active", "inactive"})
 RESTORABLE_UNIT_FILE_STATES = frozenset({"enabled", "disabled", "not-found"})
+PACKAGE_VERSION_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
+    r"(0|[1-9][0-9]*)\+wdg(0|[1-9][0-9]*)$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class HelperError(RuntimeError):
@@ -95,8 +102,53 @@ class CandidateStateRestoreError(HelperError):
         self.evidence_path = evidence_path
 
 
+class InstallTransactionError(HelperError):
+    """One install failed after recording whether rollback was complete."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rollback_restored: bool,
+        backup: Path | None,
+    ) -> None:
+        super().__init__(message)
+        self.rollback_restored = rollback_restored
+        self.backup = backup
+
+
+class _StateRestoreEntry:
+    def __init__(
+        self,
+        *,
+        target: Path,
+        expected: list[dict[str, Any]] | None,
+        staging: Path | None,
+        recovery: Path | None,
+        staged_identity: tuple[int, int] | None = None,
+    ) -> None:
+        self.target = target
+        self.expected = expected
+        self.staging = staging
+        self.recovery = recovery
+        self.staged_identity = staged_identity
+        self.moved_old = False
+        self.moved_new = False
+
+
 def _json_output(**values: Any) -> None:
     print(json.dumps({"ok": True, **values}, sort_keys=True))
+
+
+def _json_install_error(error: InstallTransactionError) -> None:
+    print(json.dumps({
+        "ok": False,
+        "action": "install-tag",
+        "error_type": "install_failed",
+        "error": str(error),
+        "rollback_restored": error.rollback_restored,
+        "backup": str(error.backup) if error.backup is not None else None,
+    }, sort_keys=True))
 
 
 def _require_root() -> None:
@@ -330,7 +382,17 @@ def _tree_fingerprint(path: Path) -> list[dict[str, Any]] | None:
         return None
     if path.is_symlink() or not path.is_dir():
         raise HelperError(str(path) + " must be a real directory")
-    result: list[dict[str, Any]] = []
+    root_info = path.lstat()
+    # Include the root itself.  A recursive child-only fingerprint could let a
+    # damaged backup restore a directory with the wrong owner or mode while
+    # every file below it still appeared valid.
+    result: list[dict[str, Any]] = [{
+        "path": ".",
+        "mode": stat.S_IMODE(root_info.st_mode),
+        "uid": root_info.st_uid,
+        "gid": root_info.st_gid,
+        "type": "directory",
+    }]
     for entry in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
         relative = entry.relative_to(path).as_posix()
         info = entry.lstat()
@@ -538,21 +600,355 @@ def _copy_state_to_backup(backup: Path) -> dict[str, bool]:
     return presence
 
 
-def _restore_state_from_backup(backup: Path, presence: dict[str, bool]) -> None:
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _canonical_manifest_digest(manifest: dict[str, Any]) -> str:
+    payload = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _package_version_for_tag(tag: str) -> str:
+    match = TAG_RE.fullmatch(tag)
+    if match is None:
+        raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
+    major, minor, patch, revision = match.groups()
+    return f"{major}.{minor}.{patch}+wdg{revision}"
+
+
+def _release_identity(prepared: Any) -> dict[str, Any]:
+    manifest = getattr(prepared, "manifest", None)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("package"), dict):
+        raise HelperError("Verified Meshtastic release metadata is incomplete")
+    package = manifest["package"]
+    value = {
+        "tag": getattr(prepared, "tag", None),
+        "package_version": getattr(prepared, "package_version", None),
+        "package_asset": package.get("asset"),
+        "package_size": package.get("size"),
+        "package_sha256": package.get("sha256"),
+        "source_commit": manifest.get("source_commit"),
+        "manifest_sha256": _canonical_manifest_digest(manifest),
+    }
+    return _validate_release_identity(value)
+
+
+def _validate_release_identity(value: Any) -> dict[str, Any]:
+    expected_keys = {
+        "tag", "package_version", "package_asset", "package_size",
+        "package_sha256", "source_commit", "manifest_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise HelperError("Meshtastic transaction release identity is malformed")
+    tag = value.get("tag")
+    package_version = value.get("package_version")
+    if (not isinstance(tag, str) or TAG_RE.fullmatch(tag) is None
+            or package_version != _package_version_for_tag(tag)
+            or PACKAGE_VERSION_RE.fullmatch(str(package_version)) is None):
+        raise HelperError("Meshtastic transaction release identity is malformed")
+    expected_asset = f"meshtasticd-wdg_{package_version}_arm64.deb"
+    if (value.get("package_asset") != expected_asset
+            or type(value.get("package_size")) is not int
+            or value["package_size"] <= 0
+            or not isinstance(value.get("package_sha256"), str)
+            or SHA256_RE.fullmatch(value["package_sha256"]) is None
+            or not isinstance(value.get("source_commit"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", value["source_commit"]) is None
+            or not isinstance(value.get("manifest_sha256"), str)
+            or SHA256_RE.fullmatch(value["manifest_sha256"]) is None):
+        raise HelperError("Meshtastic transaction release identity is malformed")
+    return value
+
+
+def _validate_transaction_metadata(
+        metadata: Any, backup: Path, validator) -> tuple[Any | None, dict[str, bool],
+                                                         dict[str, Any]]:
+    """Validate every rollback input before any live service or path changes."""
+    if backup.is_symlink() or not backup.is_dir():
+        raise HelperError("Meshtastic rollback backup is missing or unsafe")
+    backup_info = backup.stat()
+    if (os.geteuid() == 0
+            and (backup_info.st_uid != 0 or backup_info.st_gid != 0
+                 or stat.S_IMODE(backup_info.st_mode) != 0o700)):
+        raise HelperError("Meshtastic rollback backup is not root-private")
+    expected_keys = {
+        "format", "new_release", "previous_version", "rollback_release",
+        "services", "state_presence", "state_fingerprints",
+        "semantic_baseline", "effective_mac", "mac_pin_required",
+    }
+    if (not isinstance(metadata, dict) or set(metadata) != expected_keys
+            or type(metadata.get("format")) is not int
+            or metadata["format"] != 2):
+        raise HelperError("Meshtastic transaction metadata is unsupported")
+
+    _validate_release_identity(metadata.get("new_release"))
+    _validation_baseline(metadata)
+    _validate_service_snapshot(metadata.get("services"))
+    presence = metadata.get("state_presence")
+    fingerprints = metadata.get("state_fingerprints")
+    expected_paths = {str(path) for path in STATE_PATHS}
+    expected_keys_by_path = {_state_backup_key(path) for path in STATE_PATHS}
+    if (not isinstance(presence, dict)
+            or set(presence) != expected_keys_by_path
+            or any(type(value) is not bool for value in presence.values())
+            or not isinstance(fingerprints, dict)
+            or set(fingerprints) != expected_paths):
+        raise HelperError("Meshtastic transaction state metadata is malformed")
+
+    previous_version = metadata.get("previous_version")
+    rollback_identity = metadata.get("rollback_release")
+    prepared = None
+    if previous_version is None:
+        if rollback_identity is not None:
+            raise HelperError("Meshtastic rollback package metadata is inconsistent")
+    else:
+        if (not isinstance(previous_version, str)
+                or PACKAGE_VERSION_RE.fullmatch(previous_version) is None):
+            raise HelperError("Meshtastic rollback package metadata is invalid")
+        rollback_identity = _validate_release_identity(rollback_identity)
+        if rollback_identity["package_version"] != previous_version:
+            raise HelperError("Meshtastic rollback package metadata is inconsistent")
+        rollback_dir = backup / "rollback-release" / rollback_identity["tag"]
+        prepared = validator.validate_prepared_release(
+            rollback_dir, expected_tag=rollback_identity["tag"],
+            require_secure=True, check_host=False)
+        if _release_identity(prepared) != rollback_identity:
+            raise HelperError(
+                "Verified rollback release differs from transaction metadata")
+
     state_dir = backup / "state"
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise HelperError("Meshtastic backup state directory is missing or unsafe")
+    actual_backup_keys = {entry.name for entry in state_dir.iterdir()}
+    expected_present_keys = {
+        key for key, value in presence.items() if value}
+    if actual_backup_keys != expected_present_keys:
+        raise HelperError("Meshtastic backup state contents do not match metadata")
     for target in STATE_PATHS:
         key = _state_backup_key(target)
-        if target.is_symlink():
-            raise HelperError("Refusing to replace symlinked state path " + str(target))
-        if target.exists():
-            if not target.is_dir():
-                raise HelperError("Refusing to replace non-directory state path " + str(target))
-            shutil.rmtree(target)
+        expected = fingerprints[str(target)]
+        source = state_dir / key
+        if presence[key]:
+            if (source.is_symlink() or not source.is_dir()
+                    or not isinstance(expected, list)
+                    or _tree_fingerprint(source) != expected):
+                raise HelperError(
+                    "Meshtastic backup state fingerprint does not match: " + key)
+        elif expected is not None:
+            raise HelperError("Meshtastic absent-state fingerprint is malformed")
+    return prepared, presence, fingerprints
+
+
+def _prepare_state_restore(
+        backup: Path, presence: dict[str, bool],
+        fingerprints: dict[str, Any]) -> list[_StateRestoreEntry]:
+    """Copy validated backup trees beside targets before mutating live state."""
+    entries: list[_StateRestoreEntry] = []
+    try:
+        for target in STATE_PATHS:
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise HelperError(
+                    "Refusing to replace unsafe state path " + str(target))
+            if target.parent.is_symlink() or not target.parent.is_dir():
+                raise HelperError(
+                    "Meshtastic state parent is missing or unsafe: "
+                    + str(target.parent))
+            key = _state_backup_key(target)
+            expected = fingerprints[str(target)]
+            staging = None
+            staged_identity = None
+            entry = _StateRestoreEntry(
+                target=target, expected=expected, staging=None,
+                recovery=None)
+            entries.append(entry)
+            if presence[key]:
+                source = backup / "state" / key
+                reserved = Path(tempfile.mkdtemp(
+                    prefix="." + target.name + ".wdg-restore-",
+                    dir=target.parent))
+                reserved.rmdir()
+                staging = reserved
+                entry.staging = staging
+                _run(["cp", "-a", "--", str(source), str(staging)], timeout=120)
+                if (staging.is_symlink() or not staging.is_dir()
+                        or _tree_fingerprint(staging) != expected):
+                    raise HelperError(
+                        "Prepared Meshtastic restore copy failed verification: " + key)
+                staged_info = staging.lstat()
+                staged_identity = (staged_info.st_dev, staged_info.st_ino)
+            recovery = Path(tempfile.mkdtemp(
+                prefix="." + target.name + ".wdg-recovery-",
+                dir=target.parent))
+            recovery.rmdir()
+            entry.recovery = recovery
+            entry.staged_identity = staged_identity
+        return entries
+    except Exception:
+        _cleanup_restore_entries(entries)
+        raise
+
+
+def _cleanup_restore_entries(entries: list[_StateRestoreEntry]) -> None:
+    for entry in entries:
+        for path in (entry.staging, entry.recovery):
+            if path is not None and (path.exists() or path.is_symlink()):
+                if path.is_symlink() or not path.is_dir():
+                    raise HelperError(
+                        "Meshtastic restore staging path changed unexpectedly")
+                shutil.rmtree(path)
+
+
+def _recover_state_swaps(entries: list[_StateRestoreEntry]) -> None:
+    errors: list[str] = []
+    for entry in reversed(entries):
+        try:
+            if entry.moved_new:
+                if entry.target.is_symlink() or not entry.target.is_dir():
+                    raise HelperError(
+                        "replacement path changed during state recovery")
+                info = entry.target.lstat()
+                if (info.st_dev, info.st_ino) != entry.staged_identity:
+                    raise HelperError(
+                        "replacement identity changed during state recovery")
+                shutil.rmtree(entry.target)
+                entry.moved_new = False
+            if entry.moved_old:
+                if entry.target.exists() or entry.target.is_symlink():
+                    raise HelperError(
+                        "target reappeared during state recovery")
+                if entry.recovery is None:
+                    raise HelperError("state recovery path was not allocated")
+                os.rename(entry.recovery, entry.target)
+                entry.moved_old = False
+            _fsync_directory(entry.target.parent)
+        except Exception as exc:  # noqa: BLE001 - report every recovery failure
+            errors.append(str(entry.target) + ": " + str(exc))
+    if errors:
+        raise HelperError(
+            "Meshtastic live state recovery was incomplete: " + "; ".join(errors))
+
+
+def _apply_state_restore(entries: list[_StateRestoreEntry]) -> None:
+    """Swap all prepared trees in; recover earlier swaps if any later one fails."""
+    try:
+        # Revalidate every path first so a bad later entry cannot be discovered
+        # only after an earlier live directory has already moved.
+        for entry in entries:
+            if (entry.target.is_symlink()
+                    or (entry.target.exists() and not entry.target.is_dir())
+                    or entry.recovery is None
+                    or entry.recovery.exists()
+                    or entry.recovery.is_symlink()):
+                raise HelperError(
+                    "Meshtastic restore target changed after preflight: "
+                    + str(entry.target))
+            if entry.staging is None:
+                if entry.expected is not None:
+                    raise HelperError("Meshtastic restore staging is incomplete")
+            else:
+                if entry.staging.is_symlink() or not entry.staging.is_dir():
+                    raise HelperError("Meshtastic restore staging is missing")
+                info = entry.staging.lstat()
+                if ((info.st_dev, info.st_ino) != entry.staged_identity
+                        or _tree_fingerprint(entry.staging) != entry.expected):
+                    raise HelperError(
+                        "Meshtastic restore staging changed after preflight")
+        for entry in entries:
+            if entry.target.exists():
+                if entry.recovery is None:
+                    raise HelperError("state recovery path was not allocated")
+                os.rename(entry.target, entry.recovery)
+                entry.moved_old = True
+            if entry.staging is not None:
+                os.rename(entry.staging, entry.target)
+                entry.moved_new = True
+            _fsync_directory(entry.target.parent)
+        for entry in entries:
+            actual = _tree_fingerprint(entry.target)
+            if actual != entry.expected:
+                raise HelperError(
+                    "Meshtastic restored state failed verification: "
+                    + str(entry.target))
+    except Exception as restore_error:
+        try:
+            _recover_state_swaps(entries)
+        except Exception as recovery_error:
+            raise HelperError(
+                f"Meshtastic state restore failed ({restore_error}); recovery "
+                f"also failed ({recovery_error})") from restore_error
+        raise
+
+
+def _finalize_state_restore(entries: list[_StateRestoreEntry]) -> None:
+    for entry in entries:
+        if entry.recovery is not None and entry.recovery.exists():
+            if entry.recovery.is_symlink() or not entry.recovery.is_dir():
+                raise HelperError(
+                    "Meshtastic recovery copy changed before cleanup")
+            shutil.rmtree(entry.recovery)
+        entry.moved_old = False
+        entry.moved_new = False
+        _fsync_directory(entry.target.parent)
+
+
+def _restore_state_from_backup(
+        backup: Path, presence: dict[str, bool],
+        expected_fingerprints: dict[str, Any] | None = None) -> None:
+    """Restore a private state copy only after proving every source tree.
+
+    ``expected_fingerprints`` is supplied by candidate validation, where the
+    pre-candidate snapshot is the trust anchor.  The optional form remains
+    useful for the narrowly scoped MAC-pin rollback, whose root-private copy
+    is created and consumed inside one helper invocation.
+    """
+    expected_keys = {_state_backup_key(path) for path in STATE_PATHS}
+    if (not isinstance(presence, dict) or set(presence) != expected_keys
+            or any(type(value) is not bool for value in presence.values())):
+        raise HelperError("Meshtastic backup presence metadata is malformed")
+    state_dir = backup / "state"
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise HelperError("Meshtastic backup state directory is missing or unsafe")
+    if expected_fingerprints is not None:
+        if (not isinstance(expected_fingerprints, dict)
+                or set(expected_fingerprints) != {
+                    str(path) for path in STATE_PATHS}):
+            raise HelperError(
+                "Meshtastic backup fingerprint metadata is malformed")
+        fingerprints = dict(expected_fingerprints)
+    else:
+        fingerprints = {}
+    for target in STATE_PATHS:
+        key = _state_backup_key(target)
         if presence.get(key):
             source = state_dir / key
             if source.is_symlink() or not source.is_dir():
                 raise HelperError("Backup state is missing or unsafe: " + key)
-            _run(["cp", "-a", "--", str(source), str(target)], timeout=120)
+            actual = _tree_fingerprint(source)
+            if expected_fingerprints is None:
+                fingerprints[str(target)] = actual
+            elif actual != fingerprints[str(target)]:
+                raise HelperError(
+                    "Meshtastic backup state fingerprint does not match: " + key)
+        else:
+            if (state_dir / key).exists() or (state_dir / key).is_symlink():
+                raise HelperError("Unexpected backup state exists: " + key)
+            if expected_fingerprints is None:
+                fingerprints[str(target)] = None
+            elif fingerprints[str(target)] is not None:
+                raise HelperError(
+                    "Meshtastic absent-state fingerprint is malformed")
+    entries = _prepare_state_restore(backup, presence, fingerprints)
+    _apply_state_restore(entries)
+    _finalize_state_restore(entries)
 
 
 def _state_backup_key(path: Path) -> str:
@@ -588,7 +984,9 @@ def _read_private_json(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HelperError("Meshtastic transaction metadata is invalid") from exc
-    if not isinstance(value, dict) or value.get("format") != 1:
+    if (not isinstance(value, dict)
+            or type(value.get("format")) is not int
+            or value.get("format") != 2):
         raise HelperError("Meshtastic transaction metadata is unsupported")
     return value
 
@@ -718,11 +1116,10 @@ def _create_backup(tag: str, prepared: Any, validator,
         baseline = _candidate_dry_run_preserving_live_state(
             backup, fingerprints, presence)
         metadata = {
-            "format": 1,
-            "new_tag": tag,
-            "new_version": prepared.package_version,
+            "format": 2,
+            "new_release": _release_identity(prepared),
             "previous_version": previous_version,
-            "rollback_tag": rollback_tag,
+            "rollback_release": _release_identity(rollback_release),
             "services": services,
             "state_presence": presence,
             "state_fingerprints": fingerprints,
@@ -785,34 +1182,66 @@ def _restore_services(snapshot: dict[str, Any]) -> None:
 
 
 def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> None:
-    for service in TARGET_SERVICES.values():
-        _run(["systemctl", "stop", service], timeout=30, check=False)
-    previous_version = metadata.get("previous_version")
-    rollback_tag = metadata.get("rollback_tag")
-    if previous_version is None:
-        _run(["dpkg", "--purge", PACKAGE_NAME], timeout=120, check=False)
-    else:
-        rollback_dir = backup / "rollback-release" / str(rollback_tag)
-        if not isinstance(rollback_tag, str) or not TAG_RE.fullmatch(rollback_tag):
-            raise HelperError("Rollback package metadata is invalid")
-        prepared = validator.validate_prepared_release(
-            rollback_dir, expected_tag=rollback_tag, require_secure=True,
-            check_host=False)
-        if prepared.package_version != previous_version:
-            raise HelperError("Rollback package version does not match the transaction")
-        _run([
-            "apt-get", "-y", "--allow-downgrades",
-            "--no-install-recommends", "install",
-            str(prepared.package_path),
-        ], timeout=300)
-    if _installed_version() != previous_version:
-        raise HelperError(
-            "Meshtastic package rollback did not restore the previous version")
-    _restore_state_from_backup(backup, metadata.get("state_presence", {}))
-    if not _state_unchanged(metadata):
-        raise HelperError(
-            "Meshtastic state rollback did not restore the verified backup")
-    _restore_services(metadata.get("services", {}))
+    """Restore one transaction only after complete, immutable preflight."""
+    prepared, presence, fingerprints = _validate_transaction_metadata(
+        metadata, backup, validator)
+    entries = _prepare_state_restore(backup, presence, fingerprints)
+    state_applied = False
+    try:
+        # Revalidate the exact package bytes immediately before the first live
+        # mutation. The root-only cache is trusted, but this also detects disk
+        # damage between transaction creation and rollback.
+        if prepared is not None:
+            rollback_identity = metadata["rollback_release"]
+            prepared = validator.validate_prepared_release(
+                prepared.directory, expected_tag=rollback_identity["tag"],
+                require_secure=True, check_host=False)
+            if _release_identity(prepared) != rollback_identity:
+                raise HelperError(
+                    "Rollback release changed after restore preflight")
+
+        for service in TARGET_SERVICES.values():
+            _run(["systemctl", "stop", service], timeout=30, check=False)
+        previous_version = metadata["previous_version"]
+        if previous_version is None:
+            _run(["dpkg", "--purge", PACKAGE_NAME], timeout=120, check=False)
+        else:
+            assert prepared is not None
+            _run([
+                "apt-get", "-y", "--allow-downgrades",
+                "--no-install-recommends", "install",
+                str(prepared.package_path),
+            ], timeout=300)
+        if _installed_version() != previous_version:
+            raise HelperError(
+                "Meshtastic package rollback did not restore the previous version")
+        if prepared is not None:
+            # Prove both the cached release and every installed payload byte
+            # still match the exact identity recorded by the transaction.
+            checked = validator.validate_prepared_release(
+                prepared.directory,
+                expected_tag=metadata["rollback_release"]["tag"],
+                require_secure=True, check_host=False)
+            if _release_identity(checked) != metadata["rollback_release"]:
+                raise HelperError(
+                    "Rollback release identity changed during installation")
+            validator.validate_installed_package_payload(
+                checked.package_path, checked.manifest)
+
+        _apply_state_restore(entries)
+        state_applied = True
+        if not _state_unchanged(metadata):
+            raise HelperError(
+                "Meshtastic state rollback did not restore the verified backup")
+        _restore_services(metadata["services"])
+        _finalize_state_restore(entries)
+    except Exception:
+        if not state_applied:
+            _cleanup_restore_entries(entries)
+        # Once the verified old package and state are restored, retain them if
+        # service restoration fails. Replacing them with candidate-era state
+        # would make recovery less safe; the private backup remains available.
+        raise
 
 
 def _socket_request(client: socket.socket, request_id: str, name: str) -> dict[str, Any]:
@@ -833,12 +1262,40 @@ def _socket_request(client: socket.socket, request_id: str, name: str) -> dict[s
             reply = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HelperError("meshtasticd-wdg returned invalid health JSON") from exc
-        if (isinstance(reply, dict) and reply.get("type") == "reply"
-                and reply.get("request_id") == request_id):
-            if reply.get("ok") is not True or not isinstance(reply.get("body"), dict):
-                raise HelperError("meshtasticd-wdg rejected the health request")
-            return reply["body"]
+        if (not isinstance(reply, dict)
+                or type(reply.get("v")) is not int
+                or reply.get("v") != 1):
+            raise HelperError(
+                "meshtasticd-wdg returned an invalid health envelope")
+        packet_type = reply.get("type")
+        if packet_type == "event":
+            if (type(reply.get("event_id")) is not int
+                    or reply["event_id"] < 0
+                    or not isinstance(reply.get("name"), str)
+                    or not reply["name"]
+                    or not isinstance(reply.get("body"), dict)):
+                raise HelperError(
+                    "meshtasticd-wdg returned an invalid event envelope")
+            continue
+        if (packet_type != "reply"
+                or reply.get("request_id") != request_id):
+            raise HelperError(
+                "meshtasticd-wdg returned an unexpected health reply")
+        if reply.get("ok") is not True or not isinstance(reply.get("body"), dict):
+            raise HelperError("meshtasticd-wdg rejected the health request")
+        return reply["body"]
     raise HelperError("meshtasticd-wdg health request timed out")
+
+
+def _validate_health_bodies(
+        hello: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
+    if (type(hello.get("protocol_version")) is not int
+            or hello["protocol_version"] != 1):
+        raise HelperError("meshtasticd-wdg exposes an incompatible WDG API")
+    if (status.get("state") != "ready"
+            or status.get("radio_status") != "ready"):
+        raise HelperError("meshtasticd-wdg radio is not ready")
+    return status
 
 
 def _health_check(
@@ -873,13 +1330,8 @@ def _health_check(
         try:
             client.connect(str(socket_path))
             hello = _socket_request(client, "install-health-hello", "hello")
-            if hello.get("protocol_version") != 1:
-                raise HelperError("meshtasticd-wdg exposes an incompatible WDG API")
             status = _socket_request(client, "install-health-status", "get_status")
-            state = status.get("radio_status", status.get("state"))
-            if state != "ready":
-                raise HelperError("meshtasticd-wdg radio is not ready")
-            return status
+            return _validate_health_bodies(hello, status)
         except (OSError, HelperError) as exc:
             last_error = str(exc)
             time.sleep(0.25)
@@ -1804,7 +2256,8 @@ def _candidate_dry_run_preserving_live_state(
             "isolated validation")
 
     try:
-        _restore_state_from_backup(backup, presence)
+        _restore_state_from_backup(
+            backup, presence, expected_fingerprints)
         restored = _current_state_fingerprints()
         if restored != expected_fingerprints:
             raise HelperError(
@@ -2051,6 +2504,71 @@ def _record_last_backup(backup: Path) -> None:
     os.replace(temp, LAST_BACKUP)
 
 
+def _prepare_first_tag(tag: str) -> dict[str, Any]:
+    """Validate a fixed root-only inbox, then seal it in the release cache."""
+    _require_root()
+    if not TAG_RE.fullmatch(tag):
+        raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
+    _secure_root_directory(CACHE_ROOT)
+    _secure_root_directory(FIRST_INSTALL_INBOX)
+    validator = _load_validator()
+    with _lock_transaction():
+        if _installed_version() is not None:
+            raise HelperError(
+                "meshtasticd-wdg is already installed; use the in-game updater")
+        inbox = FIRST_INSTALL_INBOX / tag
+        if inbox.exists() or inbox.is_symlink():
+            prepared = validator.validate_prepared_release(
+                inbox, expected_tag=tag, require_secure=True, check_host=True)
+            target = CACHE_ROOT / tag
+            if target.exists() or target.is_symlink():
+                cached = validator.validate_prepared_release(
+                    target, expected_tag=tag, require_secure=True,
+                    check_host=True)
+                if _release_identity(cached) != _release_identity(prepared):
+                    raise HelperError(
+                        "Protected release cache differs from first-install inbox")
+                prepared = cached
+            else:
+                staging_root = Path(tempfile.mkdtemp(
+                    prefix=".first-install-", dir=CACHE_ROOT))
+                staging = staging_root / tag
+                try:
+                    shutil.copytree(
+                        inbox, staging, copy_function=shutil.copy2)
+                    os.chmod(staging, 0o700)
+                    for child in staging.iterdir():
+                        os.chmod(child, 0o600)
+                    checked = validator.validate_prepared_release(
+                        staging, expected_tag=tag, require_secure=True,
+                        check_host=True)
+                    if _release_identity(checked) != _release_identity(prepared):
+                        raise HelperError(
+                            "Copied first-install release failed verification")
+                    os.rename(staging, target)
+                    _fsync_directory(CACHE_ROOT)
+                finally:
+                    shutil.rmtree(staging_root, ignore_errors=True)
+                prepared = validator.validate_prepared_release(
+                    target, expected_tag=tag, require_secure=True,
+                    check_host=True)
+        else:
+            # Once a tag is published, first installs can resolve it directly.
+            # Pre-publication hardware testing uses the fixed inbox above.
+            prepared = _prepare_exact_release(tag, validator)
+        checked = validator.validate_prepared_release(
+            prepared.directory, expected_tag=tag, require_secure=True,
+            check_host=True)
+        if _release_identity(checked) != _release_identity(prepared):
+            raise HelperError("First-install release changed during validation")
+    return {
+        "action": "prepare-first-tag",
+        "tag": tag,
+        "package_version": prepared.package_version,
+        "package_path": str(prepared.package_path),
+    }
+
+
 def _install_tag(tag: str) -> dict[str, Any]:
     _require_root()
     if not TAG_RE.fullmatch(tag):
@@ -2064,6 +2582,7 @@ def _install_tag(tag: str) -> dict[str, Any]:
         services = _service_snapshot()
         backup = None
         metadata = None
+        package_mutation_started = False
         try:
             for target, service in TARGET_SERVICES.items():
                 if services[target].get("load_state") != "not-found":
@@ -2073,14 +2592,27 @@ def _install_tag(tag: str) -> dict[str, Any]:
             # All later comparisons use the private on-disk record, rather
             # than a value that only existed in this process before apt.
             metadata = _read_private_json(backup / "transaction.json")
+            _validate_transaction_metadata(metadata, backup, validator)
+            if metadata["new_release"] != _release_identity(prepared):
+                raise HelperError(
+                    "Candidate release differs from transaction metadata")
             baseline_semantic, effective_mac, pin_required = (
                 _validation_baseline(metadata))
+            package_mutation_started = True
             _run([
                 "apt-get", "-y", "--no-install-recommends", "install",
                 str(prepared.package_path),
             ], timeout=300)
             if _installed_version() != prepared.package_version:
                 raise HelperError("Installed package version does not match the release")
+            prepared = validator.validate_prepared_release(
+                prepared.directory, expected_tag=tag, require_secure=True,
+                check_host=True)
+            if metadata["new_release"] != _release_identity(prepared):
+                raise HelperError(
+                    "Candidate release identity changed during installation")
+            validator.validate_installed_package_payload(
+                prepared.package_path, prepared.manifest)
             if not _state_unchanged(metadata):
                 raise HelperError("Package installation modified Meshtastic identity/state")
             _run([
@@ -2120,19 +2652,24 @@ def _install_tag(tag: str) -> dict[str, Any]:
             _record_last_backup(backup)
         except Exception as install_error:
             try:
-                if backup is not None and metadata is not None:
+                if (package_mutation_started
+                        and backup is not None and metadata is not None):
                     _restore_transaction(backup, metadata, validator)
                     outcome = "was rolled back"
                 else:
                     _restore_services(services)
                     outcome = "was aborted before package changes; services were restored"
             except Exception as rollback_error:  # noqa: BLE001 - preserve both failures
-                raise HelperError(
+                raise InstallTransactionError(
                     f"Meshtastic install failed ({install_error}); automatic rollback "
-                    f"also failed ({rollback_error}). Backup: {backup or 'not created'}"
+                    f"also failed ({rollback_error}). Backup: {backup or 'not created'}",
+                    rollback_restored=False,
+                    backup=backup,
                 ) from install_error
-            raise HelperError(
-                f"Meshtastic install failed and {outcome}: {install_error}"
+            raise InstallTransactionError(
+                f"Meshtastic install failed and {outcome}: {install_error}",
+                rollback_restored=True,
+                backup=backup,
             ) from install_error
     return {
         "action": "install-tag",
@@ -2194,6 +2731,10 @@ def main(argv: list[str] | None = None) -> int:
         if len(args) == 2 and args[0] == "install-tag" and TAG_RE.fullmatch(args[1]):
             _json_output(**_install_tag(args[1]))
             return 0
+        if (len(args) == 2 and args[0] == "prepare-first-tag"
+                and TAG_RE.fullmatch(args[1])):
+            _json_output(**_prepare_first_tag(args[1]))
+            return 0
         if (len(args) == 2 and args[0] == "adopt-installed"
                 and TAG_RE.fullmatch(args[1])):
             _json_output(**_adopt_installed(args[1]))
@@ -2203,8 +2744,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise HelperError(
             "Usage: watchdogs-meshtastic version | status/start/stop/enable/disable/"
-            "select-service wdg|stock | install-tag/adopt-installed "
+            "select-service wdg|stock | install-tag/prepare-first-tag/"
+            "adopt-installed "
             "vX.Y.Z-wdg.N | rollback")
+    except InstallTransactionError as exc:
+        _json_install_error(exc)
+        return 2
     except (HelperError, ValueError, OSError, subprocess.SubprocessError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

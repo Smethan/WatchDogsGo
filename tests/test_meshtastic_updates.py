@@ -181,9 +181,13 @@ def test_tag_and_package_names_are_a_separate_version_contract():
     assert updates.parse_meshtastic_tag(TAG) == (2, 8, 1, 1)
     assert updates.package_version_for_tag(TAG) == VERSION
     assert updates.package_asset_for_tag(TAG) == ASSET
-    for value in ("v2.8.1", "2.8.1-wdg.1", "v2.8.1-wdg.0/../../x"):
+    for value in (
+            "v2.8.1", "2.8.1-wdg.1", "v2.8.1-wdg.0/../../x",
+            "v02.8.1-wdg.1", "v2.08.1-wdg.1", "v2.8.01-wdg.1",
+            "v2.8.1-wdg.01"):
         with pytest.raises(ValueError):
             updates.parse_meshtastic_tag(value)
+    assert updates.parse_meshtastic_tag("v0.0.0-wdg.0") == (0, 0, 0, 0)
 
 
 def test_release_list_accepts_only_exact_smethan_assets(monkeypatch):

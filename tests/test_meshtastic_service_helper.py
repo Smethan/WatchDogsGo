@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 4})
+        return result({"ok": True, "helper_version": 5})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 4
+    assert controller.version() == 5
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -125,6 +125,52 @@ def test_controller_rejects_pre_hardening_helper_version():
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
         controller.require_current()
+
+
+def test_controller_exposes_structured_install_rollback_outcome():
+    payload = {
+        "ok": False,
+        "action": "install-tag",
+        "error_type": "install_failed",
+        "error": "candidate health failed; previous package restored",
+        "rollback_restored": True,
+        "backup": "/var/backups/meshtasticd-wdg/20260925T120000Z-test",
+    }
+    controller = service.MeshtasticServiceController(
+        runner=lambda *a, **k: result(payload, returncode=2),
+        geteuid=lambda: 0)
+
+    with pytest.raises(service.MeshtasticInstallError) as caught:
+        controller.install_tag("v2.8.1-wdg.1")
+
+    assert caught.value.rollback_restored is True
+    assert caught.value.backup == Path(payload["backup"])
+
+
+@pytest.mark.parametrize("mutation", [
+    {"rollback_restored": "yes"},
+    {"backup": "/tmp/untrusted"},
+    {"ok": True},
+    {"unexpected": "field"},
+])
+def test_controller_rejects_malformed_structured_install_failure(mutation):
+    payload = {
+        "ok": False,
+        "action": "install-tag",
+        "error_type": "install_failed",
+        "error": "failed",
+        "rollback_restored": False,
+        "backup": None,
+    }
+    payload.update(mutation)
+    controller = service.MeshtasticServiceController(
+        runner=lambda *a, **k: result(payload, returncode=2),
+        geteuid=lambda: 0)
+
+    with pytest.raises(RuntimeError) as caught:
+        controller.install_tag("v2.8.1-wdg.1")
+
+    assert not isinstance(caught.value, service.MeshtasticInstallError)
 
 
 @pytest.mark.parametrize(
@@ -229,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 4
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 5
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -237,7 +283,10 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         ["start", "other.service"],
         ["select-service", "other.service"],
         ["install-tag", "/tmp/evil.deb"],
+        ["install-tag", "v02.8.1-wdg.1"],
         ["install-tag", "v2.8.1-wdg.1", "/tmp/evil.deb"],
+        ["prepare-first-tag", "/tmp/evil.deb"],
+        ["prepare-first-tag", "v2.08.1-wdg.1"],
         ["adopt-installed", "/tmp/evil.deb"],
         ["adopt-installed", "v2.8.1-wdg.1", "/tmp/evil.deb"],
         ["rollback", "/tmp/backup"],
@@ -246,6 +295,29 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
     for argv in rejected:
         assert helper.main(list(argv)) == 1
         assert "Usage:" in capsys.readouterr().err
+
+
+def test_source_helper_emits_structured_nonzero_install_outcome(
+        monkeypatch, capsys):
+    helper = load_helper()
+    backup = Path("/var/backups/meshtasticd-wdg/20260925T120000Z-test")
+    monkeypatch.setattr(
+        helper, "_install_tag",
+        Mock(side_effect=helper.InstallTransactionError(
+            "candidate failed and rollback failed",
+            rollback_restored=False, backup=backup)))
+
+    assert helper.main(["install-tag", "v2.8.1-wdg.1"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "ok": False,
+        "action": "install-tag",
+        "error_type": "install_failed",
+        "error": "candidate failed and rollback failed",
+        "rollback_restored": False,
+        "backup": str(backup),
+    }
 
 
 def test_source_helper_serializes_direct_service_mutations(monkeypatch):
@@ -1299,7 +1371,10 @@ def test_backup_persists_private_sanitized_preinstall_baseline(
     cached = tmp_path / "v2.8.0-wdg.1"
     cached.mkdir()
     (cached / "old.deb").write_bytes(b"old")
-    rollback = NS(tag=cached.name, directory=cached)
+    rollback = fake_prepared_release(cached.name, cached)
+    prepared_dir = tmp_path / "v2.8.1-wdg.1"
+    prepared_dir.mkdir()
+    prepared = fake_prepared_release(prepared_dir.name, prepared_dir)
     raw = semantic_status()
     raw["identity"]["private_key"] = "PRIVATE-KEY-BYTES"
     raw["channels"][0]["psk"] = "SECRET-PSK-BYTES"
@@ -1319,7 +1394,7 @@ def test_backup_persists_private_sanitized_preinstall_baseline(
     monkeypatch.setattr(helper.os, "fchown", lambda *a: None)
 
     backup, metadata = helper._create_backup(
-        "v2.8.1-wdg.1", NS(package_version="2.8.1+wdg1"), NS(), {})
+        "v2.8.1-wdg.1", prepared, NS(), {})
 
     transaction = backup / "transaction.json"
     serialized = transaction.read_text(encoding="utf-8")
@@ -1328,6 +1403,9 @@ def test_backup_persists_private_sanitized_preinstall_baseline(
     assert persisted["semantic_baseline"] == semantic
     assert persisted["effective_mac"] == "02:00:A1:B2:C3:D4"
     assert persisted["mac_pin_required"] is True
+    assert persisted["format"] == 2
+    assert persisted["new_release"]["package_sha256"] == "a" * 64
+    assert persisted["rollback_release"]["tag"] == "v2.8.0-wdg.1"
     assert "PRIVATE-KEY-BYTES" not in serialized
     assert "SECRET-PSK-BYTES" not in serialized
     assert "private_key" not in persisted["semantic_baseline"]
@@ -1344,13 +1422,14 @@ def test_install_failure_runs_automatic_rollback(tmp_path, monkeypatch):
     package = stage / "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"
     package.write_bytes(b"deb")
     package.chmod(0o600)
-    prepared = NS(
-        tag="v2.8.1-wdg.1", package_version="2.8.1+wdg1",
-        package_path=package, directory=stage)
-    validator = NS(validate_prepared_release=lambda *a, **k: prepared)
+    prepared = fake_prepared_release(stage.name, stage)
+    validator = NS(
+        validate_prepared_release=lambda *a, **k: prepared,
+        validate_installed_package_payload=Mock())
     backup = tmp_path / "backup"
     backup.mkdir(mode=0o700)
     metadata = baseline_metadata(helper)
+    metadata["new_release"] = helper._release_identity(prepared)
     rolled_back = []
     monkeypatch.setattr(helper, "CACHE_ROOT", cache)
     monkeypatch.setattr(helper, "_secure_root_directory", lambda path: None)
@@ -1359,6 +1438,9 @@ def test_install_failure_runs_automatic_rollback(tmp_path, monkeypatch):
     monkeypatch.setattr(helper, "_lock_transaction", lambda: _Context())
     monkeypatch.setattr(helper, "_create_backup", lambda *a: (backup, metadata))
     monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
+    monkeypatch.setattr(
+        helper, "_validate_transaction_metadata",
+        lambda value, *_args: (helper._validation_baseline(value), {}, {}))
     monkeypatch.setattr(helper, "_service_snapshot", lambda: {
         "wdg": {"load_state": "loaded"},
         "stock": {"load_state": "loaded"},
@@ -1381,16 +1463,17 @@ def test_malformed_persisted_baseline_aborts_before_apt(
     stage.mkdir(parents=True, mode=0o700)
     package = stage / "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"
     package.write_bytes(b"deb")
-    prepared = NS(
-        tag=stage.name, package_version="2.8.1+wdg1",
-        package_path=package, directory=stage)
-    validator = NS(validate_prepared_release=lambda *a, **k: prepared)
+    prepared = fake_prepared_release(stage.name, stage)
+    validator = NS(
+        validate_prepared_release=lambda *a, **k: prepared,
+        validate_installed_package_payload=Mock())
     backup = tmp_path / "backup"
     backup.mkdir()
     metadata = baseline_metadata(helper)
     metadata["semantic_baseline"]["node_id"] = "not-a-node"
     calls = []
-    restored = []
+    transaction_restore = Mock()
+    services_restore = Mock()
     monkeypatch.setattr(helper, "CACHE_ROOT", cache)
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
@@ -1404,116 +1487,237 @@ def test_malformed_persisted_baseline_aborts_before_apt(
         helper, "_create_backup", lambda *a: (backup, metadata))
     monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
     monkeypatch.setattr(
+        helper, "_validate_transaction_metadata",
+        lambda value, *_args: (helper._validation_baseline(value), {}, {}))
+    monkeypatch.setattr(
         helper, "_run",
         lambda command, **_kwargs: (
             calls.append(command) or NS(returncode=0, stdout="", stderr="")))
     monkeypatch.setattr(
         helper, "_restore_transaction",
-        lambda *args: restored.append(args[0]))
+        transaction_restore)
+    monkeypatch.setattr(helper, "_restore_services", services_restore)
 
-    with pytest.raises(helper.HelperError, match="was rolled back.*malformed"):
+    with pytest.raises(
+            helper.HelperError,
+            match="aborted before package changes.*malformed"):
         helper._install_tag(prepared.tag)
 
-    assert restored == [backup]
+    transaction_restore.assert_not_called()
+    services_restore.assert_called_once()
     assert not any(command[0] == "apt-get" for command in calls)
 
 
-@pytest.mark.parametrize("previous_version", [None, "2.8.0+wdg1"])
-def test_restore_transaction_verifies_package_state_and_files(
-        tmp_path, monkeypatch, previous_version):
+def restore_transaction_fixture(tmp_path, monkeypatch, *, with_package=True):
     helper = load_helper()
+    live_config = tmp_path / "etc" / "meshtasticd"
+    live_state = tmp_path / "var" / "lib" / "meshtasticd"
+    live_config.mkdir(parents=True)
+    live_state.mkdir(parents=True)
+    (live_config / "config.yaml").write_text("candidate", encoding="utf-8")
+    (live_state / "identity.bin").write_bytes(b"candidate")
+    monkeypatch.setattr(helper, "STATE_PATHS", (live_config, live_state))
+
     backup = tmp_path / "backup"
-    backup.mkdir()
-    rollback_tag = "v2.8.0-wdg.1" if previous_version else None
-    rollback_dir = backup / "rollback-release" / str(rollback_tag)
-    if previous_version:
+    state_root = backup / "state"
+    state_root.mkdir(parents=True)
+    backup.chmod(0o700)
+    for target, payload in (
+            (live_config, b"verified config"),
+            (live_state, b"verified identity")):
+        source = state_root / helper._state_backup_key(target)
+        source.mkdir()
+        (source / "value.bin").write_bytes(payload)
+
+    new_dir = tmp_path / "new" / "v2.8.1-wdg.1"
+    new_dir.mkdir(parents=True)
+    new_release = fake_prepared_release(new_dir.name, new_dir, digest="c" * 64)
+    previous_version = "2.8.0+wdg1" if with_package else None
+    rollback_release = None
+    if with_package:
+        rollback_dir = backup / "rollback-release" / "v2.8.0-wdg.1"
         rollback_dir.mkdir(parents=True)
-    metadata = {
-        "previous_version": previous_version,
-        "rollback_tag": rollback_tag,
-        "state_presence": {},
-        "state_fingerprints": {},
-        "services": {},
+        rollback_release = fake_prepared_release(
+            rollback_dir.name, rollback_dir, digest="d" * 64)
+    services = {
+        "wdg": {
+            "load_state": "loaded", "active_state": "inactive",
+            "unit_file_state": "enabled",
+        },
+        "stock": {
+            "load_state": "loaded", "active_state": "active",
+            "unit_file_state": "disabled",
+        },
     }
-    prepared = NS(
-        package_version=previous_version,
-        package_path=rollback_dir / "rollback.deb")
-    validator = NS(validate_prepared_release=Mock(return_value=prepared))
-    calls = []
-    monkeypatch.setattr(
-        helper, "_run",
-        lambda command, **kwargs: calls.append((command, kwargs)))
-    monkeypatch.setattr(
-        helper, "_installed_version", lambda: previous_version)
-    monkeypatch.setattr(helper, "_restore_state_from_backup", Mock())
-    monkeypatch.setattr(helper, "_state_unchanged", lambda _metadata: True)
+    presence = {
+        helper._state_backup_key(path): True for path in helper.STATE_PATHS}
+    fingerprints = {
+        str(path): helper._tree_fingerprint(
+            state_root / helper._state_backup_key(path))
+        for path in helper.STATE_PATHS
+    }
+    metadata = {
+        "format": 2,
+        "new_release": helper._release_identity(new_release),
+        "previous_version": previous_version,
+        "rollback_release": (
+            helper._release_identity(rollback_release)
+            if rollback_release is not None else None),
+        "services": services,
+        "state_presence": presence,
+        "state_fingerprints": fingerprints,
+        "semantic_baseline": helper._semantic_status_snapshot(semantic_status()),
+        "effective_mac": "02:00:A1:B2:C3:D4",
+        "mac_pin_required": False,
+    }
+    validator = NS(
+        validate_prepared_release=Mock(return_value=rollback_release),
+        validate_installed_package_payload=Mock())
+    commands = []
+
+    def run(command, **kwargs):
+        if command[0] == "cp":
+            shutil.copytree(command[-2], command[-1], copy_function=shutil.copy2)
+        else:
+            commands.append((command, kwargs))
+        return NS(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(helper, "_run", run)
+    monkeypatch.setattr(helper, "_installed_version", lambda: previous_version)
     monkeypatch.setattr(helper, "_restore_services", Mock())
+    return (helper, backup, metadata, validator, commands,
+            live_config, live_state, rollback_release)
+
+
+@pytest.mark.parametrize("with_package", [False, True])
+def test_restore_transaction_verifies_package_state_and_files(
+        tmp_path, monkeypatch, with_package):
+    (helper, backup, metadata, validator, calls,
+     live_config, live_state, rollback_release) = restore_transaction_fixture(
+         tmp_path, monkeypatch, with_package=with_package)
 
     helper._restore_transaction(backup, metadata, validator)
 
-    helper._restore_state_from_backup.assert_called_once_with(backup, {})
-    helper._restore_services.assert_called_once_with({})
-    if previous_version is None:
+    assert (live_config / "value.bin").read_bytes() == b"verified config"
+    assert (live_state / "value.bin").read_bytes() == b"verified identity"
+    helper._restore_services.assert_called_once_with(metadata["services"])
+    if not with_package:
         assert any(command[:2] == ["dpkg", "--purge"]
                    for command, _kwargs in calls)
+        validator.validate_installed_package_payload.assert_not_called()
     else:
-        validator.validate_prepared_release.assert_called_once()
         apt_commands = [
             command for command, _kwargs in calls if command[0] == "apt-get"]
         assert apt_commands == [[
             "apt-get", "-y", "--allow-downgrades",
             "--no-install-recommends", "install",
-            str(prepared.package_path),
+            str(rollback_release.package_path),
         ]]
+        validator.validate_installed_package_payload.assert_called_once_with(
+            rollback_release.package_path, rollback_release.manifest)
 
 
-def test_restore_transaction_does_not_claim_success_after_failed_purge(
+def test_restore_preflight_rejects_corrupt_backup_before_live_mutation(
         tmp_path, monkeypatch):
-    helper = load_helper()
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    metadata = {
-        "previous_version": None,
-        "rollback_tag": None,
-        "state_presence": {},
-        "state_fingerprints": {},
-        "services": {},
-    }
-    monkeypatch.setattr(helper, "_run", lambda *a, **k: None)
-    monkeypatch.setattr(
-        helper, "_installed_version", lambda: "2.8.1+wdg1")
-    monkeypatch.setattr(helper, "_restore_state_from_backup", Mock())
-    monkeypatch.setattr(helper, "_restore_services", Mock())
+    (helper, backup, metadata, validator, calls,
+     live_config, _live_state, _release) = restore_transaction_fixture(
+         tmp_path, monkeypatch)
+    before = (live_config / "config.yaml").read_bytes()
+    source = backup / "state" / helper._state_backup_key(live_config) / "value.bin"
+    source.write_bytes(b"tampered")
 
-    with pytest.raises(helper.HelperError, match="package rollback"):
-        helper._restore_transaction(backup, metadata, NS())
+    with pytest.raises(helper.HelperError, match="fingerprint"):
+        helper._restore_transaction(backup, metadata, validator)
 
-    helper._restore_state_from_backup.assert_not_called()
+    assert (live_config / "config.yaml").read_bytes() == before
+    assert calls == []
     helper._restore_services.assert_not_called()
 
 
-def test_restore_transaction_rejects_unverified_restored_state(
+def test_restore_preflight_rejects_missing_backup_before_live_mutation(
+        tmp_path, monkeypatch):
+    (helper, backup, metadata, validator, calls,
+     live_config, live_state, _release) = restore_transaction_fixture(
+         tmp_path, monkeypatch)
+    before_config = helper._tree_fingerprint(live_config)
+    before_state = helper._tree_fingerprint(live_state)
+    shutil.rmtree(
+        backup / "state" / helper._state_backup_key(live_state))
+
+    with pytest.raises(helper.HelperError, match="contents do not match"):
+        helper._restore_transaction(backup, metadata, validator)
+
+    assert helper._tree_fingerprint(live_config) == before_config
+    assert helper._tree_fingerprint(live_state) == before_state
+    assert calls == []
+    helper._restore_services.assert_not_called()
+
+
+def test_restore_preflight_rejects_release_digest_mismatch_before_mutation(
+        tmp_path, monkeypatch):
+    (helper, backup, metadata, validator, calls,
+     live_config, live_state, _release) = restore_transaction_fixture(
+         tmp_path, monkeypatch)
+    before_config = helper._tree_fingerprint(live_config)
+    before_state = helper._tree_fingerprint(live_state)
+    metadata["rollback_release"]["manifest_sha256"] = "e" * 64
+
+    with pytest.raises(
+            helper.HelperError,
+            match="differs from transaction metadata"):
+        helper._restore_transaction(backup, metadata, validator)
+
+    assert helper._tree_fingerprint(live_config) == before_config
+    assert helper._tree_fingerprint(live_state) == before_state
+    assert calls == []
+    helper._restore_services.assert_not_called()
+
+
+def test_state_swap_recovers_earlier_target_when_later_swap_fails(
+        tmp_path, monkeypatch):
+    (helper, backup, metadata, _validator, _calls,
+     live_config, live_state, _release) = restore_transaction_fixture(
+         tmp_path, monkeypatch, with_package=False)
+    entries = helper._prepare_state_restore(
+        backup, metadata["state_presence"], metadata["state_fingerprints"])
+    original_rename = helper.os.rename
+    failed = False
+
+    def fail_second_staging(source, target):
+        nonlocal failed
+        if (not failed and Path(target) == live_state
+                and Path(source) == entries[1].staging):
+            failed = True
+            raise OSError("simulated second swap failure")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(helper.os, "rename", fail_second_staging)
+    with pytest.raises(OSError, match="second swap"):
+        helper._apply_state_restore(entries)
+
+    assert (live_config / "config.yaml").read_text() == "candidate"
+    assert (live_state / "identity.bin").read_bytes() == b"candidate"
+    helper._cleanup_restore_entries(entries)
+
+
+def test_candidate_restore_rejects_changed_backup_before_live_mutation(
         tmp_path, monkeypatch):
     helper = load_helper()
-    backup = tmp_path / "backup"
-    backup.mkdir()
-    metadata = {
-        "previous_version": None,
-        "rollback_tag": None,
-        "state_presence": {},
-        "state_fingerprints": {"/etc/meshtasticd": []},
-        "services": {},
-    }
-    monkeypatch.setattr(helper, "_run", lambda *a, **k: None)
-    monkeypatch.setattr(helper, "_installed_version", lambda: None)
-    monkeypatch.setattr(helper, "_restore_state_from_backup", Mock())
-    monkeypatch.setattr(helper, "_state_unchanged", lambda _metadata: False)
-    monkeypatch.setattr(helper, "_restore_services", Mock())
+    (live_config, live_state, snapshot, presence,
+     before) = candidate_live_state(helper, tmp_path, monkeypatch)
+    backup_file = (
+        snapshot / "state" / helper._state_backup_key(live_config)
+        / "config.yaml")
+    backup_file.write_text("tampered backup\n", encoding="utf-8")
+    live_config_fingerprint = helper._tree_fingerprint(live_config)
+    live_state_fingerprint = helper._tree_fingerprint(live_state)
 
-    with pytest.raises(helper.HelperError, match="state rollback"):
-        helper._restore_transaction(backup, metadata, NS())
+    with pytest.raises(helper.HelperError, match="fingerprint"):
+        helper._restore_state_from_backup(
+            snapshot, presence, before)
 
-    helper._restore_services.assert_not_called()
+    assert helper._tree_fingerprint(live_config) == live_config_fingerprint
+    assert helper._tree_fingerprint(live_state) == live_state_fingerprint
 
 
 def test_install_tag_downloads_only_the_matching_release_into_root_cache(
@@ -1550,6 +1754,55 @@ def test_install_tag_downloads_only_the_matching_release_into_root_cache(
     }]
 
 
+def test_prepare_first_tag_seals_root_inbox_before_returning_package(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    tag = "v2.8.1-wdg.1"
+    cache = tmp_path / "cache"
+    inbox_root = cache / "first-install-inbox"
+    inbox = inbox_root / tag
+    inbox.mkdir(parents=True, mode=0o700)
+    for name in (
+            "compatibility.json", "SHA256SUMS", "SOURCE.txt", "copyright",
+            "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"):
+        (inbox / name).write_bytes(b"abc")
+        (inbox / name).chmod(0o600)
+
+    validations = []
+
+    def validate(directory, **kwargs):
+        validations.append((Path(directory), kwargs))
+        return fake_prepared_release(tag, directory)
+
+    validator = NS(validate_prepared_release=validate)
+    monkeypatch.setattr(helper, "CACHE_ROOT", cache)
+    monkeypatch.setattr(helper, "FIRST_INSTALL_INBOX", inbox_root)
+    monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
+    monkeypatch.setattr(helper, "_load_validator", lambda: validator)
+    monkeypatch.setattr(helper, "_require_root", lambda: None)
+    monkeypatch.setattr(helper, "_installed_version", lambda: None)
+    monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
+
+    outcome = helper._prepare_first_tag(tag)
+
+    protected = cache / tag
+    package = protected / "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"
+    assert package.read_bytes() == b"abc"
+    assert outcome == {
+        "action": "prepare-first-tag",
+        "tag": tag,
+        "package_version": "2.8.1+wdg1",
+        "package_path": str(package),
+    }
+    assert validations[0][0] == inbox
+    assert validations[-1][0] == protected
+    assert all(call_kwargs == {
+        "expected_tag": tag,
+        "require_secure": True,
+        "check_host": True,
+    } for _path, call_kwargs in validations)
+
+
 def semantic_status(*, node_id="!a1b2c3d4", long_name="uConsole",
                     short_name="UC", public=True, private=True,
                     channels=None):
@@ -1566,6 +1819,27 @@ def semantic_status(*, node_id="!a1b2c3d4", long_name="uConsole",
         },
         "channels": channels,
     }
+
+
+def fake_prepared_release(tag, directory, *, digest="a" * 64):
+    version = tag.removeprefix("v").replace("-wdg.", "+wdg")
+    asset = f"meshtasticd-wdg_{version}_arm64.deb"
+    manifest = {
+        "source_commit": "b" * 40,
+        "package": {
+            "asset": asset,
+            "version": version,
+            "size": 3,
+            "sha256": digest,
+        },
+    }
+    return NS(
+        tag=tag,
+        package_version=version,
+        package_path=Path(directory) / asset,
+        directory=Path(directory),
+        manifest=manifest,
+    )
 
 
 def baseline_metadata(helper, *, pin_required=False, status=None):
@@ -1900,6 +2174,92 @@ def test_candidate_health_reports_shared_radio_lock_contention():
             process=process)
 
 
+class _HealthSocket:
+    def __init__(self, *packets):
+        self.packets = [json.dumps(packet).encode("utf-8")
+                        for packet in packets]
+        self.sent = []
+
+    def sendall(self, payload):
+        self.sent.append(json.loads(payload))
+
+    def recv(self, _size):
+        return self.packets.pop(0)
+
+
+def test_health_socket_requires_versioned_reply_envelope():
+    helper = load_helper()
+    valid_body = {"protocol_version": 1}
+
+    for invalid in (
+        {"type": "reply", "request_id": "health", "ok": True,
+         "body": valid_body},
+        {"v": 2, "type": "reply", "request_id": "health", "ok": True,
+         "body": valid_body},
+        {"v": True, "type": "reply", "request_id": "health", "ok": True,
+         "body": valid_body},
+        {"v": 1, "type": "reply", "request_id": "other", "ok": True,
+         "body": valid_body},
+        {"v": 1, "type": "unknown", "request_id": "health", "ok": True,
+         "body": valid_body},
+    ):
+        with pytest.raises(helper.HelperError, match="health (envelope|reply)"):
+            helper._socket_request(
+                _HealthSocket(invalid), "health", "get_status")
+
+
+def test_health_socket_accepts_only_well_formed_events_before_reply():
+    helper = load_helper()
+    client = _HealthSocket(
+        {"v": 1, "type": "event", "event_id": 1, "name": "ready",
+         "body": {}},
+        {"v": 1, "type": "reply", "request_id": "health", "ok": True,
+         "body": {"protocol_version": 1}},
+    )
+
+    assert helper._socket_request(client, "health", "get_status") == {
+        "protocol_version": 1}
+    assert client.sent == [{
+        "v": 1, "type": "command", "request_id": "health",
+        "name": "get_status", "body": {},
+    }]
+
+    with pytest.raises(helper.HelperError, match="event envelope"):
+        helper._socket_request(
+            _HealthSocket({"v": 1, "type": "event", "name": "ready"}),
+            "health", "get_status")
+
+    for event_id in (True, -1, "1", None):
+        with pytest.raises(helper.HelperError, match="event envelope"):
+            helper._socket_request(
+                _HealthSocket({
+                    "v": 1, "type": "event", "event_id": event_id,
+                    "name": "ready", "body": {},
+                }),
+                "health", "get_status")
+
+
+@pytest.mark.parametrize("protocol_version", [True, 1.0, "1", 2, None])
+def test_health_requires_plain_api_version_one(protocol_version):
+    helper = load_helper()
+    with pytest.raises(helper.HelperError, match="incompatible WDG API"):
+        helper._validate_health_bodies(
+            {"protocol_version": protocol_version}, semantic_status())
+
+
+@pytest.mark.parametrize("status", [
+    {**semantic_status(), "state": "starting"},
+    {**semantic_status(), "radio_status": "starting"},
+    {key: value for key, value in semantic_status().items() if key != "state"},
+    {key: value for key, value in semantic_status().items()
+     if key != "radio_status"},
+])
+def test_health_requires_both_ready_states(status):
+    helper = load_helper()
+    with pytest.raises(helper.HelperError, match="radio is not ready"):
+        helper._validate_health_bodies({"protocol_version": 1}, status)
+
+
 def test_candidate_process_group_is_killed_after_leader_already_exited(
         monkeypatch):
     helper = load_helper()
@@ -2202,12 +2562,13 @@ def test_candidate_baseline_mismatch_triggers_automatic_rollback(
     stage.mkdir(parents=True, mode=0o700)
     package = stage / "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"
     package.write_bytes(b"deb")
-    prepared = NS(
-        tag=stage.name, package_version="2.8.1+wdg1",
-        package_path=package, directory=stage)
-    validator = NS(validate_prepared_release=lambda *a, **k: prepared)
+    prepared = fake_prepared_release(stage.name, stage)
+    validator = NS(
+        validate_prepared_release=lambda *a, **k: prepared,
+        validate_installed_package_payload=Mock())
     backup = candidate_backup(tmp_path)
     metadata = baseline_metadata(helper)
+    metadata["new_release"] = helper._release_identity(prepared)
     policy = tmp_path / "wdg-portduino.yaml"
     policy.write_text("wdg_api:\n  enabled: true\n")
     rolled_back = []
@@ -2224,6 +2585,9 @@ def test_candidate_baseline_mismatch_triggers_automatic_rollback(
     monkeypatch.setattr(
         helper, "_create_backup", lambda *a: (backup, metadata))
     monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
+    monkeypatch.setattr(
+        helper, "_validate_transaction_metadata",
+        lambda *_args: (None, {}, {}))
     monkeypatch.setattr(
         helper, "_run",
         lambda *a, **k: NS(returncode=0, stdout="", stderr=""))
@@ -2261,12 +2625,13 @@ def test_live_integrity_failure_uses_existing_automatic_rollback(
     stage.mkdir(mode=0o700)
     package = stage / "meshtasticd-wdg_2.8.1+wdg1_arm64.deb"
     package.write_bytes(b"deb")
-    prepared = NS(
-        tag=stage.name, package_version="2.8.1+wdg1",
-        package_path=package, directory=stage)
-    validator = NS(validate_prepared_release=lambda *a, **k: prepared)
+    prepared = fake_prepared_release(stage.name, stage)
+    validator = NS(
+        validate_prepared_release=lambda *a, **k: prepared,
+        validate_installed_package_payload=Mock())
     backup = candidate_backup(tmp_path)
     metadata = baseline_metadata(helper)
+    metadata["new_release"] = helper._release_identity(prepared)
     live_config = tmp_path / "live-etc"
     live_state = tmp_path / "live-state"
     live_config.mkdir()
@@ -2289,6 +2654,9 @@ def test_live_integrity_failure_uses_existing_automatic_rollback(
     monkeypatch.setattr(
         helper, "_create_backup", lambda *a: (backup, metadata))
     monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
+    monkeypatch.setattr(
+        helper, "_validate_transaction_metadata",
+        lambda *_args: (None, {}, {}))
     monkeypatch.setattr(
         helper, "_run",
         lambda *a, **k: NS(returncode=0, stdout="", stderr=""))

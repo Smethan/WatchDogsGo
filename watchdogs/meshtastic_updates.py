@@ -42,8 +42,13 @@ MESHTASTIC_WDG_API_MINOR = 0
 DPKG_DEB = "/usr/bin/dpkg-deb"
 GETCONF = "/usr/bin/getconf"
 
-TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-wdg\.(\d+)$")
-PACKAGE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)\+wdg(\d+)$")
+_CANONICAL_UINT = r"(?:0|[1-9][0-9]*)"
+TAG_RE = re.compile(
+    rf"^v({_CANONICAL_UINT})\.({_CANONICAL_UINT})\."
+    rf"({_CANONICAL_UINT})-wdg\.({_CANONICAL_UINT})$")
+PACKAGE_VERSION_RE = re.compile(
+    rf"^({_CANONICAL_UINT})\.({_CANONICAL_UINT})\."
+    rf"({_CANONICAL_UINT})\+wdg({_CANONICAL_UINT})$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 UPSTREAM_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,79}$")
 GLIBC_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?$")

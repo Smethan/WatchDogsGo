@@ -97,6 +97,7 @@ def test_sudoers_grants_only_the_closed_helper_interface():
     assert f"{helper} select-service wdg" in text
     assert f"{helper} select-service stock" in text
     assert f"{helper} install-tag v*-wdg.*" in text
+    assert f"{helper} prepare-first-tag v*-wdg.*" in text
     assert f"{helper} adopt-installed v*-wdg.*" in text
     assert f"{helper} rollback" in text
     assert "NOPASSWD: WDG_MESHTASTIC" in text

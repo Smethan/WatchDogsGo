@@ -19,7 +19,7 @@ from typing import Any
 from .meshtastic_updates import TAG_RE, parse_meshtastic_tag
 
 MESHTASTIC_HELPER = Path("/usr/local/libexec/watchdogs-meshtastic")
-REQUIRED_HELPER_VERSION = 4
+REQUIRED_HELPER_VERSION = 5
 TRANSACTION_TIMEOUT = 900
 SERVICE_TARGETS = ("wdg", "stock")
 SERVICE_ACTIONS = ("start", "stop", "enable", "disable")
@@ -45,6 +45,21 @@ class MeshtasticServiceStatus:
     @property
     def enabled(self) -> bool:
         return self.unit_file_state in ("enabled", "enabled-runtime")
+
+
+class MeshtasticInstallError(RuntimeError):
+    """A package transaction failed, with an authoritative rollback outcome."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rollback_restored: bool,
+        backup: Path | None,
+    ) -> None:
+        super().__init__(message)
+        self.rollback_restored = rollback_restored
+        self.backup = backup
 
 
 class MeshtasticServiceController:
@@ -86,6 +101,10 @@ class MeshtasticServiceController:
             self._command(operation, argument), capture_output=True, text=True,
             timeout=timeout, check=False)
         if result.returncode:
+            if operation == "install-tag":
+                structured = self._parse_install_failure(result.stdout)
+                if structured is not None:
+                    raise structured
             detail = (result.stderr or result.stdout or "Meshtastic helper failed").strip()
             raise RuntimeError(detail[:1200])
         try:
@@ -95,6 +114,46 @@ class MeshtasticServiceController:
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             raise RuntimeError("Meshtastic helper returned an invalid response")
         return payload
+
+    @staticmethod
+    def _parse_install_failure(payload_text: str) -> MeshtasticInstallError | None:
+        """Decode only the helper's closed, version-5 transaction failure."""
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        expected_keys = {
+            "ok", "action", "error_type", "error",
+            "rollback_restored", "backup",
+        }
+        if (not isinstance(payload, dict)
+                or set(payload) != expected_keys
+                or payload.get("ok") is not False
+                or payload.get("action") != "install-tag"
+                or payload.get("error_type") != "install_failed"
+                or type(payload.get("rollback_restored")) is not bool
+                or not isinstance(payload.get("error"), str)
+                or not payload["error"]):
+            return None
+        backup_value = payload.get("backup")
+        backup: Path | None
+        if backup_value is None:
+            backup = None
+        elif isinstance(backup_value, str):
+            candidate = Path(backup_value)
+            expected_parent = Path("/var/backups/meshtasticd-wdg")
+            if (candidate.parent != expected_parent
+                    or not candidate.name
+                    or candidate.name in {".", ".."}):
+                return None
+            backup = candidate
+        else:
+            return None
+        return MeshtasticInstallError(
+            payload["error"][:1200],
+            rollback_restored=payload["rollback_restored"],
+            backup=backup,
+        )
 
     def version(self) -> int:
         value = self._call("version", timeout=10).get("helper_version")
