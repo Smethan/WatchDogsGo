@@ -283,17 +283,24 @@ class LoRaManager:
     """Background LoRa operations with queue-based output."""
 
     def __init__(self, *, radio_ownership=None, service_handoff=None,
-                 thread_factory=None) -> None:
+                 thread_factory=None, operation_guard=None) -> None:
         self.queue: Queue = Queue()
         self._thread: Optional[threading.Thread] = None
         self._thread_factory = thread_factory or threading.Thread
         self._stop_event = threading.Event()
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._starting = False
+        self._stopping = False
+        self._worker_generation = 0
         self._radio_ownership = (
             radio_ownership if radio_ownership is not None
             else RadioOwnership())
         self._service_handoff = service_handoff
-        self._session_service_was_ready = False
+        self._operation_guard = operation_guard
+        # True only while MeshtasticManager retains the exact pre-suspension
+        # snapshot.  The direct-radio layer never reconstructs service state
+        # from a preferred target or readiness probe.
+        self._session_service_restore_pending = False
         self._resource_close_uncertain = False
         self.running = False
         self.mode = ""  # "sniffer", "scanner", "tracker"
@@ -337,49 +344,89 @@ class LoRaManager:
 
     @property
     def worker_active(self) -> bool:
-        thread = self._thread
-        return bool(thread is not None and thread.is_alive())
+        with self._state_lock:
+            thread = self._thread
+            return bool(
+                self._starting
+                or (thread is not None and thread.is_alive()))
+
+    def _run_worker(self, generation: int, target, args) -> None:
+        """Run one generation without allowing its exit to clear a successor."""
+        try:
+            target(*args)
+        finally:
+            self._worker_finished(generation)
 
     def _start_worker(self, mode: str, target, args=()) -> bool:
         """Start one direct-radio worker with its final mode set up front."""
+        if self._operation_guard is not None:
+            reason = str(self._operation_guard() or "").strip()
+            if reason:
+                self._emit(reason, "error")
+                return False
         with self._state_lock:
-            if self.running or self.worker_active:
+            thread = self._thread
+            if (self.running or self._starting or self._stopping
+                    or (thread is not None and thread.is_alive())):
                 return False
             if self._radio_ownership.held:
                 self._emit(
                     "SX1262 ownership is still held after an earlier cleanup "
                     "failure; restart WatchDogsGo before retrying", "error")
                 return False
+            self._worker_generation += 1
+            generation = self._worker_generation
             self._stop_event.clear()
             self.running = True
+            self._starting = True
             self.mode = mode
             self.packets_received = 0
-            thread = self._thread_factory(
-                target=target,
-                args=args,
-                name=f"wdg-lora-{mode}",
-                daemon=True,
-            )
-            self._thread = thread
-        try:
-            thread.start()
-        except Exception:
-            with self._state_lock:
-                if self._thread is thread:
-                    self._thread = None
+            try:
+                thread = self._thread_factory(
+                    target=self._run_worker,
+                    args=(generation, target, args),
+                    name=f"wdg-lora-{mode}",
+                    daemon=True,
+                )
+                self._thread = thread
+                # Keep construction and start under the same lifecycle lock.
+                # stop() cannot mistake an assigned-but-unstarted Thread for a
+                # completed worker and then allow it to begin after returning.
+                thread.start()
+            except Exception as exc:
+                self._thread = None
                 self.running = False
-            raise
+                self._stop_event.set()
+                self._emit(
+                    "Could not start direct LoRa worker: " + str(exc)[:120],
+                    "error")
+                return False
+            finally:
+                self._starting = False
         return True
 
-    def _worker_finished(self) -> None:
+    def _worker_finished(self, generation: int) -> None:
         with self._state_lock:
+            if generation != self._worker_generation:
+                return
             self.running = False
             if self._thread is threading.current_thread():
                 self._thread = None
 
-    def _restore_service_after_failed_start(self, was_ready: bool) -> None:
-        """Restore a daemon displaced by a failed direct-radio startup."""
-        if not was_ready or self._service_handoff is None:
+    def _service_restore_pending(self) -> bool:
+        """Return the service manager's authoritative rollback state."""
+        handoff = self._service_handoff
+        if handoff is None:
+            return False
+        pending = getattr(handoff, "service_restore_pending", False)
+        try:
+            return bool(pending() if callable(pending) else pending)
+        except Exception:
+            return False
+
+    def _restore_service_after_failed_start(self) -> None:
+        """Retry only the exact snapshot retained by MeshtasticManager."""
+        if self._service_handoff is None or not self._service_restore_pending():
             return
         try:
             if self._service_handoff.resume_service(
@@ -397,47 +444,70 @@ class LoRaManager:
 
     def _finish_radio_session(self, startup_complete: bool) -> None:
         """Restore a displaced service only when direct startup itself failed."""
-        was_ready = self._session_service_was_ready
-        self._session_service_was_ready = False
+        service_restore_pending = self._session_service_restore_pending
+        self._session_service_restore_pending = False
         if (startup_complete or self._stop_event.is_set()
                 or self._radio_ownership.held):
             return
-        self._restore_service_after_failed_start(was_ready)
+        if service_restore_pending:
+            self._restore_service_after_failed_start()
 
     def _open_radio_session(self):
         """Suspend the daemon, claim process ownership, then initialize SPI."""
-        self._session_service_was_ready = False
+        self._session_service_restore_pending = False
         if self._stop_event.is_set():
             return None
-        was_ready = False
+        service_restore_pending = False
         handoff = self._service_handoff
         if handoff is not None:
             try:
-                was_ready = bool(handoff.service_ready())
+                # Powering the rail off after a successful direct session
+                # deliberately leaves its exact pre-session service snapshot
+                # retained.  Before opening another direct session, restore
+                # that snapshot without connecting a client, then take a fresh
+                # suspension snapshot.  This work runs in the direct worker,
+                # so bounded systemd waits never block the UI thread.
+                if self._service_restore_pending():
+                    if not handoff.resume_service(
+                            timeout=15.0, connect=False):
+                        self._emit(
+                            "Could not restore the retained Meshtastic service "
+                            "state; direct SX1262 access was not started",
+                            "error")
+                        return None
+                    if self._service_restore_pending():
+                        self._emit(
+                            "Meshtastic service restore remained unresolved; "
+                            "direct SX1262 access was not started", "error")
+                        return None
                 if not handoff.suspend_service(timeout=10.0):
                     self._emit(
                         "Could not stop the selected Meshtastic service; "
                         "direct SX1262 access was not started", "error")
-                    try:
-                        if was_ready and not handoff.service_ready():
-                            self._restore_service_after_failed_start(True)
-                    except Exception:
-                        pass
+                    # suspend_service(False) is authoritative.  It may have
+                    # retained a partially restored snapshot, in which case
+                    # the only safe recovery is retrying that exact token.
+                    self._restore_service_after_failed_start()
                     return None
+                if not self._service_restore_pending():
+                    self._emit(
+                        "Meshtastic service suspension did not retain an "
+                        "exact restore snapshot; direct SX1262 access was "
+                        "not started", "error")
+                    return None
+                service_restore_pending = True
             except Exception as exc:
                 self._emit(
                     "Could not hand off the SX1262 from Meshtastic: "
                     + str(exc)[:120], "error")
-                try:
-                    if was_ready and not handoff.service_ready():
-                        self._restore_service_after_failed_start(True)
-                except Exception:
-                    pass
+                self._restore_service_after_failed_start()
                 return None
 
         # stop() may have been requested while the bounded service handoff was
         # waiting.  A cancelled worker must never claim GPIO/SPI afterward.
         if self._stop_event.is_set():
+            if service_restore_pending:
+                self._restore_service_after_failed_start()
             return None
 
         try:
@@ -446,30 +516,37 @@ class LoRaManager:
         except RadioOwnershipBusy as exc:
             self._emit(
                 f"{exc}; stop the other radio user before retrying", "error")
+            if service_restore_pending:
+                self._restore_service_after_failed_start()
             return None
         except Exception as exc:
             self._emit(
                 "Could not acquire the AIO SX1262 ownership lock: "
                 + str(exc)[:120], "error")
-            self._restore_service_after_failed_start(was_ready)
+            if service_restore_pending:
+                self._restore_service_after_failed_start()
             return None
 
         if self._stop_event.is_set():
             self._cleanup_radio(None)
+            if (not self._radio_ownership.held
+                    and service_restore_pending):
+                self._restore_service_after_failed_start()
             return None
 
         self._resource_close_uncertain = False
         lora = self._init_radio()
         if lora is not None:
-            self._session_service_was_ready = was_ready
+            self._session_service_restore_pending = service_restore_pending
             return lora
 
         # _init_radio() closes a partially initialized SPI object.  Release
         # process ownership before restarting any service that previously had
         # the hardware.
         self._cleanup_radio(None)
-        if not self._radio_ownership.held:
-            self._restore_service_after_failed_start(was_ready)
+        if (not self._radio_ownership.held
+                and service_restore_pending):
+            self._restore_service_after_failed_start()
         return None
 
     def _close_radio_resources(self, lora) -> bool:
@@ -640,7 +717,6 @@ class LoRaManager:
     ) -> None:
         lora = self._open_radio_session()
         if not lora:
-            self._worker_finished()
             return
         startup_complete = False
         try:
@@ -725,7 +801,6 @@ class LoRaManager:
             self.cancel_meshcore_discovery()
             self._cleanup_radio(lora)
             self._finish_radio_session(startup_complete)
-            self._worker_finished()
             self._emit("Sniffer stopped.", "dim")
 
     # ------------------------------------------------------------------
@@ -739,7 +814,6 @@ class LoRaManager:
     def _run_scanner(self) -> None:
         lora = self._open_radio_session()
         if not lora:
-            self._worker_finished()
             return
         startup_complete = False
         try:
@@ -794,7 +868,6 @@ class LoRaManager:
         finally:
             self._cleanup_radio(lora)
             self._finish_radio_session(startup_complete)
-            self._worker_finished()
             self._emit("Scanner stopped.", "dim")
 
     # ------------------------------------------------------------------
@@ -808,7 +881,6 @@ class LoRaManager:
     def _run_tracker(self) -> None:
         lora = self._open_radio_session()
         if not lora:
-            self._worker_finished()
             return
         startup_complete = False
         try:
@@ -864,7 +936,6 @@ class LoRaManager:
         finally:
             self._cleanup_radio(lora)
             self._finish_radio_session(startup_complete)
-            self._worker_finished()
             self._emit("Tracker stopped.", "dim")
 
     def _parse_balloon(
@@ -1967,24 +2038,36 @@ class LoRaManager:
 
     def stop(self, timeout: float = 5.0) -> bool:
         """Stop the worker and confirm that hardware ownership was released."""
-        self._stop_event.set()
-        thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=max(0.0, timeout))
-        if thread and thread.is_alive():
-            self._emit(
-                "Direct radio worker did not stop; SX1262 remains unavailable",
-                "error",
-            )
-            return False
         with self._state_lock:
-            if self._thread is thread:
-                self._thread = None
-            self.running = False
-        self.cancel_meshcore_discovery()
-        if self._radio_ownership.held:
-            self._emit(
-                "Direct radio stopped but the SX1262 ownership lock is still "
-                "held", "error")
-            return False
-        return True
+            if self._stopping:
+                self._emit("Direct radio stop is already in progress", "error")
+                return False
+            self._stopping = True
+            self._stop_event.set()
+            generation = self._worker_generation
+            thread = self._thread
+        try:
+            if (thread and thread.is_alive()
+                    and thread is not threading.current_thread()):
+                thread.join(timeout=max(0.0, timeout))
+            if thread and thread.is_alive():
+                self._emit(
+                    "Direct radio worker did not stop; SX1262 remains unavailable",
+                    "error",
+                )
+                return False
+            with self._state_lock:
+                if (generation == self._worker_generation
+                        and self._thread is thread):
+                    self._thread = None
+                    self.running = False
+            self.cancel_meshcore_discovery()
+            if self._radio_ownership.held:
+                self._emit(
+                    "Direct radio stopped but the SX1262 ownership lock is still "
+                    "held", "error")
+                return False
+            return True
+        finally:
+            with self._state_lock:
+                self._stopping = False

@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from queue import Queue
+from queue import Empty, Full, Queue
 from pathlib import Path
 
 import pyxel
@@ -45,7 +45,13 @@ from .race_attack import RACEAttack
 from .aio_manager import AioManager
 from .whitelist_manager import WhitelistManager
 from .lora_manager import LoRaManager
+from .radio_ownership import RadioOwnership, RadioOwnershipBusy
 from .meshtastic_manager import MeshtasticManager
+from .meshtastic_service import (
+    MESHTASTIC_HELPER,
+    MeshtasticInstallError,
+    MeshtasticServiceController,
+)
 from .sdr_manager import SDRManager
 from .plugin_loader import discover_plugins
 from .watch_manager import WatchManager
@@ -603,18 +609,66 @@ class WatchDogsGame(OtaMixin):
         self._fw_update_available = False
 
         # MeshCore Messenger (runs in background when LoRa enabled)
-        self._meshtastic = MeshtasticManager()
-        self._lora = LoRaManager(service_handoff=self._meshtastic)
+        self._meshtastic_service = (
+            MeshtasticServiceController()
+            if MESHTASTIC_HELPER.is_file() else None)
+        self._meshtastic = MeshtasticManager(
+            backend_mode=_wardrive_settings["meshtastic_backend"],
+            phone_ble_enabled=_wardrive_settings[
+                "meshtastic_phone_ble_enabled"],
+            phone_ble_adapter=_wardrive_settings[
+                "meshtastic_phone_adapter"],
+            service_controller=self._meshtastic_service,
+            operation_guard=lambda: (
+                "SX1262 ownership is uncertain after a failed power-barrier "
+                "release; restart WatchDogsGo before starting Meshtastic"
+                if getattr(
+                    self, "_lora_power_ownership_uncertain", False) else ""),
+        )
+        self._meshtastic_update_running = False
+        self._meshtastic_update_result: Queue = Queue()
+        self._meshtastic_update_thread = None
+        self._meshtastic_transition_lock = threading.Lock()
+        self._meshtastic_transition_state = ""
+        self._lora_power_ownership_uncertain = False
+        self._lora_power_uncertain_barrier = None
+        self._lora = LoRaManager(
+            service_handoff=self._meshtastic,
+            operation_guard=lambda: (
+                "SX1262 ownership is uncertain after a failed power-barrier "
+                "release; restart WatchDogsGo before using LoRa"
+                if self._lora_power_ownership_uncertain else
+                "Meshtastic service update is running; direct LoRa is paused"
+                if self._meshtastic_update_running else ""),
+        )
         self._lora_transition_queue: Queue = Queue()
         self._lora_transition_thread = None
+        self._lora_transition_threads: list[threading.Thread] = []
         self._lora_transition_thread_factory = threading.Thread
+        self._lora_power_on_pending = False
+        self._lora_start_pending = ""
+        self._lora_start_epoch = 0
+        self._lora_handoff_pending: tuple[str, int] | None = None
+        self._lora_power_intent = self._lora_enabled
+        self._meshtastic_update_thread_factory = threading.Thread
         self._lora._on_node = self._on_mc_node
         self._lora._on_message = self._on_mc_message
         self._lora._on_dm = self._on_mc_dm
         self._lora._on_dm_ack = self._on_mc_dm_ack
         self._sdr = SDRManager()
         self._sdr_aircraft_xp: set = set()  # ICAO set for XP dedup
-        self._watch = WatchManager()
+        self._watch = WatchManager(
+            pairing_lease_acquire=(
+                self._meshtastic.acquire_pairing_agent_lease),
+            pairing_lease_release=(
+                self._meshtastic.release_pairing_agent_lease),
+            scan_lease_acquire=(
+                lambda seconds: self._meshtastic.acquire_ble_scan_lease(
+                    seconds, owner="watch")),
+            scan_lease_release=(
+                lambda: self._meshtastic.release_ble_scan_lease(
+                    owner="watch")),
+        )
         self._watch_screen = False     # watch overlay active
         self._watch_scan_sel = 0       # selected device in scan list
         self._watch_pin_input = ""     # PIN being typed
@@ -623,8 +677,13 @@ class WatchDogsGame(OtaMixin):
         self._watch_log: list = []     # [(text, color)] for watch overlay
         # Auto-connect to watch if already connected in BlueZ
         _watch_addr = self._watch.check_existing()
-        if _watch_addr:
-            self._watch.connect(_watch_addr)
+        self._watch_autoconnect_address = _watch_addr or ""
+        self._watch_autoconnect_next = 0.0
+        self._watch_autoconnect_result: Queue = Queue(maxsize=1)
+        self._watch_autoconnect_thread = None
+        self._watch_autoconnect_cancel = threading.Event()
+        self._watch_autoconnect_delay = 1.0
+        self._watch_autoconnect_last_detail = ""
         # Plugins
         self._plugins = discover_plugins()
         self._plugin_overlay = None  # active plugin overlay
@@ -1495,6 +1554,7 @@ class WatchDogsGame(OtaMixin):
         self._poll_serial()
         self._poll_lora()
         self._poll_meshtastic()
+        self._poll_meshtastic_update()
         self._poll_sdr()
         self._poll_watch()
         self._poll_wpasec_result()
@@ -2619,6 +2679,132 @@ class WatchDogsGame(OtaMixin):
     # GPS / LoRa toggle (AIO v2 GPIO or software)
     # ------------------------------------------------------------------
 
+    def _begin_meshtastic_transition(self, state: str) -> bool:
+        """Serialize service controls, updates, and shared-radio changes."""
+        lock = getattr(self, "_meshtastic_transition_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._meshtastic_transition_lock = lock
+        if not lock.acquire(blocking=False):
+            return False
+        self._meshtastic_transition_state = str(state)
+        return True
+
+    def _end_meshtastic_transition(self) -> None:
+        lock = getattr(self, "_meshtastic_transition_lock", None)
+        self._meshtastic_transition_state = ""
+        if lock is not None and lock.locked():
+            lock.release()
+
+    def _meshtastic_transition_busy(self) -> bool:
+        lock = getattr(self, "_meshtastic_transition_lock", None)
+        return bool(lock is not None and lock.locked())
+
+    def _meshtastic_bluetooth_busy_reason(self) -> str:
+        """Return the live Bluetooth owner that blocks service mutation."""
+        wardrive = getattr(self, "wardrive", None)
+        host_ble = getattr(wardrive, "host_ble", None)
+        if host_ble is not None and getattr(host_ble, "worker_active", False):
+            return "an active host BLE scan"
+        watch = getattr(self, "_watch", None)
+        if watch is not None and getattr(watch, "worker_active", False):
+            return "an active watch Bluetooth operation"
+        watch_ready = getattr(self, "_watch_autoconnect_thread", None)
+        if watch_ready is not None and watch_ready.is_alive():
+            return "an active watch auto-connect readiness check"
+        manager = getattr(self, "_meshtastic", None)
+        if manager is not None:
+            if getattr(manager, "ble_scan_lease_active", False):
+                return "an active Bluetooth scan lease"
+            if getattr(manager, "pairing_agent_lease_active", False):
+                return "an active Bluetooth pairing lease"
+        return ""
+
+    def _begin_lora_async_start(self, action: str) -> int:
+        """Return a generation token used to reject stale start completions."""
+        self._lora_start_epoch = int(
+            getattr(self, "_lora_start_epoch", 0)) + 1
+        return self._lora_start_epoch
+
+    def _track_lora_transition_thread(self, thread) -> None:
+        """Retain every owner-changing worker until its exit is confirmed."""
+        threads = getattr(self, "_lora_transition_threads", None)
+        if threads is None:
+            threads = []
+            self._lora_transition_threads = threads
+        if thread is not None and not any(item is thread for item in threads):
+            threads.append(thread)
+
+    def _forget_lora_transition_thread(self, thread) -> None:
+        threads = getattr(self, "_lora_transition_threads", None)
+        if threads is not None:
+            self._lora_transition_threads = [
+                item for item in threads if item is not thread]
+
+    def _live_lora_transition_threads(self) -> list:
+        """Return and retain every transition worker still able to mutate state."""
+        candidates = list(getattr(self, "_lora_transition_threads", []) or [])
+        current = getattr(self, "_lora_transition_thread", None)
+        if (current is not None
+                and not any(item is current for item in candidates)):
+            candidates.append(current)
+        live = []
+        for thread in candidates:
+            try:
+                alive = bool(thread.is_alive())
+            except Exception:
+                # An uninspectable worker is conservatively still live.
+                alive = True
+            if alive:
+                live.append(thread)
+        self._lora_transition_threads = live
+        return list(live)
+
+    def _cancel_pending_lora_start(self, *, collector_only: bool = False) -> bool:
+        """Invalidate a pending direct or daemon start without racing its exit.
+
+        A completion may already be queued when the user turns LoRa or its
+        wardrive collector off.  Advancing the epoch makes that completion
+        stale; the poller then stops/releases the newly started owner instead
+        of claiming it.
+        """
+        direct = getattr(self, "_lora_start_pending", "")
+        handoff = getattr(self, "_lora_handoff_pending", None)
+        direct_action = direct[0] if isinstance(direct, tuple) else direct
+        handoff_action = handoff[0] if isinstance(handoff, tuple) else ""
+        actions = {str(direct_action or ""), str(handoff_action or "")}
+        if collector_only and not actions.intersection(("wardrive", "power_on")):
+            return False
+        pending = bool(
+            direct or handoff
+            or self._live_lora_transition_threads())
+        if not pending:
+            return False
+        self._lora_start_epoch = int(
+            getattr(self, "_lora_start_epoch", 0)) + 1
+        return True
+
+    def _lora_start_completion_allowed(self, action: str, epoch: int) -> bool:
+        if epoch != int(getattr(self, "_lora_start_epoch", 0)):
+            return False
+        if not bool(getattr(
+                self, "_lora_power_intent",
+                getattr(self, "_lora_enabled", False))):
+            return False
+        if action in ("wardrive", "power_on"):
+            wardrive = getattr(self, "wardrive", None)
+            if (wardrive is None
+                    or not wardrive.settings.get("wardrive_lora", False)):
+                return False
+        return True
+
+    def _lora_poweroff_handles_cleanup(self) -> bool:
+        """Whether the serialized power worker owns stop/release cleanup."""
+        return bool(
+            not getattr(self, "_lora_power_intent", True)
+            and getattr(self, "_meshtastic_transition_state", "")
+            == "lora_power")
+
     def _toggle_gps(self):
         new_state = not self._gps_enabled
         if self._aio_available:
@@ -2651,6 +2837,303 @@ class WatchDogsGame(OtaMixin):
         self.glitch_timer = 2
 
     def _toggle_lora(self):
+        if getattr(self, "_lora_power_ownership_uncertain", False):
+            self.msg(
+                "[LoRa] SX1262 ownership is uncertain; restart WatchDogsGo",
+                C_ERROR)
+            return False
+        bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+        if bluetooth_busy:
+            self.msg(
+                "[MT] Finish " + bluetooth_busy + " before changing LoRa power",
+                C_WARNING)
+            return False
+        if not self._begin_meshtastic_transition("lora_power"):
+            self.msg("[MT] Another radio/service operation is running", C_WARNING)
+            return False
+        if self._lora_enabled:
+            pending_start_threads = tuple(
+                self._live_lora_transition_threads())
+            self._lora_power_intent = False
+            self._cancel_pending_lora_start()
+            factory = getattr(
+                self, "_lora_transition_thread_factory", threading.Thread)
+            thread = factory(
+                target=self._run_lora_power_off,
+                args=(pending_start_threads,),
+                name="wdg-lora-power-off", daemon=True)
+            self._lora_transition_thread = thread
+            self._track_lora_transition_thread(thread)
+            try:
+                thread.start()
+            except Exception as exc:
+                self._forget_lora_transition_thread(thread)
+                self._lora_transition_thread = None
+                self._lora_power_intent = self._lora_enabled
+                self._end_meshtastic_transition()
+                self.msg(
+                    "[LoRa] Could not start power-off worker: "
+                    + str(exc)[:90], C_ERROR)
+                return False
+            self.msg("[LoRa] Stopping radio owners...", C_DIM)
+            return True
+        try:
+            self._lora_power_intent = True
+            accepted = self._toggle_lora_locked()
+        except Exception as exc:
+            self.msg("[LoRa] Startup failed: " + str(exc)[:100], C_ERROR)
+            self._lora_enabled = True
+            self._lora_power_on_pending = True
+            self._start_failed_lora_power_on_rollback()
+            return False
+        if not accepted and not self._lora_power_on_pending:
+            self._lora_power_intent = self._lora_enabled
+        if not self._lora_power_on_pending:
+            self._end_meshtastic_transition()
+        return accepted
+
+    def _start_failed_lora_power_on_rollback(self) -> None:
+        """Finish a rejected asynchronous power-on through the safe off path."""
+        pending_start_threads = tuple(self._live_lora_transition_threads())
+        self._lora_power_intent = False
+        self._cancel_pending_lora_start()
+        factory = getattr(
+            self, "_lora_transition_thread_factory", threading.Thread)
+        thread = factory(
+            target=self._run_lora_power_off,
+            args=(pending_start_threads,),
+            name="wdg-lora-power-on-rollback", daemon=True)
+        self._lora_transition_thread = thread
+        self._track_lora_transition_thread(thread)
+        try:
+            thread.start()
+        except Exception as exc:
+            self._forget_lora_transition_thread(thread)
+            self._lora_transition_thread = None
+            self._lora_power_on_pending = False
+            self._lora_power_intent = self._lora_enabled
+            self.msg(
+                "[LoRa] Startup failed and safe power rollback could not "
+                "start: " + str(exc)[:90], C_ERROR)
+            self._end_meshtastic_transition()
+
+    def _run_lora_power_off(self, pending_start_threads=()):
+        """Release all radio owners and cut the rail outside Pyxel's thread."""
+        ok = False
+        rail_off = False
+        detail = "LoRa power-off did not complete"
+        direct_active = False
+        prior_direct_mode = ""
+        prior_service_target = None
+        service_suspended = False
+        barrier = None
+        if pending_start_threads is None:
+            pending_start_threads = ()
+        elif not isinstance(pending_start_threads, (tuple, list, set)):
+            pending_start_threads = (pending_start_threads,)
+        # Do not cut power, release the transition barrier, or begin another
+        # service mutation while a displaced handoff can still finish.  The
+        # helper calls used by those workers are bounded; waiting here keeps
+        # an overrun fail-closed without blocking the Pyxel thread.
+        for pending_thread in pending_start_threads:
+            if (pending_thread is not None
+                    and pending_thread is not threading.current_thread()):
+                pending_thread.join()
+        # A displaced handoff can restore a direct owner as its final rollback
+        # action.  Sample ownership only after every such worker has exited;
+        # the values from before the join are no longer authoritative.
+        direct_active = (
+            self._lora.running or self._lora.worker_active
+            or self._lora.radio_owned)
+        prior_direct_mode = self._lora.mode if direct_active else ""
+        try:
+            prior_service_target = self._meshtastic.active_service_target()
+        except Exception:
+            pass
+        try:
+            bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+            if bluetooth_busy:
+                detail = "cannot stop services while " + bluetooth_busy
+            elif direct_active and not self._lora.stop():
+                detail = "direct LoRa worker did not release the SX1262"
+            else:
+                # A successful direct-radio session retains the exact service
+                # snapshot captured before it claimed SPI.  That token already
+                # proves both daemons are persistently suspended, and replacing
+                # it with a snapshot of the suspended state would destroy the
+                # only trustworthy rollback path.
+                service_suspended = self._meshtastic_service_restore_pending()
+                if not service_suspended:
+                    service_suspended = self._meshtastic.suspend_service(
+                        timeout=10.0)
+                if not service_suspended:
+                    detail = "Meshtastic service did not release the SX1262"
+                    if prior_direct_mode:
+                        self._restore_lora_power_owner(
+                            prior_direct_mode, None)
+                    elif prior_service_target:
+                        try:
+                            if (self._meshtastic.active_service_target()
+                                    != prior_service_target):
+                                self._meshtastic.resume_service(
+                                    timeout=15.0, connect=True,
+                                    target=prior_service_target)
+                        except Exception:
+                            pass
+                else:
+                    factory = getattr(
+                        self, "_lora_power_barrier_factory", RadioOwnership)
+                    barrier = factory()
+                    try:
+                        barrier.acquire("WatchDogsGo LoRa power transition")
+                    except RadioOwnershipBusy as exc:
+                        restored = self._restore_lora_power_owner(
+                            prior_direct_mode, prior_service_target)
+                        detail = (
+                            str(exc)[:120] + "; LoRa rail remains on; "
+                            + ("previous owner restored" if restored else
+                               "previous owner could not be restored"))
+                    except Exception as exc:
+                        restored = self._restore_lora_power_owner(
+                            prior_direct_mode, prior_service_target)
+                        detail = (
+                            "could not acquire the SX1262 power barrier: "
+                            + str(exc)[:100] + "; LoRa rail remains on; "
+                            + ("previous owner restored" if restored else
+                               "previous owner could not be restored"))
+                    else:
+                        if (self._aio_available
+                                and not AioManager.toggle("lora", False)):
+                            try:
+                                barrier.release()
+                            except Exception as exc:
+                                self._mark_lora_power_ownership_uncertain(
+                                    barrier, exc)
+                                detail = (
+                                    "GPIO power-off failed and the SX1262 "
+                                    "ownership barrier could not be released; "
+                                    "restart WatchDogsGo")
+                            else:
+                                restored = self._restore_lora_power_owner(
+                                    prior_direct_mode, prior_service_target)
+                                detail = (
+                                    "GPIO power-off failed; the LoRa rail remains "
+                                    "on; "
+                                    + ("previous owner restored" if restored else
+                                       "previous owner could not be restored"))
+                        else:
+                            rail_off = True
+                            ok = True
+                            detail = "LoRa disabled, mesh clients stopped"
+        except Exception as exc:
+            detail = "LoRa power-off failed: " + str(exc)[:140]
+            barrier_released = True
+            if barrier is not None and getattr(barrier, "held", False):
+                try:
+                    barrier.release()
+                except Exception:
+                    barrier_released = False
+                    self._mark_lora_power_ownership_uncertain(barrier)
+            if ((service_suspended or prior_direct_mode or prior_service_target)
+                    and barrier_released):
+                restored = self._restore_lora_power_owner(
+                    prior_direct_mode, prior_service_target)
+                detail += ("; previous owner restored" if restored else
+                           "; previous owner could not be restored")
+            elif not barrier_released:
+                detail += "; ownership barrier could not be released"
+        finally:
+            if barrier is not None and getattr(barrier, "held", False):
+                try:
+                    barrier.release()
+                except Exception as exc:
+                    self._mark_lora_power_ownership_uncertain(barrier, exc)
+                    ok = False
+                    detail += (
+                        "; ownership barrier release failed; SX1262 ownership "
+                        "is uncertain; restart WatchDogsGo: " + str(exc)[:80])
+        queue = getattr(self, "_lora_transition_queue", None)
+        if queue is not None:
+            queue.put((ok, detail, "power_off", {"rail_off": rail_off}))
+        else:
+            self._end_meshtastic_transition()
+
+    def _meshtastic_service_restore_pending(self) -> bool:
+        """Read the manager's authoritative retained-service snapshot flag."""
+        pending = getattr(
+            getattr(self, "_meshtastic", None),
+            "service_restore_pending", False)
+        try:
+            return bool(pending() if callable(pending) else pending)
+        except Exception:
+            return False
+
+    def _mark_lora_power_ownership_uncertain(
+            self, barrier, error=None) -> None:
+        """Retain an unreleased barrier and block every later radio owner."""
+        self._lora_power_ownership_uncertain = True
+        self._lora_power_uncertain_barrier = barrier
+        if error is not None:
+            self._term_add(
+                "[LoRa] SX1262 barrier release could not be confirmed: "
+                + str(error)[:120], raw=True)
+
+    def _restore_lora_power_owner(
+            self, direct_mode: str, service_target: str | None) -> bool:
+        """Restore the exact owner displaced before a failed rail cut."""
+        def direct_start_accepted(start) -> bool:
+            epoch = self._begin_lora_async_start("restore")
+            marker = ("restore", epoch)
+            self._lora_start_pending = marker
+            accepted = bool(start())
+            if accepted:
+                wardrive = getattr(self, "wardrive", None)
+                if wardrive is not None:
+                    wardrive._wdg_owned_lora = False
+            elif self._lora_start_pending == marker:
+                self._lora_start_pending = ""
+            return accepted
+
+        try:
+            # A direct owner can only be reopened after the retained systemd
+            # snapshot is restored.  Its worker will then suspend that exact
+            # state again before reclaiming SPI, producing a fresh rollback
+            # token for the restored direct session.
+            if (direct_mode
+                    and self._meshtastic_service_restore_pending()
+                    and not self._meshtastic.resume_service(
+                        timeout=15.0, connect=False)):
+                return False
+            if direct_mode == "meshcore":
+                self._lora.set_mc_channels(self._mc_channels_list)
+                return direct_start_accepted(
+                    lambda: self._lora.start_meshcore(self._mc_region))
+            if direct_mode == "meshtastic":
+                return direct_start_accepted(self._lora.start_meshtastic)
+            if direct_mode == "scanner":
+                return direct_start_accepted(self._lora.start_scanner)
+            if direct_mode == "tracker":
+                return direct_start_accepted(self._lora.start_tracker)
+            if direct_mode == "sniffer":
+                config = getattr(self._lora, "_radio_cfg", None)
+                if config and len(config) >= 6:
+                    freq, sf, cr, bw, sync_word, preamble = config[:6]
+                    return direct_start_accepted(lambda: self._lora.start_sniffer(
+                        freq, sf, cr, bw, "Restored", sync_word, preamble))
+                return False
+            if (service_target
+                    or self._meshtastic_service_restore_pending()):
+                return bool(self._meshtastic.resume_service(
+                    timeout=15.0, connect=True, target=service_target))
+            return True
+        except Exception:
+            pending = getattr(self, "_lora_start_pending", "")
+            if (isinstance(pending, tuple) and pending
+                    and pending[0] == "restore"):
+                self._lora_start_pending = ""
+            return False
+
+    def _toggle_lora_locked(self):
         new_state = not self._lora_enabled
         # Power-up must precede client startup. Power-down is the inverse:
         # release daemon/SPI owners before cutting the SX1262 rail.
@@ -2658,15 +3141,24 @@ class WatchDogsGame(OtaMixin):
             ok = AioManager.toggle("lora", new_state)
             if not ok:
                 self.msg("[LoRa] GPIO toggle failed", C_ERROR)
-                return
+                return False
         # Start/stop the selected mesh protocol.
         if new_state:
             self._lora_enabled = True
+            self._lora_power_intent = True
             automatic = self.wardrive.settings["wardrive_lora"]
             protocol = self.wardrive.settings["lora_protocol"]
             if automatic:
-                self._switch_lora_protocol(protocol, start_if_enabled=True)
-                self.wardrive._wdg_owned_lora = True
+                self._lora_power_on_pending = True
+                accepted = self._switch_lora_protocol_locked(
+                    protocol, start_if_enabled=True,
+                    transition_action="power_on")
+                if not accepted:
+                    self.wardrive._wdg_owned_lora = False
+                    self.msg("[LoRa] Startup rejected; restoring power OFF",
+                             C_ERROR)
+                    self._start_failed_lora_power_on_rollback()
+                    return False
                 self.msg(
                     f"[LoRa] ON — {protocol.title()} starting", C_SUCCESS)
             else:
@@ -2674,55 +3166,32 @@ class WatchDogsGame(OtaMixin):
                 self._term_add(
                     "[SYS] LoRa powered; no WDG mesh client started",
                     raw=True)
-        else:
-            if self._lora_transition_active():
-                self.msg(
-                    "[LoRa] Radio handoff in progress; power remains ON",
-                    C_ERROR)
-                self._term_add(
-                    "[SYS] Refusing LoRa power-off during radio handoff",
-                    raw=True)
-                return
-            direct_active = (
-                self._lora.running or self._lora.worker_active
-                or self._lora.radio_owned)
-            if direct_active and not self._lora.stop():
-                self.msg(
-                    "[LoRa] Direct radio is still stopping; power remains ON",
-                    C_ERROR)
-                self._term_add(
-                    "[SYS] Refusing LoRa power-off while SX1262 ownership is "
-                    "still active", raw=True)
-                return
-            # Powering the AIO LoRa rail off also requires meshtasticd to
-            # release SPI. This is an explicit hardware-off action.
-            self._meshtastic.close(stop_daemon=True)
-            if self._aio_available:
-                ok = AioManager.toggle("lora", False)
-                if not ok:
-                    self.msg("[LoRa] GPIO toggle failed", C_ERROR)
-                    self._term_add(
-                        "[SYS] Mesh clients stopped, but LoRa power-off failed",
-                        raw=True)
-                    return
-            self._lora_enabled = False
-            self.wardrive._wdg_owned_lora = False
-            self._mc_screen = False
-            self._mc_bubbles.clear()
-            self.msg("[LoRa] OFF", C_WARNING)
-            self._term_add("[SYS] LoRa disabled, mesh clients stopped", raw=True)
         self.glitch_timer = 2
+        return True
 
     def _lora_transition_active(self) -> bool:
-        thread = getattr(self, "_lora_transition_thread", None)
-        return bool(thread is not None and thread.is_alive())
+        return bool(self._live_lora_transition_threads())
 
-    def _run_meshtastic_handoff(self) -> None:
+    def _run_meshtastic_handoff(self, action: str = "handoff",
+                                epoch: int | None = None) -> None:
         """Release direct SPI, then restore the selected daemon off-thread."""
         ok = False
         detail = ""
+        direct_released = False
+        activation_attempted = False
+        safe_to_restore_direct = True
+        if epoch is None:
+            epoch = int(getattr(self, "_lora_start_epoch", 0))
+        prior_direct_mode = (
+            getattr(self._lora, "mode", "")
+            if (getattr(self._lora, "running", False)
+                or getattr(self._lora, "worker_active", False)
+                or getattr(self._lora, "radio_owned", False)) else "")
         try:
-            if not self._lora.stop():
+            bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+            if bluetooth_busy:
+                detail = "Meshtastic start blocked by " + bluetooth_busy
+            elif not self._lora.stop():
                 detail = (
                     "direct radio worker did not release the SX1262; "
                     "Meshtastic was not started")
@@ -2730,80 +3199,221 @@ class WatchDogsGame(OtaMixin):
                 detail = (
                     "direct radio ownership remained held; Meshtastic was "
                     "not started")
-            elif not self._meshtastic.resume_service(
-                    timeout=15.0, connect=True):
-                detail = "Meshtastic service did not become ready"
             else:
-                ok = True
-                detail = "Meshtastic service ready"
+                direct_released = True
+                # LoRaManager intentionally leaves the pre-direct service
+                # snapshot retained for the lifetime of a successful direct
+                # session.  Restore it before beginning a new transactional
+                # backend selection; activate_backend_service() correctly
+                # refuses to overwrite an unresolved snapshot.
+                if (self._meshtastic_service_restore_pending()
+                        and not self._meshtastic.resume_service(
+                            timeout=15.0, connect=False)):
+                    safe_to_restore_direct = False
+                    detail = (
+                        "previous Meshtastic service state could not be "
+                        "restored; backend selection was not attempted")
+                else:
+                    mode = self._meshtastic.backend_mode
+                    activation_attempted = True
+                    if not self._meshtastic.activate_backend_service(
+                            mode, timeout=15.0):
+                        detail = "Meshtastic service did not become ready"
+                    elif not self._meshtastic.start():
+                        detail = "Meshtastic client did not start"
+                    elif not self._meshtastic.wait_connected(timeout=15.0):
+                        detail = (
+                            "Meshtastic endpoint opened but protocol negotiation "
+                            "did not complete")
+                    else:
+                        self._meshtastic.commit_backend_service_activation()
+                        ok = True
+                        detail = "Meshtastic service ready"
         except Exception as exc:
             detail = "Meshtastic handoff failed: " + str(exc)[:140]
+        if not ok and activation_attempted:
+            # Once service selection has begun, disconnecting the candidate
+            # client is a hard barrier.  Never mutate systemd state or reopen
+            # direct SPI while that worker might still issue requests.
+            try:
+                closed = bool(self._meshtastic.close())
+            except Exception as exc:
+                closed = False
+                detail += "; Meshtastic client close failed: " + str(exc)[:100]
+            if not closed:
+                safe_to_restore_direct = False
+                detail += (
+                    "; Meshtastic client worker did not stop; service rollback "
+                    "and direct-radio restore were blocked")
+            else:
+                try:
+                    restored = bool(
+                        self._meshtastic.rollback_backend_service_activation(
+                            timeout=15.0))
+                except Exception as exc:
+                    restored = False
+                    detail += "; service rollback failed: " + str(exc)[:100]
+                if not restored:
+                    safe_to_restore_direct = False
+                    detail += "; previous service state could not be restored"
+        if (not ok and prior_direct_mode and direct_released
+                and safe_to_restore_direct):
+            if self._restore_lora_power_owner(prior_direct_mode, None):
+                detail += "; previous direct radio restored"
+            else:
+                detail += "; previous direct radio could not be restored"
         queue = getattr(self, "_lora_transition_queue", None)
         if queue is not None:
-            queue.put((ok, detail))
+            queue.put((ok, detail, action, epoch))
 
-    def _start_meshtastic_handoff(self) -> bool:
+    def _start_meshtastic_handoff(self, action: str = "handoff") -> bool:
         """Start one nonblocking direct-radio to daemon transition."""
+        if getattr(self, "_lora_power_ownership_uncertain", False):
+            self.msg(
+                "[MT] SX1262 ownership is uncertain; restart WatchDogsGo",
+                C_ERROR)
+            return False
+        if getattr(self, "_meshtastic_update_running", False):
+            self.msg("[MT] Service update is running", C_WARNING)
+            return False
+        bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+        if bluetooth_busy:
+            self.msg("[MT] Finish " + bluetooth_busy + " first", C_WARNING)
+            return False
         if self._lora_transition_active():
             return False
         if not hasattr(self, "_lora_transition_queue"):
             self._lora_transition_queue = Queue()
-        factory = getattr(
-            self, "_lora_transition_thread_factory", threading.Thread)
-        thread = factory(
-            target=self._run_meshtastic_handoff,
-            name="wdg-lora-to-meshtastic",
-            daemon=True,
-        )
-        self._lora_transition_thread = thread
-        thread.start()
+        epoch = self._begin_lora_async_start(action)
+        marker = (action, epoch)
+        self._lora_handoff_pending = marker
+        try:
+            factory = getattr(
+                self, "_lora_transition_thread_factory", threading.Thread)
+            thread = factory(
+                target=self._run_meshtastic_handoff,
+                args=(action, epoch),
+                name="wdg-lora-to-meshtastic",
+                daemon=True,
+            )
+            self._lora_transition_thread = thread
+            self._track_lora_transition_thread(thread)
+            thread.start()
+        except Exception as exc:
+            self._forget_lora_transition_thread(
+                locals().get("thread"))
+            self._lora_transition_thread = None
+            if self._lora_handoff_pending == marker:
+                self._lora_handoff_pending = None
+            self._term_add(
+                "[MT] Could not start radio handoff: " + str(exc)[:120],
+                raw=True)
+            return False
         return True
 
     def _switch_lora_protocol(self, protocol: str,
-                              *, start_if_enabled: bool = True):
+                              *, start_if_enabled: bool = True,
+                              _transition_owned: bool = False,
+                              _transition_action: str = "handoff"):
         """Release the old radio owner and activate the selected protocol."""
+        bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+        if bluetooth_busy:
+            self.msg("[MT] Finish " + bluetooth_busy + " first", C_WARNING)
+            return False
+        acquired = False
+        if not _transition_owned:
+            acquired = self._begin_meshtastic_transition("lora_protocol")
+            if not acquired:
+                self.msg("[MT] Another radio/service operation is running",
+                         C_WARNING)
+                return False
+        try:
+            return self._switch_lora_protocol_locked(
+                protocol, start_if_enabled=start_if_enabled,
+                transition_action=_transition_action)
+        finally:
+            if acquired:
+                self._end_meshtastic_transition()
+
+    def _switch_lora_protocol_locked(self, protocol: str,
+                                     *, start_if_enabled: bool = True,
+                                     transition_action: str = "handoff") -> bool:
+        if protocol not in ("meshcore", "meshtastic"):
+            self._term_add(
+                "[LoRa] Unsupported protocol selection: " + str(protocol)[:40],
+                raw=True)
+            return False
+        if getattr(self, "_lora_power_ownership_uncertain", False):
+            self.msg(
+                "[LoRa] SX1262 ownership is uncertain; restart WatchDogsGo",
+                C_ERROR)
+            return False
+        if getattr(self, "_meshtastic_update_running", False):
+            self.msg("[MT] Service update is running; radio switch deferred",
+                     C_WARNING)
+            self._term_add(
+                "[MT] Radio protocol changes are blocked during service update",
+                raw=True)
+            return False
         if not start_if_enabled:
             # Changing the preferred protocol while automatic ownership is
             # disabled must not stop a daemon another app may be using.
             if self._lora.running and self._lora.mode == "meshcore":
-                self._lora.stop()
-            self._meshtastic.close()
-            return
+                if not self._lora.stop():
+                    return False
+            return bool(self._meshtastic.close())
         if protocol == "meshtastic":
             if self._lora_enabled and start_if_enabled:
-                if self._start_meshtastic_handoff():
+                if self._start_meshtastic_handoff(transition_action):
                     self._term_add(
                         "[SYS] Releasing direct radio before Meshtastic start",
                         raw=True)
-            return
+                    return True
+                return False
+            return True
 
         if self._lora_transition_active():
             self._term_add(
                 "[MC] Waiting for the current radio handoff to finish",
                 raw=True)
-            return
+            return False
 
         # LoRaManager performs the daemon handoff in its worker before it
         # acquires process ownership and touches SPI/GPIO.  This also covers
         # direct starts initiated by All Wardrive.
         if self._lora_enabled and start_if_enabled:
+            epoch = self._begin_lora_async_start(transition_action)
+            marker = (transition_action, epoch)
+            self._lora_start_pending = marker
             try:
                 self._lora.set_mc_channels(self._mc_channels_list)
                 started = self._lora.start_meshcore(self._mc_region)
                 if not started:
+                    if self._lora_start_pending == marker:
+                        self._lora_start_pending = ""
                     self._term_add(
                         "[MC] Direct radio is already starting or active",
                         raw=True)
-                    return
+                    return False
                 lat = self.player_lat if self.gps_fix else 0.0
                 lon = self.player_lon if self.gps_fix else 0.0
-                self._lora.send_meshcore_advert(
-                    self._mc_node_name, lat, lon)
+                try:
+                    self._lora.send_meshcore_advert(
+                        self._mc_node_name, lat, lon)
+                except Exception as exc:
+                    self._term_add(
+                        "[MC] Initial advert was not queued: "
+                        + str(exc)[:100], raw=True)
                 self._term_add(
                     "[SYS] MeshCore radio handoff starting", raw=True)
+                return True
             except Exception as exc:
+                if self._lora_start_pending == marker:
+                    self._lora_start_pending = ""
                 self._term_add(
                     "[MC] MeshCore start failed: " + str(exc)[:120], raw=True)
+                return False
+        return True
 
     def _toggle_sdr(self):
         new_state = not self._sdr_enabled
@@ -3036,6 +3646,7 @@ class WatchDogsGame(OtaMixin):
 
     def _poll_watch(self):
         """Process PipBoy watch events."""
+        self._poll_watch_autoconnect()
         try:
             for etype, data in self._watch.poll_events():
                 if etype == "status":
@@ -4229,10 +4840,101 @@ class WatchDogsGame(OtaMixin):
         if transition_queue is not None:
             try:
                 while not transition_queue.empty():
-                    ok, detail = transition_queue.get_nowait()
+                    result = transition_queue.get_nowait()
+                    ok, detail = result[:2]
+                    action = result[2] if len(result) > 2 else "handoff"
+                    power_meta = (
+                        result[3] if (action == "power_off"
+                                      and len(result) > 3
+                                      and isinstance(result[3], dict))
+                        else {})
+                    epoch = (
+                        result[3] if (action != "power_off"
+                                      and len(result) > 3) else
+                        int(getattr(self, "_lora_start_epoch", 0)))
+                    marker = (action, epoch)
+                    if getattr(self, "_lora_handoff_pending", None) == marker:
+                        self._lora_handoff_pending = None
                     prefix = "[SYS]" if ok else "[LoRa]"
                     self._term_add(f"{prefix} {detail}", raw=True)
-                    if not ok:
+                    if action == "power_off":
+                        self._lora_power_on_pending = False
+                        # Releasing the process lock is distinct from cutting
+                        # the physical rail.  If GPIO succeeded but unlock
+                        # acknowledgement failed, reflect the real powered-off
+                        # state while the uncertainty guard blocks every new
+                        # owner until restart.
+                        rail_off = bool(power_meta.get("rail_off", ok))
+                        if rail_off:
+                            self._lora_enabled = False
+                            self._lora_power_intent = False
+                            self._lora_start_pending = ""
+                            self._lora_handoff_pending = None
+                            self.wardrive._wdg_owned_lora = False
+                            self._mc_screen = False
+                            self._mc_bubbles.clear()
+                            if ok:
+                                self.msg("[LoRa] OFF", C_WARNING)
+                            else:
+                                self.msg(f"[LoRa] OFF — {detail}", C_ERROR)
+                            self.glitch_timer = 2
+                        else:
+                            self._lora_power_intent = self._lora_enabled
+                            direct_pending = getattr(
+                                self, "_lora_start_pending", "")
+                            if (isinstance(direct_pending, tuple)
+                                    and direct_pending[1] != int(getattr(
+                                        self, "_lora_start_epoch", 0))):
+                                self._lora_start_pending = ""
+                            handoff_pending = getattr(
+                                self, "_lora_handoff_pending", None)
+                            if (isinstance(handoff_pending, tuple)
+                                    and handoff_pending[1] != int(getattr(
+                                        self, "_lora_start_epoch", 0))):
+                                self._lora_handoff_pending = None
+                            self.msg(f"[LoRa] {detail}", C_ERROR)
+                        self._end_meshtastic_transition()
+                    elif action == "power_on":
+                        allowed = self._lora_start_completion_allowed(
+                            action, epoch)
+                        poweroff_cleanup = self._lora_poweroff_handles_cleanup()
+                        if ok and allowed:
+                            self._lora_power_on_pending = False
+                            self.wardrive._wdg_owned_lora = True
+                            self.msg("[LoRa] ON — Meshtastic ready", C_SUCCESS)
+                            self._end_meshtastic_transition()
+                        elif ok:
+                            self.wardrive._wdg_owned_lora = False
+                            if (not poweroff_cleanup
+                                    and not self._meshtastic.close()):
+                                self._term_add(
+                                    "[MT] Cancelled start completed, but its "
+                                    "client worker did not stop", raw=True)
+                            if not poweroff_cleanup:
+                                self._lora_power_on_pending = False
+                                self._end_meshtastic_transition()
+                        else:
+                            self.wardrive._wdg_owned_lora = False
+                            self.msg(f"[LoRa] {detail}", C_ERROR)
+                            if (epoch != int(getattr(
+                                    self, "_lora_start_epoch", 0))
+                                    and self._lora_power_intent):
+                                self._lora_power_on_pending = False
+                                self._end_meshtastic_transition()
+                            elif self._lora_power_intent:
+                                self._start_failed_lora_power_on_rollback()
+                    elif ok and self._lora_start_completion_allowed(
+                            action, epoch):
+                        self.wardrive._wdg_owned_lora = True
+                    elif ok:
+                        self.wardrive._wdg_owned_lora = False
+                        if (not self._lora_poweroff_handles_cleanup()
+                                and not self._meshtastic.close()):
+                            self._term_add(
+                                "[MT] Cancelled start completed, but its "
+                                "client worker did not stop", raw=True)
+                    elif not ok:
+                        self.wardrive._wdg_owned_lora = False
                         self.msg(f"[LoRa] {detail}", C_ERROR)
             except Exception:
                 pass
@@ -4244,8 +4946,42 @@ class WatchDogsGame(OtaMixin):
                 text, attr = self._lora.queue.get_nowait()
                 # Telemetry goes to terminal only, not chat
                 self._term_add(f"[LoRa] {text}", raw=True)
+                pending = getattr(self, "_lora_start_pending", "")
+                if isinstance(pending, tuple):
+                    pending_action, pending_epoch = pending
+                else:
+                    pending_action = pending
+                    pending_epoch = int(
+                        getattr(self, "_lora_start_epoch", 0))
+                if attr == "success" and text.startswith("Sniffer started:"):
+                    if pending:
+                        self._lora_start_pending = ""
+                        allowed = self._lora_start_completion_allowed(
+                            pending_action, pending_epoch)
+                        self.wardrive._wdg_owned_lora = allowed
+                        if not allowed:
+                            if (not self._lora_poweroff_handles_cleanup()
+                                    and not self._lora.stop()):
+                                self._term_add(
+                                    "[LoRa] Cancelled direct-radio start did "
+                                    "not release ownership", raw=True)
+                        if pending_action == "power_on":
+                            if allowed or not self._lora_poweroff_handles_cleanup():
+                                self._lora_power_on_pending = False
+                                self._end_meshtastic_transition()
                 if attr == "error":
                     self.msg(f"[LoRa] {text}", C_ERROR)
+                    if pending:
+                        self._lora_start_pending = ""
+                        self.wardrive._wdg_owned_lora = False
+                        if pending_action == "power_on":
+                            if (pending_epoch != int(getattr(
+                                    self, "_lora_start_epoch", 0))
+                                    and self._lora_power_intent):
+                                self._lora_power_on_pending = False
+                                self._end_meshtastic_transition()
+                            elif self._lora_power_intent:
+                                self._start_failed_lora_power_on_rollback()
         except Exception:
             pass
         # Process thread-safe event queue from callbacks
@@ -4374,6 +5110,375 @@ class WatchDogsGame(OtaMixin):
                         float(data.get("rssi") or 0))
             elif event == "node":
                 self._remember_meshtastic_node(data)
+
+    def _poll_watch_autoconnect(self):
+        """Reconnect a known watch only after BlueZ coordination is safe."""
+        cancel = getattr(self, "_watch_autoconnect_cancel", None)
+        if cancel is not None and cancel.is_set():
+            return
+        address = getattr(self, "_watch_autoconnect_address", "")
+        if not address:
+            return
+        if self._watch.connected:
+            self._watch_autoconnect_address = ""
+            return
+        if self._watch.worker_active:
+            return
+        manager = self._meshtastic
+        if time.monotonic() < getattr(self, "_watch_autoconnect_next", 0.0):
+            return
+        # A starting fork has not opened the control socket yet. Waiting here
+        # avoids racing its default pairing agent or advertising setup.
+        if manager.connected:
+            self._connect_watch_autoconnect(address)
+            return
+        result_queue = getattr(self, "_watch_autoconnect_result", None)
+        if result_queue is None:
+            result_queue = Queue(maxsize=1)
+            self._watch_autoconnect_result = result_queue
+        try:
+            ready, detail = result_queue.get_nowait()
+        except Empty:
+            ready = None
+            detail = ""
+        if ready is True:
+            self._watch_autoconnect_thread = None
+            if self._connect_watch_autoconnect(address):
+                self._watch_autoconnect_delay = 1.0
+                self._watch_autoconnect_last_detail = ""
+            else:
+                self._watch_autoconnect_next = time.monotonic() + 0.25
+            return
+        if ready is False:
+            self._watch_autoconnect_thread = None
+            delay = float(getattr(self, "_watch_autoconnect_delay", 1.0))
+            self._watch_autoconnect_next = time.monotonic() + delay
+            self._watch_autoconnect_delay = min(15.0, delay * 2.0)
+            if (detail and detail != getattr(
+                    self, "_watch_autoconnect_last_detail", "")):
+                self._term_add("[Watch] Auto-connect waiting: " + detail,
+                               raw=True)
+                self._watch_autoconnect_last_detail = detail
+        thread = getattr(self, "_watch_autoconnect_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        if not self._begin_meshtastic_transition("watch_autoconnect"):
+            return
+
+        def check_ready():
+            try:
+                if cancel is not None and cancel.is_set():
+                    return
+                value = bool(manager.ble_coordination_ready())
+                if cancel is not None and cancel.is_set():
+                    return
+                result_queue.put_nowait((
+                    value, "" if value else
+                    "Meshtastic BLE coordination is not ready"))
+            except Exception as exc:
+                try:
+                    result_queue.put_nowait((False, str(exc)[:100]))
+                except Full:
+                    pass
+            finally:
+                self._end_meshtastic_transition()
+
+        self._watch_autoconnect_thread = threading.Thread(
+            target=check_ready, name="wdg-watch-autoconnect", daemon=True)
+        try:
+            self._watch_autoconnect_thread.start()
+        except Exception:
+            self._watch_autoconnect_thread = None
+            self._end_meshtastic_transition()
+            raise
+
+    def _connect_watch_autoconnect(self, address: str) -> bool:
+        """Start the watch worker under the shared Bluetooth transition lock."""
+        cancel = getattr(self, "_watch_autoconnect_cancel", None)
+        if cancel is not None and cancel.is_set():
+            return False
+        if not self._begin_meshtastic_transition("watch_autoconnect_connect"):
+            return False
+        try:
+            if cancel is not None and cancel.is_set():
+                return False
+            started = bool(self._watch.connect(address))
+            if started:
+                self._watch_autoconnect_address = ""
+                self._watch_autoconnect_delay = 1.0
+                self._watch_autoconnect_last_detail = ""
+                return True
+            delay = float(getattr(self, "_watch_autoconnect_delay", 1.0))
+            self._watch_autoconnect_next = time.monotonic() + delay
+            self._watch_autoconnect_delay = min(15.0, delay * 2.0)
+            return False
+        finally:
+            self._end_meshtastic_transition()
+
+    def _stop_watch_autoconnect(self, timeout: float = 7.0) -> bool:
+        """Cancel and join readiness before the Meshtastic socket is closed."""
+        cancel = getattr(self, "_watch_autoconnect_cancel", None)
+        if cancel is not None:
+            cancel.set()
+        thread = getattr(self, "_watch_autoconnect_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout)))
+        stopped = not thread or not thread.is_alive()
+        if stopped:
+            self._watch_autoconnect_thread = None
+        return stopped
+
+    def _start_meshtastic_update(self):
+        """Check and install the newest compatible daemon release off-thread."""
+        if self._meshtastic_update_running:
+            self.msg("[MT] Service update is already running", C_DIM)
+            return False
+        if getattr(self, "_lora_power_ownership_uncertain", False):
+            self.msg(
+                "[MT] SX1262 ownership is uncertain; restart WatchDogsGo "
+                "before updating the service", C_ERROR)
+            return False
+        if not self._begin_meshtastic_transition("update"):
+            self.msg("[MT] Another radio/service operation is running",
+                     C_WARNING)
+            return False
+
+        def reject(message):
+            self.msg(message, C_WARNING)
+            self._end_meshtastic_transition()
+            return False
+
+        if self._meshtastic_service is None:
+            return reject(
+                "[MT] Rerun setup.sh to install the protected updater")
+        if not getattr(self, "_lora_enabled", False):
+            return reject("[MT] Enable the LoRa power rail before updating")
+        if self._lora_transition_active():
+            return reject("[MT] Wait for the current radio handoff to finish")
+        if (self._lora.running or self._lora.worker_active
+                or self._lora.radio_owned):
+            return reject("[MT] Stop MeshCore/direct LoRa before updating")
+        bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
+        if bluetooth_busy:
+            return reject("[MT] Finish " + bluetooth_busy + " before updating")
+        wardrive = getattr(self, "wardrive", None)
+        host_ble = getattr(wardrive, "host_ble", None)
+        action_thread = getattr(wardrive, "_meshtastic_action_thread", None)
+        if host_ble is not None and host_ble.worker_active:
+            return reject("[MT] Stop the active host BLE scan before updating")
+        if getattr(self._watch, "worker_active", False):
+            return reject("[MT] Finish the active watch Bluetooth operation")
+        if action_thread is not None and action_thread.is_alive():
+            return reject("[MT] Wait for the current service control action")
+        if (getattr(self._meshtastic, "ble_scan_lease_active", False)
+                or getattr(self._meshtastic,
+                           "pairing_agent_lease_active", False)):
+            return reject("[MT] Finish the active Bluetooth lease before updating")
+        self._meshtastic_update_running = True
+        self.msg("[MT] Checking Smethan/meshtastic-firmware releases...", C_DIM)
+
+        def worker():
+            reconnect = False
+            prior_backend = ""
+            prior_service_target = None
+            ok = False
+            detail = "Meshtastic update did not complete"
+
+            def restored_service_matches() -> bool:
+                if prior_service_target not in ("wdg", "stock"):
+                    return True
+                current = self._meshtastic.active_service_target()
+                return current == prior_service_target
+
+            def reconnect_previous_backend() -> tuple[bool, str]:
+                """Reconnect only after the helper proved rollback complete."""
+                if not reconnect:
+                    return True, ""
+                try:
+                    if not restored_service_matches():
+                        return False, (
+                            "the restored Meshtastic service does not match "
+                            "the pre-update owner")
+                    if not self._meshtastic.start():
+                        return False, "the previous Meshtastic client did not restart"
+                    if not self._meshtastic.wait_connected(
+                            timeout=15.0, backend=prior_backend):
+                        return False, (
+                            "the previous backend did not recover ("
+                            + prior_backend + ")")
+                    return True, ""
+                except Exception as exc:
+                    return False, str(exc)[:120]
+
+            try:
+                # A stopped direct-radio session may still hold the exact
+                # pre-session systemd snapshot.  Resolve that authoritative
+                # token before release lookup or privileged package/service
+                # mutation; an installer transaction must never coexist with
+                # an older restore state that could later overwrite it.
+                if self._meshtastic_service_restore_pending():
+                    if not self._meshtastic.resume_service(
+                            timeout=15.0, connect=False):
+                        raise RuntimeError(
+                            "Previous Meshtastic service state could not be "
+                            "restored; update was not started")
+                    if self._meshtastic_service_restore_pending():
+                        raise RuntimeError(
+                            "Previous Meshtastic service state remains "
+                            "unresolved; update was not started")
+                from .meshtastic_updates import (
+                    meshtastic_releases, package_version_for_tag,
+                )
+                self._meshtastic_service.require_current()
+                releases = meshtastic_releases()
+                if not releases:
+                    raise RuntimeError(
+                        "No compatible Smethan Meshtastic release was found")
+                tag = releases[0]["tag_name"]
+                expected = package_version_for_tag(tag)
+                status = self._meshtastic_service.status("wdg")
+                if status.package_version == expected:
+                    ok = True
+                    detail = f"Already up to date ({tag})"
+                else:
+                    reconnect = bool(
+                        self._meshtastic.running or self._meshtastic.connected)
+                    prior_backend = str(
+                        getattr(self._meshtastic, "active_backend", "") or "")
+                    if prior_backend not in ("fork_socket", "legacy_tcp"):
+                        prior_backend = (
+                            "legacy_tcp"
+                            if self._meshtastic.backend_mode == "legacy_tcp"
+                            else "fork_socket")
+                    try:
+                        prior_service_target = (
+                            self._meshtastic.active_service_target())
+                    except Exception:
+                        prior_service_target = None
+                    if not self._meshtastic.close():
+                        raise RuntimeError(
+                            "Meshtastic client worker did not stop; package "
+                            "update was aborted before installation")
+                    try:
+                        result = self._meshtastic_service.install_tag(tag)
+                    except MeshtasticInstallError as install_exc:
+                        if not install_exc.rollback_restored:
+                            backup = (
+                                " Backup: " + str(install_exc.backup)
+                                if install_exc.backup is not None else "")
+                            raise RuntimeError(
+                                str(install_exc)[:150]
+                                + "; automatic rollback was not confirmed; "
+                                "the Meshtastic client remains stopped."
+                                + backup) from install_exc
+                        restored, restore_detail = reconnect_previous_backend()
+                        if not restored:
+                            raise RuntimeError(
+                                str(install_exc)[:120]
+                                + "; package rollback completed, but "
+                                + restore_detail) from install_exc
+                        raise RuntimeError(
+                            str(install_exc)[:140]
+                            + "; package update was rolled back and the "
+                            "previous backend was restored") from install_exc
+                    installed = result.get("package_version") or expected
+                    expected_backend = (
+                        "legacy_tcp"
+                        if self._meshtastic.backend_mode == "legacy_tcp"
+                        else "fork_socket")
+                    try:
+                        # The installer validates and enables the fork.
+                        # Preserve an explicit legacy selection across reboot
+                        # by restoring its exact service selection.
+                        if self._meshtastic.backend_mode == "legacy_tcp":
+                            self._meshtastic_service.select("stock")
+                        if reconnect:
+                            if not self._meshtastic.start():
+                                raise RuntimeError(
+                                    "updated Meshtastic client did not restart")
+                            if not self._meshtastic.wait_connected(
+                                    timeout=15.0, backend=expected_backend):
+                                raise RuntimeError(
+                                    "updated " + expected_backend
+                                    + " backend did not complete negotiation")
+                    except Exception as validation_exc:
+                        # The privileged helper saved an immutable transaction
+                        # pointer during install.  Roll back the package and
+                        # exact service snapshot before attempting to restore
+                        # WDG's previous client connection.
+                        if (self._meshtastic.running
+                                or self._meshtastic.connected):
+                            if not self._meshtastic.close():
+                                raise RuntimeError(
+                                    str(validation_exc)[:110]
+                                    + "; rollback is blocked because the "
+                                    "updated client worker did not stop; the "
+                                    "protected transaction was retained") \
+                                    from validation_exc
+                        try:
+                            self._meshtastic_service.rollback()
+                        except Exception as rollback_exc:
+                            raise RuntimeError(
+                                str(validation_exc)[:100]
+                                + "; automatic rollback failed: "
+                                + str(rollback_exc)[:100]) from validation_exc
+                        restored, restore_detail = reconnect_previous_backend()
+                        if not restored:
+                            raise RuntimeError(
+                                str(validation_exc)[:100]
+                                + "; package was rolled back, but "
+                                + restore_detail) from validation_exc
+                        raise RuntimeError(
+                            str(validation_exc)[:120]
+                            + "; package update was rolled back and the "
+                            "previous backend was restored") \
+                            from validation_exc
+                    ok = True
+                    detail = f"Installed {tag} ({installed}); service ready"
+            except Exception as exc:
+                detail = str(exc)[:220]
+            finally:
+                self._meshtastic_update_result.put((ok, detail))
+                self._end_meshtastic_transition()
+
+        try:
+            factory = getattr(
+                self, "_meshtastic_update_thread_factory", threading.Thread)
+            thread = factory(
+                target=worker, name="wdg-meshtastic-update",
+                # Package validation/rollback must outlive the UI.  Cleanup
+                # joins this worker before it closes the control socket.
+                daemon=False)
+            self._meshtastic_update_thread = thread
+            thread.start()
+        except Exception as exc:
+            self._meshtastic_update_thread = None
+            self._meshtastic_update_running = False
+            self._end_meshtastic_transition()
+            self.msg(
+                "[MT] Could not start update worker: " + str(exc)[:90],
+                C_ERROR)
+            return False
+        return True
+
+    def _poll_meshtastic_update(self):
+        result_queue = getattr(self, "_meshtastic_update_result", None)
+        if result_queue is None:
+            return
+        try:
+            ok, detail = result_queue.get_nowait()
+        except Empty:
+            return
+        self._meshtastic_update_running = False
+        update_thread = getattr(self, "_meshtastic_update_thread", None)
+        try:
+            if update_thread is not None and not update_thread.is_alive():
+                self._meshtastic_update_thread = None
+        except Exception:
+            pass
+        message = "[MT] " + detail
+        self._term_add(message, raw=True)
+        self.msg(message, C_SUCCESS if ok else C_ERROR)
 
     def _remember_meshtastic_node(self, data):
         """Update the shared mesh contacts view and wardrive observations."""
@@ -4729,9 +5834,48 @@ class WatchDogsGame(OtaMixin):
 
     def _cleanup(self):
         """Send stop to ESP32, close serial and GPS."""
+        watch_ready_stopped = self._stop_watch_autoconnect(timeout=7.0)
+        host_ble_stopped = True
+        watch_stopped = True
+        if not watch_ready_stopped:
+            self._term_add(
+                "[Watch] Auto-connect readiness did not stop; preserving "
+                "the Meshtastic socket", raw=True)
         if hasattr(self, "wardrive"):
             self.wardrive.on_stop()
+            host_ble = getattr(self.wardrive, "host_ble", None)
+            close_host_ble = getattr(host_ble, "close", None)
+            if (close_host_ble is not None
+                    and close_host_ble(timeout=7.0) is False):
+                host_ble_stopped = False
+                self._term_add(
+                    "[BLE] Host scan did not stop before shutdown", raw=True)
             self.wardrive.close_passive()
+        # Bluetooth workers must finish their daemon lease releases while the
+        # restricted Meshtastic socket is still available.
+        if (self._watch.connected or self._watch.worker_active
+                or getattr(
+                    self._watch, "pairing_lease_release_pending", False)
+                or getattr(
+                    self._watch, "scan_lease_release_pending", False)):
+            if self._watch.close(timeout=7.0) is False:
+                watch_stopped = False
+                self._term_add(
+                    "[Watch] Bluetooth worker did not stop before shutdown",
+                    raw=True)
+        update_thread = getattr(self, "_meshtastic_update_thread", None)
+        if (update_thread is not None
+                and update_thread is not threading.current_thread()):
+            # A package transaction includes service validation and automatic
+            # rollback.  Never let application shutdown close its control
+            # socket or terminate the process between those steps.
+            update_thread.join()
+            try:
+                if not update_thread.is_alive():
+                    self._meshtastic_update_thread = None
+                    self._meshtastic_update_running = False
+            except Exception:
+                pass
         if self.serial and self.serial.is_open:
             try:
                 self.serial.send_command("stop")
@@ -4740,24 +5884,31 @@ class WatchDogsGame(OtaMixin):
                 pass
             self.serial.close()
         self.gps.close()
-        transition = getattr(self, "_lora_transition_thread", None)
-        if transition is not None and transition.is_alive():
-            transition.join(timeout=22.0)
-        transition_pending = bool(
-            transition is not None and transition.is_alive())
+        self._cancel_pending_lora_start()
+        transitions = self._live_lora_transition_threads()
+        for transition in transitions:
+            if transition is not threading.current_thread():
+                # Service helper calls are bounded, and every displaced worker
+                # stays registered.  Shutdown waits for all of them so no
+                # daemon/service mutation can outlive application cleanup.
+                transition.join()
+        transition_pending = bool(self._live_lora_transition_threads())
         if not transition_pending:
             if self._lora.running or self._lora.worker_active:
                 self._lora.stop()
             # Disconnect only WDG. Keep meshtasticd alive for the user's other
             # messaging clients after WDG exits.
-            self._meshtastic.close()
+            if watch_ready_stopped and watch_stopped and host_ble_stopped:
+                self._meshtastic.close()
+            else:
+                self._term_add(
+                    "[MT] Preserving the control socket until Bluetooth "
+                    "lease cleanup completes", raw=True)
         else:
             self._term_add(
                 "[LoRa] Radio handoff still active during shutdown", raw=True)
         if self._sdr.running:
             self._sdr.stop()
-        if self._watch.connected:
-            self._watch.disconnect()
         for p in self._plugins:
             try:
                 p.on_unload()

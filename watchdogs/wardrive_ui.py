@@ -3,6 +3,8 @@ from collections import OrderedDict, deque
 from itertools import islice
 import json
 from pathlib import Path
+from queue import Empty, Queue
+import threading
 import time
 
 from .app_state import Network
@@ -22,15 +24,16 @@ from .passive_screen import PassiveScreen
 from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
 from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
-from .host_ble import HostBleScanner
+from .host_ble import HostBleScanner, list_ble_adapters
 from .cell_monitor import HostCellScanner, find_unclean_cell_session
 from .map_display import (
     MAP_LAYERS, MODE_OFF, MODE_KEEP, MODE_RECENT, color_for_record,
     cycle_mode, display_state, layer_label, mode_label,
 )
 from .wardrive_settings import (
-    DEFAULTS, DOT_FADE_CHOICES, LORA_PROTOCOLS, TRAIL_MODES, load_settings,
-    normalize_settings, save_settings, settings_path,
+    DEFAULTS, DOT_FADE_CHOICES, LORA_PROTOCOLS, MESHTASTIC_BACKENDS,
+    TRAIL_MODES, load_settings, normalize_settings, save_settings,
+    settings_path,
 )
 
 PURPLE, ORANGE, CYAN = 2, 9, 3
@@ -40,7 +43,18 @@ class WardriveUI:
     def __init__(self, app, initial_settings=None):
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
-        self.host_ble = HostBleScanner()
+        meshtastic = getattr(app, "_meshtastic", None)
+        lease_acquire = (
+            (lambda seconds, owner: meshtastic.acquire_ble_scan_lease(
+                seconds, owner=owner))
+            if meshtastic is not None
+            and hasattr(meshtastic, "acquire_ble_scan_lease") else None)
+        lease_release = (
+            (lambda owner: meshtastic.release_ble_scan_lease(owner=owner))
+            if meshtastic is not None
+            and hasattr(meshtastic, "release_ble_scan_lease") else None)
+        self.host_ble = HostBleScanner(
+            lease_acquire=lease_acquire, lease_release=lease_release)
         self.cell = HostCellScanner(getattr(app.gps, "modem_broker", None))
         self.cell_candidates = deque(maxlen=128)
         self.cell_legacy_next = 0
@@ -71,6 +85,10 @@ class WardriveUI:
         self.selection = 0
         self.layer_selection = 0
         self.collector_selection = 0
+        self.meshtastic_selection = 0
+        self._meshtastic_action_results = Queue()
+        self._meshtastic_action_thread = None
+        self._host_ble_retry_pending = False
         self.details = False
         self.detail_selection = 0
         self.notables = OrderedDict()
@@ -91,7 +109,6 @@ class WardriveUI:
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
         lora = getattr(app, "_lora", None)
-        meshtastic = getattr(app, "_meshtastic", None)
         self._wdg_owned_lora = bool(
             (lora is not None and lora.running and lora.mode == "meshcore")
             or (meshtastic is not None and meshtastic.running))
@@ -118,6 +135,26 @@ class WardriveUI:
 
     def tick(self):
         app = self.app
+        while True:
+            try:
+                ok, label, detail, on_success = (
+                    self._meshtastic_action_results.get_nowait())
+            except Empty:
+                break
+            if ok and on_success is not None:
+                try:
+                    on_success()
+                except Exception as exc:
+                    ok = False
+                    detail = "could not save result: " + str(exc)[:110]
+            message = f"[MT] {label}: {detail}"
+            app._term_add(message, raw=True)
+            app.msg(message, CYAN if ok else ORANGE)
+            if ok and label == "Shared adapter":
+                self._host_ble_retry_pending = True
+        action_thread = self._meshtastic_action_thread
+        if action_thread is not None and not action_thread.is_alive():
+            self._meshtastic_action_thread = None
         connection = app.serial if app.serial and app.serial.is_open else None
         if connection is not self.connection:
             if self.scan.diagnostic and self.scan.active:
@@ -274,7 +311,8 @@ class WardriveUI:
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
                 if not self.host_ble.start(
                         self.scan.session,
-                        adapter=self.settings.get("host_ble_adapter", "auto")):
+                        adapter=self.settings.get("host_ble_adapter", "auto"),
+                        require_lease=self._host_ble_requires_lease()):
                     self.host_ble_error("Previous Bluetooth scan is still closing; retry shortly")
                 else:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
@@ -346,11 +384,25 @@ class WardriveUI:
                 return True  # delayed legacy text cannot stop a confirmed new session
         return False
 
-    def host_ble_error(self, message):
+    def host_ble_error(self, message, *, shared_failure=False):
+        meshtastic = getattr(self.app, "_meshtastic", None)
+        if (shared_failure and meshtastic is not None
+                and hasattr(meshtastic, "note_host_ble_failure")):
+            meshtastic.note_host_ble_failure(message)
+        self.host_ble.state = "error"
         self.scan.error = "uConsole BLE: " + message[:150]
         self.app._term_add("[ALL] " + self.scan.error, raw=True)
         self.app._term_add("[ALL] Enable Bluetooth in the OS and check that bleak is installed.", raw=True)
         self.app.msg("[ALL] Host BLE unavailable; WiFi and other collectors continue", ORANGE)
+
+    def _host_ble_requires_lease(self):
+        """Use only daemon-confirmed policy to bypass scan coordination."""
+        host = str(self.settings.get("host_ble_adapter", "auto")).upper()
+        manager = getattr(self.app, "_meshtastic", None)
+        checker = getattr(manager, "host_ble_requires_lease", None)
+        if checker is None:
+            return True
+        return bool(checker(host))
 
     def write_diagnostics(self, now):
         scan = self.scan
@@ -384,11 +436,40 @@ class WardriveUI:
         active = self.scan.state == "running" and self.scan.wifi_only
         if not active:
             self.host_ble.stop()
+            self._host_ble_retry_pending = False
+        meshtastic = getattr(self.app, "_meshtastic", None)
+        if (active and meshtastic is not None
+                and getattr(meshtastic, "host_ble_degraded", False)
+                and self._host_ble_requires_lease()):
+            reason = (getattr(meshtastic, "host_ble_pause_reason", "")
+                      or "Meshtastic phone priority")
+            active = False
+            already_paused = self.host_ble.state == "paused"
+            self.host_ble.stop()
+            self.host_ble.state = "paused"
+            if not already_paused:
+                self.app._term_add(
+                    "[ALL] Host BLE paused: " + reason[:120], raw=True)
+                self.app.msg(
+                    "[ALL] Host BLE paused; Meshtastic phone priority", ORANGE)
+        if (active and self._host_ble_retry_pending
+                and not getattr(meshtastic, "host_ble_degraded", False)
+                and not self.host_ble.worker_active):
+            if self.host_ble.start(
+                    self.scan.session,
+                    adapter=self.settings.get("host_ble_adapter", "auto"),
+                    require_lease=self._host_ble_requires_lease()):
+                self._host_ble_retry_pending = False
+                self.app._term_add(
+                    "[ALL] Retrying uConsole BLE scan", raw=True)
         for session, kind, data in self.host_ble.poll():
             if not active or session != self.scan.session:
                 continue
             if kind == "error":
                 self.host_ble_error(data)
+                active = False
+            elif kind == "shared_error":
+                self.host_ble_error(data, shared_failure=True)
                 active = False
             elif kind == "paused":
                 self.host_ble.state = "paused"
@@ -473,14 +554,23 @@ class WardriveUI:
                     try:
                         switch = getattr(app, "_switch_lora_protocol", None)
                         if switch:
-                            switch("meshtastic", start_if_enabled=True)
-                            started = bool(meshtastic.running) or started
+                            accepted = bool(switch(
+                                "meshtastic", start_if_enabled=True,
+                                _transition_action="wardrive"))
                         else:
-                            started = bool(meshtastic.start()) or started
-                        self._wdg_owned_lora = True
-                        app._term_add(
-                            "[ALL] Meshtastic client starting via meshtasticd",
-                            raw=True)
+                            accepted = bool(meshtastic.start())
+                        if accepted:
+                            started = True
+                            app._term_add(
+                                "[ALL] Meshtastic client starting via "
+                                "meshtasticd", raw=True)
+                        else:
+                            app._term_add(
+                                "[ALL] Meshtastic start was not accepted; "
+                                "WiFi/BLE continue", raw=True)
+                            app.msg(
+                                "[ALL] Meshtastic unavailable; WiFi/BLE continue",
+                                ORANGE)
                     except Exception as exc:
                         app._term_add(
                             "[ALL] Meshtastic start failed: " + str(exc)[:100],
@@ -502,10 +592,17 @@ class WardriveUI:
                     app.msg("[ALL] MeshCore skipped; LoRa is busy", ORANGE)
                 else:
                     try:
-                        channels = getattr(app, "_mc_channels_list", None)
-                        if channels:
-                            lora.set_mc_channels(channels)
-                        lora.start_meshcore(getattr(app, "_mc_region", None))
+                        switch = getattr(app, "_switch_lora_protocol", None)
+                        if switch:
+                            accepted = bool(switch(
+                                "meshcore", start_if_enabled=True,
+                                _transition_action="wardrive"))
+                        else:
+                            channels = getattr(app, "_mc_channels_list", None)
+                            if channels:
+                                lora.set_mc_channels(channels)
+                            accepted = bool(lora.start_meshcore(
+                                getattr(app, "_mc_region", None)))
                     except Exception as exc:
                         app._term_add(
                             "[ALL] MeshCore start failed: " + str(exc)[:100],
@@ -514,9 +611,8 @@ class WardriveUI:
                             "[ALL] MeshCore unavailable; WiFi/BLE continue",
                             ORANGE)
                     else:
-                        if lora.running and lora.mode == "meshcore":
+                        if accepted:
                             started = True
-                            self._wdg_owned_lora = True
                             app._term_add(
                                 "[ALL] MeshCore collection starting "
                                 "(LoRa enabled)", raw=True)
@@ -1132,6 +1228,58 @@ class WardriveUI:
                 else:
                     self.cycle_fade_seconds(direction)
             return
+        if self.settings_page == "meshtastic":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "main"
+                return
+            row_count = 8
+            if px.btnp(px.KEY_UP):
+                self.meshtastic_selection = max(
+                    0, self.meshtastic_selection - 1)
+            if px.btnp(px.KEY_DOWN):
+                self.meshtastic_selection = min(
+                    row_count - 1, self.meshtastic_selection + 1)
+            direction = 0
+            if px.btnp(px.KEY_LEFT):
+                direction = -1
+            elif px.btnp(px.KEY_RIGHT):
+                direction = 1
+            activate = px.btnp(px.KEY_RETURN)
+            row = self.meshtastic_selection
+            if row == 0 and (direction or activate):
+                self.cycle_meshtastic_backend(direction or 1)
+            elif row == 1 and activate:
+                self.toggle_meshtastic_phone_ble()
+            elif row == 2 and (direction or activate):
+                self.cycle_bluetooth_adapter(
+                    "meshtastic_phone_adapter", direction or 1)
+            elif row == 3 and (direction or activate):
+                self.cycle_bluetooth_adapter(
+                    "host_ble_adapter", direction or 1)
+            elif row == 4 and activate:
+                self._start_meshtastic_action(
+                    "Pairing window",
+                    lambda manager: manager.open_pairing(120),
+                    "open for 120 seconds")
+            elif row == 5 and activate:
+                self._start_meshtastic_action(
+                    "Forget phone", lambda manager: manager.forget_phone(),
+                    "bond removed")
+            elif row == 6 and activate:
+                self.retry_meshtastic_shared_adapter()
+            elif row == 7 and activate:
+                start_update = getattr(
+                    self.app, "_start_meshtastic_update", None)
+                if start_update is None:
+                    self.app.msg(
+                        "[MT] Service updater is not installed", ORANGE)
+                else:
+                    start_update()
+            return
         if self.settings_page == "collectors":
             if px.btnp(px.KEY_TAB):
                 self.settings_open = False
@@ -1182,7 +1330,8 @@ class WardriveUI:
                 self.persist_settings()
             return
         keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                "_collectors", "lte_modem", "cell_tracking", "cell_neighbors")
+                "_collectors", "_meshtastic", "lte_modem", "cell_tracking",
+                "cell_neighbors")
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
@@ -1193,6 +1342,9 @@ class WardriveUI:
             elif key == "_collectors":
                 self.settings_page = "collectors"
                 self.collector_selection = 0
+            elif key == "_meshtastic":
+                self.settings_page = "meshtastic"
+                self.meshtastic_selection = 0
             elif key == "trail_mode":
                 self.cycle_trail_mode()
             else:
@@ -1249,6 +1401,10 @@ class WardriveUI:
         """Apply one Wardrive Settings toggle and persist it."""
         if key not in DEFAULTS or type(DEFAULTS[key]) is not bool:
             return
+        if (key == "wardrive_lora"
+                and getattr(self.app, "_meshtastic_update_running", False)):
+            self.app.msg("[MT] Service update is running", ORANGE)
+            return
         self.settings[key] = not self.settings[key]
         if key == "wardrive_adsb" and self.settings[key]:
             self.settings["wardrive_433"] = False
@@ -1282,6 +1438,9 @@ class WardriveUI:
 
     def cycle_lora_protocol(self, direction=1):
         """Select the one protocol allowed to own the AIO SX1262."""
+        if getattr(self.app, "_meshtastic_update_running", False):
+            self.app.msg("[MT] Service update is running", ORANGE)
+            return False
         previous = self.settings["lora_protocol"]
         try:
             index = LORA_PROTOCOLS.index(previous)
@@ -1291,29 +1450,433 @@ class WardriveUI:
         selected = LORA_PROTOCOLS[(index + step) % len(LORA_PROTOCOLS)]
         if selected == previous:
             return
-        self.settings["lora_protocol"] = selected
         switch = getattr(self.app, "_switch_lora_protocol", None)
-        if switch:
-            switch(selected, start_if_enabled=self.settings["wardrive_lora"])
+        if switch and switch(
+                selected,
+                start_if_enabled=self.settings["wardrive_lora"]) is False:
+            return False
+        self.settings["lora_protocol"] = selected
+        lora = getattr(self.app, "_lora", None)
+        manager = getattr(self.app, "_meshtastic", None)
         self._wdg_owned_lora = bool(
-            self.settings["wardrive_lora"]
-            and getattr(self.app, "_lora_enabled", False))
+            (selected == "meshcore" and lora is not None
+             and lora.running and lora.mode == "meshcore"
+             and getattr(lora, "radio_owned", False))
+            or (selected == "meshtastic" and manager is not None
+                and manager.connected))
         self.persist_settings()
+        return True
+
+    def cycle_meshtastic_backend(self, direction=1):
+        """Select the daemon transport off-thread without closing live leases."""
+        current = self.settings.get("meshtastic_backend", "auto")
+        try:
+            index = MESHTASTIC_BACKENDS.index(current)
+        except ValueError:
+            index = 0
+        step = -1 if direction < 0 else 1
+        selected = MESHTASTIC_BACKENDS[
+            (index + step) % len(MESHTASTIC_BACKENDS)]
+        manager = getattr(self.app, "_meshtastic", None)
+        if manager is None:
+            self.app.msg("[MT] Meshtastic manager is unavailable", ORANGE)
+            return False
+        host_ble = getattr(self, "host_ble", None)
+        if ((host_ble is not None and host_ble.worker_active)
+                or getattr(manager, "ble_scan_lease_active", False)
+                or getattr(manager, "pairing_agent_lease_active", False)):
+            self.app.msg(
+                "[MT] Finish the active Bluetooth operation first", ORANGE)
+            return False
+        watch = getattr(self.app, "_watch", None)
+        if watch is not None and watch.worker_active:
+            self.app.msg("[MT] Finish the active watch operation first", ORANGE)
+            return False
+        lora = getattr(self.app, "_lora", None)
+        transition_active = getattr(
+            self.app, "_lora_transition_active", lambda: False)
+        if (transition_active()
+                or (lora is not None and (
+                    lora.running or lora.worker_active or lora.radio_owned))):
+            self.app.msg(
+                "[MT] Finish the current LoRa ownership transition first",
+                ORANGE)
+            return False
+
+        def switch_backend(value):
+            was_running = bool(value.running)
+            previous_mode = value.backend_mode
+            previous_expected = (
+                None if previous_mode == "auto" else previous_mode)
+            controller = getattr(value, "_service_controller", None)
+            if controller is not None:
+                try:
+                    controller.require_current()
+                except Exception as exc:
+                    value.last_error = str(exc)
+                    return False
+            if not value.close():
+                value.last_error = (
+                    "Meshtastic client worker did not stop; backend switch "
+                    "was aborted")
+                return False
+
+            def restore_previous(reason):
+                # Closing the candidate client is a hard barrier.  Without it
+                # systemd rollback could race a worker still using the new
+                # endpoint, and restarting the old manager could create two
+                # active clients.
+                try:
+                    closed = bool(value.close())
+                except Exception as exc:
+                    closed = False
+                    reason += "; close failed: " + str(exc)[:100]
+                if not closed:
+                    value.last_error = (
+                        reason + "; candidate client worker did not stop, so "
+                        "service rollback was blocked")
+                    return False
+                rollback = getattr(
+                    value, "rollback_backend_service_activation", None)
+                try:
+                    restored = bool(
+                        rollback(timeout=15.0)) if rollback else True
+                except Exception as exc:
+                    restored = False
+                    reason += "; service rollback failed: " + str(exc)[:100]
+                if not restored:
+                    value.last_error = (
+                        reason + "; previous service state was not restored")
+                    return False
+                if not value.set_backend_mode(previous_mode):
+                    value.last_error = (
+                        reason + "; previous backend mode was not restored")
+                    return False
+                if was_running:
+                    if not value.start():
+                        value.last_error = (
+                            reason + "; previous client did not restart")
+                        return False
+                    if not value.wait_connected(
+                            timeout=15.0, backend=previous_expected):
+                        value.last_error = (
+                            reason + "; previous client did not reconnect")
+                        return False
+                value.last_error = reason
+                return False
+
+            activation_attempted = False
+            try:
+                activation_attempted = True
+                if not value.activate_backend_service(selected):
+                    return restore_previous(
+                        "Selected Meshtastic service did not become ready")
+                if not value.set_backend_mode(selected):
+                    return restore_previous(
+                        "Selected Meshtastic backend mode was rejected")
+                if not value.start():
+                    return restore_previous(
+                        "Selected Meshtastic client did not start")
+                expected = None if selected == "auto" else selected
+                if not value.wait_connected(timeout=15.0, backend=expected):
+                    return restore_previous(
+                        "Selected Meshtastic endpoint opened, but protocol "
+                        "negotiation did not complete")
+                if not was_running and not value.close():
+                    value.last_error = (
+                        "Temporary Meshtastic client did not stop; backend "
+                        "selection was not committed")
+                    return False
+                commit = getattr(
+                    value, "commit_backend_service_activation", None)
+                if commit is not None:
+                    commit()
+                return True
+            except Exception as exc:
+                if activation_attempted:
+                    return restore_previous(
+                        "Meshtastic backend switch failed: " + str(exc)[:120])
+                value.last_error = str(exc)[:160]
+                return False
+
+        def persist_backend():
+            self.settings["meshtastic_backend"] = selected
+            self.persist_settings()
+            if selected == "legacy_tcp":
+                self._host_ble_retry_pending = True
+            self.app._term_add(
+                f"[MT] Backend and service set to {selected}",
+                raw=True)
+
+        return self._start_meshtastic_action(
+            "Backend", switch_backend, "set to " + selected,
+            on_success=persist_backend)
+
+    def _bluetooth_adapter_choices(self, current):
+        choices = ["auto"]
+        try:
+            choices.extend(address for address, _name in list_ble_adapters())
+        except OSError:
+            pass
+        current = str(current or "auto")
+        if current.lower() != "auto" and current not in choices:
+            choices.append(current)
+        return choices
+
+    def cycle_bluetooth_adapter(self, key, direction=1):
+        """Cycle persistent controller MACs; never persist volatile hci names."""
+        if getattr(self.app, "_meshtastic_update_running", False):
+            self.app.msg("[MT] Service update is running", ORANGE)
+            return False
+        if getattr(self.app, "_lora_transition_active", lambda: False)():
+            self.app.msg("[MT] Radio ownership transition is running", ORANGE)
+            return False
+        lora = getattr(self.app, "_lora", None)
+        if (lora is not None and lora.worker_active
+                and not lora.running):
+            self.app.msg("[MT] Direct LoRa startup is still running", ORANGE)
+            return False
+        manager = getattr(self.app, "_meshtastic", None)
+        if (getattr(self.host_ble, "worker_active", False)
+                or getattr(manager, "ble_scan_lease_active", False)):
+            self.app.msg(
+                "[BLE] Stop the active host scan before changing adapters",
+                ORANGE)
+            return False
+        current = self.settings.get(key, "auto")
+        choices = self._bluetooth_adapter_choices(current)
+        try:
+            index = choices.index(current)
+        except ValueError:
+            index = 0
+        step = -1 if direction < 0 else 1
+        selected = choices[(index + step) % len(choices)]
+        self.settings[key] = selected
+        self.persist_settings()
+        if key == "meshtastic_phone_adapter":
+            if manager is not None:
+                manager.configure_phone_ble(
+                    self.settings["meshtastic_phone_ble_enabled"], selected)
+            if (manager is not None and manager.connected
+                    and manager.backend == "fork_socket"):
+                self._start_meshtastic_action(
+                    "Phone adapter",
+                    lambda value: value.apply_phone_ble(),
+                    "set to " + selected)
+        elif self.host_ble.state in ("starting", "running"):
+            self.app.msg(
+                "[BLE] Host adapter changes on the next scan", ORANGE)
+        elif (key == "host_ble_adapter"
+              and self.host_ble.state in ("paused", "error")):
+            self._host_ble_retry_pending = True
+
+    def toggle_meshtastic_phone_ble(self):
+        if getattr(self.app, "_meshtastic_update_running", False):
+            self.app.msg("[MT] Service update is running", ORANGE)
+            return False
+        manager = getattr(self.app, "_meshtastic", None)
+        if (getattr(getattr(self, "host_ble", None), "worker_active", False)
+                or getattr(manager, "ble_scan_lease_active", False)):
+            self.app.msg(
+                "[BLE] Stop the active host scan before changing phone BLE",
+                ORANGE)
+            return False
+        enabled = not self.settings["meshtastic_phone_ble_enabled"]
+        self.settings["meshtastic_phone_ble_enabled"] = enabled
+        self.persist_settings()
+        if manager is not None:
+            manager.configure_phone_ble(
+                enabled, self.settings["meshtastic_phone_adapter"])
+        if (manager is not None and manager.connected
+                and manager.backend == "fork_socket"):
+            self._start_meshtastic_action(
+                "Phone BLE",
+                lambda value: value.apply_phone_ble(),
+                "enabled" if enabled else "disabled")
+        else:
+            self.app.msg(
+                "[MT] Phone BLE setting saved for the next fork connection",
+                CYAN)
+        if not enabled:
+            self._host_ble_retry_pending = True
+        return True
+
+    def retry_meshtastic_shared_adapter(self):
+        """Retry coexistence only after host scanning releases BlueZ."""
+        manager = getattr(self.app, "_meshtastic", None)
+        if (getattr(getattr(self, "host_ble", None), "worker_active", False)
+                or getattr(manager, "ble_scan_lease_active", False)):
+            self.app.msg(
+                "[BLE] Stop the active host scan before retrying the adapter",
+                ORANGE)
+            return False
+        return self._start_meshtastic_action(
+            "Shared adapter",
+            lambda value: value.retry_shared_adapter(),
+            "retry enabled")
+
+    def _start_meshtastic_action(self, label, operation, success_detail,
+                                 *, on_success=None):
+        """Run a bounded daemon control call without stalling Pyxel."""
+        if getattr(self.app, "_meshtastic_update_running", False):
+            self.app.msg("[MT] Service update is running", ORANGE)
+            return False
+        if getattr(self.app, "_lora_transition_active", lambda: False)():
+            self.app.msg("[MT] Radio ownership transition is running", ORANGE)
+            return False
+        lora = getattr(self.app, "_lora", None)
+        if (lora is not None and lora.worker_active
+                and not lora.running):
+            self.app.msg("[MT] Direct LoRa startup is still running", ORANGE)
+            return False
+        thread = self._meshtastic_action_thread
+        if thread is not None and thread.is_alive():
+            self.app.msg("[MT] Another control action is running", ORANGE)
+            return False
+        manager = getattr(self.app, "_meshtastic", None)
+        if manager is None:
+            self.app.msg("[MT] Meshtastic manager is unavailable", ORANGE)
+            return False
+        begin = getattr(self.app, "_begin_meshtastic_transition", None)
+        transition_acquired = bool(begin and begin("control"))
+        if begin is not None and not transition_acquired:
+            self.app.msg("[MT] Another radio/service operation is running",
+                         ORANGE)
+            return False
+
+        def worker():
+            try:
+                ok = bool(operation(manager))
+                detail = (success_detail if ok else
+                          manager.last_error or "daemon rejected the request")
+            except Exception as exc:
+                ok = False
+                detail = str(exc)[:140]
+            finally:
+                if transition_acquired:
+                    end = getattr(
+                        self.app, "_end_meshtastic_transition", None)
+                    if end is not None:
+                        end()
+            self._meshtastic_action_results.put((
+                ok, label, detail, on_success))
+
+        try:
+            factory = getattr(
+                self, "_meshtastic_action_thread_factory", threading.Thread)
+            thread = factory(
+                target=worker, name="wdg-meshtastic-control", daemon=True)
+            self._meshtastic_action_thread = thread
+            thread.start()
+        except Exception as exc:
+            self._meshtastic_action_thread = None
+            if transition_acquired:
+                end = getattr(
+                    self.app, "_end_meshtastic_transition", None)
+                if end is not None:
+                    end()
+            self.app.msg(
+                "[MT] Could not start control worker: " + str(exc)[:90],
+                ORANGE)
+            return False
+        return True
 
     def _apply_collector_setting_change(self, key):
         """Release WDG-owned radios and apply enabled choices mid-session."""
         app = self.app
+        release_ok = True
         if key == "wardrive_lora" and not self.settings[key]:
             lora = getattr(app, "_lora", None)
             meshtastic = getattr(app, "_meshtastic", None)
-            if self._wdg_owned_lora:
-                if (lora is not None and lora.running
-                        and lora.mode == "meshcore"):
-                    lora.stop()
-                if meshtastic is not None and meshtastic.running:
-                    meshtastic.close()
-                app._term_add("[ALL] WDG LoRa client stopped", raw=True)
-            self._wdg_owned_lora = False
+            cancel = getattr(app, "_cancel_pending_lora_start", None)
+            cancelled = bool(cancel and cancel(collector_only=True))
+            direct_pending = getattr(app, "_lora_start_pending", "")
+            direct_action = (
+                direct_pending[0] if isinstance(direct_pending, tuple)
+                else direct_pending)
+            if self._wdg_owned_lora or cancelled:
+                if (lora is not None
+                        and (lora.running or lora.worker_active
+                             or lora.radio_owned)
+                        and (lora.mode == "meshcore"
+                             or direct_action == "wardrive")):
+                    try:
+                        direct_stopped = bool(lora.stop())
+                    except Exception as exc:
+                        direct_stopped = False
+                        direct_error = str(exc)[:100]
+                    else:
+                        direct_error = ""
+                    direct_survives = bool(
+                        getattr(lora, "running", False)
+                        or getattr(lora, "worker_active", False)
+                        or getattr(lora, "radio_owned", False))
+                    if not direct_stopped or direct_survives:
+                        release_ok = False
+                        self._wdg_owned_lora = True
+                        detail = (
+                            "direct LoRa worker or SX1262 lock is still active"
+                            if direct_survives else
+                            direct_error or "direct LoRa stop was not confirmed")
+                        app._term_add(
+                            "[ALL] LoRa collector stop incomplete: " + detail,
+                            raw=True)
+                        notify = getattr(app, "msg", None)
+                        if notify:
+                            notify(
+                                "[ALL] LoRa stop incomplete; ownership retained",
+                                ORANGE)
+                # A pending daemon handoff will observe the cancelled epoch
+                # and close itself after its worker exits.  Do not race close
+                # against service selection here.
+                if (meshtastic is not None
+                        and (getattr(meshtastic, "running", False)
+                             or getattr(meshtastic, "connected", False))):
+                    handoff = getattr(app, "_lora_handoff_pending", None)
+                    handoff_action = (
+                        handoff[0] if isinstance(handoff, tuple) else "")
+                    if handoff_action == "wardrive":
+                        release_ok = False
+                        self._wdg_owned_lora = True
+                        app._term_add(
+                            "[ALL] Meshtastic collector cancellation is "
+                            "waiting for its service handoff", raw=True)
+                        notify = getattr(app, "msg", None)
+                        if notify:
+                            notify(
+                                "[ALL] Meshtastic stop pending; ownership "
+                                "retained", ORANGE)
+                    else:
+                        try:
+                            client_stopped = bool(meshtastic.close())
+                        except Exception as exc:
+                            client_stopped = False
+                            client_error = str(exc)[:100]
+                        else:
+                            client_error = ""
+                        client_survives = bool(
+                            getattr(meshtastic, "running", False)
+                            or getattr(meshtastic, "connected", False))
+                        if not client_stopped or client_survives:
+                            release_ok = False
+                            self._wdg_owned_lora = True
+                            detail = (
+                                "Meshtastic client worker is still active"
+                                if client_survives else
+                                client_error
+                                or "Meshtastic client close was not confirmed")
+                            app._term_add(
+                                "[ALL] Meshtastic collector stop incomplete: "
+                                + detail, raw=True)
+                            notify = getattr(app, "msg", None)
+                            if notify:
+                                notify(
+                                    "[ALL] Meshtastic stop incomplete; "
+                                    "ownership retained", ORANGE)
+                if release_ok:
+                    app._term_add("[ALL] WDG LoRa client stopped", raw=True)
+            if release_ok:
+                self._wdg_owned_lora = False
 
         sdr = getattr(app, "_sdr", None)
         desired = self._selected_sdr_collector()
@@ -1336,6 +1899,7 @@ class WardriveUI:
                        and bool(desired)))
         if active and enabled:
             self.start_auxiliary_collectors()
+        return release_ok
 
     def persist_settings(self):
         try:
@@ -1366,6 +1930,75 @@ class WardriveUI:
                 px.text(55,259,"OFF hides only the marker; collection and loot continue.",13)
                 px.text(55,271,"FADE dims then removes recent dots. KEEP uses bounded history.",13)
                 px.text(55,291,"MeshCore is the positioned LoRa layer.  ESC returns.",10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
+            if self.settings_page == "meshtastic":
+                px.text(55,47,
+                        "MESHTASTIC SERVICE   arrows / ENTER / ESC",7)
+                manager = getattr(self.app, "_meshtastic", None)
+                action_busy = bool(
+                    self._meshtastic_action_thread is not None
+                    and self._meshtastic_action_thread.is_alive())
+                action_busy = action_busy or bool(getattr(
+                    self.app, "_meshtastic_update_running", False))
+                transition_busy = getattr(
+                    self.app, "_meshtastic_transition_busy", None)
+                if transition_busy is not None:
+                    action_busy = action_busy or bool(transition_busy())
+                rows = (
+                    ("Backend", self.settings["meshtastic_backend"].upper()),
+                    ("Phone BLE", "ON" if self.settings[
+                        "meshtastic_phone_ble_enabled"] else "OFF"),
+                    ("Phone BLE adapter", self.settings[
+                        "meshtastic_phone_adapter"]),
+                    ("Host scan adapter", self.settings["host_ble_adapter"]),
+                    ("Open pairing", "BUSY" if action_busy else "120 SECONDS"),
+                    ("Forget paired phone", "BUSY" if action_busy else "RUN"),
+                    ("Retry shared adapter", "BUSY" if action_busy else "RUN"),
+                    ("Update service", "BUSY" if action_busy else "CHECK"),
+                )
+                for i, (label, value) in enumerate(rows):
+                    selected = i == self.meshtastic_selection
+                    px.text(
+                        55, 64+i*18,
+                        (("> " if selected else "  ") + label + ": "
+                         + str(value))[:100],
+                        11 if selected else 7)
+                connected = bool(manager is not None and manager.connected)
+                backend = manager.backend if manager is not None else "unavailable"
+                service = (manager.service_state if manager is not None
+                           else "unavailable")
+                client_label = (
+                    "WDG socket" if backend == "fork_socket" else "TCP client")
+                client_state = (
+                    "CONNECTED" if connected else
+                    "RECONNECTING" if manager is not None and manager.running
+                    else "DISCONNECTED")
+                ble = manager.ble_status if manager is not None else "unavailable"
+                if manager is not None and manager.phone_connected:
+                    ble = "phone connected"
+                radio = manager.radio_status if manager is not None else "unavailable"
+                px.text(55,216,
+                        f"Service: {service.upper()}  backend: {backend}"[:100],13)
+                px.text(55,230,
+                        (f"{client_label}: {client_state}  Phone BLE: {ble}"
+                         )[:100],13)
+                px.text(55,244,
+                        (f"Radio: {radio}  "
+                         f"Full client: {getattr(manager, 'full_client_owner', 'unknown')}"
+                         )[:100],13)
+                if manager is not None and manager.pairing_pin:
+                    px.text(55,258,
+                            "Pairing PIN: " + manager.pairing_pin,11)
+                elif manager is not None and manager.last_error:
+                    px.text(55,258,
+                            ("Last error: " + manager.last_error)[:100],8)
+                px.text(55,276,
+                        "Adapter choices use stable MACs; hci numbers may change.",10)
+                px.text(55,288,
+                        "A connected phone has priority on a shared controller.",10)
+                px.text(55,300,"ESC returns   TAB closes settings",10)
                 px.camera()
                 self.app._draw_mc_toast()
                 return
@@ -1403,13 +2036,15 @@ class WardriveUI:
                 return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
             keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                    "_collectors", "lte_modem", "cell_tracking", "cell_neighbors")
+                    "_collectors", "_meshtastic", "lte_modem",
+                    "cell_tracking", "cell_neighbors")
             labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
                       "Map dot layers", "Wardrive trail", "All Wardrive collectors",
+                      "Meshtastic service and phone BLE",
                       "LTE modem integration", "Cell mast tracking",
                       "Experimental QMI neighbors")
             for i,(key,label) in enumerate(zip(keys,labels)):
-                if key in ("_map_layers", "_collectors"):
+                if key in ("_map_layers", "_collectors", "_meshtastic"):
                     value = "OPEN..."
                 elif key == "trail_mode":
                     value = self.trail_mode().upper()
@@ -1417,20 +2052,20 @@ class WardriveUI:
                     value = "ON" if self.settings[key] else "OFF"
                 if key in ("cell_tracking", "cell_neighbors") and not self.settings["lte_modem"]:
                     value += " (LTE OFF)"
-                px.text(55,68+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
-            px.text(55,180,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
-            px.text(55,191,"Precise = where YOU heard it, not the camera location.",13)
-            px.text(55,202,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
+                px.text(55,64+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
+            px.text(55,188,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
+            px.text(55,199,"Precise = where YOU heard it, not the camera location.",13)
+            px.text(55,210,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)
             route = self.history_trail.path.parent.name if self.history_trail else "current session"
-            px.text(55,214,"[H] Route history: " + route,13)
-            px.text(55,227,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
+            px.text(55,222,"[H] Route history: " + route,13)
+            px.text(55,235,"[D] DETECTIONS   [M] mute selected   [R] reset mutes",7)
             items = list(self.notables.values())
             offset = max(0,self.detail_selection-4) if self.details else max(0,len(items)-5)
             for i,item in enumerate(items[offset:offset+5]):
                 selected = self.details and i+offset == self.detail_selection
                 label = ("> " if selected else "  ")+item["label"]+" "+item["mac"]+" "+str(item["rssi"])+"dBm"
                 if item["identity"] in self.settings["suppressed_devices"]: label += " MUTED"
-                px.text(55,241+i*12,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
+                px.text(55,249+i*12,label[:104],7 if selected else ORANGE if item["category"]=="axon" else 14)
             if self.details and items:
                 item = items[min(self.detail_selection,len(items)-1)]
                 px.text(55,291,("Rules: "+", ".join(h["id"] for h in item["evidence"]))[:104],13)

@@ -16,6 +16,7 @@ import stat
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -32,6 +33,14 @@ LEGACY_SERVICE = "meshtasticd.service"
 BACKEND_MODES = ("auto", "fork_socket", "legacy_tcp")
 MT_DISCOVERY_INTERVAL = 60.0
 MT_DISCOVERY_MIN_DISTANCE_M = 50.0
+LEASE_INACTIVE = "inactive"
+LEASE_ACTIVE = "active"
+LEASE_POSSIBLY_ACTIVE = "possibly-active"
+_SERVICE_TRANSITIONAL_STATES = {
+    "activating", "deactivating", "reloading", "refreshing",
+}
+_SERVICE_SNAPSHOT_ATTEMPTS = 20
+_SERVICE_SNAPSHOT_POLL_SECONDS = 0.05
 
 
 class WdgProtocolError(RuntimeError):
@@ -50,6 +59,120 @@ class _ControlWaiter:
     ok: bool = False
     body: dict = field(default_factory=dict)
     reason: str = ""
+    deadline: float = 0.0
+    sent: bool = False
+    completed: bool = False
+    cancelled: bool = False
+    indeterminate: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def begin_send(self, now: float) -> bool:
+        """Claim the right to send unless the caller already timed out."""
+        with self._lock:
+            if self.cancelled or self.completed or now >= self.deadline:
+                self.cancelled = True
+                self.reason = self.reason or "Control command expired before send"
+                self.event.set()
+                return False
+            self.sent = True
+            return True
+
+    def resolve(self, ok: bool, reason: str = "",
+                body: dict | None = None) -> bool:
+        """Publish one result unless the caller already gave up.
+
+        A late reply is consumed silently.  In particular, it must not turn an
+        already reported indeterminate timeout into a later definitive error.
+        """
+        with self._lock:
+            if self.cancelled or self.completed:
+                return False
+            self.ok = bool(ok)
+            self.reason = str(reason or "")
+            self.body = dict(body or {})
+            self.completed = True
+            self.event.set()
+            return True
+
+    def timeout(self, name: str) -> tuple[bool, str, dict] | None:
+        """Cancel an unsent command or mark a sent result indeterminate.
+
+        ``None`` means a reply won the deadline race and the caller should
+        consume the resolved values instead.
+        """
+        with self._lock:
+            if self.completed:
+                return None
+            self.cancelled = True
+            if self.sent:
+                self.indeterminate = True
+                self.reason = (
+                    f"Timed out waiting for Meshtastic {name} reply; "
+                    "the daemon may have completed the request")
+                body = {"_indeterminate": True, "_sent": True}
+            else:
+                self.reason = (
+                    f"Timed out before Meshtastic {name} was sent; "
+                    "the request was cancelled")
+                body = {"_indeterminate": False, "_sent": False}
+            self.event.set()
+            return False, self.reason, body
+
+    def result(self) -> tuple[bool, str, dict]:
+        with self._lock:
+            return self.ok, self.reason, dict(self.body)
+
+
+@dataclass(frozen=True)
+class _ServiceSnapshot:
+    """Exact systemd state needed to reverse a radio-owner transition."""
+
+    target: str
+    load_state: str
+    active_state: str
+    unit_file_state: str
+
+    @property
+    def installed(self) -> bool:
+        return self.load_state == "loaded"
+
+    @property
+    def active(self) -> bool:
+        return self.active_state == "active"
+
+    @property
+    def enabled(self) -> bool:
+        # ``enabled-runtime`` is just as capable of starting the daemon for
+        # the current boot.  Treating it as disabled can let WDG hand the
+        # SX1262 to a direct client while systemd still owns an activation
+        # path for the daemon.
+        return self.unit_file_state in ("enabled", "enabled-runtime")
+
+    @property
+    def exactly_restorable(self) -> bool:
+        """Whether WDG's narrow helper can reproduce this boot-time state.
+
+        The privileged helper intentionally exposes only enable/disable.  It
+        cannot safely reconstruct runtime enables, masks, or links.  Those
+        states must therefore stop a transition before either service is
+        mutated instead of being flattened to ``disabled``.
+        """
+        return (
+            (self.load_state == "loaded"
+             and self.active_state in ("active", "inactive")
+             and self.unit_file_state in ("enabled", "disabled"))
+            or (self.load_state == "not-found"
+                and self.active_state == "inactive"
+                and self.unit_file_state == "not-found")
+        )
+
+    @property
+    def transitional(self) -> bool:
+        return self.active_state in _SERVICE_TRANSITIONAL_STATES
+
+    def describe(self) -> str:
+        return (f"{self.load_state}/{self.active_state}/"
+                f"{self.unit_file_state}")
 
 
 def _default_dependencies():
@@ -114,6 +237,7 @@ class MeshtasticManager:
         monotonic: Callable[[], float] = time.monotonic,
         phone_ble_enabled: bool | None = None,
         phone_ble_adapter: str = "auto",
+        operation_guard: Callable[[], str] | None = None,
     ) -> None:
         if backend is not None:
             if backend_mode != "auto" and backend_mode != backend:
@@ -136,7 +260,15 @@ class MeshtasticManager:
         self.packets_received = 0
         self.ble_status = "unknown"
         self.phone_connected = False
+        self.pairing_pin = ""
+        self.host_ble_degraded = False
+        self.host_ble_pause_reason = ""
         self.radio_status = "unknown"
+        self.full_client_owner = "unknown"
+        # Service lifetime and client transport lifetime are deliberately
+        # distinct.  A daemon can remain active while its local socket is
+        # restarting, so the UI must not infer systemd state from connected.
+        self._service_states = {"wdg": "unknown", "stock": "unknown"}
         self.last_error = ""
 
         self._dependency_loader = dependency_loader
@@ -147,6 +279,7 @@ class MeshtasticManager:
         self._socket_probe = socket_probe
         self._socket_connector = socket_connector
         self._monotonic = monotonic
+        self._operation_guard = operation_guard
         self._interface = None
         self._socket: socket.socket | None = None
         self._pub = None
@@ -155,7 +288,10 @@ class MeshtasticManager:
         self._commands: Queue = Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._fork_connected_event = threading.Event()
+        self._connected_event = threading.Event()
         self._lock = threading.Lock()
+        self._closing = False
         self._subscriptions: list[tuple[Callable, str]] = []
         self._request_counter = 0
         self._pending_requests: dict[str, tuple[str, Any]] = {}
@@ -167,6 +303,20 @@ class MeshtasticManager:
         self._socket_capabilities: set[str] = set()
         self._phone_ble_enabled = phone_ble_enabled
         self._phone_ble_adapter = str(phone_ble_adapter or "auto")
+        self.phone_ble_enabled_applied: bool | None = None
+        self.phone_ble_adapter_applied = ""
+        self._ble_scan_lease_state = LEASE_INACTIVE
+        self._ble_scan_lease_owner = ""
+        self._ble_scan_lease_lock = threading.Lock()
+        self._pairing_agent_lease_state = LEASE_INACTIVE
+        self._control_timeout = 4.0
+        self._phone_scan_disconnects = deque(maxlen=8)
+        # A direct-radio handoff must restore the unit that was actually
+        # active, even when the saved backend preference points elsewhere.
+        self._suspended_service_target: str | None = None
+        self._suspended_service_snapshot: dict[str, _ServiceSnapshot] | None = None
+        self._backend_service_rollback: dict[str, _ServiceSnapshot] | None = None
+        self._resume_backend_once = ""
         self.started_daemon = False
 
     def _emit(self, kind: str, value: Any) -> None:
@@ -174,10 +324,84 @@ class MeshtasticManager:
             self.last_error = str(value)
         self.queue.put((kind, value))
 
+    def _operation_blocked(self) -> bool:
+        if self._operation_guard is None:
+            return False
+        reason = str(self._operation_guard() or "").strip()
+        if not reason:
+            return False
+        self._emit("error", reason)
+        return True
+
     @property
     def backend(self) -> str:
         """The active backend, or configured backend before startup."""
         return self.active_backend or self.backend_mode
+
+    @property
+    def ble_scan_lease_active(self) -> bool:
+        """Whether a daemon scan lease is active or may be active."""
+        return self._ble_scan_lease_state != LEASE_INACTIVE
+
+    @property
+    def ble_scan_lease_state(self) -> str:
+        """Confirmed or conservative state of the daemon scan lease."""
+        return self._ble_scan_lease_state
+
+    @property
+    def ble_scan_lease_owner(self) -> str:
+        return self._ble_scan_lease_owner
+
+    @property
+    def _ble_scan_lease_active(self) -> bool:
+        """Compatibility alias for older tests and UI integrations."""
+        return self._ble_scan_lease_state != LEASE_INACTIVE
+
+    @_ble_scan_lease_active.setter
+    def _ble_scan_lease_active(self, value: bool) -> None:
+        self._ble_scan_lease_state = (
+            LEASE_ACTIVE if value else LEASE_INACTIVE)
+
+    @property
+    def pairing_agent_lease_active(self) -> bool:
+        """Whether the daemon agent lease is active or may be active."""
+        return self._pairing_agent_lease_state != LEASE_INACTIVE
+
+    @property
+    def pairing_agent_lease_state(self) -> str:
+        """Confirmed or conservative state of the daemon agent lease."""
+        return self._pairing_agent_lease_state
+
+    @property
+    def _pairing_agent_lease_active(self) -> bool:
+        """Compatibility alias for older tests and UI integrations."""
+        return self._pairing_agent_lease_state != LEASE_INACTIVE
+
+    @_pairing_agent_lease_active.setter
+    def _pairing_agent_lease_active(self, value: bool) -> None:
+        self._pairing_agent_lease_state = (
+            LEASE_ACTIVE if value else LEASE_INACTIVE)
+
+    @property
+    def service_restore_pending(self) -> bool:
+        """Whether an exact pre-handoff systemd state still needs restoring.
+
+        This is an ownership barrier, not merely cached status.  Callers must
+        retry :meth:`resume_service` and must not select or start another
+        daemon while the snapshot is present.
+        """
+        return self._suspended_service_snapshot is not None
+
+    def _service_restore_blocks(self, operation: str) -> bool:
+        """Fail closed while an earlier handoff restore is unresolved."""
+        if not self.service_restore_pending:
+            return False
+        self._emit(
+            "error",
+            "Previous Meshtastic service state is still unresolved; retry "
+            "resume_service before " + operation,
+        )
+        return True
 
     def set_backend_mode(self, mode: str) -> bool:
         """Select the transport for the next connection.
@@ -187,17 +411,125 @@ class MeshtasticManager:
         """
         if mode not in BACKEND_MODES:
             raise ValueError("Unsupported Meshtastic backend: " + str(mode))
+        if self._operation_blocked():
+            return False
         with self._lock:
-            if self.running:
+            if self.running or self._closing:
                 return False
             self.backend_mode = mode
             self.active_backend = ""
             self._fork_identified = False
         return True
 
+    def activate_backend_service(self, mode: str,
+                                 *, timeout: float = 15.0) -> bool:
+        """Make the selected daemon the exact live and boot-time radio owner.
+
+        This is intentionally separate from ``set_backend_mode`` so ordinary
+        client construction remains read-only. The settings UI calls it only
+        during an explicit backend transition after disconnecting WDG.
+        """
+        if mode not in BACKEND_MODES:
+            raise ValueError("Unsupported Meshtastic backend: " + str(mode))
+        if self._operation_blocked():
+            return False
+        if self._service_restore_blocks("selecting another service"):
+            return False
+        if self._backend_service_rollback is not None:
+            self._emit(
+                "error",
+                "A previous Meshtastic service selection is still pending; "
+                "commit or roll it back before selecting another service",
+            )
+            return False
+        previous: dict[str, _ServiceSnapshot] | None = None
+        previous_target: str | None = None
+        restored = False
+        try:
+            if self._service_controller is not None:
+                self._service_controller.require_current()
+            previous = self._capture_service_snapshot()
+            if not self._service_snapshot_is_restorable(
+                    previous, operation="switch"):
+                return False
+            previous_target = self._snapshot_selected_target(previous)
+            fork_load = previous["wdg"].load_state
+            if mode == "fork_socket" and fork_load == "not-found":
+                self._emit("error", "meshtasticd-wdg is not installed")
+                return False
+            target = (
+                "stock" if mode == "legacy_tcp"
+                or (mode == "auto" and fork_load == "not-found")
+                else "wdg")
+            if not previous[target].installed:
+                self._emit("error", "Selected Meshtastic service is not installed")
+                return False
+            self._stop_event.clear()
+            if not self._select_service_target(target):
+                raise RuntimeError("selected Meshtastic service did not activate")
+            deadline = self._monotonic() + max(0.0, float(timeout))
+            while (not self._service_target_ready(target)
+                   and self._monotonic() < deadline):
+                self._sleep(0.1)
+            if not self._service_target_ready(target):
+                raise RuntimeError(
+                    "selected Meshtastic service endpoint did not become ready")
+            if target == "stock":
+                self.host_ble_degraded = False
+                self.host_ble_pause_reason = ""
+                self._phone_scan_disconnects.clear()
+            self._resume_backend_once = ""
+            self._backend_service_rollback = previous
+            self._emit("status", "Selected Meshtastic service: " + target)
+            return True
+        except Exception as exc:
+            detail = "Could not switch Meshtastic service: " + str(exc)[:160]
+            if previous is not None:
+                restored = self._restore_service_snapshot(
+                    previous, timeout=max(1.0, float(timeout)))
+                if restored:
+                    suffix = ("previous " + previous_target + " service restored"
+                              if previous_target else
+                              "previous service state restored")
+                    detail += "; " + suffix
+                else:
+                    detail += "; previous service state could not be restored"
+            self._backend_service_rollback = (
+                previous if previous is not None and not restored else None)
+            self._emit("error", detail)
+            return False
+
+    def commit_backend_service_activation(self) -> None:
+        """Discard rollback state after transport negotiation succeeds."""
+        self._backend_service_rollback = None
+
+    def rollback_backend_service_activation(self,
+                                            *, timeout: float = 15.0) -> bool:
+        """Restore the exact state captured before the latest selection."""
+        if self._service_restore_blocks("rolling back another service change"):
+            return False
+        snapshot = self._backend_service_rollback
+        if snapshot is None:
+            return True
+        restored = self._restore_service_snapshot(snapshot, timeout=timeout)
+        if restored:
+            self._backend_service_rollback = None
+        return restored
+
     def start(self) -> bool:
         """Start the local daemon if needed and connect in a worker thread."""
+        if self._operation_blocked():
+            return False
+        if self._service_restore_blocks("starting a daemon"):
+            return False
         with self._lock:
+            if self._closing:
+                self._emit(
+                    "error",
+                    "Meshtastic client close is still in progress; start was "
+                    "not accepted",
+                )
+                return False
             if self.running:
                 return True
             # A close before the first start, or a previous stopped worker,
@@ -210,50 +542,177 @@ class MeshtasticManager:
                     break
             self.running = True
             self.connected = False
+            self._fork_connected_event.clear()
+            self._connected_event.clear()
             self.active_backend = ""
             self._pending_requests.clear()
             self._completed_requests.clear()
             self._snapshot_pending = False
             self._snapshot_active = False
             self._snapshot_seen.clear()
+            self._reset_applied_phone_ble()
             self._stop_event.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="wdg-meshtastic", daemon=True)
-            self._thread.start()
+            try:
+                thread = threading.Thread(
+                    target=self._run, name="wdg-meshtastic", daemon=True)
+                self._thread = thread
+                thread.start()
+            except Exception as exc:
+                self._thread = None
+                self.running = False
+                self._stop_event.set()
+                self._emit(
+                    "error", "Could not start Meshtastic client worker: "
+                    + str(exc)[:160])
+                return False
         return True
 
-    def close(self, *, stop_daemon: bool = False) -> None:
-        """Disconnect WDG; optionally stop the daemon to release the radio."""
-        self._stop_event.set()
-        if self.running or (self._thread and self._thread.is_alive()):
-            self._commands.put(("stop", None))
-        interface = self._interface
-        if interface is not None:
-            try:
-                interface.close()
-            except Exception:
-                pass
-        client = self._socket
-        if client is not None:
-            try:
-                client.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                client.close()
-            except OSError:
-                pass
-        thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-        if not thread or not thread.is_alive():
-            self.running = False
-            self._thread = None
-        self.connected = False
-        if stop_daemon:
-            self._stop_service()
+    def close(self, *, stop_daemon: bool = False) -> bool:
+        """Disconnect WDG and report whether its worker actually stopped.
+
+        Service ownership must never change while the old client worker can
+        still issue requests.  Callers that intend to switch or update a
+        daemon therefore use this return value as a hard lifecycle barrier.
+        """
+        with self._lock:
+            if self._closing:
+                self._emit(
+                    "error", "Meshtastic client close is already in progress")
+                return False
+            self._closing = True
+        try:
+            lease_owner = ""
+            with self._ble_scan_lease_lock:
+                if self._ble_scan_lease_active:
+                    lease_owner = self._ble_scan_lease_owner
+            if lease_owner:
+                # Release while the socket worker can still service the command.
+                # A failed release deliberately preserves the owner locally.
+                self.release_ble_scan_lease(owner=lease_owner)
+            if self.pairing_agent_lease_active:
+                # A timed-out acquisition is still possibly active. Attempt
+                # the idempotent release before ending the socket session;
+                # closing the session below is the final cleanup barrier.
+                self.release_pairing_agent_lease()
+            self._stop_event.set()
+            if self.running or (self._thread and self._thread.is_alive()):
+                self._commands.put(("stop", None))
+            interface = self._interface
+            if interface is not None:
+                try:
+                    interface.close()
+                except Exception:
+                    pass
+            client = self._socket
+            if client is not None:
+                try:
+                    client.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    client.close()
+                except OSError:
+                    pass
+            thread = self._thread
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=2.0)
+            stopped = not thread or not thread.is_alive()
+            if stopped:
+                self.running = False
+                self._thread = None
+            else:
+                self._emit(
+                    "error",
+                    "Meshtastic client worker did not stop; service operation "
+                    "was aborted",
+                )
+            if not stopped:
+                self.connected = False
+                self._fork_connected_event.clear()
+                self._connected_event.clear()
+                return False
+            self._reset_socket_session_state()
+            if stop_daemon:
+                if not self._stop_service():
+                    return False
+                # Stopping both possible owners definitively invalidates any
+                # daemon-side bounded lease whose release reply was lost.
+                self._reset_local_leases()
+            return True
+        finally:
+            with self._lock:
+                self._closing = False
 
     stop = close
+
+    def wait_connected(self, timeout: float = 10.0,
+                       *, backend: str | None = None) -> bool:
+        """Wait for complete transport negotiation, not just an open endpoint."""
+        expected = backend
+        if expected == "auto":
+            expected = None
+        deadline = self._monotonic() + max(0.0, float(timeout))
+        while True:
+            if self.connected:
+                return expected is None or self.active_backend == expected
+            thread = self._thread
+            if (not self.running
+                    and (thread is None or not thread.is_alive())):
+                return False
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return False
+            self._connected_event.wait(min(0.1, remaining))
+
+    def _reset_local_leases(self) -> None:
+        """Forget daemon-scoped leases whenever their socket session ends."""
+        with self._ble_scan_lease_lock:
+            self._ble_scan_lease_state = LEASE_INACTIVE
+            self._ble_scan_lease_owner = ""
+        self._pairing_agent_lease_state = LEASE_INACTIVE
+
+    def _reset_socket_session_state(self) -> None:
+        """Clear state that is authoritative only for one socket session."""
+        self.connected = False
+        self._fork_connected_event.clear()
+        self._connected_event.clear()
+        self.ble_status = "unknown"
+        self.phone_connected = False
+        self.pairing_pin = ""
+        self.radio_status = "unknown"
+        self.full_client_owner = "unknown"
+        self.host_ble_degraded = False
+        self.host_ble_pause_reason = ""
+        self._phone_scan_disconnects.clear()
+        self._socket_capabilities.clear()
+        self._reset_applied_phone_ble()
+        self._reset_local_leases()
+        self._snapshot_pending = False
+        self._snapshot_active = False
+        self._snapshot_seen.clear()
+
+    @property
+    def service_state(self) -> str:
+        """Cached systemd state for the daemon selected by this manager."""
+        backend = self.active_backend or self.backend_mode
+        target = "stock" if backend == "legacy_tcp" else "wdg"
+        return self._service_states.get(target, "unknown")
+
+    def _remember_service_state(
+            self, target: str, load_state: str, active_state: str) -> None:
+        if target not in self._service_states:
+            return
+        load = str(load_state or "unknown").lower()
+        active = str(active_state or "unknown").lower()
+        if load == "not-found":
+            state = "not installed"
+        elif active in ("active", "activating", "reloading"):
+            state = active
+        elif active in ("inactive", "failed", "deactivating"):
+            state = active
+        else:
+            state = "unknown"
+        self._service_states[target] = state
 
     def _control_backend(self) -> str:
         if self.active_backend:
@@ -262,53 +721,188 @@ class MeshtasticManager:
 
     def service_ready(self) -> bool:
         """Read readiness for the selected exact daemon without changing it."""
+        if self._suspended_service_target:
+            return self._service_target_ready(self._suspended_service_target)
         backend = self._control_backend()
-        if self._service_controller is not None:
-            target = "wdg" if backend == "fork_socket" else "stock"
-            try:
-                if not self._service_controller.status(target).active:
-                    return False
-            except Exception as exc:
-                self._emit("error", "Could not read Meshtastic service status: "
-                           + str(exc)[:160])
-                return False
-        if backend == "fork_socket":
-            return bool(self._socket_probe(self.socket_path))
-        return bool(self._port_probe(self.host, self.port))
+        target = "wdg" if backend == "fork_socket" else "stock"
+        return self._service_target_ready(target)
+
+    def _retry_suspended_restore(
+            self, snapshot: dict[str, _ServiceSnapshot],
+            *, timeout: float) -> bool:
+        """Restore and clear only the exact retained handoff snapshot."""
+        if self._suspended_service_snapshot is not snapshot:
+            self._emit(
+                "error",
+                "Meshtastic restore token changed unexpectedly; service "
+                "ownership remains unresolved",
+            )
+            return False
+        previous_error = self.last_error
+        try:
+            restored = bool(self._restore_service_snapshot(
+                snapshot, timeout=timeout))
+        except Exception as exc:
+            self._emit(
+                "error", "Could not restore Meshtastic service state: "
+                + str(exc)[:160])
+            return False
+        if not restored and self.last_error == previous_error:
+            self._emit(
+                "error", "Previous Meshtastic service state did not restore")
+        if restored:
+            self._suspended_service_target = None
+            self._suspended_service_snapshot = None
+        return restored
 
     def suspend_service(self, timeout: float = 10.0) -> bool:
-        """Disconnect WDG, stop the selected daemon and wait for radio release."""
-        self.close()
-        if not self._stop_service():
+        """Stop and disable both daemons while preserving exact prior state."""
+        # A retained snapshot is the only trustworthy rollback token after a
+        # partial handoff.  Never replace it with a snapshot of the already
+        # mutated state.
+        if self._service_restore_blocks("suspending services again"):
+            return False
+        try:
+            snapshot = self._capture_service_snapshot()
+        except Exception as exc:
+            self._emit("error", "Could not snapshot Meshtastic services: "
+                       + str(exc)[:160])
+            return False
+        if not self._service_snapshot_is_restorable(
+                snapshot, operation="suspend"):
+            return False
+        actual_target = self._snapshot_selected_target(snapshot)
+        if not self.close():
+            self._emit(
+                "error", "Meshtastic client worker is still running; "
+                "radio handoff aborted")
+            return False
+        self._suspended_service_target = actual_target
+        self._suspended_service_snapshot = snapshot
+        try:
+            stopped = self._stop_service()
+        except Exception as exc:
+            stopped = False
+            self._emit(
+                "error", "Could not stop Meshtastic services: "
+                + str(exc)[:160])
+        if not stopped:
+            restored = self._retry_suspended_restore(
+                snapshot, timeout=timeout)
+            if not restored:
+                self._emit(
+                    "error",
+                    "Meshtastic service stop failed and the previous state "
+                    "is still unresolved; retry resume_service",
+                )
+            return False
+        try:
+            for target in ("wdg", "stock"):
+                state = snapshot[target]
+                if (state.installed and state.unit_file_state == "enabled"
+                        and not self._set_service_enabled(target, False)):
+                    raise RuntimeError(
+                        "could not disable " + target + " service")
+        except Exception as exc:
+            restored = self._retry_suspended_restore(
+                snapshot, timeout=timeout)
+            detail = "Could not suspend Meshtastic persistently: " + str(exc)
+            if not restored:
+                detail += "; previous service state could not be restored"
+            self._emit("error", detail[:240])
             return False
         deadline = self._monotonic() + max(0.0, timeout)
-        while self.service_ready() and self._monotonic() < deadline:
+        while (not self._services_persistently_suspended()
+               and self._monotonic() < deadline):
             self._sleep(0.1)
-        if self.service_ready():
-            self._emit("error", "Meshtastic daemon stopped but remained ready")
+        if not self._services_persistently_suspended():
+            self._emit(
+                "error", "Meshtastic service remained active or enabled")
+            restored = self._retry_suspended_restore(
+                snapshot, timeout=timeout)
+            if not restored:
+                self._emit(
+                    "error",
+                    "Previous Meshtastic service state is still unresolved; "
+                    "retry resume_service",
+                )
             return False
         return True
 
     def resume_service(self, timeout: float = 15.0, *,
-                       connect: bool = True) -> bool:
-        """Start the selected daemon, wait for readiness, and optionally connect."""
-        backend = self._control_backend()
+                       connect: bool = True,
+                       target: str | None = None) -> bool:
+        """Restore the suspended unit, wait for readiness, then reconnect."""
+        if self._operation_blocked():
+            return False
+        snapshot = self._suspended_service_snapshot
+        target = target or self._suspended_service_target
+        if target not in (None, "wdg", "stock"):
+            raise ValueError("Unsupported Meshtastic service target: "
+                             + str(target))
+        backend = (
+            "fork_socket" if target == "wdg" else
+            "legacy_tcp" if target == "stock" else
+            self._control_backend()
+        )
+        target = target or ("wdg" if backend == "fork_socket" else "stock")
         # suspend_service() intentionally closes the client and sets this
         # lifecycle flag.  Service startup has its own bounded readiness wait,
         # so clear the old client cancellation before polling.  start() will
         # still drain the previous stop command before creating a new worker.
         self._stop_event.clear()
-        ready = (self._ensure_fork_service() if backend == "fork_socket"
-                 else self._ensure_legacy_service())
-        if not ready:
-            return False
-        deadline = self._monotonic() + max(0.0, timeout)
-        while not self.service_ready() and self._monotonic() < deadline:
-            self._sleep(0.1)
-        if not self.service_ready():
-            self._emit("error", "Meshtastic daemon did not become ready")
-            return False
-        return self.start() if connect else True
+        if snapshot is not None:
+            if not self._retry_suspended_restore(
+                    snapshot, timeout=timeout):
+                return False
+            active_target = next(
+                (candidate for candidate in ("wdg", "stock")
+                 if snapshot[candidate].active), None)
+            # A previously enabled but inactive daemon must stay inactive.
+            should_connect = bool(connect and active_target)
+            if active_target:
+                target = active_target
+                backend = "fork_socket" if target == "wdg" else "legacy_tcp"
+            # Exact service ownership is restored and the helper cleared the
+            # recovery token.  A later transport failure must not masquerade
+            # as an unresolved systemd rollback.
+        else:
+            ready = (self._ensure_fork_service() if backend == "fork_socket"
+                     else self._ensure_legacy_service())
+            if not ready:
+                return False
+            deadline = self._monotonic() + max(0.0, timeout)
+            while (not self._service_target_ready(target)
+                   and self._monotonic() < deadline):
+                self._sleep(0.1)
+            if not self._service_target_ready(target):
+                self._emit("error", "Meshtastic daemon did not become ready")
+                return False
+            should_connect = connect
+        if should_connect:
+            self._resume_backend_once = backend
+            if not self.start():
+                return False
+            if not self.wait_connected(timeout=timeout, backend=backend):
+                self._emit(
+                    "error", "Meshtastic daemon endpoint opened but protocol "
+                    "negotiation did not complete")
+                self.close()
+                return False
+        return True
+
+    def _services_persistently_suspended(self) -> bool:
+        for target in ("wdg", "stock"):
+            state = self._service_snapshot(target)
+            if not self._service_is_stopped(
+                    state.load_state, state.active_state):
+                return False
+            # Only an exact disabled state is safe for the direct-radio
+            # lifetime.  Runtime enables, links, masks, aliases and unknown
+            # states are not interchangeable with disabled.
+            if state.installed and state.unit_file_state != "disabled":
+                return False
+        return True
 
     def send_text(self, text: str, destination: str | int | None = None,
                   channel: int = 0) -> bool:
@@ -328,7 +922,8 @@ class MeshtasticManager:
         return True
 
     def _control_command(self, name: str, body: dict | None = None,
-                         *, timeout: float = 4.0) -> tuple[bool, str, dict]:
+                         *, timeout: float | None = None,
+                         ) -> tuple[bool, str, dict]:
         """Run one restricted fork command and wait for its correlated reply."""
         if self.active_backend != "fork_socket" or not self.connected:
             reason = "Meshtastic WDG socket is not connected"
@@ -338,30 +933,126 @@ class MeshtasticManager:
             reason = "Meshtastic control command cannot block its worker"
             self._emit("error", reason)
             return False, reason, {}
-        waiter = _ControlWaiter()
+        timeout = max(
+            0.01,
+            float(self._control_timeout if timeout is None else timeout),
+        )
+        waiter = _ControlWaiter(deadline=self._monotonic() + timeout)
         self._commands.put(("control", (name, dict(body or {}), waiter)))
-        if not waiter.event.wait(max(0.1, float(timeout))):
-            reason = f"Timed out waiting for Meshtastic {name} reply"
-            self._emit("error", reason)
-            return False, reason, {}
-        if not waiter.ok:
-            self._emit("error", waiter.reason or f"Meshtastic {name} failed")
-        return waiter.ok, waiter.reason, dict(waiter.body)
+        if not waiter.event.wait(timeout):
+            timed_out = waiter.timeout(name)
+            if timed_out is not None:
+                self._emit("error", timed_out[1])
+                return timed_out
+        ok, reason, result = waiter.result()
+        if not ok:
+            self._emit("error", reason or f"Meshtastic {name} failed")
+        return ok, reason, result
+
+    def configure_phone_ble(self, enabled: bool, adapter: str = "auto") -> None:
+        """Store desired phone BLE policy for this and future connections."""
+        self._phone_ble_enabled = bool(enabled)
+        self._phone_ble_adapter = str(adapter or "auto")
+        if not self._phone_ble_enabled:
+            self.host_ble_degraded = False
+            self.host_ble_pause_reason = ""
+            self._phone_scan_disconnects.clear()
+
+    def apply_phone_ble(self) -> bool:
+        """Apply the latest desired policy when the fork socket is connected."""
+        with self._ble_scan_lease_lock:
+            if self._ble_scan_lease_active:
+                self._emit(
+                    "error",
+                    "Finish the active host BLE scan before changing phone BLE")
+                return False
+            if self.active_backend != "fork_socket" or not self.connected:
+                return True
+            ok, _reason, body = self._control_command("set_phone_ble", {
+                "enabled": bool(self._phone_ble_enabled),
+                "adapter": self._phone_ble_adapter,
+            })
+            if ok:
+                self._record_applied_phone_ble(body)
+            if ok and not self._phone_ble_enabled:
+                self.host_ble_degraded = False
+                self.host_ble_pause_reason = ""
+                self._phone_scan_disconnects.clear()
+            return ok
+
+    def _record_applied_phone_ble(self, body: dict) -> None:
+        if "phone_ble_enabled" in body:
+            self.phone_ble_enabled_applied = bool(body["phone_ble_enabled"])
+        elif "enabled" in body:
+            self.phone_ble_enabled_applied = bool(body["enabled"])
+        if "phone_ble_adapter_address" in body:
+            address = body.get("phone_ble_adapter_address")
+            self.phone_ble_adapter_applied = str(address or "").upper()
+        elif "adapter_address" in body:
+            address = body.get("adapter_address")
+            self.phone_ble_adapter_applied = str(address or "").upper()
+
+    def _reset_applied_phone_ble(self) -> None:
+        """Forget live policy until the current daemon reports it again."""
+        self.phone_ble_enabled_applied = None
+        self.phone_ble_adapter_applied = ""
+        self.full_client_owner = "unknown"
+
+    def _record_full_client_owner(self, body: dict) -> None:
+        value = body.get("full_client_owner")
+        nested = body.get("full_client")
+        if value is None and isinstance(nested, dict):
+            value = nested.get("owner")
+        if value is None:
+            value = body.get("owner")
+        owner = str(value or "").strip().lower()
+        if owner in {"none", "bluetooth", "bluetooth_pending", "tcp"}:
+            self.full_client_owner = owner
+
+    def host_ble_requires_lease(self, host_adapter: str = "auto") -> bool:
+        """Fail closed unless the live daemon confirms a separate adapter."""
+        if self.active_backend != "fork_socket" or not self.connected:
+            return True
+        if self.phone_ble_enabled_applied is False:
+            return False
+        host = str(host_adapter or "auto").upper()
+        phone = str(self.phone_ble_adapter_applied or "").upper()
+        if (self.phone_ble_enabled_applied is True
+                and host != "AUTO" and phone and host != phone):
+            return False
+        return True
 
     def set_phone_ble(self, enabled: bool, adapter: str = "auto") -> bool:
-        """Enable or disable the daemon's phone-facing BLE transport."""
-        adapter = str(adapter or "auto")
-        ok, _reason, _body = self._control_command("set_phone_ble", {
-            "enabled": bool(enabled), "adapter": adapter,
-        })
-        if ok:
-            self._phone_ble_enabled = bool(enabled)
-            self._phone_ble_adapter = adapter
-        return ok
+        """Persist desired phone BLE policy and apply it when possible."""
+        with self._ble_scan_lease_lock:
+            if self._ble_scan_lease_active:
+                self._emit(
+                    "error",
+                    "Finish the active host BLE scan before changing phone BLE")
+                return False
+            self.configure_phone_ble(enabled, adapter)
+            # Keep the lease lock through the daemon command so a scanner
+            # cannot acquire the adapter between policy validation and apply.
+            if self.active_backend != "fork_socket" or not self.connected:
+                return True
+            ok, _reason, body = self._control_command("set_phone_ble", {
+                "enabled": bool(self._phone_ble_enabled),
+                "adapter": self._phone_ble_adapter,
+            })
+            if ok:
+                self._record_applied_phone_ble(body)
+            if ok and not self._phone_ble_enabled:
+                self.host_ble_degraded = False
+                self.host_ble_pause_reason = ""
+                self._phone_scan_disconnects.clear()
+            return ok
 
     def open_pairing(self, seconds: int = 120) -> bool:
         """Open a bounded Meshtastic phone pairing window."""
         seconds = max(1, min(120, int(seconds)))
+        # A passkey event may arrive before the correlated command reply.
+        # Clear the previous PIN first so the new asynchronous value survives.
+        self.pairing_pin = ""
         ok, _reason, _body = self._control_command(
             "open_pairing", {"seconds": seconds})
         return ok
@@ -370,23 +1061,192 @@ class MeshtasticManager:
         ok, _reason, _body = self._control_command("forget_phone")
         return ok
 
-    def acquire_ble_scan_lease(self, seconds: int = 20) -> tuple[bool, str]:
+    def acquire_ble_scan_lease(
+            self, seconds: int = 20, *, owner: str = "default",
+    ) -> tuple[bool, str]:
         """Ask the daemon to yield one adapter for a bounded host BLE scan."""
+        owner = str(owner or "default")[:64]
         seconds = max(1, min(20, int(seconds)))
-        ok, reason, body = self._control_command(
-            "ble_scan_lease_acquire", {"seconds": seconds})
-        granted = bool(body.get("granted", ok)) if ok else False
-        reason = str(body.get("reason") or reason or
-                     ("granted" if granted else "scan lease denied"))
-        return granted, reason
 
-    def release_ble_scan_lease(self) -> bool:
-        ok, _reason, _body = self._control_command("ble_scan_lease_release")
+        # Connecting the restricted socket can start the manager and its
+        # worker.  That worker retires stale local leases while establishing a
+        # new session, so waiting for it while holding the lease mutex can
+        # deadlock a stopped manager.  Establish coordination first, then
+        # serialize and revalidate every fact used to issue the command.
+        if (self._fork_may_own_resources()
+                and not self.ensure_ble_coordination(timeout=5.0)):
+            return False, "Meshtastic WDG socket is not connected"
+
+        with self._ble_scan_lease_lock:
+            held_by_owner = bool(
+                self._ble_scan_lease_state == LEASE_ACTIVE
+                and self._ble_scan_lease_owner == owner)
+            if (self._ble_scan_lease_state != LEASE_INACTIVE
+                    and self._ble_scan_lease_owner != owner):
+                return False, (
+                    "Bluetooth scanning is already leased to "
+                    + self._ble_scan_lease_owner)
+            if self._ble_scan_lease_state == LEASE_POSSIBLY_ACTIVE:
+                # A prior acquire/release reached the daemon but its reply was
+                # lost.  Retire that exact token before another acquisition.
+                if not self._release_ble_scan_lease_locked():
+                    return False, (
+                        "A previous Bluetooth scan lease may still be active "
+                        "for " + self._ble_scan_lease_owner)
+                held_by_owner = False
+            fork_active = self._fork_may_own_resources()
+            if not fork_active:
+                # A renewal can observe the daemon disappearing before the
+                # scanner reaches its finally block. Preserve that scanner's
+                # token; only its matching release may retire local ownership.
+                if not held_by_owner:
+                    self._ble_scan_lease_state = LEASE_INACTIVE
+                    self._ble_scan_lease_owner = ""
+                return True, "meshtasticd-wdg is not active"
+            if self.host_ble_degraded:
+                return False, (self.host_ble_pause_reason
+                               or "Meshtastic phone has Bluetooth priority")
+            # Coordination can disappear after the preflight wait.  Never
+            # send against a replacement or half-closed session.
+            if self.active_backend != "fork_socket" or not self.connected:
+                return False, "Meshtastic WDG socket is not connected"
+            ok, reason, body = self._control_command(
+                "ble_scan_lease_acquire", {"seconds": seconds})
+            indeterminate = bool(body.get("_indeterminate"))
+            if indeterminate:
+                self._ble_scan_lease_state = LEASE_POSSIBLY_ACTIVE
+                self._ble_scan_lease_owner = owner
+                # The command was sent, so a false return is not proof that
+                # the daemon kept its adapter. Send an ordered compensating
+                # release; preserve possibly-active if that reply is lost too.
+                cleanup_ok = self._release_ble_scan_lease_locked()
+                if not cleanup_ok:
+                    reason = (str(reason or "scan lease reply timed out")
+                              + "; lease may still be active because the "
+                              "compensating release is unconfirmed")
+                return False, str(reason)
+            granted = bool(body.get("granted", ok)) if ok else False
+            reason = str(body.get("reason") or reason or
+                         ("granted" if granted else "scan lease denied"))
+            if granted:
+                self._ble_scan_lease_state = LEASE_ACTIVE
+                self._ble_scan_lease_owner = owner
+                # A phone-priority event can arrive while the command reply is
+                # in flight. Do not let the scanner start from that stale
+                # grant; return the lease immediately. If the release reply is
+                # lost, preserve its owner until an explicit later release.
+                if self.host_ble_degraded:
+                    degraded_reason = (
+                        self.host_ble_pause_reason
+                        or "Meshtastic phone has Bluetooth priority")
+                    self._release_ble_scan_lease_locked()
+                    return False, degraded_reason
+            elif not held_by_owner:
+                self._ble_scan_lease_state = LEASE_INACTIVE
+                self._ble_scan_lease_owner = ""
+            return granted, reason
+
+    def release_ble_scan_lease(self, *, owner: str = "default") -> bool:
+        owner = str(owner or "default")[:64]
+        with self._ble_scan_lease_lock:
+            if (self._ble_scan_lease_state != LEASE_INACTIVE
+                    and self._ble_scan_lease_owner != owner):
+                # A second scanner must never release the first scanner's
+                # daemon lease.
+                return True
+            return self._release_ble_scan_lease_locked()
+
+    def _release_ble_scan_lease_locked(self) -> bool:
+        """Release the current daemon lease with ``_ble_scan_lease_lock`` held."""
+        if self._ble_scan_lease_state == LEASE_INACTIVE:
+            return True
+        if not self._fork_may_own_resources():
+            self._ble_scan_lease_state = LEASE_INACTIVE
+            self._ble_scan_lease_owner = ""
+            return True
+        if self.active_backend != "fork_socket" or not self.connected:
+            return False
+        ok, _reason, body = self._control_command(
+            "ble_scan_lease_release")
+        if ok:
+            self._ble_scan_lease_state = LEASE_INACTIVE
+            self._ble_scan_lease_owner = ""
+        elif body.get("_indeterminate"):
+            self._ble_scan_lease_state = LEASE_POSSIBLY_ACTIVE
+        return ok
+
+    def acquire_pairing_agent_lease(self, seconds: int = 120) -> bool:
+        """Yield the daemon's default BlueZ agent for another bounded flow."""
+        if not self._fork_may_own_resources():
+            self._pairing_agent_lease_state = LEASE_INACTIVE
+            return True
+        if not self.ensure_ble_coordination(timeout=5.0):
+            return False
+        if (self._pairing_agent_lease_state == LEASE_POSSIBLY_ACTIVE
+                and not self.release_pairing_agent_lease()):
+            return False
+        seconds = max(1, min(120, int(seconds)))
+        was_active = self._pairing_agent_lease_state == LEASE_ACTIVE
+        ok, _reason, body = self._control_command(
+            "pairing_agent_lease_acquire", {"seconds": seconds})
+        if ok:
+            self._pairing_agent_lease_state = LEASE_ACTIVE
+        elif body.get("_indeterminate"):
+            self._pairing_agent_lease_state = LEASE_POSSIBLY_ACTIVE
+            # A caller must not register a competing agent without a grant,
+            # but the daemon may have yielded its agent. Compensate now; an
+            # unconfirmed release remains visible and retryable.
+            self.release_pairing_agent_lease()
+        elif not was_active:
+            self._pairing_agent_lease_state = LEASE_INACTIVE
+        return ok
+
+    def release_pairing_agent_lease(self) -> bool:
+        if self._pairing_agent_lease_state == LEASE_INACTIVE:
+            return True
+        if not self._fork_may_own_resources():
+            self._pairing_agent_lease_state = LEASE_INACTIVE
+            return True
+        if self.active_backend != "fork_socket" or not self.connected:
+            return False
+        ok, _reason, body = self._control_command(
+            "pairing_agent_lease_release")
+        if ok:
+            self._pairing_agent_lease_state = LEASE_INACTIVE
+        elif body.get("_indeterminate"):
+            self._pairing_agent_lease_state = LEASE_POSSIBLY_ACTIVE
         return ok
 
     def retry_shared_adapter(self) -> bool:
-        ok, _reason, _body = self._control_command("retry_shared_adapter")
-        return ok
+        with self._ble_scan_lease_lock:
+            if self._ble_scan_lease_active:
+                self._emit(
+                    "error",
+                    "Finish the active host BLE scan before retrying the adapter")
+                return False
+            if not self._fork_may_own_resources():
+                ok = True
+            elif self.active_backend != "fork_socket" or not self.connected:
+                self._emit("error", "Meshtastic WDG socket is not connected")
+                return False
+            elif "retry_shared_adapter" in self._socket_capabilities:
+                ok, _reason, _body = self._control_command(
+                    "retry_shared_adapter")
+            else:
+                ok = True
+            if ok:
+                self.host_ble_degraded = False
+                self.host_ble_pause_reason = ""
+                self._phone_scan_disconnects.clear()
+            return ok
+
+    def note_host_ble_failure(self, reason: str) -> None:
+        """Preserve a connected phone after BlueZ rejects shared discovery."""
+        if not self.phone_connected:
+            return
+        self.host_ble_degraded = True
+        self.host_ble_pause_reason = str(
+            reason or "BlueZ rejected scanning beside the connected phone")
 
     def poll_events(self) -> list[tuple[str, Any]]:
         events = []
@@ -403,28 +1263,302 @@ class MeshtasticManager:
 
     def _fork_service_load_state(self) -> str:
         """Return systemd's load state without emitting user-facing noise."""
+        return self._fork_service_state()[0]
+
+    def _fork_service_state(self) -> tuple[str, str]:
+        """Return exact load/active state for the fork service."""
         if self._service_controller is not None:
             try:
-                return str(self._service_controller.status("wdg").load_state)
+                status = self._service_controller.status("wdg")
+                value = (
+                    str(status.load_state).lower(),
+                    str(status.active_state).lower(),
+                )
+                self._remember_service_state("wdg", *value)
+                return value
             except Exception:
-                return "unknown"
+                self._remember_service_state("wdg", "unknown", "unknown")
+                return "unknown", "unknown"
         try:
             result = self._service_runner(
-                ["systemctl", "show", "--property=LoadState", "--value",
-                 WDG_SERVICE], capture_output=True, text=True, timeout=12)
+                ["systemctl", "show", WDG_SERVICE,
+                 "--property=LoadState", "--property=ActiveState"],
+                capture_output=True, text=True, timeout=12)
         except Exception:
-            return "unknown"
+            self._remember_service_state("wdg", "unknown", "unknown")
+            return "unknown", "unknown"
         if result.returncode:
-            return "not-found"
-        return (result.stdout or "").strip().lower() or "unknown"
+            self._remember_service_state("wdg", "unknown", "unknown")
+            return "unknown", "unknown"
+        properties = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key.strip()] = value.strip().lower()
+        value = (
+            properties.get("LoadState", "unknown"),
+            properties.get("ActiveState", "unknown"),
+        )
+        self._remember_service_state("wdg", *value)
+        return value
+
+    def _service_snapshot(self, target: str) -> _ServiceSnapshot:
+        if target not in ("wdg", "stock"):
+            raise ValueError("Unsupported Meshtastic service target: " + target)
+        if self._service_controller is not None:
+            status = self._service_controller.status(target)
+            snapshot = _ServiceSnapshot(
+                target=target,
+                load_state=str(
+                    getattr(status, "load_state", "unknown")).lower(),
+                active_state=str(
+                    getattr(status, "active_state", "unknown")).lower(),
+                unit_file_state=str(
+                    getattr(status, "unit_file_state", "unknown")).lower(),
+            )
+            self._remember_service_state(
+                target, snapshot.load_state, snapshot.active_state)
+            return snapshot
+        service = WDG_SERVICE if target == "wdg" else LEGACY_SERVICE
+        result = self._service_runner(
+            ["systemctl", "show", service,
+             "--property=LoadState", "--property=ActiveState",
+             "--property=UnitFileState"],
+            capture_output=True, text=True, timeout=12)
+        if result.returncode:
+            self._remember_service_state(target, "unknown", "unknown")
+            return _ServiceSnapshot(target, "unknown", "unknown", "unknown")
+        properties = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key.strip()] = value.strip().lower()
+        snapshot = _ServiceSnapshot(
+            target=target,
+            load_state=properties.get("LoadState", "unknown"),
+            active_state=properties.get("ActiveState", "unknown"),
+            unit_file_state=properties.get("UnitFileState", "unknown"),
+        )
+        self._remember_service_state(
+            target, snapshot.load_state, snapshot.active_state)
+        return snapshot
+
+    def _capture_service_snapshot(self) -> dict[str, _ServiceSnapshot]:
+        """Capture both units only after any bounded transition settles.
+
+        ``systemctl show`` is not an atomic two-unit query.  Retrying the full
+        pair avoids preserving one side of a service handoff as if it were a
+        stable rollback point.  Unknown, failed and otherwise inconsistent
+        states are returned immediately and rejected by the strict validator;
+        only documented transitional ActiveState values are polled.
+        """
+        snapshot: dict[str, _ServiceSnapshot] = {}
+        for attempt in range(_SERVICE_SNAPSHOT_ATTEMPTS):
+            snapshot = {
+                target: self._service_snapshot(target)
+                for target in ("wdg", "stock")
+            }
+            if not any(state.transitional for state in snapshot.values()):
+                return snapshot
+            if attempt + 1 < _SERVICE_SNAPSHOT_ATTEMPTS:
+                self._sleep(_SERVICE_SNAPSHOT_POLL_SECONDS)
+        return snapshot
+
+    def _service_snapshot_is_restorable(
+            self, snapshot: dict[str, _ServiceSnapshot],
+            *, operation: str) -> bool:
+        """Accept only complete, stable states the helper can restore exactly."""
+        for target in ("wdg", "stock"):
+            state = snapshot.get(target)
+            if state is None:
+                self._emit(
+                    "error",
+                    "Cannot " + operation + " Meshtastic services because "
+                    + target + " service state is missing",
+                )
+                return False
+            if state.exactly_restorable:
+                continue
+            self._emit(
+                "error",
+                "Cannot " + operation + " Meshtastic services from unstable "
+                + target + " state " + state.describe()
+                + "; wait for loaded/active or loaded/inactive with an "
+                "enabled/disabled unit, or not-found/inactive/not-found",
+            )
+            return False
+        active = [target for target in ("wdg", "stock")
+                  if snapshot[target].active]
+        if len(active) > 1:
+            self._emit(
+                "error",
+                "Cannot " + operation + " Meshtastic services while both "
+                "meshtasticd-wdg and stock meshtasticd are active",
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _snapshot_selected_target(
+            snapshot: dict[str, _ServiceSnapshot]) -> str | None:
+        active = [target for target in ("wdg", "stock")
+                  if snapshot[target].installed and snapshot[target].active]
+        if len(active) == 1:
+            return active[0]
+        if len(active) > 1:
+            return None
+        enabled = [target for target in ("wdg", "stock")
+                   if snapshot[target].installed and snapshot[target].enabled]
+        return enabled[0] if enabled else None
+
+    def _set_service_enabled(self, target: str, enabled: bool) -> bool:
+        if self._service_controller is not None:
+            status = (self._service_controller.enable(target) if enabled
+                      else self._service_controller.disable(target))
+            actual = str(getattr(status, "unit_file_state", "")).lower()
+            return actual == ("enabled" if enabled else "disabled")
+        service = WDG_SERVICE if target == "wdg" else LEGACY_SERVICE
+        result = self._run_service("enable" if enabled else "disable", service)
+        if result.returncode:
+            detail = (result.stderr or result.stdout
+                      or "systemctl failed").strip()
+            self._emit(
+                "error", f"Could not {'enable' if enabled else 'disable'} "
+                + service + ": " + detail[:160])
+            return False
+        try:
+            actual = self._service_snapshot(target).unit_file_state
+        except Exception:
+            return False
+        return actual == ("enabled" if enabled else "disabled")
+
+    def _select_service_target(self, target: str) -> bool:
+        """Persist and start one exact daemon while stopping its peer."""
+        other = "stock" if target == "wdg" else "wdg"
+        if self._service_controller is not None:
+            status = self._service_controller.select(target)
+            return bool(getattr(status, "active", False))
+        if not self._stop_exact_service(other):
+            return False
+        try:
+            other_installed = self._service_snapshot(other).installed
+        except Exception:
+            other_installed = True
+        if other_installed and not self._set_service_enabled(other, False):
+            return False
+        if not self._set_service_enabled(target, True):
+            return False
+        ready = (self._ensure_fork_service() if target == "wdg"
+                 else self._ensure_legacy_service())
+        return bool(ready)
+
+    def _restore_service_snapshot(
+            self, snapshot: dict[str, _ServiceSnapshot],
+            *, timeout: float = 15.0) -> bool:
+        """Restore active and enabled state for both mutually exclusive units."""
+        if not self._service_snapshot_is_restorable(
+                snapshot, operation="restore"):
+            return False
+        try:
+            # Stop unwanted owners before changing persistent selection.
+            for target in ("wdg", "stock"):
+                desired = snapshot[target]
+                if not desired.active and not self._stop_exact_service(target):
+                    return False
+            for target in ("wdg", "stock"):
+                desired = snapshot[target]
+                if not desired.installed:
+                    continue
+                current = self._service_snapshot(target)
+                if current.unit_file_state != desired.unit_file_state:
+                    if not self._set_service_enabled(target, desired.enabled):
+                        return False
+            for target in ("wdg", "stock"):
+                desired = snapshot[target]
+                if not desired.active:
+                    continue
+                if self._service_controller is not None:
+                    status = self._service_controller.start(target)
+                    if not bool(getattr(status, "active", False)):
+                        return False
+                else:
+                    result = self._run_service(
+                        "start", WDG_SERVICE if target == "wdg"
+                        else LEGACY_SERVICE)
+                    if result.returncode:
+                        return False
+
+            deadline = self._monotonic() + max(0.0, float(timeout))
+            while self._monotonic() < deadline:
+                if self._service_snapshot_matches(snapshot):
+                    return True
+                self._sleep(0.1)
+            return self._service_snapshot_matches(snapshot)
+        except Exception as exc:
+            self._emit("error", "Could not restore Meshtastic service state: "
+                       + str(exc)[:160])
+            return False
+
+    def _service_snapshot_matches(
+            self, snapshot: dict[str, _ServiceSnapshot]) -> bool:
+        for target in ("wdg", "stock"):
+            desired = snapshot[target]
+            actual = self._service_snapshot(target)
+            if desired.installed and not actual.installed:
+                return False
+            if actual.unit_file_state != desired.unit_file_state:
+                return False
+            if desired.active:
+                if not self._service_target_ready(target):
+                    return False
+            elif not self._service_is_stopped(
+                    actual.load_state, actual.active_state):
+                return False
+        return True
+
+    def _fork_may_own_resources(self) -> bool:
+        """Fail closed for an active or transitional fork without a socket."""
+        if self._socket_probe(self.socket_path):
+            return True
+        load_state, active_state = self._fork_service_state()
+        return not (
+            load_state == "not-found"
+            or active_state in ("inactive", "failed"))
+
+    def ble_coordination_ready(self) -> bool:
+        """Whether a host BLE user can safely request its bounded lease."""
+        if not self._fork_may_own_resources():
+            return True
+        return self.ensure_ble_coordination(timeout=5.0)
+
+    def ensure_ble_coordination(self, timeout: float = 5.0) -> bool:
+        """Maintain the restricted socket whenever the live fork owns BlueZ."""
+        if not self._fork_may_own_resources():
+            return True
+        if self.active_backend == "fork_socket" and self.connected:
+            return True
+        if self.backend_mode == "legacy_tcp":
+            self._emit(
+                "error", "The WDG daemon is active while legacy TCP is "
+                "selected; switch the Meshtastic backend first")
+            return False
+        if not self.running:
+            self.start()
+        self._fork_connected_event.wait(max(0.1, float(timeout)))
+        return self.active_backend == "fork_socket" and self.connected
 
     def _ensure_fork_service(self) -> bool:
         if self._socket_probe(self.socket_path):
             if self._service_controller is None:
                 self._fork_identified = True
+                self._remember_service_state("wdg", "loaded", "active")
                 return True
             try:
-                if self._service_controller.status("wdg").active:
+                status = self._service_controller.status("wdg")
+                self._remember_service_state(
+                    "wdg", getattr(status, "load_state", "loaded"),
+                    getattr(status, "active_state", "active"))
+                if status.active:
                     self._fork_identified = True
                     return True
             except Exception:
@@ -433,6 +1567,9 @@ class MeshtasticManager:
         try:
             if self._service_controller is not None:
                 status = self._service_controller.start("wdg")
+                self._remember_service_state(
+                    "wdg", getattr(status, "load_state", "loaded"),
+                    getattr(status, "active_state", "active"))
                 if not status.active:
                     self._emit("error", "Could not start meshtasticd-wdg: "
                                "service remained inactive")
@@ -452,6 +1589,7 @@ class MeshtasticManager:
             if self._stop_event.is_set():
                 return False
             if self._socket_probe(self.socket_path):
+                self._remember_service_state("wdg", "loaded", "active")
                 return True
             self._sleep(0.25)
         self._emit(
@@ -461,15 +1599,23 @@ class MeshtasticManager:
     def _ensure_legacy_service(self) -> bool:
         if self._port_probe(self.host, self.port):
             if self._service_controller is None:
+                self._remember_service_state("stock", "loaded", "active")
                 return True
             try:
-                if self._service_controller.status("stock").active:
+                status = self._service_controller.status("stock")
+                self._remember_service_state(
+                    "stock", getattr(status, "load_state", "loaded"),
+                    getattr(status, "active_state", "active"))
+                if status.active:
                     return True
             except Exception:
                 pass
         try:
             if self._service_controller is not None:
                 status = self._service_controller.start("stock")
+                self._remember_service_state(
+                    "stock", getattr(status, "load_state", "loaded"),
+                    getattr(status, "active_state", "active"))
                 if not status.active:
                     self._emit("error", "Could not start meshtasticd: "
                                "service remained inactive")
@@ -489,12 +1635,17 @@ class MeshtasticManager:
             if self._stop_event.is_set():
                 return False
             if self._port_probe(self.host, self.port):
+                self._remember_service_state("stock", "loaded", "active")
                 return True
             self._sleep(0.25)
         self._emit("error", "meshtasticd started but TCP port 4403 never opened")
         return False
 
     def _select_backend(self) -> str:
+        if self._resume_backend_once:
+            backend = self._resume_backend_once
+            self._resume_backend_once = ""
+            return backend
         if self.backend_mode == "fork_socket":
             self._fork_identified = True
             return "fork_socket"
@@ -511,44 +1662,145 @@ class MeshtasticManager:
             return "fork_socket"
         return "legacy_tcp"
 
-    def _stop_service(self) -> bool:
-        fork = (self.active_backend == "fork_socket"
-                or self.backend_mode == "fork_socket"
-                or self._fork_identified)
-        service = WDG_SERVICE if fork else LEGACY_SERVICE
-        label = "meshtasticd-wdg" if fork else "meshtasticd"
+    @staticmethod
+    def _service_is_stopped(load_state: str, active_state: str) -> bool:
+        return (load_state == "not-found"
+                or active_state in ("inactive", "failed"))
+
+    def active_service_target(self) -> str | None:
+        """Return the active unit, or the sole persistently enabled unit.
+
+        Saved UI preference and client transport are intentionally ignored:
+        systemd state is the ownership authority for a direct-radio handoff.
+        Returning an enabled but inactive unit lets a failed direct-radio
+        startup restore its exact boot-time selection without starting it.
+        """
+        candidates = []
+        enabled = []
+        for target in ("wdg", "stock"):
+            try:
+                state = self._service_snapshot(target)
+            except Exception:
+                continue
+            if state.installed and state.active:
+                candidates.append(target)
+            if state.installed and state.enabled:
+                enabled.append(target)
+        if not candidates:
+            if len(enabled) == 1:
+                return enabled[0]
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        preferred = (
+            "wdg" if self.active_backend == "fork_socket" else
+            "stock" if self.active_backend == "legacy_tcp" else "")
+        return preferred if preferred in candidates else candidates[0]
+
+    def _service_target_ready(self, target: str) -> bool:
         try:
             if self._service_controller is not None:
-                target = "wdg" if fork else "stock"
-                status = self._service_controller.stop(target)
-                if status.active:
-                    self._emit("error", f"Could not stop {label}: "
-                               "service remained active")
+                status = self._service_controller.status(target)
+                if not bool(getattr(status, "active", False)):
                     return False
-                result = None
             else:
-                result = self._run_service("stop", service)
-            if result is not None and result.returncode != 0:
-                detail = (result.stderr or result.stdout or "systemctl failed").strip()
+                _load_state, active_state = self._service_state(target)
+                if active_state != "active":
+                    return False
+        except Exception as exc:
+            self._emit("error", "Could not read Meshtastic service status: "
+                       + str(exc)[:160])
+            return False
+        if target == "wdg":
+            return bool(self._socket_probe(self.socket_path))
+        return bool(self._port_probe(self.host, self.port))
+
+    def _service_state(self, target: str) -> tuple[str, str]:
+        if self._service_controller is not None:
+            status = self._service_controller.status(target)
+            value = (
+                str(getattr(status, "load_state", "unknown")).lower(),
+                str(getattr(status, "active_state", "unknown")).lower(),
+            )
+            self._remember_service_state(target, *value)
+            return value
+        service = WDG_SERVICE if target == "wdg" else LEGACY_SERVICE
+        result = self._service_runner(
+            ["systemctl", "show", service,
+             "--property=LoadState", "--property=ActiveState"],
+            capture_output=True, text=True, timeout=12)
+        if result.returncode:
+            self._remember_service_state(target, "unknown", "unknown")
+            return "unknown", "unknown"
+        properties = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key.strip()] = value.strip().lower()
+        value = (
+            properties.get("LoadState", "unknown"),
+            properties.get("ActiveState", "unknown"),
+        )
+        self._remember_service_state(target, *value)
+        return value
+
+    def _stop_exact_service(self, target: str) -> bool:
+        service = WDG_SERVICE if target == "wdg" else LEGACY_SERVICE
+        label = "meshtasticd-wdg" if target == "wdg" else "meshtasticd"
+        load_state, active_state = self._service_state(target)
+        if self._service_is_stopped(load_state, active_state):
+            return True
+        if self._service_controller is not None:
+            self._service_controller.stop(target)
+        else:
+            result = self._run_service("stop", service)
+            if result.returncode:
+                detail = (result.stderr or result.stdout
+                          or "systemctl failed").strip()
                 self._emit("error", f"Could not stop {label}: " + detail[:160])
                 return False
-            self._emit("status", f"{label} stopped; SX1262 released")
+        deadline = self._monotonic() + 10.0
+        for _ in range(100):
+            load_state, active_state = self._service_state(target)
+            if self._service_is_stopped(load_state, active_state):
+                self._remember_service_state(target, load_state, active_state)
+                self._emit("status", f"{label} stopped")
+                return True
+            if self._monotonic() >= deadline:
+                break
+            self._sleep(0.1)
+        self._emit(
+            "error", f"Could not stop {label}: service remained "
+            f"{active_state or 'unknown'}")
+        return False
+
+    def _stop_service(self) -> bool:
+        """Stop every daemon that could still own the shared SX1262."""
+        # Configuration and historical client state are not ownership proof.
+        # Inspect both mutually exclusive units because a failed install,
+        # manual systemctl use, or an old setup can leave the unexpected unit
+        # active or transitional. Unknown state is handled fail-closed by an
+        # explicit stop attempt.
+        try:
+            for target in ("wdg", "stock"):
+                if not self._stop_exact_service(target):
+                    return False
         except Exception as exc:
-            self._emit("error", f"Could not stop {label}: {exc}")
+            self._emit("error", "Could not release Meshtastic services: "
+                       + str(exc)[:160])
             return False
         self.started_daemon = False
+        self._emit("status", "Meshtastic services stopped; SX1262 released")
         return True
 
     def _legacy_phoneapi_conflict(self) -> bool:
         """Whether TCP could steal a BLE-enabled fork's full-client lease."""
-        if self._phone_ble_enabled is False:
-            return False
-        if self._service_controller is not None:
-            try:
-                return bool(self._service_controller.status("wdg").active)
-            except Exception:
-                pass
-        return bool(self._socket_probe(self.socket_path))
+        # A saved "phone BLE off" preference is not proof that an already
+        # running daemon applied it.  The restricted socket is the only path
+        # that acknowledges that mutation, and selecting legacy deliberately
+        # avoids that socket.  Therefore any live fork blocks TCP; callers that
+        # want the stock daemon must switch the exact systemd service first.
+        return self._fork_may_own_resources()
 
     def _subscribe(self, callback: Callable, topic: str) -> None:
         self._pub.subscribe(callback, topic)
@@ -585,6 +1837,7 @@ class MeshtasticManager:
                 self._run_legacy_backend()
         finally:
             self.connected = False
+            self._connected_event.clear()
             with self._lock:
                 self.running = False
                 if self._thread is threading.current_thread():
@@ -615,6 +1868,7 @@ class MeshtasticManager:
                 return
 
             self.connected = True
+            self._connected_event.set()
             self._refresh_identity_and_channels()
             self._snapshot_nodes(cached=True)
             self._emit("connected", {
@@ -638,6 +1892,7 @@ class MeshtasticManager:
             interface = self._interface
             self._interface = None
             self.connected = False
+            self._connected_event.clear()
             self._unsubscribe_all()
             if interface is not None:
                 try:
@@ -650,6 +1905,10 @@ class MeshtasticManager:
         delay = 0.25
         while not self._stop_event.is_set():
             was_connected = False
+            # Applied policy belongs to one daemon connection. A restarted or
+            # downgraded daemon may omit these fields, so never authorize a
+            # lease bypass from the previous socket's acknowledgement.
+            self._reset_socket_session_state()
             try:
                 client = self._socket_connector(self.socket_path)
                 client.settimeout(0.25)
@@ -658,6 +1917,8 @@ class MeshtasticManager:
                 if self._stop_event.is_set():
                     break
                 self.connected = True
+                self._fork_connected_event.set()
+                self._connected_event.set()
                 was_connected = True
                 delay = 0.25
                 self._emit("connected", {
@@ -688,14 +1949,11 @@ class MeshtasticManager:
                     except OSError:
                         pass
                 if was_connected and not self._stop_event.is_set():
-                    self.connected = False
                     self._emit("disconnected", "meshtasticd-wdg connection lost")
                 self._fail_control_waiters(
                     "meshtasticd-wdg connection closed")
                 self._pending_requests.clear()
-                self._snapshot_pending = False
-                self._snapshot_active = False
-                self._snapshot_seen.clear()
+                self._reset_socket_session_state()
             if self._stop_event.is_set():
                 break
             # An interruptible wait keeps close() responsive and bounds log
@@ -832,10 +2090,11 @@ class MeshtasticManager:
         if (self._phone_ble_enabled is not None
                 and "set_phone_ble" in self._socket_capabilities):
             try:
-                self._socket_request(client, "set_phone_ble", {
+                applied = self._socket_request(client, "set_phone_ble", {
                     "enabled": bool(self._phone_ble_enabled),
                     "adapter": self._phone_ble_adapter,
                 })
+                self._record_applied_phone_ble(applied)
             except (OSError, WdgProtocolError) as exc:
                 # A BLE policy error must not take the LoRa node or WDG event
                 # stream down.  Surface it and keep the local API connected.
@@ -866,15 +2125,24 @@ class MeshtasticManager:
                     }, pending={})
                 elif command == "control":
                     name, body, waiter = data
-                    try:
-                        self._socket_command(
-                            client, name, body, pending=waiter)
-                    except (OSError, WdgProtocolError) as exc:
-                        waiter.reason = str(exc)
-                        waiter.event.set()
+                    self._dispatch_control_command(
+                        client, name, body, waiter)
             message = self._socket_receive(client)
             if message is not None:
                 self._handle_socket_message(client, message)
+
+    def _dispatch_control_command(
+            self, client: socket.socket, name: str, body: dict,
+            waiter: _ControlWaiter) -> bool:
+        """Send one queued control only while its caller can observe it."""
+        if not waiter.begin_send(self._monotonic()):
+            return False
+        try:
+            self._socket_command(client, name, body, pending=waiter)
+        except (OSError, WdgProtocolError) as exc:
+            waiter.resolve(False, str(exc))
+            return False
+        return True
 
     def _handle_socket_message(self, client: socket.socket,
                                message: dict) -> None:
@@ -935,15 +2203,43 @@ class MeshtasticManager:
             self._emit("status", f"Meshtastic event overflow ({count}); resyncing")
             self._request_snapshot(client)
         elif name in ("phone_connected", "phone_disconnected", "ble_status",
-                      "pairing_passkey"):
+                      "pairing_passkey", "pairing_pin",
+                      "full_client_owner", "full_client_status"):
             if name == "phone_connected":
                 self.phone_connected = True
+                self.pairing_pin = ""
             elif name == "phone_disconnected":
                 self.phone_connected = False
+                if self._ble_scan_lease_active:
+                    now = self._monotonic()
+                    self._phone_scan_disconnects.append(now)
+                    while (self._phone_scan_disconnects
+                           and now - self._phone_scan_disconnects[0] > 300):
+                        self._phone_scan_disconnects.popleft()
+                    if len(self._phone_scan_disconnects) >= 2:
+                        self.host_ble_degraded = True
+                        self.host_ble_pause_reason = (
+                            "Meshtastic phone disconnected repeatedly during "
+                            "host BLE scanning")
+                        self._emit(
+                            "status",
+                            "Host BLE paused: Meshtastic phone priority")
             elif name == "ble_status":
                 self.ble_status = str(body.get("state") or
                                       body.get("status") or "unknown")
+                if body.get("host_ble_paused") or body.get("degraded"):
+                    self.host_ble_degraded = True
+                    self.host_ble_pause_reason = str(
+                        body.get("reason") or
+                        "Meshtastic phone has Bluetooth priority")
+            elif name in ("pairing_passkey", "pairing_pin"):
+                self.pairing_pin = str(
+                    body.get("pin") or body.get("passkey") or "")
+            elif name in ("full_client_owner", "full_client_status"):
+                self._record_full_client_owner(body)
             text = body.get("message") or name.replace("_", " ")
+            if self.pairing_pin and name in ("pairing_passkey", "pairing_pin"):
+                text = f"Meshtastic phone PIN: {self.pairing_pin}"
             self._emit("status", str(text))
 
     def _handle_socket_reply(self, message: dict) -> None:
@@ -957,8 +2253,7 @@ class MeshtasticManager:
             text = (message.get("message") or message.get("error_code")
                     or f"{name} failed")
             if isinstance(context, _ControlWaiter):
-                context.reason = str(text)
-                context.event.set()
+                context.resolve(False, str(text))
             else:
                 self._emit("error", str(text))
             if name == "snapshot_nodes":
@@ -967,10 +2262,8 @@ class MeshtasticManager:
         body = message.get("body", message.get("payload", {}))
         body = body if isinstance(body, dict) else {}
         if isinstance(context, _ControlWaiter):
-            context.ok = True
-            context.body = dict(body)
-            context.reason = str(body.get("reason") or "")
-            context.event.set()
+            context.resolve(
+                True, str(body.get("reason") or ""), dict(body))
         elif name == "send_text":
             value = dict(context)
             value.update({key: body[key] for key in ("packet_id", "id")
@@ -993,8 +2286,7 @@ class MeshtasticManager:
     def _fail_control_waiters(self, reason: str) -> None:
         for _name, context in self._pending_requests.values():
             if isinstance(context, _ControlWaiter):
-                context.reason = reason
-                context.event.set()
+                context.resolve(False, reason)
 
     def _request_snapshot(self, client: socket.socket) -> None:
         if self._snapshot_pending:
@@ -1042,6 +2334,8 @@ class MeshtasticManager:
             self.ble_status = str(body.get("ble_status") or "unknown")
         if "phone_connected" in body:
             self.phone_connected = bool(body["phone_connected"])
+        self._record_applied_phone_ble(body)
+        self._record_full_client_owner(body)
         radio = body.get("radio")
         if isinstance(radio, dict):
             self.radio_status = str(radio.get("state") or
@@ -1300,6 +2594,7 @@ class MeshtasticManager:
         if interface is not None and interface is not self._interface:
             return
         self.connected = False
+        self._fork_connected_event.clear()
         self._emit("disconnected", "meshtasticd connection lost")
 
     def _send_now(self, data: dict) -> None:

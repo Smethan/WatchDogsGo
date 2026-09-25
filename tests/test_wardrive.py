@@ -826,7 +826,8 @@ def test_split_wardrive_host_ble_detection_and_stop(game):
     assert w.scan.wifi_only
     assert game.serial.send_command.call_args.args[0] == "start_wardrive_wifi_serial " + token
     w.handle_line(wire(record("started", session=token, seq=1)))
-    w.host_ble.start.assert_called_once_with(token, adapter="auto")
+    w.host_ble.start.assert_called_once_with(
+        token, adapter="auto", require_lease=True)
     device = NS(address="C2:00:00:00:00:01", details={"props":{"AddressType":"random"}})
     adv = NS(local_name="Penguin-123", rssi=-52, manufacturer_data={}, service_data={}, service_uuids=[])
     d = advertisement_record(device, adv)
@@ -921,6 +922,7 @@ def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only
     def start_meshcore(region):
         lora.running = True
         lora.mode = "meshcore"
+        return True
 
     lora.start_meshcore = Mock(side_effect=start_meshcore)
     sdr = NS(running=False, mode="")
@@ -935,6 +937,7 @@ def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only
     w.scan.wifi_supported = True
     if wifi_only:
         w.host_ble = Mock(state="idle", drops=0)
+        w.host_ble.worker_active = False
         w.host_ble.start.return_value = True
         w.host_ble.poll.return_value = []
 
@@ -949,7 +952,8 @@ def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only
     sdr.start_adsb.assert_called_once_with(str(game.loot.session_path))
     assert w.scan.state == "running"
     if wifi_only:
-        w.host_ble.start.assert_called_once_with(token, adapter="auto")
+            w.host_ble.start.assert_called_once_with(
+                token, adapter="auto", require_lease=True)
 
 
 def test_all_wardrive_aux_collectors_skip_diagnostic_and_busy_radios(game):
@@ -1059,10 +1063,12 @@ def test_all_wardrive_uses_selected_meshtastic_client(game, wifi_only):
     meshtastic = NS(
         running=False, connected=False, start=Mock(return_value=True))
 
-    def switch(protocol, *, start_if_enabled):
+    def switch(protocol, *, start_if_enabled, _transition_action="handoff"):
         assert protocol == "meshtastic" and start_if_enabled
+        assert _transition_action == "wardrive"
         meshtastic.start()
         meshtastic.running = True
+        return True
 
     game._switch_lora_protocol = Mock(side_effect=switch)
     game._meshtastic = meshtastic
@@ -1076,10 +1082,33 @@ def test_all_wardrive_uses_selected_meshtastic_client(game, wifi_only):
 
     assert w.start_auxiliary_collectors()
     game._switch_lora_protocol.assert_called_once_with(
-        "meshtastic", start_if_enabled=True)
+        "meshtastic", start_if_enabled=True,
+        _transition_action="wardrive")
     meshtastic.start.assert_called_once()
     game._lora.start_meshcore.assert_not_called()
-    assert w._wdg_owned_lora
+    # Ownership is claimed only after the asynchronous service-ready result.
+    assert not w._wdg_owned_lora
+
+
+def test_all_wardrive_rejected_meshtastic_start_never_claims_ownership(game):
+    w = game.wardrive
+    w.settings.update(
+        lora_protocol="meshtastic", wardrive_lora=True,
+        wardrive_adsb=False, wardrive_433=False, lte_modem=False)
+    game._meshtastic = NS(running=False, connected=False)
+    game._lora = NS(running=False, mode="")
+    game._lora_enabled = True
+    game._sdr_enabled = False
+    game._switch_lora_protocol = Mock(return_value=False)
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    w.scan.diagnostic = False
+    w._wdg_owned_lora = False
+
+    assert not w.start_auxiliary_collectors()
+    assert not w._wdg_owned_lora
+    assert any("start was not accepted" in call.args[0]
+               for call in game._term_add.call_args_list)
 
 
 def test_disabled_lora_collector_suppresses_active_meshcore_discovery(game):
@@ -1322,7 +1351,8 @@ def test_lte_off_never_starts_cell_and_does_not_block_all_wardrive(game, wifi_on
     assert w.scan.state == "running"
     w.cell.start.assert_not_called()
     if wifi_only:
-        w.host_ble.start.assert_called_once_with(token, adapter="auto")
+            w.host_ble.start.assert_called_once_with(
+                token, adapter="auto", require_lease=True)
 
 
 def test_lte_toggle_stops_only_cell_and_reconfigures_gps(game):
