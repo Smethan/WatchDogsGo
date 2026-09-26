@@ -332,6 +332,7 @@ def test_lora_protocol_switch_rejection_does_not_persist_or_claim_owner():
 def test_meshtastic_backend_switch_reconnects_existing_client_only():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
+    ui.settings["lora_protocol"] = "meshtastic"
     ui.persist_settings = Mock()
     ui.host_ble = NS(worker_active=False)
     ui._meshtastic_action_results = Queue()
@@ -371,9 +372,55 @@ def test_meshtastic_backend_switch_reconnects_existing_client_only():
     ui.persist_settings.assert_called_once_with()
 
 
+def test_meshcore_backend_choice_defers_service_handoff():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    assert ui.settings["lora_protocol"] == "meshcore"
+    ui.persist_settings = Mock()
+    ui.host_ble = NS(worker_active=False)
+    ui._meshtastic_action_results = Queue()
+    ui._meshtastic_action_thread = None
+    ui._host_ble_retry_pending = False
+    manager = NS(
+        running=False, connected=False, backend_mode="auto", last_error="",
+        ble_scan_lease_active=False, pairing_agent_lease_active=False,
+        set_backend_mode=Mock(return_value=True), close=Mock(),
+        activate_backend_service=Mock(), start=Mock(),
+        commit_backend_service_activation=Mock(),
+        rollback_backend_service_activation=Mock(),
+        _service_controller=None)
+    ui.app = NS(
+        _meshtastic=manager, _term_add=Mock(), msg=Mock(),
+        _watch=NS(worker_active=False),
+        _lora=NS(running=False, worker_active=False, radio_owned=False),
+        _lora_transition_active=lambda: False)
+
+    assert ui.cycle_meshtastic_backend()
+    ui._meshtastic_action_thread.join(timeout=2.0)
+    ok, _label, detail, on_success = (
+        ui._meshtastic_action_results.get_nowait())
+    assert ok
+    assert detail == "preference set to fork_socket"
+    on_success()
+
+    assert ui.settings["meshtastic_backend"] == "fork_socket"
+    manager.set_backend_mode.assert_called_once_with("fork_socket")
+    manager.close.assert_not_called()
+    manager.activate_backend_service.assert_not_called()
+    manager.start.assert_not_called()
+    manager.commit_backend_service_activation.assert_not_called()
+    manager.rollback_backend_service_activation.assert_not_called()
+    ui.persist_settings.assert_called_once_with()
+    ui.app._term_add.assert_called_once_with(
+        "[MT] Backend preference set to fork_socket; applies when Meshtastic "
+        "is selected",
+        raw=True)
+
+
 def test_meshtastic_backend_switch_aborts_before_service_change_if_close_sticks():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
+    ui.settings["lora_protocol"] = "meshtastic"
     ui.persist_settings = Mock()
     ui.host_ble = NS(worker_active=False)
     ui._meshtastic_action_results = Queue()
@@ -409,6 +456,7 @@ def test_meshtastic_backend_switch_aborts_before_service_change_if_close_sticks(
 def test_backend_switch_rolls_back_and_does_not_persist_before_negotiation():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
+    ui.settings["lora_protocol"] = "meshtastic"
     ui.persist_settings = Mock()
     ui.host_ble = NS(worker_active=False)
     ui._meshtastic_action_results = Queue()
@@ -448,6 +496,7 @@ def test_backend_switch_rolls_back_and_does_not_persist_before_negotiation():
 def test_backend_switch_does_not_commit_or_rollback_without_close_barrier():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
+    ui.settings["lora_protocol"] = "meshtastic"
     ui.persist_settings = Mock()
     ui.host_ble = NS(worker_active=False)
     ui._meshtastic_action_results = Queue()
@@ -486,6 +535,7 @@ def test_backend_switch_does_not_commit_or_rollback_without_close_barrier():
 def test_failed_backend_switch_does_not_restart_previously_stopped_client():
     ui = WardriveUI.__new__(WardriveUI)
     ui.settings = normalize_settings({})
+    ui.settings["lora_protocol"] = "meshtastic"
     ui.persist_settings = Mock()
     ui.host_ble = NS(worker_active=False)
     ui._meshtastic_action_results = Queue()

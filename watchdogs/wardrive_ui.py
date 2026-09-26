@@ -1503,6 +1503,43 @@ class WardriveUI:
                 ORANGE)
             return False
 
+        # The backend choice is only meaningful once Meshtastic owns the
+        # SX1262.  A completed direct MeshCore session deliberately retains
+        # the exact pre-session service snapshot while both daemons remain
+        # stopped.  Persist the future transport choice without touching that
+        # rollback token; the normal MeshCore -> Meshtastic handoff restores
+        # it and activates this selected backend transactionally.
+        deferred = self.settings.get("lora_protocol") != "meshtastic"
+
+        def persist_backend():
+            self.settings["meshtastic_backend"] = selected
+            self.persist_settings()
+            if selected == "legacy_tcp":
+                self._host_ble_retry_pending = True
+            if deferred:
+                self.app._term_add(
+                    f"[MT] Backend preference set to {selected}; applies when "
+                    "Meshtastic is selected",
+                    raw=True)
+            else:
+                self.app._term_add(
+                    f"[MT] Backend and service set to {selected}",
+                    raw=True)
+
+        if deferred:
+            def defer_backend(value):
+                if value.running or value.connected:
+                    value.last_error = (
+                        "Meshtastic client is still running while MeshCore is "
+                        "selected; stop it before changing the preference")
+                    return False
+                return value.set_backend_mode(selected)
+
+            return self._start_meshtastic_action(
+                "Backend", defer_backend,
+                "preference set to " + selected,
+                on_success=persist_backend)
+
         def switch_backend(value):
             was_running = bool(value.running)
             previous_mode = value.backend_mode
@@ -1598,15 +1635,6 @@ class WardriveUI:
                         "Meshtastic backend switch failed: " + str(exc)[:120])
                 value.last_error = str(exc)[:160]
                 return False
-
-        def persist_backend():
-            self.settings["meshtastic_backend"] = selected
-            self.persist_settings()
-            if selected == "legacy_tcp":
-                self._host_ble_retry_pending = True
-            self.app._term_add(
-                f"[MT] Backend and service set to {selected}",
-                raw=True)
 
         return self._start_meshtastic_action(
             "Backend", switch_backend, "set to " + selected,
