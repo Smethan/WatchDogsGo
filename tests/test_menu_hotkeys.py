@@ -8,7 +8,6 @@ import pytest
 import watchdogs.app as appmod
 from watchdogs.app import MENU_CATS, WatchDogsGame, _menu_hotkey_key
 
-
 MENU_ITEMS = [
     (cat_idx, item_idx, item[0])
     for cat_idx, (_name, items) in enumerate(MENU_CATS)
@@ -163,7 +162,6 @@ def test_menu_availability_tracks_live_addon_switches():
     ("_wardrive_settings", "_wardrive_settings"),
     ("_evil_twin", "evil_twin"),
     ("_evil_portal", "portal"),
-    ("_meshcore_region", "_mc_region_screen"),
     ("_flipper", "_flipper"),
     ("_watch_connect", "_watch"),
 ])

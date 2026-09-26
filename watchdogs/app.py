@@ -196,7 +196,6 @@ MENU_CATS = [
         ("2", "BT Wardrive",     "scan_bt",                "bt_scanning",  None),
         ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
         ("9", "All Wardrive (host BLE)", "start_wardrive_wifi_serial", "all_wardrive_host", None),
-        ("8", "ESP Dual Test", "start_wardrive_serial", "all_wardrive_test", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
@@ -220,7 +219,6 @@ MENU_CATS = [
         ("h", "BLE HID (WIP)",   "_bt_hid_wip",            "_bt_hid_wip",  None),
         ("i", "HID Type (WIP)",  "_bt_hid_wip",            "_bt_hid_wip",  None),
         ("9", "Mesh Messenger",  "_meshcore",            "meshcore",     None),
-        ("r", "MeshCore Region", "_meshcore_region",         "_mc_region_screen", None),
         ("f", "Flipper Zero",    "_flipper",               "_flipper",     None),
         ("a", "ADS-B Radar",     "_sdr_adsb",              "_sdr_adsb",    None),
         ("4", "433 MHz Scanner", "_sdr_433",               "_sdr_433",     None),
@@ -726,6 +724,7 @@ class WatchDogsGame(OtaMixin):
         from .lora_manager import DEFAULT_MESHCORE_REGION
         self._mc_region = _mc_cfg.get("region", DEFAULT_MESHCORE_REGION)
         self._mc_region_screen = False
+        self._mc_region_return_to_settings = False
         self._mc_region_sel = 0
         self._mc_channels_list = _mc_cfg.get("_channels", [])
         self._mc_active_ch = 0
@@ -1877,9 +1876,6 @@ class WatchDogsGame(OtaMixin):
                     and getattr(lora, "mode", "") != "meshcore"):
                 mode = getattr(lora, "mode", "") or "another mode"
                 return f"[MC] LoRa busy in {mode}; stop it first"
-        if cmd == "_meshcore_region" and hasattr(self, "wardrive"):
-            if self.wardrive.settings.get("lora_protocol") != "meshcore":
-                return "[MC] Region applies only when LoRa protocol is MeshCore"
         return ""
 
     def _activate_menu_item(self, cat_idx: int, item_idx: int):
@@ -1960,7 +1956,7 @@ class WatchDogsGame(OtaMixin):
                 scan.probe()
                 self.msg("[WDG] Checking firmware; retry All Wardrive in a few seconds.", C_WARNING)
             return
-        if state_key in ("all_wardrive", "all_wardrive_test") and not self._is_running(state_key) and not self.wardrive.scan.supported:
+        if state_key == "all_wardrive" and not self._is_running(state_key) and not self.wardrive.scan.supported:
             self.wardrive.scan.probe()
             self.msg("[WDG] Needs serial wardrive firmware; checking capabilities.", C_WARNING)
             return
@@ -2086,7 +2082,9 @@ class WatchDogsGame(OtaMixin):
                 return
 
         # GPS fix check — only wardriving modes (SNIFF tab) need GPS for loot
-        _is_wardrive = state_key in ("wardriving", "bt_scanning", "all_wardrive", "all_wardrive_host", "all_wardrive_test")
+        _is_wardrive = state_key in (
+            "wardriving", "bt_scanning", "all_wardrive",
+            "all_wardrive_host")
         running = self._is_running(state_key)
         if _is_wardrive and not running and not self.gps_fix:
             # No GPS fix — show wait/cancel dialog
@@ -2143,9 +2141,8 @@ class WatchDogsGame(OtaMixin):
 
     def _is_running(self, state_key: str) -> bool:
         return {
-            "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and not self.wardrive.scan.diagnostic and not self.wardrive.scan.wifi_only,
+            "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and not self.wardrive.scan.wifi_only,
             "all_wardrive_host": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and self.wardrive.scan.wifi_only,
-            "all_wardrive_test": self.wardrive.scan.active and self.wardrive.scan.diagnostic,
             "hs_sniff": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
             "_hs_sniff_menu": self.wardrive.scan.active and self.wardrive.scan.mode == "hs_sniff",
             "wardriving":    self.wifi_scanning,
@@ -2385,18 +2382,6 @@ class WatchDogsGame(OtaMixin):
                     ("\x11 Shortcuts: Ctrl+N=name  Ctrl+A=advert  "
                      "Ctrl+C=channel  Ctrl+X=clear", 13))
                 self._mc_help_shown = True
-            return
-
-        # ── MeshCore Region picker ──
-        if cmd == "_meshcore_region":
-            from .lora_manager import MESHCORE_PRESETS
-            keys = list(MESHCORE_PRESETS.keys())
-            try:
-                self._mc_region_sel = keys.index(self._mc_region)
-            except ValueError:
-                self._mc_region_sel = 0
-            self._mc_region_screen = True
-            self.menu_open = False
             return
 
         if cmd == "_flipper":
@@ -6766,7 +6751,8 @@ class WatchDogsGame(OtaMixin):
                 p = self.wardrive.passive
                 tool_name = f"HS SNIFF {self.wardrive.scan.state.upper()} EAPOL:{p.eapol} PMKID:{p.pmkids}"
             else:
-                label = "ESP DUAL TEST" if self.wardrive.scan.diagnostic else "ALL WARDRIVE (HOST BLE)" if self.wardrive.scan.wifi_only else "ALL WARDRIVE"
+                label = ("ALL WARDRIVE (HOST BLE)"
+                         if self.wardrive.scan.wifi_only else "ALL WARDRIVE")
                 tool_name = label + " " + self.wardrive.scan.state.upper()
         elif self.capturing_hs: tool_name = "HANDSHAKE"
         elif self.wifi_scanning or self._wifi_scan_only: tool_name = "WiFi SCAN"
@@ -7531,7 +7517,7 @@ class WatchDogsGame(OtaMixin):
         pyxel.text(dx + 4, dy + dh - 11, hint, C_DIM)
 
     # ------------------------------------------------------------------
-    # MeshCore region picker (ADDONS > MeshCore Region)
+    # MeshCore region picker (Wardrive Settings > LoRa settings)
     # ------------------------------------------------------------------
 
     def _update_mc_region_picker(self):
@@ -7540,7 +7526,7 @@ class WatchDogsGame(OtaMixin):
         from .lora_manager import MESHCORE_PRESETS, save_meshcore_config
         keys = list(MESHCORE_PRESETS.keys())
         if not keys:
-            self._mc_region_screen = False
+            self._close_mc_region_picker()
             return
         if px.btnp(px.KEY_UP):
             self._mc_region_sel = max(0, self._mc_region_sel - 1)
@@ -7571,10 +7557,18 @@ class WatchDogsGame(OtaMixin):
                     self._term_add(f"[MC] Retuned to {label}", raw=True)
                 except Exception as exc:
                     self._term_add(f"[MC] retune failed: {exc}", raw=True)
-            self._mc_region_screen = False
+            self._close_mc_region_picker()
         elif px.btnp(px.KEY_ESCAPE):
-            self._mc_region_screen = False
+            self._close_mc_region_picker()
             self._esc_consumed_frame = pyxel.frame_count
+
+    def _close_mc_region_picker(self):
+        """Close the picker and restore its originating settings page."""
+        self._mc_region_screen = False
+        if getattr(self, "_mc_region_return_to_settings", False):
+            self._mc_region_return_to_settings = False
+            self.wardrive.settings_open = True
+            self.wardrive.settings_page = "lora"
 
     def _draw_mc_region_picker(self):
         """Draw MeshCore regional preset picker overlay."""

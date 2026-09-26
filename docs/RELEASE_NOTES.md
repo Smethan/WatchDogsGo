@@ -1,5 +1,15 @@
 # Smethan WatchDogsGo
 
+## Unreleased — LoRa settings menu
+
+- Group LoRa protocol, MeshCore region, and Meshtastic service/phone controls
+  under **Wardrive Settings > LoRa settings**. The automatic LoRa collector
+  toggle remains under **All Wardrive collectors**, while LoRa power remains in
+  SYSTEM and Mesh Messenger remains in ADDONS.
+- Remove the obsolete ESP Dual Test menu mode and its timing-log plumbing. The
+  two supported All Wardrive choices retain the corrected control/data liveness
+  checks and sequence-gap counters.
+
 ## 0.9.41 — Shared AIO GPS ownership through gpsd
 
 - Make `gpsd` the sole reader of the uConsole AIO GPS UART when Meshtastic is

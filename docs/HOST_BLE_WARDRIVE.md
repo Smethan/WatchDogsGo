@@ -1,61 +1,33 @@
-# All Wardrive and ESP Dual Test
+# All Wardrive radio modes
 
-WDG 0.9.27 has three distinct modes under SNIFF. All Wardrive defaults to the
-ESP32 for both radios; host Bluetooth is an explicit separate option. Firmware
-1.7.10 adds the preferred ten-second batch transport; older firmware keeps the
-streaming fallback.
+WDG provides two modes under SNIFF. **All Wardrive** uses the ESP32 for both
+Wi-Fi and BLE. **All Wardrive (host BLE)** keeps Wi-Fi on the ESP32 and uses a
+uConsole BlueZ adapter for BLE. Firmware 1.7.10 adds the preferred ten-second
+batch transport; older supported firmware uses the streaming fallback.
 
-WDG 0.9.31 records the registered serving cell in both All Wardrive modes from
-ModemManager's cached location state. It uses the same batch boundary and host
-GPS fix whether BLE comes from the ESP32 or BlueZ. The safe default does not
-launch qmicli or open a modem device node. Optional QMI neighbor measurements
-are local-only and disabled by default. See [cellular stability and
+Both modes can record the registered serving cell from ModemManager's cached
+location state and use the same host GPS fix. The safe default does not launch
+qmicli or open a modem device node. Optional QMI neighbor measurements are
+local-only and disabled by default. See [cellular stability and
 setup](CELLULAR_STABILITY.md).
 
 | Mode | Wi-Fi radio | BLE radio | Firmware required |
 | --- | --- | --- | --- |
 | All Wardrive (6) | ESP32, ten-second batch | ESP32, same batch | 1.7.10 preferred; v1 fallback |
 | All Wardrive (host BLE) (9) | ESP32, ten-second batch | uConsole/BlueZ, continuous | 1.7.10 preferred; 1.7.3 fallback |
-| ESP Dual Test (8) | ESP32, ten-second batch | ESP32, same batch | 1.7.10 preferred; v1 fallback |
 
-## Why change it?
+## Session liveness
 
 Espressif marks C5 Wi-Fi sniffer plus BLE coexistence as supported with unstable
-performance. That does not prove a given timeout was a firmware crash. WDG also
-had a separate false-timeout path: only started/stats messages renewed its
-seven-second watchdog, even while valid discovery records were arriving.
-Version 0.9.27 tracks control heartbeats and ESP observations independently.
-After six seconds without control it asks `wardrive_status` for the current
-phase. It stops after 15 seconds only if both control and ESP records are absent.
-Stale sessions, duplicate sequences, malformed records, host BLE observations
-and ModemManager cell snapshots cannot keep an unresponsive ESP32 session alive. The
-firmware's 15-second host lease and five-second WDG keepalives remain in effect.
+performance. That alone does not identify the cause of a timeout. WDG tracks
+firmware control records and ESP observations independently. After six seconds
+without control it asks `wardrive_status` for the current phase. It stops after
+15 seconds only if both control and ESP records are absent. Stale sessions,
+duplicate sequences, malformed records, host BLE observations and ModemManager
+cell snapshots cannot keep an unresponsive ESP32 session alive. The firmware's
+15-second host lease and WDG's five-second keepalive remain in effect.
 
 Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html
-
-## Test before reflashing
-
-1. Update WDG with SYSTEM → Update WDG or `bash update.sh`, then restart.
-2. Select SNIFF → ESP Dual Test (8). Both scans stay on the ESP32; no host
-   Bluetooth is started. Use the same area and conditions that caused timeouts.
-3. Watch the overlay: `ctl` is the age of the last firmware control frame;
-   `data` is the age of the last ESP32 observation, and `probes` counts explicit
-   state queries. `gaps` counts
-   missing record sequence numbers, not all over-the-air packet loss. Its
-   percentage is missing sequence positions divided by the latest accepted
-   sequence number, over the whole session so far.
-4. A late heartbeat produces a status query rather than an immediate stop. If
-   both control and ESP observations stop for 15 seconds, WDG stops the scan.
-   That indicates a stream interruption, which may be firmware, USB, host
-   processing, or power. It does not alone prove a coexistence crash.
-5. Stop with the normal STOP action. Timing snapshots are appended once per
-   second and on state changes to `wardrive_diagnostics.jsonl` in the current
-   loot session. The console prints its location. It includes counts, firmware
-   stats, sequence gaps, invalid records, errors and false-timeout episodes.
-   Serial disconnects are recorded before resetting the controller.
-
-The test leaves the normal keepalive active and retains the real-silence
-watchdog. It does not deliberately run an uncontrolled or disconnected scan.
 
 ## What gaps mean
 
@@ -72,8 +44,8 @@ count needs a denominator: 1,000 gaps in 100,000 positions is 1%, whereas 1,000
 in 2,000 is 50%. These are examples, not safe/unsafe thresholds. Repeated
 sightings can still discover devices despite some loss, but brief sightings or
 signature evidence can be missed. Neither gaps nor drops measure all RF loss.
-Compare timing logs, gap percentage, `invalid_records`, firmware drops and
-discovery continuity when diagnosing sustained high loss.
+Compare gap percentage, `invalid_records`, firmware drops and discovery
+continuity when diagnosing sustained high loss.
 
 ## Switch to host Bluetooth
 

@@ -7,9 +7,17 @@ from unittest.mock import Mock
 import pytest
 
 from watchdogs.wardrive_settings import (
-    DEFAULTS, load_settings, normalize_settings, save_settings,
+    DEFAULTS,
+    load_settings,
+    normalize_settings,
+    save_settings,
 )
-from watchdogs.wardrive_ui import WardriveUI
+from watchdogs.wardrive_ui import (
+    COLLECTOR_SETTINGS,
+    LORA_SETTINGS,
+    MAIN_SETTINGS,
+    WardriveUI,
+)
 
 
 def test_legacy_settings_keep_existing_values_and_enable_lte_by_default(tmp_path):
@@ -96,6 +104,50 @@ def test_collector_defaults_and_invalid_sdr_pair_are_exclusive():
         "lora_protocol"] == "meshcore"
 
 
+def test_lora_settings_are_grouped_away_from_wardrive_capture_toggle():
+    from watchdogs.app import MENU_CATS
+
+    main_keys = tuple(key for key, _label in MAIN_SETTINGS)
+    collector_keys = tuple(key for key, _label in COLLECTOR_SETTINGS)
+    lora_keys = tuple(key for key, _label in LORA_SETTINGS)
+    assert "_lora_settings" in main_keys
+    assert "_meshtastic" not in main_keys
+    assert collector_keys == (
+        "wardrive_lora", "wardrive_adsb", "wardrive_433")
+    assert lora_keys == (
+        "lora_protocol", "_meshcore_region", "_meshtastic")
+
+    sniff_labels = next(items for name, items in MENU_CATS if name == "SNIFF")
+    addon_commands = next(items for name, items in MENU_CATS if name == "ADDONS")
+    assert all(item[1] != "ESP Dual Test" for item in sniff_labels)
+    assert all(item[2] != "_meshcore_region" for item in addon_commands)
+
+
+def test_meshcore_region_picker_returns_to_lora_settings():
+    from watchdogs.app import WatchDogsGame
+    from watchdogs.lora_manager import MESHCORE_PRESETS
+
+    game = WatchDogsGame.__new__(WatchDogsGame)
+    ui = WardriveUI.__new__(WardriveUI)
+    game.wardrive = ui
+    ui.app = game
+    ui.settings_open = True
+    ui.settings_page = "lora"
+    game._mc_region = next(iter(MESHCORE_PRESETS))
+    game._mc_region_screen = False
+    game._mc_region_return_to_settings = False
+
+    ui.open_meshcore_region_picker()
+    assert game._mc_region_screen
+    assert game._mc_region_return_to_settings
+    assert not ui.settings_open
+
+    game._close_mc_region_picker()
+    assert not game._mc_region_screen
+    assert ui.settings_open
+    assert ui.settings_page == "lora"
+
+
 def test_meshtastic_backend_and_adapter_settings_are_normalized():
     defaults = normalize_settings({})
     assert defaults["meshtastic_backend"] == "auto"
@@ -144,7 +196,7 @@ def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():
     sdr = NS(running=True, mode="adsb", stop=Mock())
     ui.app = NS(_lora=lora, _sdr=sdr,
                 _term_add=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.toggle_setting("wardrive_433")
     assert ui.settings["wardrive_433"] is True
@@ -174,7 +226,7 @@ def test_disabling_lora_collector_retains_owner_until_worker_and_lock_release(
         mode="meshcore", stop=Mock(return_value=stop_result))
     ui.app = NS(
         _lora=lora, _meshtastic=None, _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert not ui._apply_collector_setting_change("wardrive_lora")
@@ -202,7 +254,7 @@ def test_disabling_lora_collector_honors_negative_stop_ack_after_worker_exit():
     lora.stop = Mock(side_effect=unconfirmed_stop)
     ui.app = NS(
         _lora=lora, _meshtastic=None, _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert not ui._apply_collector_setting_change("wardrive_lora")
@@ -221,7 +273,7 @@ def test_disabling_lora_collector_retains_owner_until_client_close_barrier(
     ui.app = NS(
         _lora=None, _meshtastic=manager, _lora_handoff_pending=None,
         _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert not ui._apply_collector_setting_change("wardrive_lora")
@@ -247,7 +299,7 @@ def test_disabling_lora_collector_honors_negative_close_ack_after_worker_exit():
     ui.app = NS(
         _lora=None, _meshtastic=manager, _lora_handoff_pending=None,
         _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert not ui._apply_collector_setting_change("wardrive_lora")
@@ -270,7 +322,7 @@ def test_disabling_lora_collector_clears_owner_after_confirmed_client_close():
     ui.app = NS(
         _lora=None, _meshtastic=manager, _lora_handoff_pending=None,
         _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert ui._apply_collector_setting_change("wardrive_lora")
@@ -287,7 +339,7 @@ def test_disabling_lora_collector_keeps_pending_handoff_owned():
         _lora_handoff_pending=("wardrive", 4),
         _cancel_pending_lora_start=Mock(return_value=True),
         _lora_start_pending="", _term_add=Mock(), msg=Mock())
-    ui.scan = NS(state="idle", mode="", diagnostic=False)
+    ui.scan = NS(state="idle", mode="")
 
     ui.settings["wardrive_lora"] = False
     assert not ui._apply_collector_setting_change("wardrive_lora")

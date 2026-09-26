@@ -16,12 +16,12 @@ class ScanController:
         self.capture_exclusions_supported = self.capture_pcapng_supported = None
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
-        self.wifi_only = self.diagnostic = self.batch = self.legacy = False
+        self.wifi_only = self.batch = self.legacy = False
         self.record_counts = Counter()
-        self.seq_gaps = self.false_timeouts = 0
-        self._old_timeout = self._control_warned = False
+        self.seq_gaps = 0
+        self._control_warned = False
         now = self.clock()
-        self.last_stats = self.last_control = self.last_data = self.last_heartbeat = now
+        self.last_control = self.last_data = self.last_heartbeat = now
         self.mode = "wardrive"
         self.probing = False
         self.probe_deadline = self.next_probe = 0
@@ -63,22 +63,21 @@ class ScanController:
         self.send("get_capabilities")
         return True
 
-    def start(self, mode="wardrive", wifi_only=False, diagnostic=False):
+    def start(self, mode="wardrive", wifi_only=False):
         supported = self.hs_supported if mode == "hs_sniff" else (
             self.wifi_supported if wifi_only else self.supported)
         if not supported or self.active:
             return False
         self.mode = mode
         self.wifi_only = wifi_only and mode == "wardrive"
-        self.diagnostic = diagnostic
         self.batch = mode == "wardrive" and (
             self.wifi_batch_supported if self.wifi_only else self.batch_supported)
         self.legacy = mode == "wardrive" and not self.batch
         self.record_counts.clear()
-        self.seq_gaps = self.false_timeouts = 0
-        self._old_timeout = self._control_warned = False
+        self.seq_gaps = 0
+        self._control_warned = False
         now = self.clock()
-        self.last_stats = self.last_control = self.last_data = self.last_heartbeat = now
+        self.last_control = self.last_data = self.last_heartbeat = now
         self.session = secrets.token_hex(8)
         self.seq = 0
         self.last_seen.clear()
@@ -161,7 +160,6 @@ class ScanController:
             self.deadline = now + (8 if self.batch else 6)
         if kind in ("started", "stats", "heartbeat", "status", "batch_start",
                     "batch_results", "batch_done"):
-            self.last_stats = now
             self.stats = d
         if d.get("v", 1) == 2:
             self.batch_number = d.get("batch", self.batch_number)
@@ -190,10 +188,6 @@ class ScanController:
 
     def tick(self):
         now = self.clock()
-        if (self.legacy and self.state == "running" and now-self.last_stats > 7
-                and now-self.last_data <= 7 and not self._old_timeout):
-            self.false_timeouts += 1
-            self._old_timeout = True
         if self.probing:
             if now >= self.probe_deadline:
                 self.probing = False

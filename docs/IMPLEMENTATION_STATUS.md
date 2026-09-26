@@ -4,8 +4,8 @@
 
 WDG 0.9.31 restores serving-cell tracking through ModemManager's cached 3GPP
 location and GPS-NMEA sources. Both All Wardrive modes sample the serving cell
-at completed firmware batches. ESP Dual Test and handshake modes remain
-excluded. The default path performs no `GetCellInfo`, qmicli, direct AT, or
+at completed firmware batches. Handshake modes remain excluded. The default
+path performs no `GetCellInfo`, qmicli, direct AT, or
 modem-device open. Experimental QMI neighbors are opt-in, rate-limited,
 provisional, local-only, and circuit-broken after one session failure.
 

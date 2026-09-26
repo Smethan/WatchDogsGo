@@ -473,21 +473,18 @@ def test_only_controller_contention_is_a_shared_adapter_failure():
     assert not shared_adapter_conflict("bleak is not installed")
 
 
-def test_valid_records_prevent_false_heartbeat_but_silence_still_stops():
+def test_valid_records_keep_legacy_session_alive_but_silence_still_stops():
     now = [0]
     sent = []
     scan = ScanController(sent.append, lambda:now[0])
     scan.supported = True
-    scan.start(diagnostic=True)
+    scan.start()
     scan.handle(dict(kind="started", session=scan.session, seq=1))
     now[0] = 8
     scan.handle(dict(kind="wifi", session=scan.session, seq=3))
     scan.tick()
-    assert scan.state == "running" and scan.false_timeouts == 1 and scan.seq_gaps == 1
+    assert scan.state == "running" and scan.seq_gaps == 1
     assert sent[-1].startswith("wardrive_keepalive")
-    now[0] = 9
-    scan.tick()
-    assert scan.false_timeouts == 1
     # Duplicate and foreign-session records cannot hide a real timeout.
     scan.handle(dict(kind="wifi", session=scan.session, seq=3))
     scan.handle(dict(kind="stats", session="other", seq=4))
@@ -501,7 +498,7 @@ def test_wifi_only_requires_explicit_firmware_capability():
     scan = ScanController(sent.append, lambda:0)
     scan.handle(dict(kind="capabilities", wardrive_serial_v1=True))
     assert not scan.start(wifi_only=True)
-    assert scan.start(diagnostic=True)  # current firmware can run ESP Dual Test
+    assert scan.start()  # combined ESP Wi-Fi/BLE needs the base capability
     scan.reset()
     scan.handle(dict(kind="capabilities", wardrive_serial_v1=True, wardrive_wifi_serial_v1=True))
     assert scan.start(wifi_only=True)

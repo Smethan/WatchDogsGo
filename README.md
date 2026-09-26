@@ -297,7 +297,6 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
 | All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and the selected LoRa/ADS-B/433 collectors |
 | All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and selected host collectors |
-| ESP Dual Test | `start_wardrive_batch_serial` | Diagnostic WiFi+BLE transport without cellular collection |
 
 ### ATTACK
 
@@ -467,8 +466,8 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 ## Mesh Messenger
 
 The messenger supports two mutually exclusive owners for the AIO v2 SX1262.
-Choose **MeshCore** or **Meshtastic** under **SNIFF > Wardrive Settings > All
-Wardrive collectors**. MeshCore uses WDG's direct LoRaRF/SPI implementation.
+Choose **MeshCore** or **Meshtastic** under **SNIFF > Wardrive Settings > LoRa
+settings**. MeshCore uses WDG's direct LoRaRF/SPI implementation.
 Meshtastic leaves the radio entirely under a daemon; WDG never opens SPI while
 that protocol is selected. The preferred `meshtasticd-wdg` fork exposes a
 restricted `/run/meshtasticd/wdg.sock` API, so WDG can receive nodes and
@@ -492,8 +491,10 @@ every 60 seconds after moving 50 metres. The zero hop limit discovers nodes in
 direct radio range without routing the request across the mesh.
 
 **SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
-may automatically use the powered LoRa and SDR devices. With automatic LoRa
-off, switching the preferred protocol does not stop `meshtasticd` or claim SPI.
+may automatically use the powered LoRa and SDR devices. Protocol, MeshCore
+region, and Meshtastic service/phone options are grouped under **LoRa
+settings**. With automatic LoRa off, switching the preferred protocol does not
+stop `meshtasticd` or claim SPI.
 Opening Mesh Messenger remains an explicit request to start the selected
 backend. Switching to MeshCore or powering LoRa off stops `meshtasticd` so the
 direct driver or GPIO power control can safely own the hardware.
@@ -514,7 +515,8 @@ Meshtastic service helper. Setup also grants the login account access to the
 shared radio-lock group; log out and back in if setup reports that it added the
 membership. Setup does not download or start a daemon package. After the first
 fork package has been installed, hardware-checked, and explicitly adopted,
-**Meshtastic Service > Update service** can install only validated tags from
+**LoRa settings > Meshtastic service and phone BLE > Update service** can
+install only validated tags from
 [`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware)
 and retains a transactional rollback. The helper deliberately refuses to use a
 new package as its own first semantic baseline; the one-time adoption procedure
@@ -734,8 +736,8 @@ FTDI, or Espressif USB-JTAG. The game logs all USB serial devices it
 sees in the diagnostic block.
 
 **MeshCore radio stays "OFF"** — MeshCore and a Meshtastic daemon cannot own the
-same SX1262 simultaneously. Select MeshCore in Wardrive Settings and open Mesh
-Messenger; WDG will stop the selected daemon before opening SPI. Inspect both
+same SX1262 simultaneously. Select MeshCore under **LoRa settings** and open
+Mesh Messenger; WDG will stop the selected daemon before opening SPI. Inspect both
 possible owners before intervening:
 ```bash
 systemctl status meshtasticd-wdg.service meshtasticd.service

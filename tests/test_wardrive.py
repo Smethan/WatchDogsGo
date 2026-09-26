@@ -864,37 +864,12 @@ def test_host_ble_failure_keeps_wifi_running_and_ignores_old_session(game):
     assert "stop" not in [call.args[0] for call in game.serial.send_command.call_args_list]
 
 
-def test_dual_diagnostic_works_on_previous_firmware_and_saves_timing(game, monkeypatch):
-    import watchdogs.wardrive_ui as ui
-    w = game.wardrive
-    w.scan.clock = lambda:ui.time.monotonic()
-    w.scan.supported = True
-    game._start_scan_cmd("start_wardrive_serial", "all_wardrive_test", "ESP Dual Test")
-    w.handle_line("All operations stopped.")
-    assert w.scan.diagnostic and not w.scan.wifi_only
-    token = w.scan.session
-    w.handle_line(wire(record("started",session=token,seq=1)))
-    monkeypatch.setattr(ui.time,"monotonic",lambda:18)
-    w.handle_line(wire(record("wifi",session=token,seq=2)))
-    w.tick()
-    assert w.scan.state == "running" and w.scan.false_timeouts == 1
-    path = Path(game.loot.session_path) / "wardrive_diagnostics.jsonl"
-    last = json.loads(path.read_text().splitlines()[-1])
-    assert last["stats_age"] == 8 and last["record_age"] == 0 and last["false_timeouts"] == 1
-    assert w.host_ble._thread is None
-    monkeypatch.setattr(ui.time,"monotonic",lambda:26)
-    w.tick()
-    assert w.scan.state == "stopping"
-    last = json.loads(path.read_text().splitlines()[-1])
-    assert "No firmware records" in last["error"]
-
-
-@pytest.mark.parametrize("label,command,wifi_only,diagnostic", [
-    ("All Wardrive", "start_wardrive_serial", False, False),
-    ("All Wardrive (host BLE)", "start_wardrive_wifi_serial", True, False),
-    ("ESP Dual Test", "start_wardrive_serial", False, True),
+@pytest.mark.parametrize("label,command,wifi_only", [
+    ("All Wardrive", "start_wardrive_serial", False),
+    ("All Wardrive (host BLE)", "start_wardrive_wifi_serial", True),
 ])
-def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_only, diagnostic):
+def test_all_wardrive_menu_selects_distinct_backends(
+        game, label, command, wifi_only):
     from watchdogs.app import MENU_CATS
     game._is_running = Mock(return_value=False)
     w = game.wardrive
@@ -906,7 +881,7 @@ def test_all_wardrive_menu_selects_distinct_backends(game, label, command, wifi_
     assert game._pending_state == entry[3]
     w.handle_line("All operations stopped.")
     assert w.scan.state == "starting"
-    assert w.scan.wifi_only is wifi_only and w.scan.diagnostic is diagnostic
+    assert w.scan.wifi_only is wifi_only
     assert game.serial.send_command.call_args.args[0] == command + " " + w.scan.session
     # Cell work starts only after the firmware acknowledges the new session.
     assert not w.cell.active
@@ -956,7 +931,7 @@ def test_all_wardrive_starts_enabled_adsb_and_meshcore_after_ack(game, wifi_only
                 token, adapter="auto", require_lease=True)
 
 
-def test_all_wardrive_aux_collectors_skip_diagnostic_and_busy_radios(game):
+def test_all_wardrive_aux_collectors_skip_busy_radios(game):
     w = game.wardrive
     w.settings["lte_modem"] = False
     game._lora_enabled = game._sdr_enabled = True
@@ -966,14 +941,8 @@ def test_all_wardrive_aux_collectors_skip_diagnostic_and_busy_radios(game):
     game._sdr = NS(
         running=True, mode="433", start_adsb=Mock(),
         poll_events=Mock(return_value=[]))
-    w.scan.supported = True
-    assert w.scan.start(diagnostic=True)
-    w.handle_line(wire(record(
-        "started", session=w.scan.session, seq=1)))
-    game._lora.start_meshcore.assert_not_called()
-    game._sdr.start_adsb.assert_not_called()
-
-    w.scan.diagnostic = False
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
     assert not w.start_auxiliary_collectors()
     game._lora.start_meshcore.assert_not_called()
     game._sdr.start_adsb.assert_not_called()
@@ -993,7 +962,6 @@ def test_all_wardrive_reuses_running_aux_collectors(game):
         poll_events=Mock(return_value=[]))
     w.scan.mode = "wardrive"
     w.scan.state = "running"
-    w.scan.diagnostic = False
 
     assert not w.start_auxiliary_collectors()
     game._lora.start_meshcore.assert_not_called()
@@ -1020,7 +988,6 @@ def test_all_wardrive_collector_settings_leave_lora_free_and_start_433(
     w.scan.mode = "wardrive"
     w.scan.state = "running"
     w.scan.wifi_only = wifi_only
-    w.scan.diagnostic = False
 
     assert w.start_auxiliary_collectors()
 
@@ -1046,7 +1013,6 @@ def test_all_wardrive_can_disable_every_host_radio_collector(game):
                    start_433=Mock())
     w.scan.mode = "wardrive"
     w.scan.state = "running"
-    w.scan.diagnostic = False
 
     assert not w.start_auxiliary_collectors()
     game._lora.start_meshcore.assert_not_called()
@@ -1078,7 +1044,6 @@ def test_all_wardrive_uses_selected_meshtastic_client(game, wifi_only):
     w.scan.mode = "wardrive"
     w.scan.state = "running"
     w.scan.wifi_only = wifi_only
-    w.scan.diagnostic = False
 
     assert w.start_auxiliary_collectors()
     game._switch_lora_protocol.assert_called_once_with(
@@ -1102,7 +1067,6 @@ def test_all_wardrive_rejected_meshtastic_start_never_claims_ownership(game):
     game._switch_lora_protocol = Mock(return_value=False)
     w.scan.mode = "wardrive"
     w.scan.state = "running"
-    w.scan.diagnostic = False
     w._wdg_owned_lora = False
 
     assert not w.start_auxiliary_collectors()
@@ -1116,7 +1080,6 @@ def test_disabled_lora_collector_suppresses_active_meshcore_discovery(game):
     w.settings["wardrive_lora"] = False
     w.scan.mode = "wardrive"
     w.scan.state = "running"
-    w.scan.diagnostic = False
     game._lora_enabled = True
     game._lora = NS(
         running=True,
@@ -1141,7 +1104,6 @@ def test_all_wardrive_meshcore_discovery_uses_fresh_moving_gps(
     w.scan.state = "running"
     w.scan.session = "disc-session"
     w.scan.wifi_only = wifi_only
-    w.scan.diagnostic = False
 
     w.fixes.update(GpsFix(
         valid=True, latitude=40.0, longitude=-90.0, received_at=10), 10)
@@ -1160,13 +1122,6 @@ def test_all_wardrive_meshcore_discovery_uses_fresh_moving_gps(
     assert w.poll_meshcore_discovery(70)
     assert send.call_count == 2
 
-    w.scan.diagnostic = True
-    w.fixes.update(GpsFix(
-        valid=True, latitude=40.002, longitude=-90.0, received_at=100), 100)
-    assert not w.poll_meshcore_discovery(100)
-    assert send.call_count == 2
-
-
 @pytest.mark.parametrize("wifi_only", [False, True])
 def test_all_wardrive_meshtastic_discovery_is_zero_hop_manager_request(
         game, wifi_only):
@@ -1179,7 +1134,6 @@ def test_all_wardrive_meshtastic_discovery_is_zero_hop_manager_request(
     w.scan.state = "running"
     w.scan.session = "mt-disc-session"
     w.scan.wifi_only = wifi_only
-    w.scan.diagnostic = False
 
     w.fixes.update(GpsFix(
         valid=True, latitude=40.0, longitude=-90.0, received_at=10), 10)
@@ -1318,15 +1272,6 @@ def test_cell_tracking_starts_after_ack_and_saves_on_batch_done(game, wifi_only)
     assert len(w.cell.unique)==w.cell.observations==1
     assert game.loot_points[-1]["type"]=="cell"
     w.cell.stop()
-
-
-def test_cell_tracking_never_starts_for_dual_test(game):
-    game.wardrive.cell=Mock(active=False)
-    w=game.wardrive;w.scan.supported=True;w.scan.batch_supported=True
-    assert w.scan.start(diagnostic=True)
-    token=w.scan.session
-    w.handle_line(wire(batch_control("started",session=token,seq=1,batch=0)))
-    w.cell.start.assert_not_called()
 
 
 @pytest.mark.parametrize("wifi_only", [False, True])

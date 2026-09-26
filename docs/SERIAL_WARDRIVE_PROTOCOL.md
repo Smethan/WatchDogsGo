@@ -49,12 +49,10 @@ A missing `started` or heartbeat is an error, not proof of successful dual captu
 
 Firmware 1.7.3 adds `wardrive_wifi_serial_v1: true` and
 `start_wardrive_wifi_serial <session>`. The new command emits the same Wi-Fi
-records and stats, with no ESP32 BLE discovery. WDG 0.9.16 All Wardrive uses this
-command with host BlueZ BLE; ESP Dual Test retains the combined ESP32 command.
-All validated current-session records now renew WDG's liveness timer, while the
-test separately measures the old stats-only watchdog. See
-[host BLE and diagnostics](HOST_BLE_WARDRIVE.md).
+records and stats, with no ESP32 BLE discovery. All Wardrive (host BLE) uses
+this command with host BlueZ BLE. All validated current-session records renew
+WDG's liveness timer. See [All Wardrive radio modes](HOST_BLE_WARDRIVE.md).
 
 In WDG 0.9.17, All Wardrive defaults back to `start_wardrive_serial` (both ESP32
 radios). The separate All Wardrive (host BLE) option selects the Wi-Fi-only
-command. The corrected liveness rule applies to both options and ESP Dual Test.
+command. The corrected liveness rule applies to both options.

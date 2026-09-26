@@ -39,6 +39,31 @@ from .wardrive_settings import (
 PURPLE, ORANGE, CYAN = 2, 9, 3
 RADAR_TRAIL_POINT_LIMIT = 160
 
+MAIN_SETTINGS = (
+    ("flock", "Flock detection"),
+    ("axon", "Axon detection"),
+    ("precise", "Precise Flock/Axon markers"),
+    ("_map_layers", "Map dot layers"),
+    ("trail_mode", "Wardrive trail"),
+    ("_collectors", "All Wardrive collectors"),
+    ("_lora_settings", "LoRa settings"),
+    ("lte_modem", "LTE modem integration"),
+    ("cell_tracking", "Cell mast tracking"),
+    ("cell_neighbors", "Experimental QMI neighbors"),
+)
+
+COLLECTOR_SETTINGS = (
+    ("wardrive_lora", "Automatic LoRa collector"),
+    ("wardrive_adsb", "ADS-B aircraft"),
+    ("wardrive_433", "433 MHz sensors"),
+)
+
+LORA_SETTINGS = (
+    ("lora_protocol", "LoRa protocol"),
+    ("_meshcore_region", "MeshCore region"),
+    ("_meshtastic", "Meshtastic service and phone BLE"),
+)
+
 class WardriveUI:
     def __init__(self, app, initial_settings=None):
         self.app = app
@@ -85,6 +110,7 @@ class WardriveUI:
         self.selection = 0
         self.layer_selection = 0
         self.collector_selection = 0
+        self.lora_selection = 0
         self.meshtastic_selection = 0
         self._meshtastic_action_results = Queue()
         self._meshtastic_action_thread = None
@@ -101,9 +127,6 @@ class WardriveUI:
         self.invalid_records = 0
         self.last_error = ""
         self.last_probe_error = ""
-        self.diagnostic_next = 0
-        self.diagnostic_state = ""
-        self.reported_false_timeouts = 0
         self.host_ble_batch_lines = deque(maxlen=256)
         self.mc_discovery_session = None
         self.mc_discovery_next = 0.0
@@ -157,10 +180,6 @@ class WardriveUI:
             self._meshtastic_action_thread = None
         connection = app.serial if app.serial and app.serial.is_open else None
         if connection is not self.connection:
-            if self.scan.diagnostic and self.scan.active:
-                self.scan.state = "error"
-                self.scan.error = "Serial connection lost or changed"
-                self.write_diagnostics(time.monotonic())
             self.host_ble.stop()
             self.host_ble_batch_lines.clear()
             self.cell.stop()
@@ -197,11 +216,6 @@ class WardriveUI:
         self.poll_host_ble(now)
         self.poll_cell(now)
         self.poll_lora_discovery(now)
-        self.write_diagnostics(now)
-        if self.scan.false_timeouts > self.reported_false_timeouts:
-            self.reported_false_timeouts = self.scan.false_timeouts
-            app._term_add("[TEST] Old heartbeat rule would stop, but valid ESP32 records are still arriving.", raw=True)
-            app.msg("[TEST] Stats late; ESP32 data still arriving. Old timeout avoided.", ORANGE)
         if not self.scan.active and self.passive.file:
             self.close_passive()
         if self.cell_unclean and not self.cell_unclean_reported:
@@ -344,7 +358,7 @@ class WardriveUI:
             if app._pending_cmd:
                 cmd, state, name = app._pending_cmd, app._pending_state, app._pending_cmd_name
                 app._pending_cmd = None
-                if state in ("all_wardrive", "all_wardrive_host", "all_wardrive_test", "hs_sniff"):
+                if state in ("all_wardrive", "all_wardrive_host", "hs_sniff"):
                     self.detector.clear()
                     if state == "hs_sniff":
                         if not self.app.loot or not self.app.loot.active:
@@ -355,7 +369,9 @@ class WardriveUI:
                         except OSError as exc:
                             app.msg("[HS SNIFF] Cannot save capture: " + str(exc)[:60], 8)
                             return True
-                    if not self.scan.start("hs_sniff" if state == "hs_sniff" else "wardrive", wifi_only=state == "all_wardrive_host", diagnostic=state == "all_wardrive_test"):
+                    if not self.scan.start(
+                            "hs_sniff" if state == "hs_sniff" else "wardrive",
+                            wifi_only=state == "all_wardrive_host"):
                         self.close_passive()
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
@@ -363,12 +379,6 @@ class WardriveUI:
                         self.host_ble_batch_lines.clear()
                         self.cell_candidates.clear()
                     self.last_error = ""
-                    self.reported_false_timeouts = 0
-                    self.diagnostic_next = 0
-                    if self.scan.diagnostic:
-                        app._term_add("[TEST] ESP32 WiFi + BLE; comparing stats heartbeat with all valid records.", raw=True)
-                        if app.loot and app.loot.active:
-                            app._term_add("[TEST] Timing log: " + str(Path(app.loot.session_path) / "wardrive_diagnostics.jsonl"), raw=True)
                 else:
                     if capture_storage(cmd):
                         self.capture.start(cmd)
@@ -403,34 +413,6 @@ class WardriveUI:
         if checker is None:
             return True
         return bool(checker(host))
-
-    def write_diagnostics(self, now):
-        scan = self.scan
-        if not scan.diagnostic or not self.app.loot or not self.app.loot.active:
-            return
-        if now < self.diagnostic_next and scan.state == self.diagnostic_state:
-            return
-        if not scan.active and scan.state == self.diagnostic_state:
-            return
-        self.diagnostic_next = now + 1
-        self.diagnostic_state = scan.state
-        entry = dict(time=time.time(), session=scan.session, state=scan.state,
-                     stats_age=round(now-scan.last_stats, 3),
-                     record_age=round(now-scan.last_heartbeat, 3),
-                     control_age=round(now-scan.last_control, 3),
-                     data_age=round(now-scan.last_data, 3),
-                     status_probes=scan.status_attempts,
-                     batch=scan.batch_number, batch_phase=scan.batch_phase,
-                     received=dict(scan.record_counts), sequence_gaps=scan.seq_gaps,
-                     sequence_gap_percent=round(scan.gap_percent, 3),
-                     false_timeouts=scan.false_timeouts, firmware_stats=scan.stats,
-                     invalid_records=self.invalid_records, error=scan.error)
-        try:
-            path = Path(self.app.loot.session_path) / "wardrive_diagnostics.jsonl"
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry, separators=(",", ":")) + "\n")
-        except OSError as exc:
-            self.app._term_add("[TEST] Cannot save timing log: " + str(exc), raw=True)
 
     def poll_host_ble(self, now):
         active = self.scan.state == "running" and self.scan.wifi_only
@@ -500,7 +482,7 @@ class WardriveUI:
         """Start cell collection only after the ESP wardrive is acknowledged."""
         if (not self.settings["lte_modem"] or not self.settings["cell_tracking"]
                 or self.scan.mode != "wardrive"
-                or self.scan.diagnostic or self.scan.state != "running"
+                or self.scan.state != "running"
                 or not self.app.gps.available
                 or self.cell.active or not self.app.loot or not self.app.loot.active):
             return False
@@ -526,8 +508,7 @@ class WardriveUI:
         map/menu is opened or the ESP scan is stopped.
         """
         app = self.app
-        if (self.scan.mode != "wardrive" or self.scan.diagnostic
-                or self.scan.state != "running"):
+        if (self.scan.mode != "wardrive" or self.scan.state != "running"):
             return False
 
         started = False
@@ -718,8 +699,7 @@ class WardriveUI:
         modes share this scan state and therefore get the selected probe.
         """
         active = (self.scan.state == "running"
-                  and self.scan.mode == "wardrive"
-                  and not self.scan.diagnostic)
+                  and self.scan.mode == "wardrive")
         if not active:
             self.mc_discovery_session = None
             self.mc_discovery_next = 0.0
@@ -797,7 +777,7 @@ class WardriveUI:
 
     def poll_cell(self, now):
         active = (self.scan.state == "running" and self.scan.mode == "wardrive"
-                  and not self.scan.diagnostic and self.settings["lte_modem"]
+                  and self.settings["lte_modem"]
                   and self.settings["cell_tracking"]
                   and self.app.gps.available)
         if not active:
@@ -1234,7 +1214,7 @@ class WardriveUI:
                 self.settings_page = "main"
                 return
             if px.btnp(px.KEY_ESCAPE):
-                self.settings_page = "main"
+                self.settings_page = "lora"
                 return
             row_count = 8
             if px.btnp(px.KEY_UP):
@@ -1280,6 +1260,39 @@ class WardriveUI:
                 else:
                     start_update()
             return
+        if self.settings_page == "lora":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_UP):
+                self.lora_selection = max(0, self.lora_selection - 1)
+            if px.btnp(px.KEY_DOWN):
+                self.lora_selection = min(
+                    len(LORA_SETTINGS) - 1, self.lora_selection + 1)
+            direction = 0
+            if px.btnp(px.KEY_LEFT):
+                direction = -1
+            elif px.btnp(px.KEY_RIGHT):
+                direction = 1
+            activate = px.btnp(px.KEY_RETURN)
+            key = LORA_SETTINGS[self.lora_selection][0]
+            if key == "lora_protocol" and (direction or activate):
+                self.cycle_lora_protocol(direction or 1)
+            elif key == "_meshcore_region" and activate:
+                if self.settings["lora_protocol"] != "meshcore":
+                    self.app.msg(
+                        "[MC] Region applies only when protocol is MeshCore",
+                        ORANGE)
+                else:
+                    self.open_meshcore_region_picker()
+            elif key == "_meshtastic" and activate:
+                self.settings_page = "meshtastic"
+                self.meshtastic_selection = 0
+            return
         if self.settings_page == "collectors":
             if px.btnp(px.KEY_TAB):
                 self.settings_open = False
@@ -1288,9 +1301,7 @@ class WardriveUI:
             if px.btnp(px.KEY_ESCAPE):
                 self.settings_page = "main"
                 return
-            collector_keys = (
-                "lora_protocol", "wardrive_lora",
-                "wardrive_adsb", "wardrive_433")
+            collector_keys = tuple(key for key, _label in COLLECTOR_SETTINGS)
             if px.btnp(px.KEY_UP):
                 self.collector_selection = max(
                     0, self.collector_selection - 1)
@@ -1300,10 +1311,7 @@ class WardriveUI:
                     self.collector_selection + 1)
             if px.btnp(px.KEY_RETURN):
                 key = collector_keys[self.collector_selection]
-                if key == "lora_protocol":
-                    self.cycle_lora_protocol()
-                else:
-                    self.toggle_setting(key)
+                self.toggle_setting(key)
             return
         if px.btnp(px.KEY_ESCAPE) or px.btnp(px.KEY_TAB):
             self.settings_open = False
@@ -1329,9 +1337,7 @@ class WardriveUI:
                 self.settings["suppressed_devices"] = []
                 self.persist_settings()
             return
-        keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                "_collectors", "_meshtastic", "lte_modem", "cell_tracking",
-                "cell_neighbors")
+        keys = tuple(key for key, _label in MAIN_SETTINGS)
         if px.btnp(px.KEY_UP): self.selection = max(0,self.selection-1)
         if px.btnp(px.KEY_DOWN): self.selection = min(len(keys)-1,self.selection+1)
         if px.btnp(px.KEY_RETURN):
@@ -1342,13 +1348,26 @@ class WardriveUI:
             elif key == "_collectors":
                 self.settings_page = "collectors"
                 self.collector_selection = 0
-            elif key == "_meshtastic":
-                self.settings_page = "meshtastic"
-                self.meshtastic_selection = 0
+            elif key == "_lora_settings":
+                self.settings_page = "lora"
+                self.lora_selection = 0
             elif key == "trail_mode":
                 self.cycle_trail_mode()
             else:
                 self.toggle_setting(key)
+
+    def open_meshcore_region_picker(self):
+        """Open the existing regional preset picker and return here after it."""
+        from .lora_manager import MESHCORE_PRESETS
+
+        keys = list(MESHCORE_PRESETS)
+        try:
+            self.app._mc_region_sel = keys.index(self.app._mc_region)
+        except ValueError:
+            self.app._mc_region_sel = 0
+        self.app._mc_region_return_to_settings = True
+        self.app._mc_region_screen = True
+        self.settings_open = False
 
     def _map_policy_changed(self):
         self._refresh_notable_identities()
@@ -1920,8 +1939,7 @@ class WardriveUI:
             self._wdg_owned_sdr = False
 
         active = (self.scan.state == "running"
-                  and self.scan.mode == "wardrive"
-                  and not self.scan.diagnostic)
+                  and self.scan.mode == "wardrive")
         enabled = ((key == "wardrive_lora" and self.settings[key])
                    or (key in ("wardrive_adsb", "wardrive_433")
                        and bool(desired)))
@@ -2030,17 +2048,47 @@ class WardriveUI:
                 px.camera()
                 self.app._draw_mc_toast()
                 return
+            if self.settings_page == "lora":
+                from .lora_manager import MESHCORE_PRESETS
+
+                px.text(55, 47,
+                        "LORA SETTINGS   arrows / ENTER / ESC", 7)
+                region = MESHCORE_PRESETS.get(
+                    getattr(self.app, "_mc_region", ""))
+                region_label = region[4] if region else "UNKNOWN"
+                rows = (
+                    ("LoRa protocol", self.settings["lora_protocol"].upper()),
+                    ("MeshCore region", region_label),
+                    ("Meshtastic service and phone BLE", "OPEN..."),
+                )
+                for i, (label, value) in enumerate(rows):
+                    if (i == 1
+                            and self.settings["lora_protocol"] != "meshcore"):
+                        value += " (MESHCORE ONLY)"
+                    selected = i == self.lora_selection
+                    px.text(
+                        55, 64+i*20,
+                        (("> " if selected else "  ") + label + ": "
+                         + str(value))[:100],
+                        11 if selected else 7)
+                px.text(55, 138,
+                        "Protocol selects the one owner of the AIO SX1262.", 13)
+                px.text(55, 154,
+                        "MeshCore uses direct SPI; Meshtastic uses meshtasticd.",
+                        13)
+                px.text(55, 176,
+                        "Automatic LoRa capture remains under All Wardrive",
+                        10)
+                px.text(55, 188, "collectors.", 10)
+                px.text(55, 300, "ESC returns   TAB closes settings", 10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
             if self.settings_page == "collectors":
                 px.text(55,47,
                         "ALL WARDRIVE COLLECTORS   arrows / ENTER / ESC",7)
-                keys = ("lora_protocol", "wardrive_lora",
-                        "wardrive_adsb", "wardrive_433")
-                labels = ("LoRa protocol", "Automatic LoRa collector",
-                          "ADS-B aircraft", "433 MHz sensors")
-                for i, (key, label) in enumerate(zip(keys, labels)):
-                    value = (self.settings[key].upper()
-                             if key == "lora_protocol" else
-                             "ON" if self.settings[key] else "OFF")
+                for i, (key, label) in enumerate(COLLECTOR_SETTINGS):
+                    value = "ON" if self.settings[key] else "OFF"
                     px.text(
                         55, 64+i*20,
                         ("> " if i == self.collector_selection else "  ")
@@ -2049,7 +2097,7 @@ class WardriveUI:
                 px.text(55,153,
                         "These control automatic WDG radio ownership.",13)
                 px.text(55,169,
-                        "Meshtastic uses meshtasticd; MeshCore uses direct SPI.",13)
+                        "LoRa protocol and radio options are in LoRa Settings.",13)
                 px.text(55,185,
                         "ADS-B and 433 MHz share one RTL-SDR; enabling one",10)
                 px.text(55,197,
@@ -2063,16 +2111,8 @@ class WardriveUI:
                 self.app._draw_mc_toast()
                 return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
-            keys = ("flock", "axon", "precise", "_map_layers", "trail_mode",
-                    "_collectors", "_meshtastic", "lte_modem",
-                    "cell_tracking", "cell_neighbors")
-            labels = ("Flock detection", "Axon detection", "Precise Flock/Axon markers",
-                      "Map dot layers", "Wardrive trail", "All Wardrive collectors",
-                      "Meshtastic service and phone BLE",
-                      "LTE modem integration", "Cell mast tracking",
-                      "Experimental QMI neighbors")
-            for i,(key,label) in enumerate(zip(keys,labels)):
-                if key in ("_map_layers", "_collectors", "_meshtastic"):
+            for i, (key, label) in enumerate(MAIN_SETTINGS):
+                if key in ("_map_layers", "_collectors", "_lora_settings"):
                     value = "OPEN..."
                 elif key == "trail_mode":
                     value = self.trail_mode().upper()
@@ -2110,8 +2150,6 @@ class WardriveUI:
                 text = "Last heard "+ages+" drops:"+str(self.scan.stats.get("drops",0))+" bad:"+str(self.invalid_records)
                 if self.scan.wifi_only:
                     text = "ESP WiFi / host BLE:"+self.host_ble.state+" "+ages+" drops:"+str(self.scan.stats.get("drops",0))+"/"+str(self.host_ble.drops)
-                elif self.scan.diagnostic:
-                    text = f"TEST ctl:{now-self.scan.last_control:.1f}s data:{now-self.scan.last_data:.1f}s probes:{self.scan.status_attempts} gaps:{self.scan.seq_gaps} ({self.scan.gap_percent:.1f}%)"
                 if self.scan.batch:
                     if self.scan.batch_phase == "scanning":
                         elapsed = min(10, max(0, now-self.scan.batch_started))

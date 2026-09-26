@@ -10,7 +10,8 @@ WatchDogsGo supports two Meshtastic daemon configurations:
   legacy unrestricted PhoneAPI on `127.0.0.1:4403`. Phone BLE coexistence
   through the WDG fork is unavailable in this mode.
 
-The settings are under **SNIFF > Wardrive Settings > Meshtastic Service**.
+The settings are under **SNIFF > Wardrive Settings > LoRa settings >
+Meshtastic service and phone BLE**.
 `AUTO` prefers the fork socket and also treats an installed fork service as
 authoritative while it starts. `FORK_SOCKET` requires the fork. `LEGACY_TCP`
 requires the stock service. WDG will not open the legacy TCP API against an
