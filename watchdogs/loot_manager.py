@@ -1410,10 +1410,14 @@ class LootManager:
         try:
             with open(filepath, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.writer(fh)
-                writer.writerow(["SSID", "Channel", "Clients", "Client_MACs"])
+                writer.writerow([
+                    "BSSID", "SSID", "Channel", "Clients", "Packets",
+                    "Probe_Requesters", "Client_MACs",
+                ])
                 for ap in aps:
                     writer.writerow([
-                        ap.ssid, ap.channel, ap.client_count,
+                        ap.bssid, ap.ssid, ap.channel, ap.client_count,
+                        ap.packet_count, ap.probe_count,
                         ";".join(ap.clients),
                     ])
                 _fsync_file(fh)
@@ -1429,9 +1433,9 @@ class LootManager:
         try:
             with open(filepath, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.writer(fh)
-                writer.writerow(["SSID", "MAC"])
+                writer.writerow(["SSID", "MAC", "RSSI"])
                 for p in probes:
-                    writer.writerow([p.ssid, p.mac])
+                    writer.writerow([p.ssid, p.mac, p.rssi])
                 _fsync_file(fh)
             log.info("Sniffer probes saved: %d", len(probes))
         except OSError as exc:

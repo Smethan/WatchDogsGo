@@ -5,6 +5,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from test_wardrive import game as game
+from test_wardrive import loot as loot
+from watchdogs.app_state import Network
 from watchdogs.handshake_capture import COMMANDS
 from watchdogs.handshake_targets import (
     MAX_EXCLUSIONS,
@@ -14,7 +17,6 @@ from watchdogs.handshake_targets import (
     parse_target_record,
 )
 from watchdogs.serial_manager import SerialLineBuffer
-from test_wardrive import game, loot
 
 
 def hst(kind, token="scan_token", **extra):
@@ -23,19 +25,20 @@ def hst(kind, token="scan_token", **extra):
     return "HST:" + json.dumps(record, separators=(",", ":"))
 
 
-def ap(seq, bssid=None, name=None, rssi=-60, channel=6, auth=3, token="scan_token"):
+def ap(seq, bssid=None, name=None, rssi=-60, channel=6, auth=3,
+       token="scan_token", **extra):
     bssid = bssid or f"02:00:00:00:00:{seq:02X}"
     name = name if name is not None else f"Network {seq}"
-    return hst(
-        "ap",
-        token,
-        seq=seq,
-        bssid=bssid,
-        ssid_hex=name.encode().hex(),
-        channel=channel,
-        rssi=rssi,
-        auth=auth,
-    )
+    values = {
+        "seq": seq,
+        "bssid": bssid,
+        "ssid_hex": name.encode().hex(),
+        "channel": channel,
+        "rssi": rssi,
+        "auth": auth,
+    }
+    values.update(extra)
+    return hst("ap", token, **values)
 
 
 def ready_target(now, rows, token="scan_token"):
@@ -65,6 +68,106 @@ def test_hst_records_survive_fragmented_serial_input_and_sanitize_names():
     assert [record["kind"] for record in records] == ["scan_started", "ap", "scan_done"]
     assert records[1]["bssid"] == "02:AA:BB:CC:DD:01"
     assert records[1]["name"] == "Cafe WiFi"
+
+
+def test_hst_target_intel_is_bounded_and_published_with_scan_snapshot():
+    now = [10.0]
+    target = HandshakeTargets(lambda: now[0])
+    target.token = "intel_scan"
+    target.state = "scanning"
+    target.accept(parse_target_record(hst("scan_started", "intel_scan")))
+    target.accept(parse_target_record(ap(
+        1, token="intel_scan", clients=3, packets=421, probes=2)))
+    target.accept(parse_target_record(hst(
+        "scan_done", "intel_scan", count=1, intel=True,
+        packets=913, probes=7, intel_age_ms=1500)))
+    assert target.state == "ready"
+    row = next(iter(target.rows.values()))
+    assert (row["clients"], row["packets"], row["probes"]) == (3, 421, 2)
+    assert target.intel_available
+    assert (target.intel_packets, target.intel_probes,
+            target.intel_age_ms) == (913, 7, 1500)
+
+    malformed = json.loads(ap(1, clients=51)[4:])
+    assert parse_target_record("HST:" + json.dumps(malformed)) is None
+
+
+def test_evil_twin_scan_keeps_same_ssid_metrics_bssid_keyed(game):
+    target = game.wardrive.targets
+    target.token = "evil_twin_scan"
+    target.state = "scanning"
+    game._et_scan_pending = True
+    game._et_net_selected = set()
+    game._attack_mode = "evil_twin"
+    rows = (
+        hst("scan_started", "evil_twin_scan"),
+        ap(1, token="evil_twin_scan", name="Mesh", clients=1,
+           packets=100, probes=3),
+        ap(2, token="evil_twin_scan", name="Mesh", clients=4,
+           packets=900, probes=3),
+        hst("scan_done", "evil_twin_scan", count=2, intel=True,
+            packets=1000, probes=3, intel_age_ms=250),
+    )
+    for row in rows:
+        assert game.wardrive.handle_line(row)
+
+    assert not game._et_scan_pending
+    assert game._et_net_screen and game._attack_step == "select_net"
+    assert [net.bssid for net in game._attack_scan_results] == [
+        "02:00:00:00:00:01", "02:00:00:00:00:02"]
+    assert [(net.client_count, net.packet_count)
+            for net in game._attack_scan_results] == [(1, 100), (4, 900)]
+    assert game.state.sniffer_packets == 1000
+    assert game.state.sniffer_probe_count == 3
+
+
+def test_stopped_sniffer_exports_results_only_after_final_ack(game):
+    game._sniffer_results_pending = True
+    game._request_sniffer_intel = Mock(return_value=True)
+    game._evil_twin_starting = False
+    game._evil_twin_start_deadline = 0.0
+    assert game.wardrive.handle_line("All operations stopped.")
+    game._request_sniffer_intel.assert_called_once_with()
+
+
+def test_evil_twin_scan_error_leaves_a_dismissible_error_state(game):
+    target = game.wardrive.targets
+    target.token = "evil_twin_scan"
+    target.state = "scanning"
+    game._et_scan_pending = True
+    game._attack_mode = "evil_twin"
+
+    assert game.wardrive.handle_line(hst(
+        "scan_error", "evil_twin_scan", count=0,
+        error="scan_failed_or_cancelled"))
+
+    assert not game._et_scan_pending
+    assert game._attack_step == "error"
+    assert target.state == "error"
+    assert "scan failed" in game.msg.call_args.args[0].lower()
+
+
+def test_evil_twin_confirmation_blocks_any_whitelisted_deauth_target(
+        game, monkeypatch):
+    game._et_net_screen = True
+    game._et_net_sel = 0
+    game._et_net_selected = {0, 1}
+    game._portal_select_screen = False
+    game._attack_scan_results = [
+        Network(index="1", ssid="Clone", bssid="02:00:00:00:00:01"),
+        Network(index="2", ssid="Aux", bssid="02:00:00:00:00:02"),
+    ]
+    game._whitelist = Mock()
+    game._whitelist.is_blocked.side_effect = lambda mac: mac.endswith("02")
+    game._show_portal_selection = Mock()
+    px = sys.modules["pyxel"]
+    monkeypatch.setattr(px, "btnp", lambda key: key == px.KEY_RETURN)
+
+    game._update_picker_overlay()
+
+    assert game._et_net_screen
+    game._show_portal_selection.assert_not_called()
+    assert "selection blocked" in game.msg.call_args.args[0]
 
 
 @pytest.mark.parametrize(

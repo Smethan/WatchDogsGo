@@ -55,7 +55,7 @@ HS_RESCAN_INTERVAL = 45  # seconds between handshake auto-rescan cycles (no sele
 # ESP32 serial commands
 CMD_SCAN_NETWORKS = "scan_networks"
 CMD_SHOW_SCAN_RESULTS = "show_scan_results"
-CMD_START_SNIFFER = "start_sniffer"
+CMD_START_SNIFFER = "start_sniffer_all"
 CMD_START_SNIFFER_NOSCAN = "start_sniffer_noscan"
 CMD_PACKET_MONITOR = "packet_monitor"
 CMD_CHANNEL_VIEW = "channel_view"

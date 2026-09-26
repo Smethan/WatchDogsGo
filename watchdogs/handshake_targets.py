@@ -48,8 +48,23 @@ def parse_target_record(line):
                 return None
             d['bssid'] = d['bssid'].upper()
             d['name'] = display_bytes(d['ssid_hex']) or '<hidden>'
+            for key, high in (('clients', 50), ('packets', 2**32-1),
+                              ('probes', 200)):
+                if key in d:
+                    integer(d, key, 0, high)
+                else:
+                    d[key] = 0
         elif kind == 'scan_done':
             integer(d, 'count', 0, MAX_NETWORKS)
+            if 'intel' in d:
+                if type(d['intel']) is not bool:
+                    return None
+                integer(d, 'packets', 0, 2**32-1)
+                integer(d, 'probes', 0, 200)
+                integer(d, 'intel_age_ms', 0, 2**32-1)
+            else:
+                d.update(intel=False, packets=0, probes=0,
+                         intel_age_ms=0)
         return d
     except (ValueError, TypeError, KeyError, RecursionError):
         return None
@@ -70,6 +85,10 @@ class HandshakeTargets:
         self.min_rssi = None
         self.sort_name = False
         self.draft = set()
+        self.intel_available = False
+        self.intel_packets = 0
+        self.intel_probes = 0
+        self.intel_age_ms = 0
 
     @property
     def busy(self):
@@ -79,6 +98,8 @@ class HandshakeTargets:
         self.token = secrets.token_hex(8)
         self.rows.clear(); self.draft.clear()
         self.seq = 0; self.started = False
+        self.intel_available = False
+        self.intel_packets = self.intel_probes = self.intel_age_ms = 0
         self.state = 'waiting'; self.error = ''
         self.deadline = self.clock() + 15
         return 'hs_scan ' + self.token
@@ -120,6 +141,10 @@ class HandshakeTargets:
         elif d['kind'] == 'scan_done':
             if not self.started or d['count'] != self.seq:
                 self.cancel('Scan results were incomplete. Press R to rescan.'); return
+            self.intel_available = d['intel']
+            self.intel_packets = d['packets']
+            self.intel_probes = d['probes']
+            self.intel_age_ms = d['intel_age_ms']
             self.state = 'ready'; self.completed = self.clock()
 
     def visible(self):

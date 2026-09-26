@@ -13,6 +13,7 @@ import math
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
@@ -28,8 +29,9 @@ from .gps_manager import GpsManager
 from .wardrive_ui import WardriveUI
 from .wardrive_settings import load_settings as load_wardrive_settings
 from .loot_manager import LootManager
-from .app_state import AppState, Network
+from .app_state import AppState
 from .network_manager import NetworkManager
+from .sniffer_intel import SnifferIntelCollector, parse_sniffer_record
 from .coastline import COASTLINES
 from .tile_manager import TileRenderer, download_tiles
 from .map_index import GeoObjectIndex
@@ -197,7 +199,7 @@ MENU_CATS = [
         ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
         ("9", "All Wardrive (host BLE)", "start_wardrive_wifi_serial", "all_wardrive_host", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
-        ("3", "Pkt Sniffer",     "start_sniffer",          "sniffer",      None),
+        ("3", "Pkt Sniffer",     "start_sniffer_all",      "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
         ("5", "HS Capture no SD","start_handshake_serial", "_hs_capture_serial_menu",    None),
         ("7", "HS Sniff",        "_hs_sniff_menu",        "_hs_sniff_menu", None),
@@ -466,6 +468,9 @@ class WatchDogsGame(OtaMixin):
         self.serial: SerialManager | None = None
         self.gps = GpsManager(modem_enabled=_wardrive_settings["lte_modem"])
         self.net_mgr = NetworkManager(self.state)
+        self._sniffer_intel = SnifferIntelCollector()
+        self._sniffer_results_pending = False
+        self._sniffer_results_deadline = 0.0
         self.loot: LootManager | None = None
 
         # AIO v2: auto-enable USB BEFORE serial detection
@@ -913,7 +918,9 @@ class WatchDogsGame(OtaMixin):
         self.menu_sel = 0       # selected item index within category
         self._pending_cmd = None
         self._pending_cmd_frame = 0
+        self._pending_state = ""
         self._pending_cmd_name = ""
+        self._pending_deadline = 0.0
 
         # Input dialog (for commands needing params)
         self.input_mode = False
@@ -953,6 +960,8 @@ class WatchDogsGame(OtaMixin):
         self._et_select_args = ""        # "1 3 5" for select_networks cmd
         self._et_net_screen = False      # show network picker overlay
         self._et_scan_pending = False    # waiting for scan results
+        self._evil_twin_starting = False
+        self._evil_twin_start_deadline = 0.0
 
         # Loot password history viewer
         self._loot_pwd_screen = False
@@ -1595,11 +1604,31 @@ class WatchDogsGame(OtaMixin):
         self.scan_pulse = (self.scan_pulse + 1) % 60
 
         self.wardrive.tick()
+        if (self._sniffer_intel.state in ("waiting", "receiving") and
+                self._sniffer_results_deadline and
+                time.monotonic() > self._sniffer_results_deadline):
+            self._sniffer_intel.state = "error"
+            self._sniffer_intel.error = "result export timed out"
+            self._sniffer_results_deadline = 0.0
+            self.msg("[SNIFFER] Result export timed out; capture data remains on ESP32.", C_WARNING)
+        if (self._evil_twin_starting and self._evil_twin_start_deadline and
+                time.monotonic() > self._evil_twin_start_deadline):
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            self._attack_step = "error"
+            self.msg("[ET] Firmware did not confirm startup; stopped for safety.", C_ERROR)
+            self._send("stop")
         if self._pending_cmd and time.monotonic() > self._pending_deadline:
             pending_state = getattr(self, "_pending_state", "")
             self._pending_cmd = None
+            self._pending_state = ""
             if pending_state in ("wl_wifi_scan", "wl_ble_scan"):
                 self._wl_scan_fail("Stop not confirmed; scan cancelled")
+            elif pending_state in ("hs_target_scan", "evil_twin_start") and self._attack_mode == "evil_twin":
+                self._et_scan_pending = False
+                self._evil_twin_starting = False
+                self._attack_step = "error"
+                self.msg("[ET] Stop not confirmed; operation cancelled.", C_ERROR)
             else:
                 self.msg("[ERR] Stop not confirmed; command cancelled. Retry STOP.", C_ERROR)
 
@@ -1712,6 +1741,8 @@ class WatchDogsGame(OtaMixin):
                 if pyxel.btnp(pyxel.KEY_0):
                     self.proj.reset_view()
                 if pyxel.btnp(pyxel.KEY_S) and not self._attack_mode:
+                    if self.sniffing:
+                        self._sniffer_results_pending = True
                     self._send("stop")
                     self.wifi_scanning = False
                     self.ble_scanning = False
@@ -1960,7 +1991,13 @@ class WatchDogsGame(OtaMixin):
             self.wardrive.scan.probe()
             self.msg("[WDG] Needs serial wardrive firmware; checking capabilities.", C_WARNING)
             return
+        if state_key == "sniffer" and not self._is_running(state_key) and self.wardrive.scan.sniffer_scope_supported is not True:
+            self.wardrive.scan.probe()
+            self.msg("[SNIFFER] Current projectZero firmware required for explicit all-network scope.", C_WARNING)
+            return
         if state_key == "_stop_all":
+            if self.sniffing:
+                self._sniffer_results_pending = True
             self._send("stop")
             self.wifi_scanning = False
             self.ble_scanning = False
@@ -1987,8 +2024,13 @@ class WatchDogsGame(OtaMixin):
                 self._race.stop()
             if self.state.portal_running:
                 self.state.reset_portal()
-            if self.state.evil_twin_running:
+            if self.state.evil_twin_running or self._evil_twin_starting:
                 self.state.reset_evil_twin()
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            if getattr(self, "_pending_state", "") == "evil_twin_start":
+                self._pending_cmd = None
+                self._pending_state = ""
             self._et_scan_pending = False
             self._attack_mode = ""
             self._attack_step = ""
@@ -2100,6 +2142,8 @@ class WatchDogsGame(OtaMixin):
         final_cmd = (cmd + " " + " ".join(v for v in field_values if v)
                      if field_values else cmd)
         if running:
+            if state_key == "sniffer":
+                self._sniffer_results_pending = True
             self._send("stop")
             self.msg(f"[STOP] {name}", C_DIM)
             self._set_running(state_key, False)
@@ -2128,9 +2172,16 @@ class WatchDogsGame(OtaMixin):
         self._wifi_scan_done_time = self._bt_scan_done_time = 0.0
         self._bt_scan_start_time = 0.0
         self._pending_cmd = None
+        self._pending_state = ""
+        self._pending_cmd_name = ""
+        self._pending_deadline = 0.0
 
     def _start_scan_cmd(self, final_cmd: str, state_key: str, name: str):
         # All transitions wait for firmware's final stop message, never just a timer.
+        if getattr(self, "sniffing", False):
+            # Target-intel scans consume the same preserved firmware snapshot;
+            # other transitions must not interleave a large export.
+            self._sniffer_results_pending = False
         self._send("stop")
         self._clear_scan_state()
         self._pending_cmd = final_cmd
@@ -2138,6 +2189,55 @@ class WatchDogsGame(OtaMixin):
         self._pending_cmd_name = name
         self._pending_deadline = time.monotonic() + 10
         self.msg(f"[INIT] Stopping before {name}...", C_DIM)
+
+    def _request_sniffer_intel(self) -> bool:
+        """Request the stopped Packet Sniffer snapshot without blocking UI."""
+        self._sniffer_results_pending = False
+        if self.wardrive.scan.sniffer_intel_supported is not True:
+            self.msg("[SNIFFER] Update projectZero firmware to import packet/probe results.", C_WARNING)
+            return False
+        token = secrets.token_hex(8)
+        self._send(self._sniffer_intel.start(token))
+        self._sniffer_results_deadline = time.monotonic() + 20
+        self.msg("[SNIFFER] Importing AP/client/probe results...", C_DIM)
+        return True
+
+    def _commit_sniffer_intel(self) -> None:
+        result = self._sniffer_intel
+        self._sniffer_results_deadline = 0.0
+        self.state.sniffer_intel_available = result.available
+        self.state.sniffer_packets = result.packets
+        self.state.sniffer_probe_count = len(result.probes)
+        self.state.sniffer_intel_age_ms = result.age_ms
+        self.state.sniffer_aps = list(result.aps)
+        self.state.sniffer_probes = list(result.probes)
+        if self.loot:
+            self.loot.save_sniffer_aps(self.state.sniffer_aps)
+            self.loot.save_sniffer_probes(self.state.sniffer_probes)
+        self.msg(
+            f"[SNIFFER] {result.packets} packets | "
+            f"{sum(ap.client_count for ap in result.aps)} AP-client links | "
+            f"{len(result.probes)} probes",
+            C_SUCCESS,
+        )
+
+    def _dispatch_evil_twin_start(self, pending: str) -> None:
+        prefix = "__evil_twin_start__ "
+        if not pending.startswith(prefix):
+            self.msg("[ET] Invalid queued target selection.", C_ERROR)
+            return
+        args = pending[len(prefix):].strip()
+        if not args or not all(part.isdigit() for part in args.split()):
+            self.msg("[ET] Invalid queued target selection.", C_ERROR)
+            return
+        self._term_add(f"[ET:CMD] select_networks {args}", raw=True)
+        self._send(f"select_networks {args}")
+        self._term_add("[ET:CMD] start_evil_twin", raw=True)
+        self._send("start_evil_twin")
+        self._evil_twin_starting = True
+        self._evil_twin_start_deadline = time.monotonic() + 15
+        self._attack_step = "starting"
+        self.msg(f"[ET] Starting — SSID: {self._portal_ssid}", C_WARNING)
 
     def _is_running(self, state_key: str) -> bool:
         return {
@@ -2194,7 +2294,10 @@ class WatchDogsGame(OtaMixin):
                     45.0 if kind == "wifi" else 20.0)
         elif state_key == "bt_tracking":  self._bt_tracking    = val
         elif state_key == "bt_airtag":    self._bt_airtag      = val
-        elif state_key == "sniffer":      self.sniffing        = val
+        elif state_key == "sniffer":
+            self.sniffing = val
+            if val:
+                self.state.reset_sniffer()
         elif state_key in ("handshake", "handshake_start"): self.capturing_hs = val
 
     # ------------------------------------------------------------------
@@ -2303,19 +2406,26 @@ class WatchDogsGame(OtaMixin):
                     self.msg("[ET] No ESP32 — plug in device", C_ERROR)
                     return
             self._attack_mode = "evil_twin"
-            # Check if we have fresh scan results (<30s)
-            nets = self.state.networks
-            if nets and (time.time() - self._wifi_scan_done_time) < 30:
-                self._attack_scan_results = list(nets)
-                self._show_net_selection()
-            else:
-                # Need to scan first
-                self._attack_step = "scanning"
-                self._et_scan_pending = True
-                self.state.networks.clear()
-                self._state_network_by_bssid.clear()
-                self._send("scan_networks")
-                self.msg("[ET] Scanning for networks...", C_HACK_CYAN)
+            if (self.wardrive.scan.capture_targets_supported is not True or
+                    self.wardrive.scan.target_intel_supported is not True):
+                self.wardrive.scan.probe()
+                self._attack_mode = ""
+                self.msg("[ET] Network intel needs current projectZero firmware; checking support.", C_WARNING)
+                return
+            # Use the same token-bound, BSSID-addressed snapshot as HS Capture.
+            # It carries the latest Packet Sniffer client/packet/probe metrics
+            # and cannot race a still-running sniffer operation.
+            self._attack_step = "scanning"
+            self._et_scan_pending = True
+            self.state.networks.clear()
+            self._state_network_by_bssid.clear()
+            self._send("stop")
+            command = self.wardrive.targets.prepare_scan()
+            self._pending_cmd = command
+            self._pending_state = "hs_target_scan"
+            self._pending_cmd_name = "Evil Twin network intel scan"
+            self._pending_deadline = time.monotonic() + 10
+            self.msg("[ET] Stopping current mode, then scanning networks...", C_HACK_CYAN)
             return
 
         # ── MeshCore Messenger ──
@@ -2529,6 +2639,26 @@ class WatchDogsGame(OtaMixin):
                 self._attack_mode = ""
                 self._esc_consumed_frame = pyxel.frame_count
                 return True
+
+        # ── Evil Portal / Evil Twin: cancel startup or dismiss result ──
+        if (self._attack_mode in ("evil_portal", "evil_twin")
+                and self._attack_step in ("starting", "error", "complete")
+                and (key == px.KEY_X or key == px.KEY_ESCAPE)):
+            if self._attack_step == "starting":
+                self._send("stop")
+            if getattr(self, "_pending_state", "") == "evil_twin_start":
+                self._pending_cmd = None
+                self._pending_state = ""
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            if self.state.evil_twin_running:
+                self.state.reset_evil_twin()
+            self._attack_mode = ""
+            self._attack_step = ""
+            self._portal_data_screen = False
+            if key == px.KEY_ESCAPE:
+                self._esc_consumed_frame = pyxel.frame_count
+            return True
 
         # ── Evil Portal / Evil Twin: running → stop / show data ──
         if (self._attack_mode in ("evil_portal", "evil_twin")
@@ -4111,11 +4241,17 @@ class WatchDogsGame(OtaMixin):
                 if not selected:
                     # Nothing toggled → use cursor position as single select
                     selected = [self._et_net_sel]
-                # Whitelist check on primary target
-                primary = nets[selected[0]]
-                if self._whitelist.is_blocked(primary.bssid):
-                    self.msg(f"[WL] {primary.bssid[-8:]} whitelisted", C_WARNING)
+                # Every selected row may receive deauth traffic, so the
+                # whitelist applies to the clone target and all auxiliaries.
+                blocked = [nets[i] for i in selected
+                           if self._whitelist.is_blocked(nets[i].bssid)]
+                if blocked:
+                    self.msg(
+                        f"[WL] {blocked[0].bssid[-8:]} whitelisted; selection blocked",
+                        C_WARNING,
+                    )
                     return
+                primary = nets[selected[0]]
                 # First selected = clone SSID, rest = deauth targets
                 self._et_net_idx = primary.index if hasattr(primary, 'index') else selected[0]
                 # Build "select_networks 1 3 5" command args
@@ -4150,42 +4286,27 @@ class WatchDogsGame(OtaMixin):
                         self._term_add(f"[{tag}] Uploading portal HTML...",
                                        raw=True)
                         upload_html_to_esp32(html, self._send)
-                        time.sleep(0.4)
+                    else:
+                        self._term_add(f"[{tag}] Restoring firmware default portal...",
+                                       raw=True)
+                        self._send("clear_html")
                     if self._attack_mode == "evil_portal":
                         self._send(f"start_portal {self._portal_ssid}")
                         self.state.portal_running = True
                         self.state.portal_ssid = self._portal_ssid
+                        self._attack_step = "running"
+                        self.msg(f"[{tag}] Started — SSID: {self._portal_ssid}",
+                                 C_WARNING)
+                        self.glitch_timer = 8
                     else:
-                        # Evil Twin: stop → clean state → select → start
+                        # Evil Twin: wait for the firmware's final stop ack.
                         self._term_add("[ET:CMD] stop (clean state)", raw=True)
                         self._send("stop")
-                        time.sleep(1.5)
-                        # Drain stale serial data
-                        if self.serial and self.serial.is_open:
-                            try:
-                                while self.serial.ser.in_waiting:
-                                    self.serial.ser.read(self.serial.ser.in_waiting)
-                            except Exception:
-                                pass
-
-                        # Select target network(s)
                         args = self._et_select_args or str(self._et_net_idx)
-                        cmd_sel = f"select_networks {args}"
-                        self._term_add(f"[ET:CMD] {cmd_sel}", raw=True)
-                        self._send(cmd_sel)
-                        time.sleep(0.5)
-                        if html is not None:
-                            self._term_add("[ET:CMD] (HTML uploaded)", raw=True)
-                        else:
-                            self._term_add("[ET:CMD] Using firmware default portal", raw=True)
-                        self._term_add("[ET:CMD] start_evil_twin", raw=True)
-                        self._send("start_evil_twin")
-                        self.state.evil_twin_running = True
-                        self.state.evil_twin_ssid = self._portal_ssid
-                    self._attack_step = "running"
-                    self.msg(f"[{tag}] Started — SSID: {self._portal_ssid}",
-                             C_WARNING)
-                    self.glitch_timer = 8
+                        self._pending_cmd = "__evil_twin_start__ " + args
+                        self._pending_state = "evil_twin_start"
+                        self._pending_cmd_name = "Evil Twin"
+                        self._pending_deadline = time.monotonic() + 10
 
                 threading.Thread(target=_start_portal_attack,
                                  daemon=True).start()
@@ -4435,6 +4556,20 @@ class WatchDogsGame(OtaMixin):
         if not s:
             return
 
+        if s.startswith("SNIFF:"):
+            record = parse_sniffer_record(s)
+            if record is None:
+                self._sniffer_intel.state = "error"
+                self._sniffer_intel.error = "malformed result record"
+                self._sniffer_results_deadline = 0.0
+                self.msg("[SNIFFER] Rejected malformed result export.", C_WARNING)
+            elif self._sniffer_intel.accept(record):
+                self._commit_sniffer_intel()
+            elif self._sniffer_intel.state == "error":
+                self._sniffer_results_deadline = 0.0
+                self.msg("[SNIFFER] Incomplete result export rejected.", C_WARNING)
+            return
+
         # Firmware version detection (from boot banner, version cmd, ping)
         # Match both legacy "JanOS version" and newer "WatchDogsGo version" — the
         # ESP32 projectZero firmware still emits "JanOS" in older builds.
@@ -4519,6 +4654,10 @@ class WatchDogsGame(OtaMixin):
         # --- Operation state from serial output ---
         sl = s.lower()
         self._wl_handle_scan_status(s, sl)
+        if getattr(self, "sniffing", False):
+            packet_count = self.net_mgr.extract_packet_count(s)
+            if packet_count is not None:
+                self.state.sniffer_packets = packet_count
         if "sniffer start" in sl or "packet sniffer" in sl:
             self.sniffing = True
         elif "handshake attack cleanup complete" in sl or "handshake attack task finished" in sl:
@@ -4540,6 +4679,37 @@ class WatchDogsGame(OtaMixin):
                 self._bt_scan_done_time = 0.0
             self.sniffing = False
             self.capturing_hs = False
+
+        if "evil twin started successfully" in sl:
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            self.state.evil_twin_running = True
+            self.state.evil_twin_ssid = self._portal_ssid
+            self._attack_step = "running"
+            self.msg(f"[ET] Started — SSID: {self._portal_ssid}", C_WARNING)
+            self.glitch_timer = 8
+        elif getattr(self, "_evil_twin_starting", False) and any(text in sl for text in (
+                "evil twin: no selected aps", "evil twin: no valid selected aps",
+                "failed to enable ap mode",
+                "failed to set ap config", "failed to start http server",
+                "failed to set ap ip info", "failed to start dhcp server",
+                "failed to create dns server task",
+                "failed to create deauth attack task", "malloc error 4 ssid",
+                "portal is already active")):
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            self.state.evil_twin_running = False
+            self._attack_step = "error"
+            self.msg("[ET] Startup failed; see terminal output.", C_ERROR)
+
+        if self.state.evil_twin_running and "password verified!" in sl:
+            self.msg("[ET] Credential verified by target network.", C_SUCCESS)
+            self._earn_badge("evil_twin")
+            self.gain_xp(150)
+        if "evil twin portal shut down successfully" in sl:
+            self.state.evil_twin_running = False
+            self.state.evil_twin_client_count = 0
+            self._attack_step = "complete"
 
         # --- Portal / Evil Twin capture parsing ---
         if self.state.portal_running or self.state.evil_twin_running:
@@ -4568,16 +4738,19 @@ class WatchDogsGame(OtaMixin):
                         self._term_add(f"[{tag}:PWD] {_fields}", raw=True)
                     else:
                         self._term_add(f"[{tag}:PWD] {decoded}", raw=True)
-                    self.msg(f"[{tag}] CREDENTIAL CAPTURED!", 12)  # blue
-                    self.gain_xp(150)
+                    self.msg(f"[{tag}] FORM SUBMISSION RECEIVED", 12)  # blue
+                    self.gain_xp(25)
                     self.glitch_timer = 6
-                    self._earn_badge("evil_twin")
                     self._load_loot_totals()  # refresh PWD count
                 elif is_client:
                     if "client count" in sl:
-                        self.state.portal_client_count = int(
+                        count = int(
                             re.search(r'\d+', s.split("=")[-1] if "=" in s else s).group()
                         ) if re.search(r'\d+', s) else 0
+                        if self.state.evil_twin_running:
+                            self.state.evil_twin_client_count = count
+                        else:
+                            self.state.portal_client_count = count
                     self.msg(f"[{tag}] Client connected", C_HACK_CYAN)
                     self._term_add(f"[{tag}:CLIENT] {s}", raw=True)
                     self.gain_xp(25)
@@ -7378,16 +7551,11 @@ class WatchDogsGame(OtaMixin):
     def _draw_net_picker(self):
         """Draw Evil Twin network selection overlay."""
         nets = self._attack_scan_results
-        # Build client count lookup from sniffer data (if available)
-        cli_map: dict[str, int] = {}
-        for sap in self.state.sniffer_aps:
-            if sap.ssid:
-                cli_map[sap.ssid] = sap.client_count
         # Solid dim background
         pyxel.rect(0, HUD_TOP, W, TERM_Y - HUD_TOP, 0)
         # Dialog box — 14px rows for 5x8 font
         ROW_H = 14
-        dw, dh = 540, min(260, 60 + len(nets) * ROW_H)
+        dw, dh = 620, min(260, 60 + len(nets) * ROW_H)
         dx = (W - dw) // 2
         dy = (H - dh) // 2
         pyxel.rect(dx, dy, dw, dh, 0)
@@ -7399,11 +7567,13 @@ class WatchDogsGame(OtaMixin):
         # Column headers — spaced for 5x8 font (widened from 4x6)
         hy = dy + 18
         pyxel.text(dx + 26,  hy, "SSID",  C_DIM)
-        pyxel.text(dx + 220, hy, "BSSID", C_DIM)
-        pyxel.text(dx + 360, hy, "CH",    C_DIM)
-        pyxel.text(dx + 390, hy, "RSSI",  C_DIM)
-        pyxel.text(dx + 430, hy, "Auth",  C_DIM)
-        pyxel.text(dx + 495, hy, "Cli",   C_DIM)
+        pyxel.text(dx + 170, hy, "BSSID", C_DIM)
+        pyxel.text(dx + 300, hy, "CH",    C_DIM)
+        pyxel.text(dx + 330, hy, "RSSI",  C_DIM)
+        pyxel.text(dx + 375, hy, "CLI",   C_DIM)
+        pyxel.text(dx + 410, hy, "PKTS",  C_DIM)
+        pyxel.text(dx + 462, hy, "PRB",   C_DIM)
+        pyxel.text(dx + 495, hy, "AUTH",  C_DIM)
         pyxel.line(dx + 2, hy + 10, dx + dw - 3, hy + 10, 1)
         # Network list with scroll
         max_vis = (dh - 70) // ROW_H
@@ -7420,22 +7590,29 @@ class WatchDogsGame(OtaMixin):
             mark = "X" if checked else " "
             pyxel.text(dx + 4, y + 2, f"[{mark}]",
                        0 if cursor else (C_WARNING if checked else C_DIM))
-            ssid = (net.ssid or "<hidden>")[:24]
+            ssid = (net.ssid or "<hidden>")[:20]
             bssid = net.bssid if hasattr(net, 'bssid') else "?"
             ch = str(net.channel) if hasattr(net, 'channel') else "?"
             rssi = str(net.rssi) if hasattr(net, 'rssi') else "?"
-            auth = (net.auth[:8] if hasattr(net, 'auth') else "?")
-            n_cli = cli_map.get(net.ssid, -1)
-            cli_str = str(n_cli) if n_cli >= 0 else "-"
+            auth = (net.auth[:15] if hasattr(net, 'auth') else "?")
+            has_intel = self.state.sniffer_intel_available
+            n_cli = getattr(net, 'client_count', 0)
+            n_packets = getattr(net, 'packet_count', 0)
+            n_probes = getattr(net, 'probe_count', 0)
+            cli_str = str(n_cli) if has_intel else "-"
+            packet_str = str(n_packets) if has_intel else "-"
+            probe_str = str(n_probes) if has_intel else "-"
             c = 0 if cursor else C_SUCCESS
             pyxel.text(dx + 26,  y + 2, ssid,  c)
-            pyxel.text(dx + 220, y + 2, bssid, 0 if cursor else C_TEXT)
-            pyxel.text(dx + 360, y + 2, ch,    0 if cursor else C_DIM)
-            pyxel.text(dx + 390, y + 2, rssi,  0 if cursor else C_DIM)
-            pyxel.text(dx + 430, y + 2, auth,  0 if cursor else C_DIM)
+            pyxel.text(dx + 170, y + 2, bssid, 0 if cursor else C_TEXT)
+            pyxel.text(dx + 300, y + 2, ch,    0 if cursor else C_DIM)
+            pyxel.text(dx + 330, y + 2, rssi,  0 if cursor else C_DIM)
             cli_c = (0 if cursor else C_WARNING) if n_cli > 0 else (
                     0 if cursor else C_DIM)
-            pyxel.text(dx + 495, y + 2, cli_str, cli_c)
+            pyxel.text(dx + 375, y + 2, cli_str, cli_c)
+            pyxel.text(dx + 410, y + 2, packet_str, 0 if cursor else C_DIM)
+            pyxel.text(dx + 462, y + 2, probe_str, 0 if cursor else C_DIM)
+            pyxel.text(dx + 495, y + 2, auth, 0 if cursor else C_DIM)
             y += ROW_H
         # Scroll indicator
         if len(nets) > max_vis:
@@ -7451,13 +7628,16 @@ class WatchDogsGame(OtaMixin):
                        f"1st=clone {n_sel-1}=deauth" if n_sel > 1 else "1 target",
                        C_WARNING)
         # Hints
-        has_cli = bool(cli_map)
         hint = "SPACE mark  ENTER confirm  ESC cancel"
-        if not has_cli:
+        if not self.state.sniffer_intel_available:
             hint += "  (run Sniffer first for client counts)"
         pyxel.text(dx + 4, dy + dh - 11, hint, C_DIM)
         # Count
-        pyxel.text(dx + dw - 90, dy + 4, f"{len(nets)} networks", C_DIM)
+        if self.state.sniffer_intel_available:
+            summary = f"{self.state.sniffer_packets} pkt/{self.state.sniffer_probe_count} probes"
+        else:
+            summary = f"{len(nets)} networks"
+        pyxel.text(dx + dw - 135, dy + 4, summary, C_DIM)
 
     def _draw_portal_picker(self):
         """Draw portal selection overlay."""
@@ -8093,7 +8273,9 @@ class WatchDogsGame(OtaMixin):
             captures = [l for l in self.terminal_lines
                         if ":PWD]" in l]
         tag = "EVIL PORTAL" if self._attack_mode == "evil_portal" else "EVIL TWIN"
-        n_clients = self.state.portal_client_count
+        n_clients = (self.state.portal_client_count
+                     if self._attack_mode == "evil_portal"
+                     else self.state.evil_twin_client_count)
         n_forms = (self.state.submitted_forms
                    + len(self.state.evil_twin_captured_data))
         # Solid background

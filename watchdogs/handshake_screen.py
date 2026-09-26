@@ -198,9 +198,16 @@ class HandshakeScreen(PassiveScreen):
         threshold = 'any' if target.min_rssi is None else f'>= {target.min_rssi} dBm'
         cursor = '_' if self.editing_filter else ''
         px.text(8,40,'Name: ' + (target.query+cursor or '(any)') + '   RSSI: ' + threshold,11 if self.editing_filter else 7)
-        px.text(8,55,'Sort: ' + ('name' if target.sort_name else 'strongest first') + ' | Selections stay checked when filtered out.',13)
+        if target.intel_available:
+            age = '<1s' if target.intel_age_ms < 1000 else f'{target.intel_age_ms // 1000}s'
+            intel = f'Pkt Sniffer: {target.intel_packets} packets / {target.intel_probes} probe requesters / age {age}'
+        else:
+            intel = 'Pkt Sniffer: no completed sample; client/packet/probe columns are unavailable'
+        px.text(8,55,intel[:120],13)
         px.line(8,69,631,69,5)
-        for x,label in ((8,'SEL'),(34,'NETWORK'),(220,'BSSID'),(344,'CH'),(387,'RSSI'),(441,'AUTH / STATUS')):
+        for x,label in ((8,'SEL'),(34,'NETWORK'),(154,'BSSID'),(278,'CH'),
+                        (310,'RSSI'),(354,'CLI'),(386,'PKTS'),(440,'PRB'),
+                        (470,'AUTH / STATUS')):
             px.text(x,75,label,3)
         self.picker_selection = min(self.picker_selection, max(0,len(rows)-1))
         offset = max(0,self.picker_selection-11)
@@ -214,7 +221,15 @@ class HandshakeScreen(PassiveScreen):
             status = 'Whitelisted' if blocked else auth_names.get(row['auth'], 'Auth '+str(row['auth']))
             if row['auth'] in (0,1): status += ' (no WPA HS)'
             color = 13 if blocked or row['auth'] in (0,1) else 7
-            for x,text in ((8,'[x]' if mac in target.draft else '[ ]'),(34,row['name'][:34]),(220,mac),(344,str(row['channel'])),(387,str(row['rssi'])),(441,status)):
+            clients = str(row['clients']) if target.intel_available else '-'
+            packets = str(row['packets']) if target.intel_available else '-'
+            probes = str(row['probes']) if target.intel_available else '-'
+            for x,text in (
+                    (8,'[x]' if mac in target.draft else '[ ]'),
+                    (34,row['name'][:22]),(154,mac),(278,str(row['channel'])),
+                    (310,str(row['rssi'])),(354,clients),
+                    (386,packets),(440,probes),
+                    (470,status[:32])):
                 px.text(x,y,text,color)
         if not rows:
             px.text(14,105,'Press R to scan nearby networks.' if not target.rows else 'No networks match the current filters.',13)
@@ -224,4 +239,4 @@ class HandshakeScreen(PassiveScreen):
         px.text(8,301,note[:120],9)
         px.line(8,319,631,319,5)
         px.text(8,327,'[SPACE] Toggle network  [ENTER] Use selected  [A] All nearby  [ESC] Back',3)
-        px.text(8,343,'Selections apply when capture starts. Both capture modes use deauth.',13)
+        px.text(8,343,'PRB = unique requester/SSID pairs. Both capture modes use deauth.',13)

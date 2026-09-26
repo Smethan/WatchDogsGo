@@ -14,13 +14,19 @@ class Network:
     auth: str = ""
     rssi: str = ""
     band: str = ""
+    client_count: int = 0
+    packet_count: int = 0
+    probe_count: int = 0
 
 
 @dataclass
 class SnifferAP:
+    bssid: str = ""
     ssid: str = ""
     channel: int = 0
     client_count: int = 0
+    packet_count: int = 0
+    probe_count: int = 0
     clients: List[str] = field(default_factory=list)
 
 
@@ -28,6 +34,7 @@ class SnifferAP:
 class ProbeEntry:
     ssid: str = ""
     mac: str = ""
+    rssi: int = -127
 
 
 @dataclass
@@ -48,9 +55,12 @@ class AppState:
     # Sniffer
     sniffer_running: bool = False
     sniffer_packets: int = 0
+    sniffer_probe_count: int = 0
     sniffer_aps: List[SnifferAP] = field(default_factory=list)
     sniffer_probes: List[ProbeEntry] = field(default_factory=list)
     sniffer_buffer: List[str] = field(default_factory=list)
+    sniffer_intel_available: bool = False
+    sniffer_intel_age_ms: int = 0
 
     # Attacks
     attack_running: bool = False
@@ -185,9 +195,12 @@ class AppState:
     def reset_sniffer(self) -> None:
         self.sniffer_running = False
         self.sniffer_packets = 0
+        self.sniffer_probe_count = 0
         self.sniffer_aps.clear()
         self.sniffer_probes.clear()
         self.sniffer_buffer.clear()
+        self.sniffer_intel_available = False
+        self.sniffer_intel_age_ms = 0
 
     def reset_portal(self) -> None:
         self.portal_running = False

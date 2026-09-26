@@ -14,6 +14,8 @@ class ScanController:
     def reset(self):
         self.supported = self.hs_supported = self.capture_targets_supported = None
         self.capture_exclusions_supported = self.capture_pcapng_supported = None
+        self.sniffer_intel_supported = self.sniffer_scope_supported = None
+        self.target_intel_supported = None
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
         self.wifi_only = self.batch = self.legacy = False
@@ -53,6 +55,8 @@ class ScanController:
             return False
         self.supported = self.hs_supported = self.capture_targets_supported = None
         self.capture_exclusions_supported = self.capture_pcapng_supported = None
+        self.sniffer_intel_supported = self.sniffer_scope_supported = None
+        self.target_intel_supported = None
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
         self.probing = True
@@ -124,6 +128,9 @@ class ScanController:
             self.capture_targets_supported = d.get("hs_capture_targets_v1", False) is True
             self.capture_exclusions_supported = d.get("hs_capture_exclusions_v1", False) is True
             self.capture_pcapng_supported = d.get("hs_capture_pcapng_v1", False) is True
+            self.sniffer_intel_supported = d.get("sniffer_intel_v1", False) is True
+            self.sniffer_scope_supported = d.get("sniffer_scope_v1", False) is True
+            self.target_intel_supported = d.get("target_intel_v1", False) is True
             self.wifi_supported = d.get("wardrive_wifi_serial_v1", False) is True
             self.batch_supported = d.get("wardrive_batch_serial_v2", False) is True
             self.wifi_batch_supported = d.get("wardrive_wifi_batch_serial_v2", False) is True

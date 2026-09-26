@@ -8,6 +8,26 @@ minor versions.
 
 ---
 
+## [0.9.42] — 2026-09-26
+
+### Added
+
+- Add token-bound Packet Sniffer result import with BSSID, client, packet and
+  probe-requester metrics plus richer AP/probe loot CSVs.
+- Add those metrics to both selected HS Capture variants and the Evil Twin
+  network picker through the shared projectZero 1.7.13 target snapshot.
+
+### Fixed
+
+- Clear stale selected-network scope before a normal Packet Sniffer run and
+  wait for final stop acknowledgement before importing its results.
+- Replace Evil Twin's fixed-delay startup with firmware acknowledgements,
+  protect every selected deauthentication target with the host whitelist,
+  restore default portal HTML explicitly, and award verified-credential
+  status only after target-AP connection succeeds.
+- Keep Evil Twin credentials out of serial logs and separate its live client
+  count from the standalone captive portal.
+
 ## [0.9.40] — 2026-09-25
 
 ### Added

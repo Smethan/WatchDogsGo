@@ -51,6 +51,18 @@ token makes selected startup fail closed. WDG never converts a stale selection
 to all-nearby capture. Once capture starts, its BSSID/channel set does not change.
 The capture remains active if you leave either the picker or progress screen.
 
+With WDG 0.9.42 and projectZero 1.7.13, the picker adds three columns from the
+latest completed **Pkt Sniffer** session: `CLI` is the number of unique client
+links attributed to that BSSID, `PKTS` is the number of packets attributed to
+that BSSID, and `PRB` is the number of unique station/SSID probe-request pairs
+for the row's exact SSID. Probe requests do not carry a destination BSSID, so
+`PRB` is deliberately SSID-associated rather than presented as BSSID evidence.
+The header shows the sniffer's total received packets, total unique probe pairs
+and sample age. A dash means no completed compatible sample is available; it
+does not mean a measured zero. Both active capture variants and Evil Twin use
+the same token-bound scan snapshot, while their capture/deauthentication
+behavior remains otherwise unchanged.
+
 ## Updates and storage
 
 Use **WDG 0.9.25+** and **Smethan projectZero firmware 1.7.9+** for optional

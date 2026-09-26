@@ -7,7 +7,7 @@ from queue import Empty, Queue
 import threading
 import time
 
-from .app_state import Network
+from .app_state import Network, SnifferAP
 from .wardrive_protocol import parse_record, display_bytes
 from .scan_controller import ScanController
 from .notable_detector import NotableDetector, ble_name
@@ -206,6 +206,10 @@ class WardriveUI:
         if self.targets.tick():
             if app._pending_cmd and app._pending_cmd.startswith("hs_scan "):
                 app._pending_cmd = None
+            if getattr(app, "_et_scan_pending", False):
+                app._et_scan_pending = False
+                app._attack_step = "error"
+                app.msg("[ET] Network intel scan timed out.", ORANGE)
             app._send("stop")
         run = self.capture.current
         if run and run.state == "starting" and time.monotonic()-run.started_at > 15:
@@ -280,7 +284,17 @@ class WardriveUI:
                     self.app.capturing_hs = False
                     self.app.msg(run.note, 8)
             else:
+                previous = self.targets.state
                 self.targets.accept(d)
+                if previous != "ready" and self.targets.state == "ready":
+                    self._publish_target_intel()
+                    if getattr(self.app, "_et_scan_pending", False):
+                        self._finish_evil_twin_scan()
+            if (self.targets.state == "error" and
+                    getattr(self.app, "_et_scan_pending", False)):
+                self.app._et_scan_pending = False
+                self.app._attack_step = "error"
+                self.app.msg("[ET] " + self.targets.error, ORANGE)
             return True
         if self.capture.handle(s):
             return True
@@ -353,11 +367,16 @@ class WardriveUI:
                 app.sniffing = app.capturing_hs = False
                 app._bt_tracking = app._bt_airtag = False
                 app.state.portal_running = app.state.evil_twin_running = False
+            if getattr(app, "_pending_state", "") != "evil_twin_start":
+                app._evil_twin_starting = False
+                app._evil_twin_start_deadline = 0.0
             if app._pending_cmd and self.scan.active:
                 return True  # wait for this session's structured stopped event first
             if app._pending_cmd:
+                app._sniffer_results_pending = False
                 cmd, state, name = app._pending_cmd, app._pending_state, app._pending_cmd_name
                 app._pending_cmd = None
+                app._pending_state = ""
                 if state in ("all_wardrive", "all_wardrive_host", "hs_sniff"):
                     self.detector.clear()
                     if state == "hs_sniff":
@@ -380,6 +399,9 @@ class WardriveUI:
                         self.cell_candidates.clear()
                     self.last_error = ""
                 else:
+                    if state == "evil_twin_start":
+                        app._dispatch_evil_twin_start(cmd)
+                        return True
                     if capture_storage(cmd):
                         self.capture.start(cmd)
                     elif state == "hs_target_scan" and not self.targets.dispatched(cmd):
@@ -390,9 +412,60 @@ class WardriveUI:
                         app._bt_scan_start_time = time.time()
                 app.msg("[START] " + name, CYAN)
                 return True
+            if getattr(app, "_sniffer_results_pending", False):
+                app._request_sniffer_intel()
+                return True
             if self.scan.state == "running":
                 return True  # delayed legacy text cannot stop a confirmed new session
         return False
+
+    def _publish_target_intel(self):
+        """Publish the latest BSSID-keyed sniffer metrics atomically."""
+        state = self.app.state
+        state.sniffer_intel_available = self.targets.intel_available
+        state.sniffer_packets = self.targets.intel_packets
+        state.sniffer_probe_count = self.targets.intel_probes
+        state.sniffer_intel_age_ms = self.targets.intel_age_ms
+        if self.targets.intel_available:
+            state.sniffer_aps = [
+                SnifferAP(
+                    bssid=row["bssid"], ssid=row["name"],
+                    channel=row["channel"], client_count=row["clients"],
+                    packet_count=row["packets"], probe_count=row["probes"],
+                )
+                for row in self.targets.rows.values()
+            ]
+        else:
+            state.sniffer_aps = []
+
+    def _finish_evil_twin_scan(self):
+        auth_names = {
+            0: "Open", 1: "WEP", 2: "WPA", 3: "WPA2",
+            4: "WPA/WPA2", 5: "Enterprise", 6: "WPA3",
+            7: "WPA2/WPA3", 9: "OWE",
+        }
+        networks = [
+            Network(
+                index=str(row["seq"]), ssid=row["name"],
+                bssid=row["bssid"], channel=str(row["channel"]),
+                auth=auth_names.get(row["auth"], "Auth " + str(row["auth"])),
+                rssi=str(row["rssi"]),
+                band="2.4GHz" if row["channel"] <= 14 else "5GHz",
+                client_count=row["clients"], packet_count=row["packets"],
+                probe_count=row["probes"],
+            )
+            for row in self.targets.rows.values()
+        ]
+        self.app._et_scan_pending = False
+        self.app._wifi_scan_done_time = time.time()
+        self.app.state.networks = list(networks)
+        if networks:
+            self.app._attack_scan_results = networks
+            self.app._show_net_selection()
+        else:
+            self.app.msg("[ET] No networks found", ORANGE)
+            self.app._attack_mode = ""
+            self.app._attack_step = ""
 
     def host_ble_error(self, message, *, shared_failure=False):
         meshtastic = getattr(self.app, "_meshtastic", None)

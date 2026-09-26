@@ -291,9 +291,9 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 |------|---------|-------------|
 | WiFi Wardrive | `scan_networks` | Continuous WiFi scan + GPS logging (WiGLE CSV) |
 | BT Wardrive | `scan_bt` | Continuous BLE scan + GPS logging |
-| Pkt Sniffer | `start_sniffer` | Raw 802.11 + BLE packet capture |
-| HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
-| HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
+| Pkt Sniffer | `start_sniffer_all` | Raw 802.11 observation with AP/client/packet/probe summaries |
+| HS Capture | `start_handshake` | Active capture to ESP32 SD; BSSID picker includes latest sniffer metrics (firmware 1.7.13+) |
+| HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; same picker and sniffer metrics (firmware 1.7.13+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
 | All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and the selected LoRa/ADS-B/433 collectors |
 | All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and selected host collectors |
@@ -306,7 +306,7 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | Blackout | `start_blackout` | All-channel deauth broadcast |
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; optional BSSID picker (firmware 1.7.9+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; optional BSSID picker (firmware 1.7.9+) |
-| Evil Twin | `start_portal` | Fake AP with captive portal (SSID input) |
+| Evil Twin | `start_evil_twin` | Clone a scanned AP, deauthenticate selected targets, and verify submitted credentials against the selected BSSID |
 | SAE Flood | `sae_overflow` | WPA3 SAE Commit overflow |
 | Dragon Drain | Python-native | WPA3 SAE DoS via scapy **!** |
 | MITM | Python-native | ARP spoofing + live traffic capture |
@@ -318,6 +318,10 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 Both active HS Capture screens keep the original all-nearby mode. Press `N` to
 scan, filter and select up to 16 BSSIDs, or `A` to return to all nearby networks.
 Capture uses deauthentication in either scope; see [HS Capture controls](docs/HS_CAPTURE.md).
+With WDG 0.9.42 and projectZero 1.7.13, selected rows also show the latest
+completed Packet Sniffer session's client links, BSSID-attributed packet count,
+and unique requester/SSID probe pairs. The same BSSID-keyed snapshot drives the
+Evil Twin target list, so duplicate SSIDs remain separate.
 
 ### ADDONS
 

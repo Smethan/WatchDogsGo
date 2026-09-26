@@ -13,7 +13,11 @@ Every machine line begins `WDG:` and contains compact JSON. Firmware emits a lea
 
 ## Records
 
-Capabilities: `v:1`, `kind:"capabilities"`, `wardrive_serial_v1:true`, `bands:["wifi24","wifi5","ble"]`, `wifi_mgmt:true`, `ble_raw_ad:true`, `ble_extended:false`, `max_line:1024`.
+Capabilities include `v:1`, `kind:"capabilities"`,
+`wardrive_serial_v1:true`, `sniffer_intel_v1:true`,
+`sniffer_scope_v1:true`, `target_intel_v1:true`,
+`bands:["wifi24","wifi5","ble"]`, `wifi_mgmt:true`,
+`ble_raw_ad:true`, `ble_extended:false`, and `max_line:1024`.
 
 All session records carry `v:1`, `kind`, `session`, and strictly increasing `seq`. Sequence gaps can reflect rejected/dropped transmissions. The host rejects stale sessions, duplicate sequences, unsupported versions and malformed records.
 
@@ -56,3 +60,10 @@ WDG's liveness timer. See [All Wardrive radio modes](HOST_BLE_WARDRIVE.md).
 In WDG 0.9.17, All Wardrive defaults back to `start_wardrive_serial` (both ESP32
 radios). The separate All Wardrive (host BLE) option selects the Wi-Fi-only
 command. The corrected liveness rule applies to both options.
+
+Firmware 1.7.13 adds the separate, token-bound `SNIFF:` result transaction and
+extends `HST:` target rows with Packet Sniffer client/packet/probe metrics.
+These records are not part of a live `WDG:` wardrive session. WDG consumes them
+only after the corresponding final stop/scan record and commits complete,
+count-matched snapshots atomically. See [HS Capture](HS_CAPTURE.md) for the UI
+semantics and the projectZero firmware protocol document for field bounds.

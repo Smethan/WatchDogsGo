@@ -10,6 +10,35 @@
   two supported All Wardrive choices retain the corrected control/data liveness
   checks and sequence-gap counters.
 
+## 0.9.42 — Packet Sniffer intelligence in HS Capture and Evil Twin
+
+- Import the completed Packet Sniffer session as a bounded, token-bound serial
+  transaction. WDG now retains BSSID, client count, per-AP packet count, exact
+  SSID probe-requester count and probe RSSI, writes the richer AP/probe CSVs,
+  and commits nothing until the complete sequence has passed validation.
+- Show `CLI`, `PKTS` and `PRB` columns in the selected-network picker shared by
+  **HS Capture** and **HS Capture no SD**, with total packets, total unique
+  requester/SSID probe pairs and sample age in the header. **Evil Twin** now
+  uses that same token-bound BSSID snapshot instead of its older text scan and
+  displays the same metrics without joining duplicate SSIDs.
+- Give normal Packet Sniffer starts explicit all-network scope so a prior
+  selected capture cannot silently narrow the next run. Result import waits
+  for the firmware's final stop acknowledgement, and every new session clears
+  its counters while preserving only the AP identities needed for matching.
+- Make Evil Twin start/stop acknowledgement-driven. WDG no longer marks it
+  running after fixed sleeps, restores the default portal when selected,
+  rejects any selected deauthentication target on the Wi-Fi whitelist, handles
+  startup timeout/failure, and separates portal client counts from Evil Twin
+  client counts. A form submission is no longer labeled as a verified
+  credential; success/badge/XP require the target AP to accept it.
+- Require projectZero 1.7.13 capabilities for the integrated lists. Older
+  firmware remains usable for existing HS Capture flows, but WDG does not
+  pretend unavailable sniffer metrics are zeros.
+
+The full WDG synthetic suite and projectZero's native firmware harness pass.
+RF client attribution, channel coverage, Evil Twin association/verification
+and physical uConsole/XIAO behavior still require field validation.
+
 ## 0.9.41 — Shared AIO GPS ownership through gpsd
 
 - Make `gpsd` the sole reader of the uConsole AIO GPS UART when Meshtastic is
