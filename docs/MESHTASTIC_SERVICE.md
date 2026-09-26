@@ -88,6 +88,40 @@ and continues radio/local-API operation if phone Bluetooth is unavailable.
 Closing WDG disconnects only the restricted client; it leaves the selected
 daemon running for mesh reception and phone reconnects.
 
+## Shared AIO GPS ownership
+
+The AIO GPS UART must have exactly one raw reader. Linux does not duplicate a
+TTY byte stream between consumers: two direct readers divide NMEA bytes and can
+both report an open device while neither receives complete position sentences.
+
+When `/etc/meshtasticd/config.yaml` claims the CM4/CM5 platform GPS with
+`GPS.SerialPath`, rerunning `sudo bash setup.sh` installs and configures gpsd as
+the sole `/dev/serial0` owner. Setup preserves one-time backups at:
+
+```text
+/etc/default/gpsd.wdg-before-shared-gps
+/etc/meshtasticd/config.yaml.wdg-before-shared-gps
+```
+
+Meshtastic is migrated to its native gpsd input:
+
+```yaml
+GPS:
+  GpsdHost: 127.0.0.1
+  GpsdPort: 2947
+```
+
+WDG records the authoritative ownership policy in
+`/etc/watchdogs/gpsd.conf` and consumes the same local gpsd JSON stream. If
+gpsd is temporarily unavailable, WDG fails closed and retries the broker; it
+does not open the raw UART and recreate the competing-reader failure. Explicit
+external GPS paths and ModemManager GNSS remain separate provider choices.
+
+The boot screen's **GPS transport** line confirms only that a provider is
+available. The map/HUD reports the independent satellite-fix state. A powered
+receiver may legitimately need time and a clear view of the sky before the
+first fix.
+
 ## Install and update transaction
 
 The first stock-to-fork migration requires a human hardware check because the

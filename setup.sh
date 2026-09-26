@@ -170,6 +170,7 @@ if command -v apt-get &>/dev/null; then
     RPI_PKGS=(
         python3-rpi-lgpio python3-lgpio   # CM5/RPi5 GPIO for LoRa
         raspi-utils                       # provides pinctrl
+        gpsd                              # one shared reader for the AIO GPS UART
     )
 
     SYS_PKGS=("${CORE_PKGS[@]}")
@@ -303,6 +304,48 @@ if [[ "$(uname)" == "Linux" ]]; then
                 break
             fi
         done
+    fi
+
+    # gpsd must be the only process reading the AIO UART. Meshtastic supports
+    # gpsd directly, and WDG consumes the same JSON stream. Configure this
+    # automatically only when an existing Meshtastic config proves that the
+    # platform UART is intended for GPS, or after WDG has already installed its
+    # ownership marker. An explicit opt-in covers first-time AIO installs.
+    SHARED_GPSD_MARKER=/etc/watchdogs/gpsd.conf
+    MESHTASTIC_CONFIG=/etc/meshtasticd/config.yaml
+    if [ -f "$SHARED_GPSD_MARKER" ] || \
+       [ "${WDG_ENABLE_SHARED_GPSD:-0}" = "1" ] || \
+       { [ -r "$MESHTASTIC_CONFIG" ] && \
+         grep -Eq '^[[:space:]]+SerialPath:[[:space:]]*/dev/(serial0|ttyS0|ttyAMA0)([[:space:]#]|$)' \
+             "$MESHTASTIC_CONFIG"; }; then
+        info "Configuring gpsd as the shared AIO GPS owner..."
+        if sudo python3 "$SCRIPT_DIR/scripts/configure_shared_gps.py" \
+                --gpsd-default /etc/default/gpsd \
+                --meshtastic-config "$MESHTASTIC_CONFIG" \
+                --marker "$SHARED_GPSD_MARKER" \
+                --device /dev/serial0 >>"$APT_LOG" 2>&1; then
+            if sudo systemctl enable gpsd.socket >>"$APT_LOG" 2>&1 && \
+               sudo systemctl restart gpsd.socket >>"$APT_LOG" 2>&1 && \
+               sudo systemctl restart gpsd.service >>"$APT_LOG" 2>&1; then
+                ok "gpsd owns /dev/serial0; WDG and Meshtastic share its fixes"
+                for unit in meshtasticd.service meshtasticd-wdg.service; do
+                    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                        sudo systemctl restart "$unit" >>"$APT_LOG" 2>&1 || {
+                            warn "$unit did not restart after GPS migration"
+                            ERRORS=$((ERRORS + 1))
+                        }
+                    fi
+                done
+            else
+                dump_log_on_fail "gpsd service activation" "$APT_LOG"
+                ERRORS=$((ERRORS + 1))
+            fi
+        else
+            dump_log_on_fail "shared GPS configuration" "$APT_LOG"
+            ERRORS=$((ERRORS + 1))
+        fi
+    else
+        info "No shared AIO GPS claim detected — leaving gpsd unconfigured"
     fi
 fi
 

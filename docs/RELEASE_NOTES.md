@@ -1,5 +1,27 @@
 # Smethan WatchDogsGo
 
+## 0.9.41 — Shared AIO GPS ownership through gpsd
+
+- Make `gpsd` the sole reader of the uConsole AIO GPS UART when Meshtastic is
+  configured for the same CM4/CM5 serial port. `setup.sh` installs gpsd,
+  preserves one-time backups, migrates Meshtastic from `GPS.SerialPath` to its
+  supported `GpsdHost`/`GpsdPort` input, and writes an authoritative WDG marker.
+  WDG and Meshtastic can now receive the same GPS stream without dividing NMEA
+  bytes between two serial readers.
+- Add a dependency-free, non-blocking gpsd JSON client to WDG. It handles
+  partial and malformed records, translates TPV/SKY reports into the existing
+  fix model, reports satellite visibility and HDOP, reconnects after a daemon
+  restart, and refuses to fall back to the raw UART while managed gpsd ownership
+  is configured.
+- Read the AIO GPS power state before initializing a provider. The boot screen
+  now reports the GPS transport separately from the map's satellite-fix state,
+  so an open port is no longer presented as evidence of a position fix.
+- Keep explicit external GPS devices and ModemManager-backed LTE GNSS behavior
+  intact. The shared-gpsd migration is automatic only for an existing
+  Meshtastic claim on `/dev/serial0`, `/dev/ttyS0`, or `/dev/ttyAMA0`, an
+  existing WDG ownership marker, or the explicit
+  `WDG_ENABLE_SHARED_GPSD=1` setup opt-in.
+
 ## 0.9.40 — Native Meshtastic phone BLE and uConsole radio integration
 
 - Add a protocol selector for the AIO v2 SX1262 and a shared **Mesh

@@ -1,16 +1,18 @@
 """GPS receiver — NMEA parser for UART/USB GPS modules."""
 
-import time
 import glob
 import logging
+import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 import serial
 
-from .config import GPS_DEVICE, GPS_BAUD_RATE
+from .config import GPS_BAUD_RATE, GPS_DEVICE
+from .gpsd_client import GpsdClient
 from .modem_location import ModemLocationBroker, managed_port_names
 
 log = logging.getLogger(__name__)
@@ -58,7 +60,8 @@ class GpsManager:
     def __init__(self, device: str = GPS_DEVICE,
                  baud: int = GPS_BAUD_RATE,
                  modem_broker: Optional[ModemLocationBroker] = None,
-                 modem_enabled: bool = True) -> None:
+                 modem_enabled: bool = True,
+                 gpsd_config: Optional[Path] = None) -> None:
         self.device = device
         self._configured_device = device
         self._baud = baud
@@ -74,10 +77,44 @@ class GpsManager:
         self.modem_enabled = bool(modem_enabled)
         self.provider = ""
         self.status_reason = ""
+        self._gpsd: Optional[GpsdClient] = None
+        self._gpsd_config_path = gpsd_config or Path(
+            os.environ.get("WDG_GPSD_CONFIG", "/etc/watchdogs/gpsd.conf"))
+        gpsd_settings = self._load_gpsd_config(self._gpsd_config_path)
+        env_host = os.environ.get("WDG_GPSD_HOST")
+        env_port = os.environ.get("WDG_GPSD_PORT")
+        self._gpsd_host = env_host or gpsd_settings.get("HOST", "127.0.0.1")
+        try:
+            self._gpsd_port = int(env_port or gpsd_settings.get("PORT", "2947"))
+        except (TypeError, ValueError):
+            self._gpsd_port = 2947
+        self._gpsd_managed = bool(gpsd_settings or env_host or env_port)
+        self._last_data_at = 0.0
 
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def data_flowing(self) -> bool:
+        return bool(self._last_data_at
+                    and time.monotonic() - self._last_data_at <= 5.0)
+
+    @staticmethod
+    def _load_gpsd_config(path: Path) -> dict[str, str]:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        result: dict[str, str] = {}
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() in {"HOST", "PORT", "DEVICE"}:
+                result[key.strip()] = value.strip().strip('"\'')
+        return result
 
     # ------------------------------------------------------------------
     # Connection
@@ -135,6 +172,17 @@ class GpsManager:
         else:
             log.info("LTE modem integration disabled; skipping ModemManager GPS")
 
+        # setup.sh makes gpsd the authoritative raw-UART owner and writes the
+        # marker read above. Never fall back to opening that same UART when a
+        # managed gpsd endpoint is temporarily unavailable: doing so would
+        # recreate the two-reader corruption this path exists to prevent.
+        if self._gpsd_managed:
+            if self._try_gpsd():
+                return True
+            self.status_reason = (
+                f"gpsd unavailable at {self._gpsd_host}:{self._gpsd_port}")
+            return False
+
         # No usable internal GNSS — probe only the documented platform UART
         # for this Compute Module.  Avoid broad ttyAMA/ttyS discovery because
         # another UART may carry the onboard Bluetooth HCI transport.
@@ -166,6 +214,22 @@ class GpsManager:
             self.status_reason = "LTE modem disabled; no external GPS found"
         log.info("No GPS found — GPS disabled")
         return False
+
+    def _try_gpsd(self) -> bool:
+        client = GpsdClient(self._gpsd_host, self._gpsd_port)
+        try:
+            client.connect()
+        except (OSError, ConnectionError) as exc:
+            log.debug("gpsd connection failed: %s", exc)
+            return False
+        self._gpsd = client
+        self._available = True
+        self.provider = "gpsd"
+        self.device = f"gpsd {self._gpsd_host}:{self._gpsd_port}"
+        self.status_reason = "gpsd connected; waiting for GPS data"
+        log.info("GPS provided by gpsd at %s:%d",
+                 self._gpsd_host, self._gpsd_port)
+        return True
 
     def set_modem_enabled(self, enabled: bool, reconnect: bool = True) -> bool:
         """Apply the persistent LTE integration choice without touching scans.
@@ -390,6 +454,9 @@ class GpsManager:
             except Exception:
                 pass
             self._conn = None
+        if self._gpsd:
+            self._gpsd.close()
+            self._gpsd = None
         if self.provider == "modemmanager":
             self.modem_broker.release("gps")
         # The same broker may have been used for cell tracking while an
@@ -398,6 +465,7 @@ class GpsManager:
         self.modem_broker.close()
         self._available = False
         self.provider = ""
+        self._last_data_at = 0.0
 
     @property
     def fd(self) -> int:
@@ -413,7 +481,13 @@ class GpsManager:
     def read_available(self) -> List[str]:
         """Non-blocking read — return complete NMEA sentences."""
         if self.provider == "modemmanager":
-            return self.modem_broker.drain_nmea()
+            sentences = self.modem_broker.drain_nmea()
+            if sentences:
+                self._last_data_at = time.monotonic()
+            return sentences
+        if self.provider == "gpsd":
+            self._read_gpsd()
+            return []
         if not self._conn:
             return []
         try:
@@ -421,10 +495,89 @@ class GpsManager:
             if waiting <= 0:
                 return []
             raw = self._conn.read(waiting)
+            if raw:
+                self._last_data_at = time.monotonic()
             return self._buf.feed(raw)
         except Exception as exc:
             log.debug("GPS read error: %s", exc)
             return []
+
+    def _read_gpsd(self) -> None:
+        client = self._gpsd
+        if client is None:
+            self._available = False
+            return
+        try:
+            reports = client.read_reports()
+        except ConnectionError as exc:
+            log.warning("GPS gpsd connection lost: %s", exc)
+            client.close()
+            self._gpsd = None
+            self._available = False
+            self.provider = ""
+            self.status_reason = str(exc)
+            return
+
+        saw_navigation = False
+        for report in reports:
+            report_class = str(report.get("class", ""))
+            if report_class == "TPV":
+                saw_navigation = self._parse_gpsd_tpv(report) or saw_navigation
+            elif report_class == "SKY":
+                saw_navigation = self._parse_gpsd_sky(report) or saw_navigation
+        if saw_navigation:
+            self._last_data_at = time.monotonic()
+            self.status_reason = (
+                "GPS fix acquired" if self.fix.valid
+                else "GPS data flowing; waiting for satellite fix")
+        elif not self.data_flowing:
+            self.status_reason = "gpsd connected; waiting for GPS data"
+
+    @staticmethod
+    def _finite_number(value) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _parse_gpsd_tpv(self, report: dict) -> bool:
+        try:
+            mode = int(report.get("mode", 0))
+        except (TypeError, ValueError):
+            mode = 0
+        lat = self._finite_number(report.get("lat"))
+        lon = self._finite_number(report.get("lon"))
+        self.fix.valid = bool(mode >= 2 and lat is not None and lon is not None)
+        if lat is not None:
+            self.fix.latitude = lat
+        if lon is not None:
+            self.fix.longitude = lon
+        for key in ("altMSL", "altHAE", "alt"):
+            altitude = self._finite_number(report.get(key))
+            if altitude is not None:
+                self.fix.altitude = altitude
+                break
+        speed = self._finite_number(report.get("speed"))
+        if speed is not None:
+            self.fix.speed_knots = speed * 1.9438444924406
+        if report.get("time"):
+            self.fix.timestamp = str(report["time"])
+        self.fix.fix_quality = 1 if self.fix.valid else 0
+        self.fix.received_at = time.monotonic()
+        return True
+
+    def _parse_gpsd_sky(self, report: dict) -> bool:
+        satellites = report.get("satellites")
+        if isinstance(satellites, list):
+            self.fix.satellites_visible = len(satellites)
+            self.fix.satellites = sum(
+                1 for satellite in satellites
+                if isinstance(satellite, dict) and satellite.get("used") is True)
+        hdop = self._finite_number(report.get("hdop"))
+        if hdop is not None:
+            self.fix.hdop = hdop
+        return True
 
     def process_sentences(self, sentences: List[str]) -> None:
         """Parse NMEA sentences and update self.fix."""

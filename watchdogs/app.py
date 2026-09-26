@@ -474,9 +474,15 @@ class WatchDogsGame(OtaMixin):
         # (ESP32 XIAO needs power via USB GPIO before we can find it)
         self._aio_available = AioManager.is_installed()
         self._usb_enabled = False
+        self._gps_enabled = False
+        self._lora_enabled = False
+        self._sdr_enabled = False
         if self._aio_available:
             _aio_st = AioManager.get_status() or {}
             self._usb_enabled = _aio_st.get("usb", False)
+            self._gps_enabled = _aio_st.get("gps", False)
+            self._lora_enabled = _aio_st.get("lora", False)
+            self._sdr_enabled = _aio_st.get("sdr", False)
             if not self._usb_enabled:
                 if AioManager.toggle("usb", True):
                     self._usb_enabled = True
@@ -519,8 +525,13 @@ class WatchDogsGame(OtaMixin):
         else:
             self._esp32 = False
 
-        # Open GPS
-        self.gps.setup()
+        # Open GPS only after reading the AIO power rail. setup.sh configures
+        # gpsd as the sole raw-UART owner, so this normally opens a local gpsd
+        # client rather than competing with meshtasticd for NMEA bytes.
+        if not self._aio_available or self._gps_enabled:
+            self.gps.setup()
+        else:
+            self.gps.status_reason = "AIO GPS power is off"
 
         # Init loot manager (uses app dir or home)
         # Resolve project root from this file's location (works under sudo).
@@ -560,16 +571,9 @@ class WatchDogsGame(OtaMixin):
         self._map_downloading = False
         self._map_download_cancel = False
 
-        # AIO v2 hardware — read remaining GPIO states (USB already handled above)
-        if self._aio_available:
-            _aio_st = AioManager.get_status() or {}
-            self._gps_enabled = _aio_st.get("gps", False)
-            self._lora_enabled = _aio_st.get("lora", False)
-            self._sdr_enabled = _aio_st.get("sdr", False)
-        else:
+        # Non-AIO systems consider an available provider their GPS power state.
+        if not self._aio_available:
             self._gps_enabled = self.gps.available
-            self._lora_enabled = False
-            self._sdr_enabled = False
 
         # Whitelist
         self._whitelist = WhitelistManager(Path(_app_dir) / "whitelist.json")
@@ -995,6 +999,7 @@ class WatchDogsGame(OtaMixin):
         self._boot_frame = 0
         self._boot_checks_done = False
         self._boot_serial_port = port
+        self._gps_retry_at = 0.0
         self._build_boot_checks()
 
         # Start the selected mesh client only when automatic LoRa collection
@@ -1209,7 +1214,7 @@ class WatchDogsGame(OtaMixin):
 
         # GPS
         if self.gps.available:
-            checks.append((f"  GPS on {self.gps.device}", C_SUCCESS))
+            checks.append((f"  GPS transport: {self.gps.device}", C_SUCCESS))
         else:
             reason = getattr(self.gps, "status_reason", "")
             checks.append(("  GPS — " + (reason[:66] if reason else "not found"), C_WARNING))
@@ -4809,17 +4814,23 @@ class WatchDogsGame(OtaMixin):
 
 
     def _poll_gps(self):
+        now = time.monotonic()
         if not self.gps.available:
             self.gps_fix = False
+            if self._gps_enabled and now >= self._gps_retry_at:
+                self._gps_retry_at = now + 5.0
+                if self.gps.setup():
+                    self._term_add(
+                        f"[GPS] Reconnected through {self.gps.device}", raw=True)
             return
         sentences = self.gps.read_available()
         if sentences:
             self.gps.process_sentences(sentences)
         fix = self.gps.fix
-        self.wardrive.fixes.update(fix, time.monotonic())
+        self.wardrive.fixes.update(fix, now)
         self.gps_sats = fix.satellites
         self.gps_sats_vis = fix.satellites_visible
-        if fix.valid and time.monotonic() - fix.received_at <= 3:
+        if fix.valid and now - fix.received_at <= 3:
             # Jitter filter: ignore moves < ~30 m (0.0003°)
             dlat = abs(fix.latitude - self.player_lat)
             dlon = abs(fix.longitude - self.player_lon)
