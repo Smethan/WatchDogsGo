@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 5})
+        return result({"ok": True, "helper_version": 6})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 5
+    assert controller.version() == 6
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -120,7 +120,7 @@ def test_controller_parses_status_and_preserves_helper_errors():
 
 def test_controller_rejects_pre_hardening_helper_version():
     controller = service.MeshtasticServiceController(
-        runner=lambda *a, **k: result({"ok": True, "helper_version": 3}),
+        runner=lambda *a, **k: result({"ok": True, "helper_version": 5}),
         geteuid=lambda: 0)
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 5
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 6
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -1871,6 +1871,64 @@ def candidate_backup(tmp_path):
     return backup
 
 
+def nested_candidate_backup(tmp_path):
+    backup = candidate_backup(tmp_path)
+    state_root = backup / "state/var-lib-meshtasticd"
+    nested = state_root / ".portduino/default"
+    nested.mkdir(parents=True)
+    (state_root / "prefs").rename(nested / "prefs")
+    (state_root / "backups").rename(nested / "backups")
+    return backup
+
+
+def test_state_fsdir_prefers_stock_portduino_layout(tmp_path):
+    helper = load_helper()
+    state_root = tmp_path / "var-lib-meshtasticd"
+    flat = state_root / "prefs"
+    nested = state_root / ".portduino/default"
+    flat.mkdir(parents=True)
+    nested.mkdir(parents=True)
+
+    assert helper._resolve_state_fsdir(state_root) == nested
+
+
+def test_state_fsdir_accepts_legacy_flat_fixture(tmp_path):
+    helper = load_helper()
+    state_root = tmp_path / "var-lib-meshtasticd"
+    (state_root / "prefs").mkdir(parents=True)
+
+    assert helper._resolve_state_fsdir(state_root) == state_root
+
+
+def test_state_fsdir_rejects_nested_symlink(tmp_path):
+    helper = load_helper()
+    state_root = tmp_path / "var-lib-meshtasticd"
+    target = tmp_path / "outside"
+    target.mkdir()
+    (state_root / ".portduino").mkdir(parents=True)
+    (state_root / ".portduino/default").symlink_to(target)
+
+    with pytest.raises(helper.HelperError, match="unsafe"):
+        helper._resolve_state_fsdir(state_root)
+
+
+def test_candidate_copy_uses_stock_nested_state(tmp_path, monkeypatch):
+    helper = load_helper()
+    backup = nested_candidate_backup(tmp_path)
+    runtime_root = install_candidate_workspace_fakes(
+        helper, monkeypatch, tmp_path)
+    candidate = None
+    try:
+        (candidate, fsdir, _config, _socket,
+         _fragment_dir) = helper._copy_candidate_state(backup, 612, 613)
+        assert fsdir == candidate / "var-lib-meshtasticd/.portduino/default"
+        assert (fsdir / "prefs/device.proto").is_file()
+    finally:
+        if candidate is not None:
+            shutil.rmtree(candidate)
+    assert list(runtime_root.iterdir()) == []
+
+
 class FakeCandidateProcess:
     def __init__(self, *, require_kill=False,
                  output=b"MAC ADDRESS: 02:00:A1:B2:C3:D4\n"):
@@ -2498,6 +2556,7 @@ def test_live_validation_rejects_critical_change(monkeypatch):
     monkeypatch.setattr(
         helper, "_critical_state_snapshot",
         lambda *_args: {"after": True})
+    monkeypatch.setattr(helper, "_resolve_state_fsdir", lambda path: path)
 
     with pytest.raises(helper.HelperError, match="modified critical"):
         helper._verify_live_state(expected, {"before": True})

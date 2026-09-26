@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 5
+HELPER_VERSION = 6
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)-wdg\.(0|[1-9][0-9]*)$")
@@ -460,6 +460,29 @@ def _critical_state_snapshot(
             for path in CRITICAL_STATE_FILES
         },
     }
+
+
+def _resolve_state_fsdir(state_root: Path) -> Path:
+    """Resolve stock Portduino state while retaining flat test compatibility."""
+    if state_root.is_symlink() or not state_root.is_dir():
+        raise HelperError("Meshtastic state directory is missing or unsafe: "
+                          + str(state_root))
+
+    portduino = state_root / ".portduino"
+    nested = portduino / "default"
+    if nested.exists() or nested.is_symlink():
+        if (portduino.is_symlink() or not portduino.is_dir()
+                or nested.is_symlink() or not nested.is_dir()):
+            raise HelperError("Meshtastic Portduino state is unsafe: "
+                              + str(nested))
+        return nested
+
+    prefs = state_root / "prefs"
+    if prefs.is_symlink() or not prefs.is_dir():
+        raise HelperError(
+            "Meshtastic state contains neither stock .portduino/default "
+            "nor a compatible flat prefs directory: " + str(state_root))
+    return state_root
 
 
 def _semantic_status_snapshot(status: dict[str, Any]) -> dict[str, Any]:
@@ -1466,14 +1489,15 @@ def _copy_candidate_state(
     try:
         os.chmod(candidate, 0o700)
         config_dir = candidate / "etc-meshtasticd"
-        fsdir = candidate / "var-lib-meshtasticd"
+        state_root = candidate / "var-lib-meshtasticd"
         shutil.copytree(
             source_config, config_dir, symlinks=False,
             copy_function=shutil.copy2)
         shutil.copytree(
-            source_fsdir, fsdir, symlinks=False,
+            source_fsdir, state_root, symlinks=False,
             copy_function=shutil.copy2)
         _chown_validation_tree(candidate, uid, gid)
+        fsdir = _resolve_state_fsdir(state_root)
         config = config_dir / "config.yaml"
         try:
             config_info = config.lstat()
@@ -2163,7 +2187,7 @@ def _verify_live_state(
             "Live meshtasticd-wdg identity or channel semantics differ from "
             "the authoritative pre-install baseline")
     critical_after = _critical_state_snapshot(
-        MESHTASTIC_STATE_DIR, MESHTASTIC_CONFIG_DIR)
+        _resolve_state_fsdir(MESHTASTIC_STATE_DIR), MESHTASTIC_CONFIG_DIR)
     if critical_after != critical_before:
         raise HelperError(
             "Live meshtasticd-wdg modified critical identity or channel state")
@@ -2643,7 +2667,8 @@ def _install_tag(tag: str) -> dict[str, Any]:
                 _pin_live_mac(effective_mac)
             _run(["systemctl", "daemon-reload"], timeout=30)
             live_critical = _critical_state_snapshot(
-                MESHTASTIC_STATE_DIR, MESHTASTIC_CONFIG_DIR)
+                _resolve_state_fsdir(MESHTASTIC_STATE_DIR),
+                MESHTASTIC_CONFIG_DIR)
             _run(["systemctl", "start", TARGET_SERVICES["wdg"]], timeout=45)
             _verify_live_state(baseline_semantic, live_critical)
             _set_enabled(TARGET_SERVICES["wdg"], True)
