@@ -23,7 +23,7 @@ ASSET = f"meshtasticd-wdg_{VERSION}_arm64.deb"
 DEFAULT_DEPENDS = (
     "adduser, bluez, dbus, util-linux, libc6 (>= 2.36), "
     "libgcc-s1 (>= 3.0), liborcania2.3 (>= 2.3.3), "
-    "libstdc++6 (>= 12), libulfius2.7 (>= 2.7.11)"
+    "libstdc++6 (>= 12), libulfius2.7t64 (>= 2.7.15)"
 )
 
 
@@ -339,6 +339,7 @@ def test_package_rejects_unreviewed_control_relationship_fields(
 @pytest.mark.parametrize("depends", [
     DEFAULT_DEPENDS + ", curl | wget",
     DEFAULT_DEPENDS + ", curl",
+    DEFAULT_DEPENDS.replace("libulfius2.7t64", "libulfius2.7"),
     DEFAULT_DEPENDS + ", libc6:any",
     "adduser, bluez, dbus, util-linux, libc6, libgcc-s1",
     (

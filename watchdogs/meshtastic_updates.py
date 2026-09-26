@@ -97,18 +97,18 @@ SAFE_STATIC_DEPENDENCIES = frozenset({
 SAFE_REQUIRED_DEPENDENCIES = frozenset({
     *SAFE_STATIC_DEPENDENCIES,
     "libc6", "libgcc-s1", "liborcania2.3", "libstdc++6",
-    "libulfius2.7",
+    "libulfius2.7t64",
 })
 # ``dpkg-shlibdeps`` emits only direct ELF dependencies.  Keep this closed to
-# the runtime packages supplied by the pinned Debian Bookworm build image so a
+# the runtime packages supplied by the pinned Debian Trixie build image so a
 # checksummed .deb cannot make apt install an unrelated package (and thereby
 # execute that package's maintainer scripts) as a side effect of an update.
 SAFE_DEPENDENCY_PACKAGES = frozenset({
     *SAFE_REQUIRED_DEPENDENCIES,
-    "libacl1", "libbluetooth3", "libbsd0", "libgpiod2", "libi2c0",
-    "libjsoncpp25", "liborcania2.3", "libsdbus-c++1", "libsdl2-2.0-0",
-    "libssl3", "libsystemd0", "libulfius2.7", "libusb-1.0-0", "libuv1",
-    "libyaml-cpp0.7",
+    "libacl1", "libbluetooth3", "libbsd0", "libgpiod3", "libi2c0",
+    "libjsoncpp26", "liborcania2.3", "libsdbus-c++2",
+    "libsdl2-2.0-0", "libssl3t64", "libsystemd0", "libulfius2.7t64",
+    "libusb-1.0-0", "libuv1t64", "libyaml-cpp0.8",
 })
 DEPENDENCY_RE = re.compile(
     r"^([a-z0-9][a-z0-9+.-]*)(?: \((>=) "
