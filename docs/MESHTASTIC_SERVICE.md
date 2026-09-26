@@ -122,7 +122,8 @@ itself. For that one migration:
    gh run download "$RUN_ID" --repo Smethan/meshtastic-firmware \
      --name "$ARTIFACT" --dir "$CANDIDATE"
    cd "$WDG_CHECKOUT"
-   sudo bash scripts/setup_meshtastic.sh "$USER" "$(id -u)"
+   sudo bash scripts/setup_meshtastic.sh \
+     --install-support "$USER" "$(id -u)"
    sudo install -d -o root -g root -m 0700 "$INBOX"
    for NAME in compatibility.json SHA256SUMS SOURCE.txt copyright "$DEB_NAME"; do
      sudo install -o root -g root -m 0600 "$CANDIDATE/$NAME" "$INBOX/$NAME"

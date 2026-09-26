@@ -11,6 +11,7 @@ LIB_TARGET="/usr/local/libexec/watchdogs-meshtastic-lib"
 SUDOERS_TARGET="/etc/sudoers.d/watchdogs-meshtastic"
 CONFIG_TARGET="/etc/meshtasticd/wdg-portduino.yaml"
 CACHE_ROOT="/var/cache/watchdogs/meshtasticd-wdg"
+FIRST_INSTALL_INBOX="$CACHE_ROOT/first-install-inbox"
 BACKUP_ROOT="/var/backups/meshtasticd-wdg"
 WATCHDOGS_GROUP="watchdogs"
 MESHTASTIC_GROUP="meshtasticd"
@@ -205,7 +206,7 @@ wdg_install_meshtastic_support() {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
 
     for path in "$HELPER_TARGET" "$LIB_TARGET" "$SUDOERS_TARGET" \
-                "$CACHE_ROOT" "$BACKUP_ROOT" "$CONFIG_TARGET" \
+                "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" "$CONFIG_TARGET" \
                 "$RADIO_LOCK_DIR" "$RADIO_LOCK_PATH" \
                 "$TRANSACTION_LOCK_PATH" \
                 "$RADIO_TMPFILES_DIR" "$RADIO_TMPFILES_TARGET"; do
@@ -219,7 +220,8 @@ wdg_install_meshtastic_support() {
     install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_TARGET"
     install -o root -g root -m 0644 \
         "$VALIDATOR_SOURCE" "$LIB_TARGET/meshtastic_updates.py"
-    install -d -o root -g root -m 0700 "$CACHE_ROOT" "$BACKUP_ROOT"
+    install -d -o root -g root -m 0700 \
+        "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT"
 
     install -d -o root -g root -m 0755 /etc/meshtasticd
     local policy_group="root" policy_mode="0600"

@@ -96,7 +96,8 @@ SAFE_STATIC_DEPENDENCIES = frozenset({
 })
 SAFE_REQUIRED_DEPENDENCIES = frozenset({
     *SAFE_STATIC_DEPENDENCIES,
-    "libc6", "libgcc-s1", "libstdc++6",
+    "libc6", "libgcc-s1", "liborcania2.3", "libstdc++6",
+    "libulfius2.7",
 })
 # ``dpkg-shlibdeps`` emits only direct ELF dependencies.  Keep this closed to
 # the runtime packages supplied by the pinned Debian Bookworm build image so a
@@ -105,8 +106,9 @@ SAFE_REQUIRED_DEPENDENCIES = frozenset({
 SAFE_DEPENDENCY_PACKAGES = frozenset({
     *SAFE_REQUIRED_DEPENDENCIES,
     "libacl1", "libbluetooth3", "libbsd0", "libgpiod2", "libi2c0",
-    "libjsoncpp25", "libsdbus-c++1", "libsdl2-2.0-0", "libssl3",
-    "libsystemd0", "libusb-1.0-0", "libuv1", "libyaml-cpp0.7",
+    "libjsoncpp25", "liborcania2.3", "libsdbus-c++1", "libsdl2-2.0-0",
+    "libssl3", "libsystemd0", "libulfius2.7", "libusb-1.0-0", "libuv1",
+    "libyaml-cpp0.7",
 })
 DEPENDENCY_RE = re.compile(
     r"^([a-z0-9][a-z0-9+.-]*)(?: \((>=) "

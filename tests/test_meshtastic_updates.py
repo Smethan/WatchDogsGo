@@ -22,7 +22,8 @@ VERSION = "2.8.1+wdg1"
 ASSET = f"meshtasticd-wdg_{VERSION}_arm64.deb"
 DEFAULT_DEPENDS = (
     "adduser, bluez, dbus, util-linux, libc6 (>= 2.36), "
-    "libgcc-s1 (>= 3.0), libstdc++6 (>= 12)"
+    "libgcc-s1 (>= 3.0), liborcania2.3 (>= 2.3.3), "
+    "libstdc++6 (>= 12), libulfius2.7 (>= 2.7.11)"
 )
 
 
