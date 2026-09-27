@@ -185,6 +185,16 @@ of hanging, and does not attempt to unregister an object BlueZ never accepted.
 The patched path has automated coverage but has not yet been validated with a
 physical uConsole and MeshMapper session.
 
+An earlier `main` build could finish bonding but then report `Pairing
+verification failed: device is not the retained MeshMapper phone`. BlueZ
+replaces a private LE connection address with the device's public identity
+address after pairing; current `main` accepts that transition only for the
+exact passkey-authenticated `Device1` object claimed in the open window. If the
+failed build already created a phone bond without saving it in WDG, remove only
+that phone once in the system Bluetooth settings (or with `bluetoothctl remove
+<phone-address>`), then open a fresh WDG pairing window. Do not bulk-remove
+other bonds.
+
 If the WDG settings page reports that no GATT server or advertising manager is
 available, confirm BlueZ is running and try the other controller. If MeshMapper
 connects but cannot complete setup, disconnect any other device on the

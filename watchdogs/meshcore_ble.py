@@ -556,6 +556,32 @@ class _PairingSecurity:
         self.claimed_authenticated = True
         return identity
 
+    def promote_paired_identity(self, device_path: str,
+                                props: dict) -> tuple[str, str]:
+        """Replace a claimed LE private address with its bonded identity.
+
+        With LE privacy, BlueZ exposes the connection address before pairing
+        and the identity address afterward.  The Device1 object path remains
+        the session binding on affected BlueZ versions, so an address change
+        is accepted only for the exact passkey-authenticated, paired and bonded
+        object already claimed by this pairing window.
+        """
+        if not self.window_open or not self.claimed_path:
+            raise PermissionError("MeshMapper pairing window is closed")
+        if str(device_path) != self.claimed_path:
+            raise PermissionError("paired identity is for another device")
+        if not self.claimed_authenticated:
+            raise PermissionError(
+                "MeshMapper pairing did not use authenticated passkey entry")
+        if not (bool(props.get("Paired")) and bool(props.get("Bonded"))):
+            raise PermissionError("MeshMapper pairing is not complete")
+        address, name = self._identity(device_path, props)
+        if self.retained_address and address != self.retained_address:
+            raise PermissionError("another MeshMapper phone is already bonded")
+        self.claimed_address = address
+        self.claimed_name = name
+        return address, name
+
     def authorize_gatt(self, device_path: str,
                        props: dict) -> tuple[str, str]:
         address, name = self._identity(device_path, props)
@@ -1135,6 +1161,12 @@ class _BluezPeripheral:
             if not self._security.claimed_authenticated:
                 raise PermissionError(
                     "pairing completed without authenticated passkey entry")
+            # BlueZ can replace the LE connection address with the device's
+            # identity address once pairing completes. Keep the exact claimed
+            # Device1 path as the session binding, then persist the resolved
+            # identity address used for all later authorisation.
+            self._security.promote_paired_identity(
+                self._security.claimed_path, props)
             properties = dbus.Interface(
                 bus.get_object("org.bluez", self._security.claimed_path),
                 "org.freedesktop.DBus.Properties")
@@ -1142,6 +1174,8 @@ class _BluezPeripheral:
                 properties.Set(
                     _BLUEZ_DEVICE_IFACE, "Trusted", dbus.Boolean(True))
                 props = device_properties(self._security.claimed_path)
+            self._security.promote_paired_identity(
+                self._security.claimed_path, props)
             self._security.authorize_gatt(
                 self._security.claimed_path, props)
             address, name = self._security.retain_claim()

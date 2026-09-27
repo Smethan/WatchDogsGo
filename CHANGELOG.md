@@ -12,6 +12,10 @@ minor versions.
 
 ### Fixed
 
+- Accept BlueZ's documented LE privacy transition from a temporary connection
+  address to the bonded identity address after authenticated MeshMapper
+  pairing. WDG still requires the exact passkey-authenticated `Device1` object
+  from the active pairing window before retaining the resolved phone identity.
 - Fix MeshCore companion startup on BlueZ by registering the GATT application
   and advertisement asynchronously while the GLib dispatcher services BlueZ's
   callbacks. The sequence now uses explicit D-Bus object paths, waits at most

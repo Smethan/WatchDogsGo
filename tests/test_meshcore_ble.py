@@ -435,6 +435,64 @@ def test_pairing_security_claims_first_device_and_requires_exact_bond_state():
     assert policy.authorize_gatt(first_path, secure)[1] == "Mapper phone"
 
 
+def test_pairing_security_promotes_private_address_to_bonded_identity():
+    policy = _PairingSecurity("/org/bluez/hci1")
+    path = "/org/bluez/hci1/dev_77_88_99_AA_BB_CC"
+    private = {
+        "Adapter": "/org/bluez/hci1",
+        "Address": "77:88:99:AA:BB:CC",
+        "AddressType": "random",
+        "Alias": "Nothing phone",
+    }
+    identity = {
+        **private,
+        "Address": "2C:BE:EE:98:55:6F",
+        "AddressType": "public",
+        "Paired": True,
+        "Bonded": True,
+        "Trusted": True,
+    }
+    policy.open_window()
+    policy.mark_passkey_displayed(path, private)
+
+    with pytest.raises(PermissionError):
+        policy.authorize_gatt(path, identity)
+    assert policy.promote_paired_identity(path, identity) == (
+        "2C:BE:EE:98:55:6F", "Nothing phone")
+    assert policy.authorize_gatt(path, identity) == (
+        "2C:BE:EE:98:55:6F", "Nothing phone")
+    assert policy.retain_claim() == (
+        "2C:BE:EE:98:55:6F", "Nothing phone")
+
+
+def test_pairing_security_identity_promotion_keeps_exact_session_binding():
+    policy = _PairingSecurity("/org/bluez/hci1")
+    claimed_path = "/org/bluez/hci1/dev_77_88_99_AA_BB_CC"
+    private = {
+        "Adapter": "/org/bluez/hci1",
+        "Address": "77:88:99:AA:BB:CC",
+    }
+    paired = {
+        **private,
+        "Address": "2C:BE:EE:98:55:6F",
+        "Paired": True,
+        "Bonded": True,
+        "Trusted": True,
+    }
+    policy.open_window()
+    policy.mark_passkey_displayed(claimed_path, private)
+
+    with pytest.raises(PermissionError):
+        policy.promote_paired_identity(
+            "/org/bluez/hci1/dev_2C_BE_EE_98_55_6F", paired)
+    with pytest.raises(PermissionError):
+        policy.promote_paired_identity(
+            claimed_path, {**paired, "Bonded": False})
+    policy.claimed_authenticated = False
+    with pytest.raises(PermissionError):
+        policy.promote_paired_identity(claimed_path, paired)
+
+
 def test_pairing_security_notify_requires_only_retained_authenticated_phone():
     retained_path = "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF"
     retained = {
