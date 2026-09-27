@@ -60,7 +60,7 @@ COLLECTOR_SETTINGS = (
 
 LORA_SETTINGS = (
     ("lora_protocol", "LoRa protocol"),
-    ("_meshcore_region", "MeshCore region"),
+    ("_meshcore", "MeshCore radio and companion BLE"),
     ("_meshtastic", "Meshtastic service and phone BLE"),
     ("_reticulum", "Reticulum RF and identity"),
 )
@@ -112,6 +112,7 @@ class WardriveUI:
         self.layer_selection = 0
         self.collector_selection = 0
         self.lora_selection = 0
+        self.meshcore_selection = 0
         self.meshtastic_selection = 0
         self.reticulum_selection = 0
         self._reticulum_draft = None
@@ -343,7 +344,9 @@ class WardriveUI:
                 if self.cell.active:
                     self.cell.observe_batch(self.fixes.at(time.monotonic()), d["batch"])
             if previous == "starting" and self.scan.state == "running" and self.scan.wifi_only:
-                if not self.host_ble.start(
+                if self.meshcore_ble_blocks_host_scan():
+                    self.pause_host_ble_for_meshcore()
+                elif not self.host_ble.start(
                         self.scan.session,
                         adapter=self.settings.get("host_ble_adapter", "auto"),
                         require_lease=self._host_ble_requires_lease()):
@@ -493,12 +496,42 @@ class WardriveUI:
             return True
         return bool(checker(host))
 
+    def meshcore_ble_blocks_host_scan(self):
+        """Return whether the companion peripheral owns the scan adapter.
+
+        ``auto`` is deliberately treated conservatively. Operators who need
+        simultaneous advertising and scanning can select two distinct stable
+        controller MAC addresses in settings.
+        """
+        manager = getattr(self.app, "_meshcore_ble", None)
+        if manager is None or not manager.running:
+            return False
+        companion = str(
+            self.settings.get("meshcore_ble_adapter", "auto")).upper()
+        host = str(self.settings.get("host_ble_adapter", "auto")).upper()
+        return (companion == "AUTO" or host == "AUTO" or companion == host)
+
+    def pause_host_ble_for_meshcore(self):
+        already_paused = self.host_ble.state == "paused"
+        self.host_ble.stop()
+        self.host_ble.state = "paused"
+        self._host_ble_retry_pending = True
+        if not already_paused:
+            self.app._term_add(
+                "[ALL] Host BLE paused: MeshCore companion uses this adapter",
+                raw=True)
+            self.app.msg(
+                "[ALL] Host BLE paused for MeshMapper", ORANGE)
+
     def poll_host_ble(self, now):
         active = self.scan.state == "running" and self.scan.wifi_only
         if not active:
             self.host_ble.stop()
             self._host_ble_retry_pending = False
         meshtastic = getattr(self.app, "_meshtastic", None)
+        if active and self.meshcore_ble_blocks_host_scan():
+            self.pause_host_ble_for_meshcore()
+            active = False
         if (active and meshtastic is not None
                 and getattr(meshtastic, "host_ble_degraded", False)
                 and self._host_ble_requires_lease()):
@@ -515,6 +548,7 @@ class WardriveUI:
                     "[ALL] Host BLE paused; Meshtastic phone priority", ORANGE)
         if (active and self._host_ble_retry_pending
                 and not getattr(meshtastic, "host_ble_degraded", False)
+                and not self.meshcore_ble_blocks_host_scan()
                 and not self.host_ble.worker_active):
             if self.host_ble.start(
                     self.scan.session,
@@ -1381,6 +1415,36 @@ class WardriveUI:
                 else:
                     start_update()
             return
+        if self.settings_page == "meshcore":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+                return
+            if px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "lora"
+                return
+            if px.btnp(px.KEY_UP):
+                self.meshcore_selection = max(
+                    0, self.meshcore_selection - 1)
+            if px.btnp(px.KEY_DOWN):
+                self.meshcore_selection = min(
+                    4, self.meshcore_selection + 1)
+            direction = (-1 if px.btnp(px.KEY_LEFT) else
+                         1 if px.btnp(px.KEY_RIGHT) else 0)
+            activate = px.btnp(px.KEY_RETURN)
+            if self.meshcore_selection == 0 and activate:
+                self.open_meshcore_region_picker()
+            elif self.meshcore_selection == 1 and activate:
+                self.toggle_meshcore_ble()
+            elif (self.meshcore_selection == 2
+                  and (direction or activate)):
+                self.cycle_bluetooth_adapter(
+                    "meshcore_ble_adapter", direction or 1)
+            elif self.meshcore_selection == 3 and activate:
+                self.open_meshcore_pairing()
+            elif self.meshcore_selection == 4 and activate:
+                self.forget_meshcore_phone()
+            return
         if self.settings_page == "lora":
             if px.btnp(px.KEY_TAB):
                 self.settings_open = False
@@ -1403,13 +1467,9 @@ class WardriveUI:
             key = LORA_SETTINGS[self.lora_selection][0]
             if key == "lora_protocol" and (direction or activate):
                 self.cycle_lora_protocol(direction or 1)
-            elif key == "_meshcore_region" and activate:
-                if self.settings["lora_protocol"] != "meshcore":
-                    self.app.msg(
-                        "[MC] Region applies only when protocol is MeshCore",
-                        ORANGE)
-                else:
-                    self.open_meshcore_region_picker()
+            elif key == "_meshcore" and activate:
+                self.settings_page = "meshcore"
+                self.meshcore_selection = 0
             elif key == "_meshtastic" and activate:
                 self.settings_page = "meshtastic"
                 self.meshtastic_selection = 0
@@ -1492,6 +1552,7 @@ class WardriveUI:
         except ValueError:
             self.app._mc_region_sel = 0
         self.app._mc_region_return_to_settings = True
+        self.app._mc_region_return_page = "meshcore"
         self.app._mc_region_screen = True
         self.settings_open = False
 
@@ -1965,6 +2026,8 @@ class WardriveUI:
             index = 0
         step = -1 if direction < 0 else 1
         selected = choices[(index + step) % len(choices)]
+        if key == "meshcore_ble_adapter":
+            return self._change_meshcore_ble_adapter(current, selected)
         self.settings[key] = selected
         self.persist_settings()
         if key == "meshtastic_phone_adapter":
@@ -1983,6 +2046,243 @@ class WardriveUI:
         elif (key == "host_ble_adapter"
               and self.host_ble.state in ("paused", "error")):
             self._host_ble_retry_pending = True
+        return True
+
+    @staticmethod
+    def _meshcore_ble_cleanup_detail(manager):
+        if manager is None:
+            return "MeshCore companion manager is unavailable"
+        detail = str(getattr(manager, "last_error", "") or "").strip()
+        if getattr(manager, "pairing_cleanup_pending", False):
+            return detail or "pairing-agent cleanup is still uncertain"
+        return detail or "peripheral cleanup could not be verified"
+
+    def _meshcore_ble_conflict(self):
+        """Return a live Bluetooth/radio owner that blocks a new action."""
+        if getattr(self.app, "_meshtastic_update_running", False):
+            return "Meshtastic service update is running"
+        if getattr(self.app, "_lora_transition_active", lambda: False)():
+            return "radio ownership transition is running"
+        transition_busy = getattr(
+            self.app, "_meshtastic_transition_busy", None)
+        if transition_busy is not None and transition_busy():
+            return "radio/service transition is running"
+        lora = getattr(self.app, "_lora", None)
+        if (lora is not None and getattr(lora, "worker_active", False)
+                and not getattr(lora, "running", False)):
+            return "direct LoRa startup is still running"
+        watch = getattr(self.app, "_watch", None)
+        if watch is not None and getattr(watch, "worker_active", False):
+            return "watch Bluetooth operation is running"
+        watch_ready = getattr(self.app, "_watch_autoconnect_thread", None)
+        if watch_ready is not None and watch_ready.is_alive():
+            return "watch auto-connect check is running"
+        coordinator = getattr(self.app, "_bluetooth_pairing", None)
+        owner = str(getattr(coordinator, "owner", "") or "")
+        if owner and owner != "meshcore":
+            return owner + " pairing owns the BlueZ agent"
+        if getattr(coordinator, "release_uncertain", False):
+            return "pairing-agent cleanup is uncertain"
+        manager = getattr(self.app, "_meshtastic", None)
+        if (manager is not None
+                and getattr(manager, "ble_scan_lease_active", False)):
+            return "Bluetooth scan lease is active"
+        if (manager is not None and owner != "meshcore"
+                and getattr(manager, "pairing_agent_lease_active", False)):
+            return "Bluetooth pairing-agent lease is active"
+        return ""
+
+    def _change_meshcore_ble_adapter(self, current, selected):
+        """Apply an adapter change only after hard peripheral cleanup."""
+        if selected == current:
+            return True
+        conflict = self._meshcore_ble_conflict()
+        # A MeshCore-owned window is closed by manager.stop(); a different
+        # owner cannot safely be disturbed by an adapter transaction.
+        if conflict:
+            self.app.msg("[MC-BLE] " + conflict, ORANGE)
+            return False
+        companion = getattr(self.app, "_meshcore_ble", None)
+        was_running = bool(companion is not None and companion.running)
+        if (companion is not None
+                and (was_running
+                     or getattr(companion, "worker_active", False)
+                     or getattr(companion, "pairing_cleanup_pending", False))
+                and not companion.stop(timeout=5.0)):
+            self.app.msg(
+                "[MC-BLE] Adapter unchanged: "
+                + self._meshcore_ble_cleanup_detail(companion)[:70], ORANGE)
+            return False
+
+        self.settings["meshcore_ble_adapter"] = selected
+        self.persist_settings()
+        lora = getattr(self.app, "_lora", None)
+        should_start = bool(
+            was_running and self.settings.get("meshcore_ble_enabled")
+            and lora is not None and lora.running
+            and getattr(lora, "meshcore_ready", False)
+            and lora.mode == "meshcore")
+        if should_start:
+            starter = getattr(
+                self.app, "_start_meshcore_companion_ble", None)
+            start_error = ""
+            try:
+                started = bool(starter is not None and starter())
+            except Exception as exc:
+                started = False
+                start_error = str(exc)
+            if not started:
+                # Restore the previously selected adapter. If its restart also
+                # fails, report that state instead of claiming success.
+                self.settings["meshcore_ble_adapter"] = current
+                self.persist_settings()
+                try:
+                    restored = bool(starter is not None and starter())
+                except Exception:
+                    restored = False
+                detail = (start_error
+                          or self._meshcore_ble_cleanup_detail(companion))
+                suffix = "previous adapter restored" if restored else (
+                    "previous adapter could not restart")
+                self.app.msg(
+                    "[MC-BLE] Adapter change failed: "
+                    + (detail + "; " + suffix)[:70], ORANGE)
+                return False
+        self._host_ble_retry_pending = True
+        return True
+
+    def toggle_meshcore_ble(self):
+        """Enable the MeshCore companion peripheral for direct-radio runs."""
+        conflict = self._meshcore_ble_conflict()
+        if conflict:
+            self.app.msg("[MC-BLE] " + conflict, ORANGE)
+            return False
+        enabled = not self.settings["meshcore_ble_enabled"]
+        companion = getattr(self.app, "_meshcore_ble", None)
+        if not enabled:
+            if companion is not None and not companion.stop(timeout=5.0):
+                self.app.msg(
+                    "[MC-BLE] Still ON: "
+                    + self._meshcore_ble_cleanup_detail(companion)[:70],
+                    ORANGE)
+                return False
+            self.settings["meshcore_ble_enabled"] = False
+            self.persist_settings()
+            self._host_ble_retry_pending = True
+            self.app.msg("[MC-BLE] Companion Bluetooth OFF", ORANGE)
+            return True
+        if (companion is not None
+                and getattr(companion, "pairing_cleanup_pending", False)):
+            self.app.msg(
+                "[MC-BLE] Cannot enable: "
+                + self._meshcore_ble_cleanup_detail(companion)[:65], ORANGE)
+            return False
+        # The app start helper consults this setting. Keep the unpersisted
+        # tentative value only for the duration of an immediate start.
+        self.settings["meshcore_ble_enabled"] = True
+        lora = getattr(self.app, "_lora", None)
+        if (lora is not None and lora.running and lora.mode == "meshcore"
+                and getattr(lora, "meshcore_ready", False)):
+            starter = getattr(self.app, "_start_meshcore_companion_ble", None)
+            try:
+                started = bool(starter is not None and starter())
+            except Exception as exc:
+                started = False
+                start_error = str(exc)
+            else:
+                start_error = ""
+            if started:
+                self.persist_settings()
+                self.app.msg("[MC-BLE] Starting MeshMapper companion", CYAN)
+                return True
+            self.settings["meshcore_ble_enabled"] = False
+            detail = getattr(companion, "last_error", "")
+            self.app.msg(
+                "[MC-BLE] "
+                + (start_error or detail or "Could not start")[:65], ORANGE)
+            return False
+        self.persist_settings()
+        self.app.msg(
+            "[MC-BLE] Saved; starts when MeshCore owns LoRa", CYAN)
+        return True
+
+    def _start_meshcore_ble_action(self, label, operation, success_detail):
+        """Queue a local peripheral action under the service transition lock."""
+        conflict = self._meshcore_ble_conflict()
+        if conflict:
+            self.app.msg("[MC-BLE] " + conflict, ORANGE)
+            return False
+        coordinator = getattr(self.app, "_bluetooth_pairing", None)
+        if str(getattr(coordinator, "owner", "") or "") == "meshcore":
+            self.app.msg(
+                "[MC-BLE] An authenticated pairing window is already active",
+                ORANGE)
+            return False
+        manager = getattr(self.app, "_meshcore_ble", None)
+        if manager is None:
+            self.app.msg(
+                "[MC-BLE] MeshCore companion manager is unavailable", ORANGE)
+            return False
+        if not getattr(manager, "running", False):
+            self.app.msg(
+                "[MC-BLE] Enable the running MeshCore companion first",
+                ORANGE)
+            return False
+        pairing_state = str(
+            getattr(manager, "pairing_state", "closed") or "closed")
+        if pairing_state in ("opening", "open", "closing"):
+            self.app.msg(
+                "[MC-BLE] Finish the active pairing window first", ORANGE)
+            return False
+        if getattr(manager, "pairing_cleanup_pending", False):
+            self.app.msg(
+                "[MC-BLE] " + self._meshcore_ble_cleanup_detail(manager)[:70],
+                ORANGE)
+            return False
+        begin = getattr(self.app, "_begin_meshtastic_transition", None)
+        transition_acquired = bool(
+            begin("meshcore-ble-control")) if begin is not None else False
+        if begin is not None and not transition_acquired:
+            self.app.msg(
+                "[MC-BLE] Another radio/service operation is running", ORANGE)
+            return False
+
+        try:
+            ok = bool(operation(manager))
+            detail = (success_detail if ok else
+                      self._meshcore_ble_cleanup_detail(manager))
+        except Exception as exc:
+            ok = False
+            detail = str(exc)[:140]
+        finally:
+            if transition_acquired:
+                end = getattr(self.app, "_end_meshtastic_transition", None)
+                if end is not None:
+                    end()
+        message = f"[MC-BLE] {label}: {detail}"
+        term_add = getattr(self.app, "_term_add", None)
+        if term_add is not None:
+            term_add(message, raw=True)
+        self.app.msg(message, CYAN if ok else ORANGE)
+        return ok
+
+    def open_meshcore_pairing(self):
+        """Open one authenticated MeshMapper pairing window."""
+        manager = getattr(self.app, "_meshcore_ble", None)
+        if manager is not None and getattr(manager, "paired_address", ""):
+            self.app.msg(
+                "[MC-BLE] Forget the paired phone before bonding another",
+                ORANGE)
+            return False
+        return self._start_meshcore_ble_action(
+            "Pairing window", lambda manager: manager.open_pairing(120),
+            "open for 120 seconds")
+
+    def forget_meshcore_phone(self):
+        """Remove only the retained MeshMapper bond from the selected adapter."""
+        return self._start_meshcore_ble_action(
+            "Forget phone", lambda manager: manager.forget_phone(),
+            "bond removed")
 
     def toggle_meshtastic_phone_ble(self):
         if getattr(self.app, "_meshtastic_update_running", False):
@@ -2346,24 +2646,94 @@ class WardriveUI:
                 px.camera()
                 self.app._draw_mc_toast()
                 return
-            if self.settings_page == "lora":
+            if self.settings_page == "meshcore":
                 from .lora_manager import MESHCORE_PRESETS
 
                 px.text(55, 47,
-                        "LORA SETTINGS   arrows / ENTER / ESC", 7)
+                        "MESHCORE RADIO / MESHMAPPER BLE   arrows / ENTER / ESC",
+                        7)
                 region = MESHCORE_PRESETS.get(
                     getattr(self.app, "_mc_region", ""))
                 region_label = region[4] if region else "UNKNOWN"
+                manager = getattr(self.app, "_meshcore_ble", None)
+                pairing_state = str(
+                    getattr(manager, "pairing_state", "closed") or
+                    "closed").upper()
+                action_busy = pairing_state in ("OPENING", "CLOSING")
+                paired_address = str(
+                    getattr(manager, "paired_address", "") or
+                    self.settings.get(
+                        "meshcore_ble_paired_address", ""))
+                paired_name = str(
+                    getattr(manager, "paired_name", "") or
+                    self.settings.get("meshcore_ble_paired_name", ""))
+                phone = ((paired_name + " " + paired_address).strip()
+                         or "NONE")
+                rows = (
+                    ("Region", region_label),
+                    ("MeshMapper companion BLE", "ON" if self.settings[
+                        "meshcore_ble_enabled"] else "OFF"),
+                    ("Companion BLE adapter", self.settings[
+                        "meshcore_ble_adapter"]),
+                    ("Open authenticated pairing",
+                     "BUSY" if action_busy else "120 SECONDS"),
+                    ("Forget paired phone",
+                     "BUSY" if action_busy else
+                     "NONE" if phone == "NONE" else "RUN"),
+                )
+                for i, (label, value) in enumerate(rows):
+                    selected = i == self.meshcore_selection
+                    px.text(
+                        55, 64+i*18,
+                        (("> " if selected else "  ") + label + ": "
+                         + str(value))[:100],
+                        11 if selected else 7)
+                state = getattr(manager, "state", "unavailable").upper()
+                adapter = getattr(manager, "adapter", "") or "not assigned"
+                connected = bool(getattr(manager, "connected", False))
+                drops = int(getattr(manager, "drop_count", 0))
+                px.text(55, 160,
+                        f"Peripheral: {state}  adapter: {adapter}"[:100], 13)
+                px.text(55, 174,
+                        ("Client: " + ("CONNECTED" if connected else
+                         "WAITING") + f"  dropped frames: {drops}")[:100], 13)
+                px.text(55, 188,
+                        (f"Pairing: {pairing_state}  Phone: {phone}")[:100], 13)
+                pin = str(getattr(manager, "pairing_pin", "") or "")
+                cleanup_pending = bool(getattr(
+                    manager, "pairing_cleanup_pending", False))
+                if pin:
+                    px.text(55, 202, "Pairing PIN: " + pin.zfill(6)[-6:], 11)
+                elif cleanup_pending:
+                    px.text(
+                        55, 202,
+                        ("CLEANUP UNCERTAIN: "
+                         + self._meshcore_ble_cleanup_detail(manager))[:100], 8)
+                elif manager is not None and manager.last_error:
+                    px.text(55, 202,
+                            ("Last error: " + manager.last_error)[:100], 8)
+                px.text(55, 224,
+                        "Authenticated BlueZ pairing is required before use.",
+                        10)
+                px.text(55, 238,
+                        "Open the 120-second window, then connect in MeshMapper.",
+                        10)
+                px.text(55, 252,
+                        "Host BLE scanning pauses on the same/auto adapter.", 10)
+                px.text(55, 300, "ESC returns   TAB closes settings", 10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
+            if self.settings_page == "lora":
+                px.text(55, 47,
+                        "LORA SETTINGS   arrows / ENTER / ESC", 7)
                 rows = (
                     ("LoRa protocol", self.settings["lora_protocol"].upper()),
-                    ("MeshCore region", region_label),
+                    ("MeshCore radio and companion BLE", "OPEN..."),
                     ("Meshtastic service and phone BLE", "OPEN..."),
                     ("Reticulum RF and identity", "OPEN..."),
                 )
                 for i, (label, value) in enumerate(rows):
-                    if (i == 1
-                            and self.settings["lora_protocol"] != "meshcore"):
-                        value += " (MESHCORE ONLY)"
                     selected = i == self.lora_selection
                     px.text(
                         55, 64+i*20,

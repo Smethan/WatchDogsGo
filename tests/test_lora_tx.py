@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 from watchdogs.lora_manager import (
     LoRaManager, LORARF_IRQ_POLLING, MC_DISCOVERY_INTERVAL,
-    MC_DISCOVERY_TYPE_FILTER, MC_DISCOVERY_WINDOW,
+    MC_DISCOVERY_TYPE_FILTER, MC_DISCOVERY_WINDOW, make_hashtag_channel,
 )
 
 
@@ -101,6 +101,68 @@ def test_meshcore_tx_timeout_is_reported_and_receive_resumes():
     assert "failed: radio timeout" in text
     assert attr == "error"
     assert radio.calls[-1] == ("request", radio.RX_CONTINUOUS)
+
+
+def test_companion_channel_send_uses_exact_channel_and_timestamp():
+    manager = LoRaManager()
+    manager.running = True
+    manager.mode = "meshcore"
+    channel = make_hashtag_channel("#wardriving")
+    manager._build_mc_group_text = Mock(return_value=b"packet")
+    manager._preseed_dedup = Mock(return_value=b"dedup")
+
+    result = manager.send_meshcore_channel_message(
+        "MM:test", "WatchDogs_test", 5, 1_700_000_000,
+        channel=channel)
+
+    assert result == b"dedup"
+    manager._build_mc_group_text.assert_called_once_with(
+        "MM:test", "WatchDogs_test", channel=channel,
+        timestamp=1_700_000_000)
+    assert manager._tx_queue.get_nowait() == b"packet"
+
+
+def test_companion_control_send_is_bounded_and_requires_meshcore():
+    manager = LoRaManager()
+    manager.running = True
+    manager.mode = "meshcore"
+    manager._preseed_dedup = Mock(return_value=b"dedup")
+
+    assert manager.send_meshcore_control(b"discovery") == b"dedup"
+    packet = manager._tx_queue.get_nowait()
+    assert packet == bytes(((0x0B << 2) | 0x02, 0)) + b"discovery"
+    assert manager.send_meshcore_control(bytes(181)) is None
+    manager.mode = "reticulum"
+    assert manager.send_meshcore_control(b"discovery") is None
+
+
+def test_companion_advert_respects_shared_tx_queue_bound():
+    manager = LoRaManager()
+    manager.running = True
+    manager.mode = "meshcore"
+    manager._build_mc_advert = Mock(return_value=b"advert")
+    manager._preseed_dedup = Mock(return_value=b"dedup")
+
+    assert manager.send_meshcore_advert("WDG") == b"dedup"
+    assert manager._tx_queue.get_nowait() == b"advert"
+    for _ in range(16):
+        manager._tx_queue.put(b"full")
+    assert manager.send_meshcore_advert("WDG") is None
+
+
+def test_companion_cleanup_uncertainty_blocks_direct_owner_handoff():
+    manager = LoRaManager()
+    manager._companion_cleanup_pending = True
+    manager._on_meshcore_stopping = Mock(return_value=False)
+
+    assert manager.worker_active
+    assert manager.start_meshcore() is False
+    assert manager.stop(timeout=0) is False
+    assert manager.worker_active
+
+    manager._on_meshcore_stopping.return_value = True
+    assert manager.stop(timeout=0) is True
+    assert not manager.worker_active
 
 
 def test_radio_initialization_disables_gpio_irq_callbacks(

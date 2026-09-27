@@ -47,6 +47,8 @@ from .race_attack import RACEAttack
 from .aio_manager import AioManager
 from .whitelist_manager import WhitelistManager
 from .lora_manager import LoRaManager
+from .meshcore_ble import MeshCoreBleManager, MeshCoreCompanionProtocol
+from .bluetooth_pairing import BluetoothPairingCoordinator
 from .reticulum_config import (
     ReticulumConfigError,
     ReticulumProfile,
@@ -640,6 +642,10 @@ class WatchDogsGame(OtaMixin):
                 if getattr(
                     self, "_lora_power_ownership_uncertain", False) else ""),
         )
+        self._bluetooth_pairing = BluetoothPairingCoordinator(
+            self._meshtastic.acquire_pairing_agent_lease,
+            self._meshtastic.release_pairing_agent_lease,
+        )
         self._meshtastic_update_running = False
         self._meshtastic_update_result: Queue = Queue()
         self._meshtastic_update_thread = None
@@ -674,9 +680,10 @@ class WatchDogsGame(OtaMixin):
         self._sdr_aircraft_xp: set = set()  # ICAO set for XP dedup
         self._watch = WatchManager(
             pairing_lease_acquire=(
-                self._meshtastic.acquire_pairing_agent_lease),
+                lambda seconds: self._bluetooth_pairing.acquire(
+                    "watch", seconds)),
             pairing_lease_release=(
-                self._meshtastic.release_pairing_agent_lease),
+                lambda: self._bluetooth_pairing.release("watch")),
             scan_lease_acquire=(
                 lambda seconds: self._meshtastic.acquire_ble_scan_lease(
                     seconds, owner="watch")),
@@ -878,6 +885,27 @@ class WatchDogsGame(OtaMixin):
                 pass
         self._flipper_used = "flipper" in self._badges
         self._mc_event_queue: Queue = Queue()  # thread-safe callback events
+        self._meshcore_ble_protocol = MeshCoreCompanionProtocol(
+            self._lora,
+            get_node_name=lambda: self._mc_node_name,
+            set_node_name=self._set_meshcore_companion_name,
+            get_channels=lambda: list(self._mc_channels_list),
+            set_channels=self._set_meshcore_companion_channels,
+            get_region=lambda: self._mc_region,
+            get_location=self._meshcore_companion_location,
+        )
+        self._meshcore_ble = MeshCoreBleManager(
+            self._meshcore_ble_protocol,
+            pairing_lease_acquire=(
+                lambda seconds: self._bluetooth_pairing.acquire(
+                    "meshcore", seconds)),
+            pairing_lease_release=(
+                lambda: self._bluetooth_pairing.release("meshcore")),
+        )
+        self._meshcore_startup_settings = _wardrive_settings
+        self._lora._on_meshcore_started = self._start_meshcore_companion_ble
+        self._lora._on_meshcore_stopping = self._stop_meshcore_companion_ble
+        self._lora._on_companion_packet = self._meshcore_ble.on_radio_packet
 
         # Player
         self.player_lat, self.player_lon = 51.1, 17.9  # Opole default
@@ -2945,6 +2973,14 @@ class WatchDogsGame(OtaMixin):
         watch_ready = getattr(self, "_watch_autoconnect_thread", None)
         if watch_ready is not None and watch_ready.is_alive():
             return "an active watch auto-connect readiness check"
+        pairing = getattr(self, "_bluetooth_pairing", None)
+        if pairing is not None:
+            if getattr(pairing, "release_uncertain", False):
+                return "an unresolved Bluetooth pairing-agent lease"
+            if getattr(pairing, "active", False):
+                owner = getattr(pairing, "owner", "")
+                return ("the MeshMapper pairing window" if owner == "meshcore"
+                        else "an active Bluetooth pairing operation")
         manager = getattr(self, "_meshtastic", None)
         if manager is not None:
             if getattr(manager, "ble_scan_lease_active", False):
@@ -4808,10 +4844,13 @@ class WatchDogsGame(OtaMixin):
                 if self._input_pending_cat == -5:  # MeshCore node name
                     name_val = vals[0].strip() if vals else ""
                     if name_val:
-                        self._mc_node_name = name_val
-                        from .lora_manager import save_meshcore_config
-                        save_meshcore_config(name_val, self._mc_channels_list)
-                        self.msg(f"[MC] Node name: {name_val}", C_SUCCESS)
+                        try:
+                            self._set_meshcore_companion_name(name_val)
+                        except Exception as exc:
+                            self.msg("[MC] " + str(exc)[:70], C_ERROR)
+                        else:
+                            self.msg(
+                                f"[MC] Node name: {name_val}", C_SUCCESS)
                     return
                 if self._input_pending_cat == -9:  # Reticulum display name
                     name_val = vals[0].strip() if vals else ""
@@ -5458,7 +5497,137 @@ class WatchDogsGame(OtaMixin):
     # LoRa / MeshCore polling + callbacks
     # ------------------------------------------------------------------
 
+    def _meshcore_companion_settings(self):
+        wardrive = getattr(self, "wardrive", None)
+        if wardrive is not None:
+            return wardrive.settings
+        return getattr(self, "_meshcore_startup_settings", {})
+
+    def _meshcore_companion_location(self):
+        if not getattr(self, "gps_fix", False):
+            return 0.0, 0.0
+        return (float(getattr(self, "player_lat", 0.0)),
+                float(getattr(self, "player_lon", 0.0)))
+
+    def _set_meshcore_companion_name(self, name):
+        """Persist a name written through the MeshCore companion API."""
+        value = str(name).strip()
+        if not value or len(value.encode("utf-8")) > 31:
+            raise ValueError("MeshCore name must be 1-31 UTF-8 bytes")
+        from .lora_manager import save_meshcore_config
+        if not save_meshcore_config(
+                value, self._mc_channels_list, region=self._mc_region):
+            raise OSError("MeshCore name could not be saved")
+        self._mc_node_name = value
+
+    def _set_meshcore_companion_channels(self, channels):
+        """Atomically replace the channel snapshot written by MeshMapper."""
+        values = list(channels)
+        if not values:
+            raise ValueError("MeshCore public channel is required")
+        from .lora_manager import save_meshcore_config
+        if not save_meshcore_config(
+                self._mc_node_name, values, region=self._mc_region):
+            raise OSError("MeshCore channels could not be saved")
+        self._mc_channels_list = values
+        self._lora.set_mc_channels(values)
+
+    def _start_meshcore_companion_ble(self):
+        settings = self._meshcore_companion_settings()
+        manager = getattr(self, "_meshcore_ble", None)
+        if manager is None or not settings.get("meshcore_ble_enabled", False):
+            return False
+        if not getattr(self._lora, "meshcore_ready", False):
+            return False
+        if manager.running:
+            return True
+        accepted = manager.start(
+            settings.get("meshcore_ble_adapter", "auto"),
+            self._mc_node_name,
+            paired_address=settings.get(
+                "meshcore_ble_paired_address", ""),
+            paired_name=settings.get("meshcore_ble_paired_name", ""),
+        )
+        if not accepted and manager.last_error:
+            raise RuntimeError(manager.last_error)
+        wardrive = getattr(self, "wardrive", None)
+        if (accepted and wardrive is not None
+                and wardrive.meshcore_ble_blocks_host_scan()):
+            wardrive.pause_host_ble_for_meshcore()
+        return accepted
+
+    def _stop_meshcore_companion_ble(self):
+        manager = getattr(self, "_meshcore_ble", None)
+        if manager is None:
+            return True
+        stopped = manager.stop(timeout=5.0)
+        if not stopped:
+            raise RuntimeError("MeshCore companion BLE worker did not stop")
+        wardrive = getattr(self, "wardrive", None)
+        if wardrive is not None:
+            wardrive._host_ble_retry_pending = True
+        return True
+
+    def _poll_meshcore_companion_ble(self):
+        manager = getattr(self, "_meshcore_ble", None)
+        if manager is None:
+            return
+        for event, detail in manager.poll_events():
+            if event == "ready":
+                self._term_add(
+                    f"[MC-BLE] MeshMapper companion ready on {detail}",
+                    raw=True)
+                self.msg("[MC-BLE] Ready for MeshMapper", C_SUCCESS)
+            elif event == "connected":
+                self._term_add("[MC-BLE] MeshMapper connected", raw=True)
+                self.msg("[MC-BLE] MeshMapper connected", C_SUCCESS)
+            elif event == "disconnected":
+                self._term_add("[MC-BLE] MeshMapper disconnected", raw=True)
+            elif event == "pairing_open":
+                self._term_add(
+                    "[MC-BLE] Authenticated pairing window open", raw=True)
+                self.msg("[MC-BLE] Pairing window open", C_SUCCESS)
+            elif event == "pairing_pin":
+                pin = str(detail).zfill(6)[-6:]
+                self._term_add("[MC-BLE] Pairing PIN: " + pin, raw=True)
+                self.msg("[MC-BLE] Pairing PIN: " + pin, C_SUCCESS)
+            elif event == "paired":
+                body = detail if isinstance(detail, dict) else {}
+                address = str(body.get("address", "")).upper()
+                name = str(body.get("name", "")).strip()
+                wardrive = getattr(self, "wardrive", None)
+                if wardrive is not None and address:
+                    wardrive.settings[
+                        "meshcore_ble_paired_address"] = address
+                    wardrive.settings["meshcore_ble_paired_name"] = name
+                    wardrive.persist_settings()
+                label = name or address or "phone"
+                self._term_add(
+                    "[MC-BLE] Authenticated phone bonded: " + label,
+                    raw=True)
+                self.msg("[MC-BLE] Paired " + label[:45], C_SUCCESS)
+            elif event == "bond_removed":
+                wardrive = getattr(self, "wardrive", None)
+                if wardrive is not None:
+                    wardrive.settings["meshcore_ble_paired_address"] = ""
+                    wardrive.settings["meshcore_ble_paired_name"] = ""
+                    wardrive.persist_settings()
+                self._term_add(
+                    "[MC-BLE] MeshMapper phone bond removed", raw=True)
+                self.msg("[MC-BLE] Paired phone forgotten", C_SUCCESS)
+            elif event == "pairing_closed":
+                self._term_add(
+                    "[MC-BLE] " + str(detail)[:140], raw=True)
+            elif event == "error":
+                self._term_add("[MC-BLE] " + str(detail)[:140], raw=True)
+                self.msg("[MC-BLE] " + str(detail)[:70], C_ERROR)
+            elif event == "stopped":
+                wardrive = getattr(self, "wardrive", None)
+                if wardrive is not None:
+                    wardrive._host_ble_retry_pending = True
+
     def _poll_lora(self):
+        self._poll_meshcore_companion_ble()
         transition_queue = getattr(self, "_lora_transition_queue", None)
         if transition_queue is not None:
             try:
@@ -6748,6 +6917,14 @@ class WatchDogsGame(OtaMixin):
                 self._term_add(
                     "[BLE] Host scan did not stop before shutdown", raw=True)
             self.wardrive.close_passive()
+        meshcore_ble = getattr(self, "_meshcore_ble", None)
+        if (meshcore_ble is not None
+                and (meshcore_ble.running or meshcore_ble.worker_active)
+                and not meshcore_ble.stop(timeout=7.0)):
+            host_ble_stopped = False
+            self._term_add(
+                "[MC-BLE] Companion worker did not stop before shutdown",
+                raw=True)
         # Bluetooth workers must finish their daemon lease releases while the
         # restricted Meshtastic socket is still available.
         if (self._watch.connected or self._watch.worker_active
@@ -6760,6 +6937,13 @@ class WatchDogsGame(OtaMixin):
                 self._term_add(
                     "[Watch] Bluetooth worker did not stop before shutdown",
                     raw=True)
+        pairing = getattr(self, "_bluetooth_pairing", None)
+        if (pairing is not None
+                and (pairing.active or pairing.release_uncertain)):
+            watch_stopped = False
+            self._term_add(
+                "[BLE] Pairing-agent ownership did not clear before shutdown; "
+                "preserving the Meshtastic socket", raw=True)
         update_thread = getattr(self, "_meshtastic_update_thread", None)
         if (update_thread is not None
                 and update_thread is not threading.current_thread()):
@@ -8453,14 +8637,14 @@ class WatchDogsGame(OtaMixin):
         elif px.btnp(px.KEY_RETURN):
             new_region = keys[self._mc_region_sel]
             old_region = self._mc_region
-            self._mc_region = new_region
             # Persist to ~/.watchdogs_meshcore.json
-            try:
-                save_meshcore_config(self._mc_node_name,
-                                     self._mc_channels_list,
-                                     region=new_region)
-            except Exception as exc:
-                self._term_add(f"[MC] config save failed: {exc}", raw=True)
+            if not save_meshcore_config(
+                    self._mc_node_name, self._mc_channels_list,
+                    region=new_region):
+                self._term_add("[MC] config save failed", raw=True)
+                self.msg("[MC] Region was not saved", C_ERROR)
+                return
+            self._mc_region = new_region
             label = MESHCORE_PRESETS[new_region][4]
             self.msg(f"[MC] Region: {label}", C_SUCCESS)
             # Re-tune the radio right away if LoRa is currently sniffing
@@ -8486,7 +8670,9 @@ class WatchDogsGame(OtaMixin):
         if getattr(self, "_mc_region_return_to_settings", False):
             self._mc_region_return_to_settings = False
             self.wardrive.settings_open = True
-            self.wardrive.settings_page = "lora"
+            self.wardrive.settings_page = getattr(
+                self, "_mc_region_return_page", "lora")
+            self._mc_region_return_page = "lora"
 
     def _draw_mc_region_picker(self):
         """Draw MeshCore regional preset picker overlay."""

@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import struct
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -177,6 +178,22 @@ def _meshcore_config_path() -> str:
     return new_path
 
 
+def _secure_meshcore_file(path: str) -> None:
+    """Keep MeshCore private state owned by the invoking desktop user."""
+    os.chmod(path, 0o600)
+    if os.geteuid() != 0:
+        return
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return
+    try:
+        import pwd
+        account = pwd.getpwnam(sudo_user)
+        os.chown(path, account.pw_uid, account.pw_gid)
+    except (KeyError, OSError) as exc:
+        log.warning("Could not set MeshCore state owner on %s: %s", path, exc)
+
+
 def load_meshcore_config() -> dict:
     """Load ~/.watchdogs_meshcore.json. Returns dict with node_name, channels."""
     import json
@@ -185,6 +202,10 @@ def load_meshcore_config() -> dict:
         if os.path.exists(path):
             with open(path, "r") as f:
                 data = json.load(f)
+            try:
+                _secure_meshcore_file(path)
+            except OSError as exc:
+                log.warning("Could not secure MeshCore config %s: %s", path, exc)
             channels = [PUBLIC_CHANNEL]
             for ch in data.get("channels", []):
                 if ch.get("is_hashtag"):
@@ -206,9 +227,14 @@ def load_meshcore_config() -> dict:
 
 
 def save_meshcore_config(node_name: str, channels: list,
-                         region: str | None = None) -> None:
+                         region: str | None = None) -> bool:
     """Save config to ~/.watchdogs_meshcore.json. `region` is a key from
-    MESHCORE_PRESETS; None preserves whatever was stored on disk."""
+    MESHCORE_PRESETS; None preserves whatever was stored on disk.
+
+    Return ``True`` only after the atomic replacement and final permissions
+    update both succeed.  Callers that expose a protocol acknowledgement can
+    therefore avoid committing a live state change that was not persisted.
+    """
     import json
     path = _meshcore_config_path()
     ch_list = []
@@ -229,12 +255,27 @@ def save_meshcore_config(node_name: str, channels: list,
             pass
     if region not in MESHCORE_PRESETS:
         region = DEFAULT_MESHCORE_REGION
+    temporary = ""
     try:
-        with open(path, "w") as f:
+        fd, temporary = tempfile.mkstemp(
+            prefix=".watchdogs_meshcore.",
+            dir=os.path.dirname(path) or ".", text=True)
+        with os.fdopen(fd, "w") as f:
             json.dump({"node_name": node_name, "region": region,
                        "channels": ch_list}, f, indent=2)
+            f.write("\n")
+        _secure_meshcore_file(temporary)
+        os.replace(temporary, path)
+        return True
     except Exception as exc:
         log.warning("meshcore config save error: %s", exc)
+        return False
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 # MeshCore payload types (header bits 5:2)
 MC_PAYLOAD_TYPES = {
@@ -318,6 +359,13 @@ class LoRaManager:
         self._on_dm = None       # callback(from_id, message, rssi, hops)
         self._on_dm_ack = None   # callback(ack_hash) — DM delivery confirmed
         self._on_tx_confirm = None  # callback(dedup_key) — own msg retransmitted
+        # The MeshCore companion BLE surface is transport-only.  These hooks
+        # let it follow the direct-radio lifecycle and receive already-read
+        # packets without ever touching the SX1262 from a second thread.
+        self._on_meshcore_started = None
+        self._on_meshcore_stopping = None
+        self._on_companion_packet = None
+        self._companion_cleanup_pending = False
         self._pending_dm_acks: dict[bytes, bool] = {}  # expected ack_hash → waiting
         self._tx_queue: Queue = Queue()  # MeshCore TX packets
         self._tx_dedup_keys: set[bytes] = set()  # keys of our own sent packets
@@ -329,6 +377,11 @@ class LoRaManager:
         self._mc_discovery_lock = threading.Lock()
         self._mc_discovery: dict | None = None
         self._mc_discovery_last_tx = 0.0
+        self.last_rssi = -128
+        self.last_snr = 0.0
+        self.noise_floor = -110
+        self._noise_sample_at = 0.0
+        self.meshcore_ready = False
 
     def set_mc_channels(self, channels: list) -> None:
         """Set channel list (thread-safe snapshot)."""
@@ -355,7 +408,30 @@ class LoRaManager:
             thread = self._thread
             return bool(
                 self._starting
+                or self._companion_cleanup_pending
                 or (thread is not None and thread.is_alive()))
+
+    def _stop_meshcore_companion(self) -> bool:
+        """Stop the BLE companion and retain a hard handoff barrier on error."""
+        callback = self._on_meshcore_stopping
+        if callback is None:
+            with self._state_lock:
+                self._companion_cleanup_pending = False
+            return True
+        try:
+            cleaned = callback() is not False
+        except Exception as exc:
+            cleaned = False
+            self._emit(
+                "MeshCore companion BLE did not stop cleanly: "
+                + str(exc)[:120], "error")
+        with self._state_lock:
+            self._companion_cleanup_pending = not cleaned
+        if not cleaned:
+            self._emit(
+                "MeshCore companion cleanup remains uncertain; Bluetooth "
+                "and Meshtastic handoffs are blocked", "error")
+        return cleaned
 
     def _run_worker(self, generation: int, target, args) -> None:
         """Run one generation without allowing its exit to clear a successor."""
@@ -374,6 +450,7 @@ class LoRaManager:
         with self._state_lock:
             thread = self._thread
             if (self.running or self._starting or self._stopping
+                    or self._companion_cleanup_pending
                     or (thread is not None and thread.is_alive())):
                 return False
             if self._radio_ownership.held:
@@ -767,6 +844,14 @@ class LoRaManager:
                         "radio refused initial continuous RX")
             startup_complete = True
             self._emit(f"Sniffer started: {tag}", "success")
+            self.meshcore_ready = self.mode == "meshcore"
+            if self.mode == "meshcore" and self._on_meshcore_started:
+                try:
+                    self._on_meshcore_started()
+                except Exception as exc:
+                    self._emit(
+                        "MeshCore companion BLE could not start: "
+                        + str(exc)[:120], "warning")
 
             errors = 0
             while not self._stop_event.is_set():
@@ -786,6 +871,15 @@ class LoRaManager:
                                 handler(lora, tag)
                         elif irq & (lora.IRQ_CRC_ERR | lora.IRQ_HEADER_ERR):
                             lora.clearIrqStatus(0x03FF)
+                        now = time.monotonic()
+                        if now - self._noise_sample_at >= 5.0:
+                            self._noise_sample_at = now
+                            try:
+                                sample = int(round(float(lora.rssiInst())))
+                                if -160 <= sample <= 0:
+                                    self.noise_floor = sample
+                            except Exception:
+                                pass
                         # Check TX queue between RX polls
                         if (not self._tx_queue.empty()
                                 and not self._meshcore_discovery_listening()):
@@ -824,6 +918,9 @@ class LoRaManager:
             self._emit(f"Sniffer error: {exc}", "error")
             log.error("LoRa sniffer error: %s", exc)
         finally:
+            self.meshcore_ready = False
+            if self.mode == "meshcore":
+                self._stop_meshcore_companion()
             self.cancel_meshcore_discovery()
             self._cleanup_radio(lora)
             self._finish_radio_session(startup_complete)
@@ -1136,6 +1233,8 @@ class LoRaManager:
         data = self._read_packet(lora)
         rssi = lora.packetRssi()
         snr = lora.snr()
+        self.last_rssi = int(rssi)
+        self.last_snr = float(snr)
         self.packets_received += 1
 
         self._emit(
@@ -1171,6 +1270,8 @@ class LoRaManager:
         data = self._read_packet(lora)
         rssi = lora.packetRssi()
         snr = lora.snr()
+        self.last_rssi = int(rssi)
+        self.last_snr = float(snr)
         self.packets_received += 1
 
         if len(data) < 2:
@@ -1213,6 +1314,15 @@ class LoRaManager:
 
         hops = hash_count
         payload = data[offset:] if offset < len(data) else bytearray()
+
+        if self._on_companion_packet:
+            try:
+                self._on_companion_packet(
+                    bytes(data), float(rssi), float(snr), payload_type,
+                    bytes(payload), int(path_byte))
+            except Exception:
+                log.debug("MeshCore companion packet callback failed",
+                          exc_info=True)
 
         # Deduplicate retransmissions: hash header + payload (skip path)
         dedup_key = bytes(data[:1]) + bytes(payload)
@@ -1504,6 +1614,37 @@ class LoRaManager:
         self._tx_queue.put(packet)
         return dedup_key
 
+    def send_meshcore_channel_message(
+        self, text: str, node_name: str, channel_index: int,
+        timestamp: int | None = None, *, channel: MeshCoreChannel | None = None,
+    ) -> bytes | None:
+        """Queue one companion-originated group message on an exact channel."""
+        if not self.running or self.mode != "meshcore":
+            return None
+        if channel is None:
+            if not 0 <= int(channel_index) < len(self._mc_channels):
+                return None
+            channel = self._mc_channels[int(channel_index)]
+        if self._tx_queue.qsize() >= 16:
+            self._emit("  MeshCore TX queue is full", "warning")
+            return None
+        packet = self._build_mc_group_text(
+            text, node_name, channel=channel, timestamp=timestamp)
+        dedup_key = self._preseed_dedup(packet)
+        self._tx_queue.put(packet)
+        return dedup_key
+
+    def send_meshcore_control(self, payload: bytes) -> bytes | None:
+        """Queue a direct, zero-hop MeshCore control payload from a client."""
+        if (not self.running or self.mode != "meshcore"
+                or not payload or len(payload) > 180
+                or self._tx_queue.qsize() >= 16):
+            return None
+        packet = bytes(((0x0B << 2) | 0x02, 0x00)) + bytes(payload)
+        dedup_key = self._preseed_dedup(packet)
+        self._tx_queue.put(packet)
+        return dedup_key
+
     def send_meshcore_dm(self, text: str, node_name: str,
                          dest_pubkey: bytes) -> bytes | None:
         """Queue an encrypted DM (payload type 0x02) to a specific node."""
@@ -1518,14 +1659,19 @@ class LoRaManager:
         return dedup_key
 
     def send_meshcore_advert(self, node_name: str,
-                             lat: float = 0.0, lon: float = 0.0) -> None:
+                             lat: float = 0.0,
+                             lon: float = 0.0) -> bytes | None:
         """Queue a MeshCore advertisement for transmission."""
         if not self.running or self.mode != "meshcore":
             self._emit("  MeshCore not running — start sniffer first", "warning")
-            return
+            return None
+        if self._tx_queue.qsize() >= 16:
+            self._emit("  MeshCore TX queue is full", "warning")
+            return None
         packet = self._build_mc_advert(node_name, lat, lon)
-        self._preseed_dedup(packet)
+        dedup_key = self._preseed_dedup(packet)
         self._tx_queue.put(packet)
+        return dedup_key
 
     @staticmethod
     def _build_mc_discovery_request(tag: bytes, since: int = 0) -> bytes:
@@ -1634,16 +1780,20 @@ class LoRaManager:
         with self._mc_discovery_lock:
             self._mc_discovery = None
 
-    def _build_mc_group_text(self, text: str, node_name: str) -> bytes:
+    def _build_mc_group_text(
+        self, text: str, node_name: str, *,
+        channel: MeshCoreChannel | None = None,
+        timestamp: int | None = None,
+    ) -> bytes:
         """Build MeshCore Group Text packet on active channel."""
         from cryptography.hazmat.primitives.ciphers import (
             Cipher, algorithms, modes,
         )
 
-        ch = self._mc_channels[self._mc_active_ch]
+        ch = channel or self._mc_channels[self._mc_active_ch]
 
         # Plaintext: timestamp(4B LE) + flags(1B) + "name: msg\x00"
-        timestamp = int(time.time())
+        timestamp = int(time.time()) if timestamp is None else int(timestamp)
         flags = 0x00  # text type=0, attempt=0
         msg = f"{node_name}: {text}\x00".encode("utf-8")
         plaintext = struct.pack("<I", timestamp) + bytes([flags]) + msg
@@ -1964,7 +2114,15 @@ class LoRaManager:
             )
             with open(key_path, "wb") as f:
                 f.write(raw)
-            os.chmod(key_path, 0o600)
+            _secure_meshcore_file(key_path)
+
+        # Older versions could leave these files owned by root when WDG was
+        # launched via sudo. MeshMapper-originated channel/name changes must
+        # remain editable by the normal uConsole account.
+        try:
+            _secure_meshcore_file(key_path)
+        except OSError as exc:
+            log.warning("Could not secure MeshCore key %s: %s", key_path, exc)
 
         pubkey_bytes = privkey.public_key().public_bytes(
             serialization.Encoding.Raw,
@@ -2088,6 +2246,10 @@ class LoRaManager:
                     self._thread = None
                     self.running = False
             self.cancel_meshcore_discovery()
+            with self._state_lock:
+                cleanup_pending = self._companion_cleanup_pending
+            if cleanup_pending and not self._stop_meshcore_companion():
+                return False
             if self._radio_ownership.held:
                 self._emit(
                     "Direct radio stopped but the SX1262 ownership lock is still "

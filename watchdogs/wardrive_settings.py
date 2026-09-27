@@ -50,6 +50,13 @@ DEFAULTS = {
     "meshtastic_backend": "auto",
     "meshtastic_phone_ble_enabled": True,
     "meshtastic_phone_adapter": "auto",
+    # Opt-in: upgrades must not unexpectedly expose a new BLE peripheral.
+    "meshcore_ble_enabled": False,
+    "meshcore_ble_adapter": "auto",
+    # BlueZ retains the cryptographic bond. WDG stores only the one permitted
+    # MeshMapper device identity so unrelated paired devices stay isolated.
+    "meshcore_ble_paired_address": "",
+    "meshcore_ble_paired_name": "",
     "host_ble_adapter": "auto",
     "realert_seconds": 60,
     "suppressed_rules": [],
@@ -114,12 +121,20 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
         result["lora_protocol"] = DEFAULTS["lora_protocol"]
     if result["meshtastic_backend"] not in MESHTASTIC_BACKENDS:
         result["meshtastic_backend"] = DEFAULTS["meshtastic_backend"]
-    for key in ("meshtastic_phone_adapter", "host_ble_adapter"):
+    for key in ("meshtastic_phone_adapter", "meshcore_ble_adapter",
+                "host_ble_adapter"):
         value = result[key].strip() if isinstance(result[key], str) else "auto"
         result[key] = (
             "auto" if value.lower() == "auto" else value.upper()
             if _BLUETOOTH_MAC.fullmatch(value) else "auto"
         )
+    paired = result["meshcore_ble_paired_address"].strip()
+    result["meshcore_ble_paired_address"] = (
+        paired.upper() if _BLUETOOTH_MAC.fullmatch(paired) else "")
+    name = result["meshcore_ble_paired_name"].strip()
+    encoded = name.encode("utf-8")[:80]
+    result["meshcore_ble_paired_name"] = encoded.decode(
+        "utf-8", errors="ignore")
     return result
 
 

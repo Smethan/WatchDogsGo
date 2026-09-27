@@ -116,7 +116,7 @@ def test_lora_settings_are_grouped_away_from_wardrive_capture_toggle():
     assert collector_keys == (
         "wardrive_lora", "wardrive_adsb", "wardrive_433")
     assert lora_keys == (
-        "lora_protocol", "_meshcore_region", "_meshtastic", "_reticulum")
+        "lora_protocol", "_meshcore", "_meshtastic", "_reticulum")
 
     sniff_labels = next(items for name, items in MENU_CATS if name == "SNIFF")
     addon_commands = next(items for name, items in MENU_CATS if name == "ADDONS")
@@ -124,7 +124,7 @@ def test_lora_settings_are_grouped_away_from_wardrive_capture_toggle():
     assert all(item[2] != "_meshcore_region" for item in addon_commands)
 
 
-def test_meshcore_region_picker_returns_to_lora_settings():
+def test_meshcore_region_picker_returns_to_meshcore_settings():
     from watchdogs.app import WatchDogsGame
     from watchdogs.lora_manager import MESHCORE_PRESETS
 
@@ -146,7 +146,7 @@ def test_meshcore_region_picker_returns_to_lora_settings():
     game._close_mc_region_picker()
     assert not game._mc_region_screen
     assert ui.settings_open
-    assert ui.settings_page == "lora"
+    assert ui.settings_page == "meshcore"
 
 
 def test_meshtastic_backend_and_adapter_settings_are_normalized():
@@ -154,27 +154,223 @@ def test_meshtastic_backend_and_adapter_settings_are_normalized():
     assert defaults["meshtastic_backend"] == "auto"
     assert defaults["meshtastic_phone_ble_enabled"] is True
     assert defaults["meshtastic_phone_adapter"] == "auto"
+    assert defaults["meshcore_ble_enabled"] is False
+    assert defaults["meshcore_ble_adapter"] == "auto"
+    assert defaults["meshcore_ble_paired_address"] == ""
+    assert defaults["meshcore_ble_paired_name"] == ""
     assert defaults["host_ble_adapter"] == "auto"
 
     settings = normalize_settings({
         "meshtastic_backend": "fork_socket",
         "meshtastic_phone_ble_enabled": False,
         "meshtastic_phone_adapter": "aa:bb:cc:dd:ee:ff",
+        "meshcore_ble_enabled": True,
+        "meshcore_ble_adapter": "22:33:44:55:66:77",
+        "meshcore_ble_paired_address": "aa:00:bb:11:cc:22",
+        "meshcore_ble_paired_name": "Sam's phone",
         "host_ble_adapter": "11:22:33:44:55:66",
     })
     assert settings["meshtastic_backend"] == "fork_socket"
     assert settings["meshtastic_phone_ble_enabled"] is False
     assert settings["meshtastic_phone_adapter"] == "AA:BB:CC:DD:EE:FF"
+    assert settings["meshcore_ble_enabled"] is True
+    assert settings["meshcore_ble_adapter"] == "22:33:44:55:66:77"
+    assert settings["meshcore_ble_paired_address"] == "AA:00:BB:11:CC:22"
+    assert settings["meshcore_ble_paired_name"] == "Sam's phone"
     assert settings["host_ble_adapter"] == "11:22:33:44:55:66"
 
     invalid = normalize_settings({
         "meshtastic_backend": "tcp_then_socket",
         "meshtastic_phone_adapter": "hci0",
+        "meshcore_ble_adapter": "hci1",
+        "meshcore_ble_paired_address": "not-an-address",
+        "meshcore_ble_paired_name": "  " + ("x" * 100),
         "host_ble_adapter": 7,
     })
     assert invalid["meshtastic_backend"] == "auto"
     assert invalid["meshtastic_phone_adapter"] == "auto"
+    assert invalid["meshcore_ble_adapter"] == "auto"
+    assert invalid["meshcore_ble_paired_address"] == ""
+    assert invalid["meshcore_ble_paired_name"] == "x" * 80
     assert invalid["host_ble_adapter"] == "auto"
+
+
+def test_meshcore_companion_ble_is_opt_in_and_starts_with_active_radio():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    ui.persist_settings = Mock()
+    ui._host_ble_retry_pending = False
+    companion = NS(running=False, stop=Mock(return_value=True), last_error="")
+    ui.app = NS(
+        _meshtastic_update_running=False,
+        _lora_transition_active=Mock(return_value=False),
+        _lora=NS(running=True, mode="meshcore", meshcore_ready=True),
+        _meshcore_ble=companion,
+        _start_meshcore_companion_ble=Mock(return_value=True),
+        msg=Mock(),
+    )
+
+    assert ui.toggle_meshcore_ble()
+    assert ui.settings["meshcore_ble_enabled"] is True
+    ui.app._start_meshcore_companion_ble.assert_called_once_with()
+
+    companion.running = True
+    assert ui.toggle_meshcore_ble()
+    assert ui.settings["meshcore_ble_enabled"] is False
+    companion.stop.assert_called_once_with(timeout=5.0)
+    assert ui._host_ble_retry_pending
+    assert ui.persist_settings.call_count == 2
+
+
+def test_meshcore_pairing_and_exact_phone_forget_use_manager_contract():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({"meshcore_ble_enabled": True})
+    manager = NS(
+        running=True, last_error="", pairing_cleanup_pending=False,
+        open_pairing=Mock(return_value=True),
+        forget_phone=Mock(return_value=True))
+    ui.app = NS(
+        _meshcore_ble=manager,
+        _meshtastic_update_running=False,
+        _lora_transition_active=Mock(return_value=False),
+        _meshtastic_transition_busy=Mock(return_value=False),
+        _lora=NS(worker_active=False, running=True),
+        _watch=NS(worker_active=False),
+        _bluetooth_pairing=NS(
+            owner="", release_uncertain=False),
+        _meshtastic=NS(ble_scan_lease_active=False),
+        _begin_meshtastic_transition=Mock(return_value=True),
+        _end_meshtastic_transition=Mock(),
+        _term_add=Mock(),
+        msg=Mock(),
+    )
+
+    assert ui.open_meshcore_pairing()
+    manager.open_pairing.assert_called_once_with(120)
+
+    assert ui.forget_meshcore_phone()
+    manager.forget_phone.assert_called_once_with()
+    assert ui.app._begin_meshtastic_transition.call_count == 2
+    assert ui.app._end_meshtastic_transition.call_count == 2
+
+
+def test_meshcore_pairing_is_blocked_by_watch_pairing_owner():
+    ui = WardriveUI.__new__(WardriveUI)
+    manager = NS(
+        running=True, pairing_cleanup_pending=False,
+        open_pairing=Mock())
+    ui.app = NS(
+        _meshcore_ble=manager,
+        _meshtastic_update_running=False,
+        _lora_transition_active=Mock(return_value=False),
+        _meshtastic_transition_busy=Mock(return_value=False),
+        _lora=NS(worker_active=False, running=True),
+        _watch=NS(worker_active=True),
+        _bluetooth_pairing=NS(owner="watch", release_uncertain=False),
+        _meshtastic=NS(ble_scan_lease_active=False),
+        msg=Mock(),
+    )
+
+    assert not ui.open_meshcore_pairing()
+    manager.open_pairing.assert_not_called()
+    assert "watch Bluetooth operation" in ui.app.msg.call_args.args[0]
+
+
+def test_meshcore_toggle_off_retains_setting_when_cleanup_is_uncertain():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({"meshcore_ble_enabled": True})
+    ui.persist_settings = Mock()
+    companion = NS(
+        stop=Mock(return_value=False), pairing_cleanup_pending=True,
+        last_error="could not unregister pairing agent")
+    ui.app = NS(_meshcore_ble=companion, msg=Mock())
+
+    assert not ui.toggle_meshcore_ble()
+
+    assert ui.settings["meshcore_ble_enabled"] is True
+    ui.persist_settings.assert_not_called()
+    assert "Still ON" in ui.app.msg.call_args.args[0]
+
+
+def test_meshcore_toggle_is_blocked_during_radio_transition():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({"meshcore_ble_enabled": True})
+    ui.persist_settings = Mock()
+    companion = NS(stop=Mock(return_value=True))
+    ui.app = NS(
+        _meshcore_ble=companion,
+        _meshtastic_update_running=False,
+        _lora_transition_active=Mock(return_value=True),
+        msg=Mock(),
+    )
+
+    assert not ui.toggle_meshcore_ble()
+
+    assert ui.settings["meshcore_ble_enabled"] is True
+    companion.stop.assert_not_called()
+    ui.persist_settings.assert_not_called()
+
+
+def test_meshcore_adapter_change_retains_old_value_on_cleanup_failure(
+        monkeypatch):
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({
+        "meshcore_ble_enabled": True,
+        "meshcore_ble_adapter": "11:22:33:44:55:66",
+    })
+    ui.persist_settings = Mock()
+    ui.host_ble = NS(worker_active=False, state="idle")
+    companion = NS(
+        running=True, worker_active=True, pairing_cleanup_pending=True,
+        last_error="agent cleanup pending", stop=Mock(return_value=False))
+    ui.app = NS(
+        _meshcore_ble=companion,
+        _meshtastic_update_running=False,
+        _lora_transition_active=Mock(return_value=False),
+        _meshtastic_transition_busy=Mock(return_value=False),
+        _lora=NS(worker_active=False, running=True),
+        _watch=NS(worker_active=False),
+        _bluetooth_pairing=NS(owner="meshcore", release_uncertain=False),
+        _meshtastic=NS(ble_scan_lease_active=False),
+        msg=Mock(),
+    )
+    monkeypatch.setattr(
+        "watchdogs.wardrive_ui.list_ble_adapters",
+        lambda: [
+            ("11:22:33:44:55:66", "hci0"),
+            ("AA:BB:CC:DD:EE:FF", "hci1"),
+        ])
+
+    assert not ui.cycle_bluetooth_adapter("meshcore_ble_adapter")
+
+    assert ui.settings["meshcore_ble_adapter"] == "11:22:33:44:55:66"
+    ui.persist_settings.assert_not_called()
+    companion.stop.assert_called_once_with(timeout=5.0)
+    assert "Adapter unchanged" in ui.app.msg.call_args.args[0]
+
+
+def test_meshcore_companion_pauses_only_an_overlapping_host_adapter():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({
+        "meshcore_ble_enabled": True,
+        "meshcore_ble_adapter": "AA:BB:CC:DD:EE:FF",
+        "host_ble_adapter": "AA:BB:CC:DD:EE:FF",
+    })
+    ui._host_ble_retry_pending = False
+    ui.host_ble = NS(state="running", stop=Mock())
+    ui.app = NS(
+        _meshcore_ble=NS(running=True), _term_add=Mock(), msg=Mock())
+
+    assert ui.meshcore_ble_blocks_host_scan()
+    ui.pause_host_ble_for_meshcore()
+    ui.host_ble.stop.assert_called_once_with()
+    assert ui.host_ble.state == "paused"
+    assert ui._host_ble_retry_pending
+
+    ui.settings["host_ble_adapter"] = "11:22:33:44:55:66"
+    assert not ui.meshcore_ble_blocks_host_scan()
+    ui.settings["meshcore_ble_adapter"] = "auto"
+    assert ui.meshcore_ble_blocks_host_scan()
 
 
 def test_collector_toggles_switch_sdr_choice_and_release_owned_lora():

@@ -493,6 +493,22 @@ saved to `meshtastic_nodes.csv`, while received text is appended to
 `meshtastic_messages.log`. Node names and channel configuration come from the
 daemon; change them with a Meshtastic client.
 
+When MeshCore is selected, WDG can also expose the AIO SX1262 to
+[MeshMapper](https://github.com/MeshMapper/MeshMapper_Flutter_App) over the
+standard MeshCore Nordic-UART BLE service. Enable it under **LoRa settings >
+MeshCore radio and companion BLE**, choose the Bluetooth controller, then open
+Mesh Messenger or start the automatic LoRa collector. MeshMapper will see an
+advertisement named `MeshCore-<WDG node name>` and can create/use its
+`#wardriving` channel, transmit pings and discovery requests, receive raw LoRa
+packets, read radio/identity metadata, and export its signed contact. WDG
+remains the only SX1262/SPI owner; the BLE service only queues
+work onto its existing radio thread. The peripheral is opt-in and requires an
+explicit 120-second authenticated pairing window. BlueZ generates a six-digit
+passkey that WDG displays; enter it on the phone to retain that one MeshMapper
+device as paired, bonded, and trusted. See
+[MeshCore companion BLE](docs/MESHCORE_BLE.md) for setup, the exact forget
+flow, controller-coexistence rules, and current limitations.
+
 When **Automatic LoRa collector** is enabled, both **All Wardrive** modes use
 the selected protocol. MeshCore sends a direct zero-hop `DISCOVER_REQ` at most
 every 30 seconds after moving 25 metres and listens seven seconds for tagged
@@ -504,8 +520,8 @@ periodic announce.
 
 **SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
 may automatically use the powered LoRa and SDR devices. Protocol, MeshCore
-region, and Meshtastic service/phone options are grouped under **LoRa
-settings**. With automatic LoRa off, switching the preferred protocol does not
+radio/companion options, and Meshtastic service/phone options are grouped under
+**LoRa settings**. With automatic LoRa off, switching the preferred protocol does not
 stop `meshtasticd` or claim SPI.
 Opening Mesh Messenger remains an explicit request to start the selected
 backend. Switching to MeshCore or powering LoRa off stops `meshtasticd` so the
@@ -544,7 +560,7 @@ source change. See
 - **Speech bubbles** on map with CB radio sprite when messages arrive
 - **Toast notifications** — always-on-top across all screens with sound
 - **Node discovery** with GPS coordinates saved to loot (dedup by node ID)
-- **Persistent MeshCore config** — node name + channels saved to `~/.janos_meshcore.json`
+- **Persistent MeshCore config** — node name + channels saved privately to `~/.watchdogs_meshcore.json`
 - **Meshtastic config reuse** — identity, channels, and node database come from `meshtasticd`
 - **Reticulum private state** — separate persistent identity, confirmed RF/IFAC and optional propagation profile, and newest-200-message UI history
 - **LoRa HUD status** in bottom bar (in line with GPS info)
@@ -685,6 +701,8 @@ watchdogs/
   bt_ducky.py         BLE HID injection (D-Bus, standalone)
   race_attack.py      Airoha BT exploit (bleak GATT)
   lora_manager.py     LoRa SX1262 (sniffer, MeshCore multi-channel)
+  meshcore_ble.py     MeshCore companion protocol + BlueZ GATT peripheral
+  bluetooth_pairing.py Shared bounded BlueZ pairing-agent arbitration
   flipper_manager.py  Flipper Zero serial CLI (SubGHz, NFC, storage)
   aio_manager.py      AIO v2 GPIO control
   upload_manager.py   WPA-sec upload (pcap) + download (potfile)
@@ -762,6 +780,29 @@ possible owners before intervening:
 ```bash
 systemctl status meshtasticd-wdg.service meshtasticd.service
 ```
+
+**MeshMapper cannot see or connect to WDG** — select MeshCore, then enable
+**LoRa settings > MeshCore radio and companion BLE > MeshMapper companion
+BLE**. The peripheral exists only while MeshCore owns the powered radio. Verify
+that the selected controller supports GATT server and LE advertising roles:
+```bash
+bluetoothctl list
+bluetoothctl show
+```
+Choose **Open authenticated pairing** in WDG, then connect to
+`MeshCore-<node name>` from inside MeshMapper before the 120-second window
+closes. Enter the six-digit passkey shown by WDG when the phone asks. Do not
+pre-pair from the generic Bluetooth settings screen. WDG retains one phone;
+use **Forget paired phone** before bonding a replacement.
+
+The retained phone must be the only connected BlueZ `Device1` on the selected
+companion adapter when it subscribes to notifications. Use a dedicated
+Bluetooth adapter for MeshMapper, or disconnect headphones, watches, and other
+devices from that adapter first. If All Wardrive host BLE is paused, choose two
+different stable controller MACs for **Companion BLE adapter** and **Host scan
+adapter**, or stop MeshMapper before resuming host scanning. MeshMapper,
+PipBoy-watch, and Meshtastic pairing windows are serialized; finish or cancel
+the active pairing operation before starting another one.
 
 **Meshtastic Messenger does not connect** — rerun setup if the protected helper
 or policy is missing, then inspect the selected service and fork socket:

@@ -1017,12 +1017,14 @@ class WardriveUpload(PluginBase):
             # (starts with "WatchDogs_") or matches an old WDG_ prefix
             if current.startswith("WatchDogs_") or current.startswith("WDG_"):
                 if current != target_name:
-                    self.app._mc_node_name = target_name
                     try:
                         from watchdogs.lora_manager import save_meshcore_config
-                        save_meshcore_config(
+                        saved = save_meshcore_config(
                             target_name,
                             getattr(self.app, "_mc_channels_list", []))
+                        if not saved:
+                            raise OSError("atomic MeshCore config save failed")
+                        self.app._mc_node_name = target_name
                         self._log_add(
                             f"  LoRa node name -> {target_name}", 11)
                         self.msg(
