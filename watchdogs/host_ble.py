@@ -1,5 +1,6 @@
 """Background BlueZ BLE discovery for All Wardrive, with bounded UI handoff."""
 import asyncio
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -10,6 +11,10 @@ from uuid import UUID
 BLE_SCAN_LEASE_SECONDS = 20
 BLE_SCAN_LEASE_RENEW_SECONDS = 8
 BLE_SCAN_LEASE_CALL_TIMEOUT = 4.5
+BLUETOOTH_SYSFS = Path("/sys/class/bluetooth")
+_AUTO_BLUEZ_OBJECTS = object()
+_ADAPTER_ADDRESS_RE = re.compile(
+    r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 
 
 def shared_adapter_conflict(message):
@@ -24,32 +29,95 @@ def shared_adapter_conflict(message):
     ))
 
 
-def list_ble_adapters(sysfs=Path("/sys/class/bluetooth")):
-    """Return powered or present BlueZ controllers by stable MAC address.
+def _bluez_managed_objects():
+    """Return BlueZ's current D-Bus object snapshot, or an empty mapping."""
+    bus = None
+    try:
+        import dbus
+
+        # Do not populate dbus-python's process-wide shared-connection cache.
+        # Pairing agents install a GLib main loop later and require a
+        # connection created with that loop already configured.
+        try:
+            bus = dbus.SystemBus(private=True)
+        except TypeError:  # older dbus-python
+            bus = dbus.bus.BusConnection(dbus.bus.BUS_SYSTEM)
+        manager = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager")
+        return manager.GetManagedObjects()
+    except Exception:
+        # Adapter discovery still works through sysfs on conventional USB
+        # controllers and on hosts without dbus-python (including CI).
+        return {}
+    finally:
+        if bus is not None:
+            try:
+                bus.close()
+            except Exception:
+                pass
+
+
+def _adapter_address(value):
+    address = str(value or "").strip().upper()
+    return address if _ADAPTER_ADDRESS_RE.fullmatch(address) else ""
+
+
+def list_ble_adapters(sysfs=BLUETOOTH_SYSFS,
+                      bluez_objects=_AUTO_BLUEZ_OBJECTS):
+    """Return present BlueZ controllers by stable MAC address.
 
     Linux's ``hciX`` numbering is assigned at discovery time and can change
     after a reboot or USB replug.  Settings therefore persist controller MACs
-    and resolve them to the current ``hciX`` only when a scan starts.
+    and resolve them to the current ``hciX`` only when a scan starts.  Some
+    UART HCI drivers omit the optional sysfs ``address`` attribute, so the
+    authoritative BlueZ ``Adapter1.Address`` property supplements sysfs.
     """
-    adapters = []
+    by_name = {}
     for address_file in sorted(Path(sysfs).glob("hci*/address")):
         try:
-            address = address_file.read_text(encoding="ascii").strip().upper()
+            address = _adapter_address(
+                address_file.read_text(encoding="ascii"))
         except OSError:
             continue
         if not address:
             continue
-        adapters.append((address, address_file.parent.name))
+        by_name[address_file.parent.name] = address
+
+    if bluez_objects is _AUTO_BLUEZ_OBJECTS:
+        bluez_objects = (
+            _bluez_managed_objects()
+            if Path(sysfs) == BLUETOOTH_SYSFS else {})
+    for path, interfaces in dict(bluez_objects or {}).items():
+        properties = dict(interfaces or {}).get("org.bluez.Adapter1")
+        if properties is None:
+            continue
+        name = str(path).rstrip("/").rsplit("/", 1)[-1]
+        address = _adapter_address(dict(properties).get("Address", ""))
+        if not re.fullmatch(r"hci\d+", name) or not address:
+            continue
+        # BlueZ is authoritative when both sources describe the same hciX.
+        by_name[name] = address
+
+    adapters = []
+    seen_addresses = set()
+    for name in sorted(by_name):
+        address = by_name[name]
+        if address in seen_addresses:
+            continue
+        seen_addresses.add(address)
+        adapters.append((address, name))
     return adapters
 
 
-def resolve_ble_adapter(selection="auto", sysfs=Path("/sys/class/bluetooth")):
+def resolve_ble_adapter(selection="auto", sysfs=BLUETOOTH_SYSFS,
+                        bluez_objects=_AUTO_BLUEZ_OBJECTS):
     """Resolve a persisted controller MAC to the current BlueZ hci name."""
     value = str(selection or "auto").strip()
     if value.lower() == "auto":
         return None
     wanted = value.upper()
-    for address, name in list_ble_adapters(sysfs):
+    for address, name in list_ble_adapters(sysfs, bluez_objects):
         if address == wanted:
             return name
     raise RuntimeError(f"Bluetooth adapter {wanted} is not available")

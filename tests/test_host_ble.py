@@ -1,9 +1,11 @@
 import asyncio
+import sys
 import threading
 import time
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
+import watchdogs.host_ble as host_ble_module
 from watchdogs.host_ble import (
     HostBleScanner,
     advertisement_record,
@@ -144,6 +146,94 @@ def test_adapter_mac_resolves_to_current_hci_name(tmp_path):
     assert resolve_ble_adapter("AA:BB:CC:DD:EE:FF", tmp_path) == "hci7"
     assert resolve_ble_adapter("auto", tmp_path) is None
     assert list_ble_adapters(tmp_path) == [("AA:BB:CC:DD:EE:FF", "hci7")]
+
+
+def test_uart_adapter_without_sysfs_address_uses_bluez_object(tmp_path):
+    (tmp_path / "hci0").mkdir()
+    objects = {
+        "/org/bluez/hci0": {
+            "org.bluez.Adapter1": {
+                "Address": "88:a2:9e:76:54:ea",
+                "Powered": True,
+            },
+            "org.bluez.GattManager1": {},
+            "org.bluez.LEAdvertisingManager1": {},
+        },
+    }
+
+    assert list_ble_adapters(tmp_path, objects) == [
+        ("88:A2:9E:76:54:EA", "hci0")]
+    assert resolve_ble_adapter(
+        "88:A2:9E:76:54:EA", tmp_path, objects) == "hci0"
+
+
+def test_default_inventory_automatically_queries_bluez_fallback(
+        monkeypatch, tmp_path):
+    (tmp_path / "hci0").mkdir()
+    objects = {
+        "/org/bluez/hci0": {
+            "org.bluez.Adapter1": {
+                "Address": "88:A2:9E:76:54:EA",
+            },
+        },
+    }
+    bluez = Mock(return_value=objects)
+    monkeypatch.setattr(host_ble_module, "BLUETOOTH_SYSFS", tmp_path)
+    monkeypatch.setattr(host_ble_module, "_bluez_managed_objects", bluez)
+
+    assert list_ble_adapters(tmp_path) == [
+        ("88:A2:9E:76:54:EA", "hci0")]
+    bluez.assert_called_once_with()
+
+
+def test_bluez_inventory_uses_private_bus_and_closes_it(monkeypatch):
+    objects = {
+        "/org/bluez/hci0": {
+            "org.bluez.Adapter1": {"Address": "88:A2:9E:76:54:EA"},
+        },
+    }
+    manager = NS(GetManagedObjects=Mock(return_value=objects))
+    bus = NS(get_object=Mock(return_value=object()), close=Mock())
+    dbus = NS(
+        SystemBus=Mock(return_value=bus),
+        Interface=Mock(return_value=manager),
+    )
+    monkeypatch.setitem(sys.modules, "dbus", dbus)
+
+    assert host_ble_module._bluez_managed_objects() == objects
+    dbus.SystemBus.assert_called_once_with(private=True)
+    bus.get_object.assert_called_once_with("org.bluez", "/")
+    dbus.Interface.assert_called_once_with(
+        bus.get_object.return_value,
+        "org.freedesktop.DBus.ObjectManager")
+    manager.GetManagedObjects.assert_called_once_with()
+    bus.close.assert_called_once_with()
+
+
+def test_bluez_adapter_merge_deduplicates_and_rejects_malformed_entries(
+        tmp_path):
+    controller = tmp_path / "hci1"
+    controller.mkdir()
+    (controller / "address").write_text("aa:bb:cc:dd:ee:ff\n")
+    objects = {
+        "/org/bluez/hci1": {
+            "org.bluez.Adapter1": {
+                "Address": "AA:BB:CC:DD:EE:FF",
+            },
+        },
+        "/org/bluez/hci2": {
+            "org.bluez.Adapter1": {"Address": "not-an-address"},
+        },
+        "/org/bluez/not-an-adapter": {
+            "org.bluez.Adapter1": {"Address": "11:22:33:44:55:66"},
+        },
+        "/org/bluez/hci3/dev_11_22_33_44_55_66": {
+            "org.bluez.Device1": {"Address": "11:22:33:44:55:66"},
+        },
+    }
+
+    assert list_ble_adapters(tmp_path, objects) == [
+        ("AA:BB:CC:DD:EE:FF", "hci1")]
 
 
 def test_selected_adapter_and_scan_lease_are_used_and_released():
