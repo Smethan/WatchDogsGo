@@ -28,6 +28,14 @@ The BLE peripheral exists only while WDG's MeshCore backend is running. It is
 removed before the direct radio releases ownership, during protocol handoff,
 when LoRa powers off, and at application shutdown.
 
+BlueZ completes peripheral setup by calling back into WDG's exported D-Bus
+objects. Current `main` prepares the GLib loop, registers the GATT application
+asynchronously, and then runs the loop so it can service BlueZ's callbacks. It
+registers the advertisement only after BlueZ accepts the application. Both
+registrations use explicit `ObjectPath` values and share a bounded ten-second
+startup deadline. Shutdown unregisters only the application and advertisement
+objects that BlueZ confirmed it accepted.
+
 ## Connect MeshMapper
 
 1. Grant MeshMapper the Bluetooth and location permissions required by the
@@ -166,6 +174,16 @@ controllers omit `/sys/class/bluetooth/hciX/address` even though BlueZ exposes
 the controller normally. Current WDG releases supplement sysfs discovery with
 BlueZ's `org.bluez.Adapter1.Address`; manually creating a sysfs file or changing
 its ownership is not required.
+
+WDG 0.9.45 could fail during peripheral startup while `bluetoothd` logged
+`client_ready_cb() No object received`, followed by WDG reporting that
+peripheral cleanup could not be verified. That release made a synchronous
+`RegisterApplication` call before the GLib dispatcher could answer BlueZ's
+object-manager callback. Current `main` uses the asynchronous GATT-then-
+advertisement sequence described above, fails after a bounded timeout instead
+of hanging, and does not attempt to unregister an object BlueZ never accepted.
+The patched path has automated coverage but has not yet been validated with a
+physical uConsole and MeshMapper session.
 
 If the WDG settings page reports that no GATT server or advertising manager is
 available, confirm BlueZ is running and try the other controller. If MeshMapper

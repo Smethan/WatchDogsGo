@@ -43,6 +43,7 @@ PROTOCOL_VERSION = 12
 MAX_SIGN_DATA_LEN = 8192
 SIGN_SESSION_TIMEOUT = 30.0
 MAX_PAIRING_WINDOW = 120
+BLUEZ_REGISTRATION_TIMEOUT = 10.0
 
 # BlueZ security flags imply the corresponding operation property.  In
 # particular, retaining a plain ``notify`` alongside authenticated-notify
@@ -59,6 +60,120 @@ MESHCORE_TX_FLAGS = (
 _BLUEZ_ADAPTER_IFACE = "org.bluez.Adapter1"
 _BLUEZ_DEVICE_IFACE = "org.bluez.Device1"
 _ADDRESS_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+class _BluezRegistration:
+    """Sequence BlueZ registration while the GLib dispatcher is running.
+
+    BlueZ calls the application's ObjectManager and advertisement Properties
+    interfaces before completing either registration.  The calls must
+    therefore be asynchronous: a synchronous dbus-python call made before the
+    GLib loop starts prevents WDG from servicing BlueZ's callbacks and BlueZ
+    reports ``client_ready_cb() No object received``.
+    """
+
+    def __init__(self, gatt, advertising, application_path: str,
+                 advertisement_path: str, *, object_path,
+                 stop_requested: Callable[[], bool],
+                 on_ready: Callable[[], None],
+                 on_terminal: Callable[[], None],
+                 clock: Callable[[], float] = time.monotonic,
+                 timeout: float = BLUEZ_REGISTRATION_TIMEOUT) -> None:
+        self.gatt = gatt
+        self.advertising = advertising
+        self.application_path = application_path
+        self.advertisement_path = advertisement_path
+        self.object_path = object_path
+        self.stop_requested = stop_requested
+        self.on_ready = on_ready
+        self.on_terminal = on_terminal
+        self.clock = clock
+        self.timeout = max(1.0, float(timeout))
+        self.started = False
+        self.ready = False
+        self.gatt_registered = False
+        self.advertisement_registered = False
+        self.deadline = 0.0
+        self.failure = ""
+
+    @staticmethod
+    def _detail(error) -> str:
+        return str(error).strip() or type(error).__name__
+
+    def _fail(self, stage: str, error) -> None:
+        if self.failure:
+            return
+        self.failure = f"{stage}: {self._detail(error)}"
+        self.on_terminal()
+
+    def begin(self) -> bool:
+        if self.started:
+            return False
+        self.started = True
+        self.deadline = self.clock() + self.timeout
+        try:
+            self.gatt.RegisterApplication(
+                self.object_path(self.application_path), {},
+                reply_handler=self._application_registered,
+                error_handler=lambda error: self._fail(
+                    "BlueZ GATT application registration failed", error))
+        except Exception as exc:
+            self._fail("BlueZ GATT application registration failed", exc)
+        return not self.failure
+
+    def _application_registered(self, *_args) -> None:
+        self.gatt_registered = True
+        if self.stop_requested():
+            self.on_terminal()
+            return
+        try:
+            self.advertising.RegisterAdvertisement(
+                self.object_path(self.advertisement_path), {},
+                reply_handler=self._advertisement_registered,
+                error_handler=lambda error: self._fail(
+                    "BlueZ advertisement registration failed", error))
+        except Exception as exc:
+            self._fail("BlueZ advertisement registration failed", exc)
+
+    def _advertisement_registered(self, *_args) -> None:
+        self.advertisement_registered = True
+        if self.stop_requested():
+            self.on_terminal()
+            return
+        self.ready = True
+        self.on_ready()
+
+    def expire(self) -> bool:
+        if self.ready or self.failure or not self.started:
+            return False
+        if self.clock() < self.deadline:
+            return False
+        self._fail(
+            "BlueZ peripheral registration failed",
+            TimeoutError(
+                f"no reply within {self.timeout:g} seconds"))
+        return True
+
+    def cleanup(self) -> list[str]:
+        """Unregister only objects BlueZ confirmed it accepted."""
+        errors = []
+        if self.advertisement_registered:
+            try:
+                self.advertising.UnregisterAdvertisement(
+                    self.object_path(self.advertisement_path))
+            except Exception as exc:
+                errors.append(
+                    "advertisement unregister failed: " + self._detail(exc))
+            self.advertisement_registered = False
+        if self.gatt_registered:
+            try:
+                self.gatt.UnregisterApplication(
+                    self.object_path(self.application_path))
+            except Exception as exc:
+                errors.append(
+                    "GATT unregister failed: " + self._detail(exc))
+            self.gatt_registered = False
+        return errors
 
 
 def _normalize_ble_address(value: str) -> str:
@@ -769,7 +884,10 @@ class _BluezPeripheral:
             @dbus.service.method("org.freedesktop.DBus.ObjectManager",
                                  out_signature="a{oa{sa{sv}}}")
             def GetManagedObjects(app_self):
-                return {obj.path: obj.properties() for obj in app_self.objects}
+                return {
+                    dbus.ObjectPath(obj.path): obj.properties()
+                    for obj in app_self.objects
+                }
 
         class Service(dbus.service.Object):
             def __init__(svc_self, app):
@@ -1090,18 +1208,19 @@ class _BluezPeripheral:
             return False
 
         self._drain_commands = drain_commands
-        gatt.RegisterApplication(app.PATH, {})
-        try:
-            advertising.RegisterAdvertisement(advertisement.PATH, {})
-        except Exception:
-            gatt.UnregisterApplication(app.PATH)
-            raise
-        self.event_callback("ready", self.adapter)
         self._loop = GLib.MainLoop()
+        registration = _BluezRegistration(
+            gatt, advertising, app.PATH, advertisement.PATH,
+            object_path=dbus.ObjectPath,
+            stop_requested=self.stop_event.is_set,
+            on_ready=lambda: self.event_callback("ready", self.adapter),
+            on_terminal=self._loop.quit,
+        )
 
         def check_stop():
             drain_commands()
-            if self._pairing_active:
+            registration.expire()
+            if registration.ready and self._pairing_active:
                 try:
                     finish_pairing_if_ready()
                 except Exception as exc:
@@ -1118,26 +1237,42 @@ class _BluezPeripheral:
 
         GLib.timeout_add(100, check_stop)
         security_cleanup_ok = True
+        cleanup_errors = []
         try:
+            if not registration.begin():
+                raise RuntimeError(registration.failure)
             self._loop.run()
+            if registration.failure and not self.stop_event.is_set():
+                raise RuntimeError(registration.failure)
         finally:
             self.protocol.cancel_signing()
             if self._pairing_active or pairing_registered:
                 security_cleanup_ok = close_pairing_window("stopped")
-            try:
-                advertising.UnregisterAdvertisement(advertisement.PATH)
-            except Exception:
-                pass
-            try:
-                gatt.UnregisterApplication(app.PATH)
-            except Exception:
-                pass
+            cleanup_errors = registration.cleanup()
             self._tx = None
             self.event_callback("stopped", "MeshCore companion BLE stopped")
+            bus_close_error = ""
             try:
                 bus.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                bus_close_error = (
+                    str(exc).strip() or type(exc).__name__)
+            if cleanup_errors and not bus_close_error:
+                log.warning(
+                    "MeshCore companion cleanup completed through D-Bus "
+                    "disconnect after explicit cleanup errors: %s",
+                    "; ".join(cleanup_errors))
+            elif cleanup_errors or bus_close_error:
+                detail = "; ".join(cleanup_errors + ([
+                    "private BlueZ connection close failed: "
+                    + bus_close_error] if bus_close_error else []))
+                if cleanup_errors:
+                    raise RuntimeError(
+                        "MeshCore companion cleanup could not be verified: "
+                        + detail)
+                log.warning(
+                    "Private BlueZ connection close failed after explicit "
+                    "peripheral unregistration: %s", bus_close_error)
             if not security_cleanup_ok:
                 raise RuntimeError(
                     "MeshMapper pairing security cleanup could not be verified")
@@ -1258,8 +1393,11 @@ class MeshCoreBleManager:
                 self.pairing_cleanup_pending = True
                 self.pairing_state = "error"
                 self.last_error = str(detail)
+                log.error(
+                    "MeshCore companion pairing cleanup error: %s", detail)
             elif name == "error":
                 self.last_error = str(detail)
+                log.error("MeshCore companion BLE error: %s", detail)
                 if self.pairing_state == "forgetting":
                     self.pairing_cleanup_pending = True
                     self.pairing_state = "error"

@@ -10,6 +10,15 @@ minor versions.
 
 ## Unreleased
 
+### Fixed
+
+- Fix MeshCore companion startup on BlueZ by registering the GATT application
+  and advertisement asynchronously while the GLib dispatcher services BlueZ's
+  callbacks. The sequence now uses explicit D-Bus object paths, waits at most
+  ten seconds, and unregisters only objects BlueZ confirmed, avoiding the
+  `client_ready_cb() No object received` startup failure and misleading
+  peripheral-cleanup uncertainty seen in 0.9.45.
+
 ## [0.9.45] — 2026-09-27
 
 ### Fixed

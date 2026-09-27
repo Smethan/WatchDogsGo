@@ -1,5 +1,6 @@
 """MeshCore companion protocol and BLE lifecycle tests."""
 
+import logging
 import stat
 import struct
 import threading
@@ -21,6 +22,7 @@ from watchdogs.lora_manager import (
     save_meshcore_config,
 )
 from watchdogs.meshcore_ble import (
+    BLUEZ_REGISTRATION_TIMEOUT,
     MAX_SIGN_DATA_LEN,
     MESHCORE_RX_FLAGS,
     MESHCORE_RX_UUID,
@@ -29,6 +31,7 @@ from watchdogs.meshcore_ble import (
     MESHCORE_TX_UUID,
     MeshCoreBleManager,
     MeshCoreCompanionProtocol,
+    _BluezRegistration,
     _PairingSecurity,
 )
 
@@ -218,6 +221,170 @@ def test_secure_bluez_flags_do_not_retain_unprotected_read_notify_or_write():
         "encrypt-authenticated-read", "encrypt-authenticated-notify")
     source = Path("watchdogs/meshcore_ble.py").read_text()
     assert "dbus.SystemBus(private=True)" in source
+
+
+def test_bluez_registration_is_async_and_ready_only_after_both_replies():
+    gatt = NS(
+        RegisterApplication=Mock(),
+        UnregisterApplication=Mock(),
+    )
+    advertising = NS(
+        RegisterAdvertisement=Mock(),
+        UnregisterAdvertisement=Mock(),
+    )
+    ready = Mock()
+    terminal = Mock()
+    registration = _BluezRegistration(
+        gatt, advertising, "/app", "/app/advertisement0",
+        object_path=lambda path: "object:" + path,
+        stop_requested=lambda: False,
+        on_ready=ready,
+        on_terminal=terminal,
+    )
+
+    assert registration.begin()
+    gatt.RegisterApplication.assert_called_once()
+    assert gatt.RegisterApplication.call_args.args == ("object:/app", {})
+    advertising.RegisterAdvertisement.assert_not_called()
+    ready.assert_not_called()
+
+    app_reply = gatt.RegisterApplication.call_args.kwargs["reply_handler"]
+    app_reply()
+    advertising.RegisterAdvertisement.assert_called_once()
+    assert advertising.RegisterAdvertisement.call_args.args == (
+        "object:/app/advertisement0", {})
+    ready.assert_not_called()
+
+    advertisement_reply = (
+        advertising.RegisterAdvertisement.call_args.kwargs["reply_handler"])
+    advertisement_reply()
+    ready.assert_called_once_with()
+    assert registration.ready
+
+    assert registration.cleanup() == []
+    advertising.UnregisterAdvertisement.assert_called_once_with(
+        "object:/app/advertisement0")
+    gatt.UnregisterApplication.assert_called_once_with("object:/app")
+
+
+def test_bluez_registration_failure_does_not_unregister_unaccepted_objects():
+    gatt = NS(
+        RegisterApplication=Mock(),
+        UnregisterApplication=Mock(),
+    )
+    advertising = NS(
+        RegisterAdvertisement=Mock(),
+        UnregisterAdvertisement=Mock(),
+    )
+    terminal = Mock()
+    registration = _BluezRegistration(
+        gatt, advertising, "/app", "/advertisement",
+        object_path=lambda path: path,
+        stop_requested=lambda: False,
+        on_ready=Mock(),
+        on_terminal=terminal,
+    )
+    assert registration.begin()
+
+    error = gatt.RegisterApplication.call_args.kwargs["error_handler"]
+    error(RuntimeError("No object received"))
+
+    assert registration.failure == (
+        "BlueZ GATT application registration failed: No object received")
+    terminal.assert_called_once_with()
+    advertising.RegisterAdvertisement.assert_not_called()
+    assert registration.cleanup() == []
+    gatt.UnregisterApplication.assert_not_called()
+    advertising.UnregisterAdvertisement.assert_not_called()
+
+
+def test_bluez_advertisement_failure_unregisters_only_accepted_gatt_app():
+    gatt = NS(
+        RegisterApplication=Mock(),
+        UnregisterApplication=Mock(),
+    )
+    advertising = NS(
+        RegisterAdvertisement=Mock(),
+        UnregisterAdvertisement=Mock(),
+    )
+    terminal = Mock()
+    registration = _BluezRegistration(
+        gatt, advertising, "/app", "/advertisement",
+        object_path=lambda path: path,
+        stop_requested=lambda: False,
+        on_ready=Mock(),
+        on_terminal=terminal,
+    )
+    assert registration.begin()
+    gatt.RegisterApplication.call_args.kwargs["reply_handler"]()
+
+    error = advertising.RegisterAdvertisement.call_args.kwargs["error_handler"]
+    error(RuntimeError("advertising unavailable"))
+
+    assert registration.failure == (
+        "BlueZ advertisement registration failed: advertising unavailable")
+    terminal.assert_called_once_with()
+    assert registration.cleanup() == []
+    advertising.UnregisterAdvertisement.assert_not_called()
+    gatt.UnregisterApplication.assert_called_once_with("/app")
+
+
+def test_bluez_registration_stop_and_timeout_are_bounded():
+    stopped = [False]
+    now = [100.0]
+    gatt = NS(
+        RegisterApplication=Mock(),
+        UnregisterApplication=Mock(),
+    )
+    advertising = NS(
+        RegisterAdvertisement=Mock(),
+        UnregisterAdvertisement=Mock(),
+    )
+    terminal = Mock()
+    registration = _BluezRegistration(
+        gatt, advertising, "/app", "/advertisement",
+        object_path=lambda path: path,
+        stop_requested=lambda: stopped[0],
+        on_ready=Mock(),
+        on_terminal=terminal,
+        clock=lambda: now[0],
+        timeout=BLUEZ_REGISTRATION_TIMEOUT,
+    )
+    assert registration.begin()
+    stopped[0] = True
+    gatt.RegisterApplication.call_args.kwargs["reply_handler"]()
+    advertising.RegisterAdvertisement.assert_not_called()
+    terminal.assert_called_once_with()
+    assert registration.cleanup() == []
+    gatt.UnregisterApplication.assert_called_once_with("/app")
+
+    gatt.RegisterApplication.reset_mock()
+    terminal.reset_mock()
+    stopped[0] = False
+    registration = _BluezRegistration(
+        gatt, advertising, "/app", "/advertisement",
+        object_path=lambda path: path,
+        stop_requested=lambda: False,
+        on_ready=Mock(),
+        on_terminal=terminal,
+        clock=lambda: now[0],
+        timeout=BLUEZ_REGISTRATION_TIMEOUT,
+    )
+    assert registration.begin()
+    now[0] += BLUEZ_REGISTRATION_TIMEOUT
+    assert registration.expire()
+    assert "no reply within 10 seconds" in registration.failure
+    terminal.assert_called_once_with()
+
+
+def test_bluez_object_manager_and_loop_follow_official_registration_order():
+    source = Path("watchdogs/meshcore_ble.py").read_text()
+    application = source.split("class Application", 1)[1].split(
+        "class Service", 1)[0]
+    assert "dbus.ObjectPath(obj.path)" in application
+    loop = source.index("self._loop = GLib.MainLoop()")
+    begin = source.index("registration.begin()", loop)
+    assert loop < begin
 
 
 def test_invalid_frames_and_unsupported_scope_fail_closed():
@@ -546,6 +713,20 @@ def test_manager_rejects_forget_while_connected_and_preserves_critical_events():
     assert manager.event_drop_count == 1
     assert "agent unregister failed" in manager.last_error
     assert "queue overflow" in manager.last_error
+
+
+def test_manager_logs_bluez_and_pairing_cleanup_errors(caplog):
+    protocol, _lora, _state = _protocol()
+    manager = MeshCoreBleManager(protocol)
+
+    with caplog.at_level(logging.ERROR, logger="watchdogs.meshcore_ble"):
+        manager._event("error", "GATT registration failed")
+        manager._event("pairing_cleanup_error", "agent unregister failed")
+
+    assert "MeshCore companion BLE error: GATT registration failed" in caplog.text
+    assert (
+        "MeshCore companion pairing cleanup error: agent unregister failed"
+        in caplog.text)
 
 
 def test_manager_waits_for_confirmed_phone_removal():
