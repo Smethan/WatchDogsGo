@@ -10,6 +10,8 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.43] — 2026-09-26
+
 ### Added
 
 - Add an experimental third LoRa protocol, Reticulum/LXMF, using a supervised

@@ -1,6 +1,6 @@
 # Smethan WatchDogsGo
 
-## Unreleased — experimental Reticulum/LXMF endpoint
+## 0.9.43 — Experimental Reticulum/LXMF endpoint
 
 - Add Reticulum as a third AIO SX1262 protocol alongside MeshCore and
   Meshtastic. A supervised child owns the process-global RNS/LXMF lifecycle;
@@ -23,7 +23,7 @@ the AIO-to-RNode physical interoperability, busy-channel, 25-switch, power-cycle
 and two-hour soak gate in `docs/RETICULUM.md`; release-ready status remains
 blocked until those checks pass.
 
-## Unreleased — LoRa settings menu
+## 0.9.42 — LoRa settings menu and Packet Sniffer intelligence
 
 - Group LoRa protocol, MeshCore region, and Meshtastic service/phone controls
   under **Wardrive Settings > LoRa settings**. The automatic LoRa collector
@@ -33,7 +33,7 @@ blocked until those checks pass.
   two supported All Wardrive choices retain the corrected control/data liveness
   checks and sequence-gap counters.
 
-## 0.9.42 — Packet Sniffer intelligence in HS Capture and Evil Twin
+### Packet Sniffer intelligence in HS Capture and Evil Twin
 
 - Import the completed Packet Sniffer session as a bounded, token-bound serial
   transaction. WDG now retains BSSID, client count, per-AP packet count, exact
