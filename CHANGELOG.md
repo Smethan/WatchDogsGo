@@ -10,6 +10,49 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.44] — 2026-09-27
+
+### Added
+
+- Add an opt-in standard MeshCore Nordic-UART companion peripheral so
+  MeshMapper can configure channels, map actively or passively, receive
+  packets, query radio/identity state, and use the AIO SX1262 through WDG's
+  existing single radio worker.
+- Add stable companion-controller selection, automatic coexistence rules for
+  All Wardrive host scanning, a 120-second authenticated pairing action, one
+  retained MeshMapper bond, and an exact-device forget action.
+- Add authenticated and bounded MeshCore `CMD_SIGN` 33-35 handling with an
+  8-KiB limit, a 30-second transaction timeout, and buffer clearing on
+  completion, overflow, expiry, disconnect, or shutdown.
+
+### Changed
+
+- Save MeshCore config and identity key atomically as mode `0600` and repair
+  ownership to the invoking desktop account when WDG runs through `sudo`.
+- Serialize MeshMapper, PipBoy-watch, and Meshtastic pairing agents through one
+  bounded coordinator, preserving the existing exact Meshtastic service-state
+  and SX1262 ownership barriers.
+
+### Security
+
+- Require BlueZ authenticated encryption for companion writes, reads, and
+  notifications. First pairing uses a BlueZ-generated six-digit passkey shown
+  by WDG and entered on the phone; only the retained paired, bonded, and trusted
+  device is authorized afterward.
+- Require that retained phone to be the sole connected BlueZ device on the
+  companion adapter before notifications begin, closing the device-identity
+  gap in BlueZ's device-less `StartNotify` call. A dedicated adapter is
+  recommended.
+- Keep the feature disabled by default and fail closed when pairing-agent or
+  adapter-state cleanup cannot be verified.
+- Retain WDG's existing plaintext-at-rest behavior for decoded MeshCore chat
+  loot and local pairing diagnostics; authenticated BLE protects the live link,
+  not those files.
+
+Automated protocol, lifecycle, ownership, and UI coverage passed without real
+Bluetooth or radio hardware. Android/iOS, BlueZ-controller, and sustained
+physical-uConsole mapping validation remain outstanding.
+
 ## [0.9.43] — 2026-09-26
 
 ### Added

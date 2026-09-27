@@ -1,5 +1,43 @@
 # Smethan WatchDogsGo
 
+## 0.9.44 — Authenticated MeshCore companion BLE for MeshMapper
+
+- Add an opt-in BlueZ GATT peripheral using the standard MeshCore service and
+  RX/TX characteristic UUIDs. It advertises as `MeshCore-<node name>` while
+  WDG's direct MeshCore backend owns the AIO SX1262.
+- Implement the MeshCore companion commands needed by MeshMapper connection,
+  signed identity export, channel setup, active mapping, discovery, radio stats,
+  and raw/control receive notifications. BLE never accesses SPI; all sends are
+  bounded and executed by the existing LoRa worker.
+- Add stable controller selection and conservative arbitration with All
+  Wardrive host scanning. One controller is dedicated to the peripheral while
+  it is active; explicitly selected distinct controllers may advertise and
+  scan concurrently.
+- Keep the peripheral disabled by default. An explicit 120-second pairing
+  window uses a BlueZ-generated six-digit passkey entered on the phone. WDG
+  retains one exact paired, bonded, and trusted MeshMapper device and provides
+  an exact-device forget action without removing unrelated bonds.
+- Require authenticated encryption for GATT writes, reads, and notifications.
+  Because BlueZ's notification-start call has no device parameter, the
+  retained phone must be the only connected device on the companion adapter;
+  a dedicated adapter is recommended.
+- Add authenticated, 8-KiB-bounded, 30-second `CMD_SIGN` 33-35 transactions
+  with buffer clearing on completion, overflow, expiry, disconnect, and
+  shutdown.
+- Serialize MeshMapper, PipBoy-watch, and Meshtastic pairing-agent ownership
+  through one bounded coordinator. Uncertain agent restoration blocks later
+  Bluetooth and radio handoffs instead of silently continuing.
+- Save MeshCore config atomically as mode `0600` and repair both config and key
+  ownership to the invoking desktop account when WDG runs through `sudo`.
+- Keep the existing plaintext-at-rest model: decoded MeshCore chat remains in
+  session loot and pairing diagnostics remain in WDG's local log, so operators
+  must protect those files even though the phone link is encrypted.
+
+Automated tests cover protocol framing, authenticated-device policy, pairing
+and forget lifecycle, queue bounds, controller coexistence, and cleanup. Phone,
+BlueZ-controller, and sustained mapping interoperability have not been tested
+on the physical uConsole and remain a release follow-up.
+
 ## 0.9.43 — Experimental Reticulum/LXMF endpoint
 
 - Add Reticulum as a third AIO SX1262 protocol alongside MeshCore and
