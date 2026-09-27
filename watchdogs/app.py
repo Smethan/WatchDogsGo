@@ -47,6 +47,14 @@ from .race_attack import RACEAttack
 from .aio_manager import AioManager
 from .whitelist_manager import WhitelistManager
 from .lora_manager import LoRaManager
+from .reticulum_config import (
+    ReticulumConfigError,
+    ReticulumProfile,
+    load_history as load_reticulum_history,
+    load_profile as load_reticulum_profile,
+    save_profile as save_reticulum_profile,
+)
+from .reticulum_manager import ReticulumManager
 from .radio_ownership import RadioOwnership, RadioOwnershipBusy
 from .meshtastic_manager import MeshtasticManager
 from .meshtastic_service import (
@@ -712,6 +720,8 @@ class WatchDogsGame(OtaMixin):
         self._mc_screen = False
         self._mc_log: list = []  # [(text, color, tag?)]
         self._mc_tx_pending: dict[bytes, int] = {}  # dedup_key → log index
+        self._rns_tx_rows: dict[str, int] = {}
+        self._rns_tx_meta: dict[str, dict] = {}
         self._mc_input = ""
         self._mc_scroll = 0
         # Load MeshCore config (node name, channels)
@@ -726,8 +736,81 @@ class WatchDogsGame(OtaMixin):
             save_meshcore_config(node_name, _mc_cfg.get("_channels", []))
         self._mc_node_name = node_name
         # MeshCore regional preset (EU/UK, US/CA, ...) — picker in ADDONS menu.
-        from .lora_manager import DEFAULT_MESHCORE_REGION
+        from .lora_manager import DEFAULT_MESHCORE_REGION, get_meshcore_preset
         self._mc_region = _mc_cfg.get("region", DEFAULT_MESHCORE_REGION)
+        _rns_seed = ReticulumProfile.seed_from_meshcore(
+            get_meshcore_preset(self._mc_region))
+        try:
+            self._reticulum_profile = load_reticulum_profile(
+                _app_dir, seed=_rns_seed)
+        except ReticulumConfigError as exc:
+            self._reticulum_profile = _rns_seed
+            self._term_add(
+                "[RNS] Profile ignored: " + str(exc)[:120], raw=True)
+        self._reticulum = ReticulumManager(
+            _app_dir,
+            service_handoff=self._meshtastic,
+            operation_guard=lambda: (
+                "SX1262 ownership is uncertain after a failed power-barrier "
+                "release; restart WatchDogsGo before using Reticulum"
+                if self._lora_power_ownership_uncertain else
+                "Meshtastic service update is running; Reticulum is paused"
+                if self._meshtastic_update_running else ""),
+        )
+        self._reticulum_start_pending: tuple[str, int] | None = None
+        # Reticulum is not persisted as the preferred protocol until the
+        # candidate sidecar reaches authenticated, radio-online readiness.
+        self._reticulum_protocol_commit_pending = False
+        self._direct_protocol_rollback = ""
+        self._direct_protocol_rollback_profile = None
+        self._reticulum_profile_result: Queue = Queue()
+        self._reticulum_profile_thread = None
+        _rns_history_diagnostics: list[str] = []
+        _rns_history_rows: dict[str, int] = {}
+        _rns_records = load_reticulum_history(
+            _app_dir, limit=1000,
+            diagnostics=_rns_history_diagnostics)
+        for _record in _rns_records:
+            _event = _record.get("event")
+            if _event == "message":
+                _text = str(_record.get("text") or "").replace("\n", " ")
+                if not _text:
+                    continue
+                _peer = str(_record.get("peer_name") or
+                            _record.get("peer_hash") or "?")[:24]
+                _direction = str(_record.get("direction") or "in")
+                _state = str(_record.get("state") or "").upper()
+                if _state == "SENDING":
+                    _state = "QUEUED"
+                _stamp = time.strftime(
+                    "%H:%M", time.localtime(float(
+                        _record.get("timestamp") or 0)))
+                _line = (f"\x11 [DM→{_peer}] {_text}"
+                         if _direction == "out"
+                         else f"\x10 [DM] {_peer}: {_text}")
+                _index = len(self._mc_log)
+                self._mc_log.append((
+                    _line, C_DIM, f"{_stamp} {_state}".strip()))
+                _correlation = str(_record.get("correlation_id") or "")
+                if _correlation:
+                    _rns_history_rows[_correlation] = _index
+            elif _event == "outbound_status":
+                _correlation = str(_record.get("correlation_id") or "")
+                _index = _rns_history_rows.get(_correlation)
+                if _index is not None and _index < len(self._mc_log):
+                    _old = self._mc_log[_index]
+                    _state = str(_record.get("state") or "queued").upper()
+                    if _state == "SENDING":
+                        _state = "QUEUED"
+                    _stamp = str(_old[2]).split()[0]
+                    _color = (C_SUCCESS if _state == "DELIVERED" else
+                              C_ERROR if _state == "FAILED" else C_DIM)
+                    self._mc_log[_index] = (
+                        _old[0], _color, f"{_stamp} {_state}")
+        if len(self._mc_log) > 200:
+            self._mc_log[:] = self._mc_log[-200:]
+        for _diagnostic in _rns_history_diagnostics:
+            self._term_add("[RNS] " + _diagnostic, raw=True)
         self._mc_region_screen = False
         self._mc_region_return_to_settings = False
         self._mc_region_sel = 0
@@ -1566,6 +1649,7 @@ class WatchDogsGame(OtaMixin):
         self._poll_gps()
         self._poll_serial()
         self._poll_lora()
+        self._poll_reticulum()
         self._poll_meshtastic()
         self._poll_meshtastic_update()
         self._poll_sdr()
@@ -1638,8 +1722,11 @@ class WatchDogsGame(OtaMixin):
         if getattr(self, '_ota_screen', False):
             self._update_ota_screen()
             return
-        if self.wardrive.settings_open:
+        if self.wardrive.settings_open and not self.input_mode:
             self.wardrive.update_settings()
+            return
+        if self.wardrive.settings_open and self.input_mode:
+            self._update_input_dialog()
             return
         if self.wardrive.capture_screen.open:
             self.wardrive.capture_screen.update()
@@ -2262,7 +2349,10 @@ class WatchDogsGame(OtaMixin):
             "portal":        self.state.portal_running,
             "evil_twin":     self.state.evil_twin_running,
             "meshcore":      (
-                self._meshtastic.connected
+                self._reticulum.ready
+                if (hasattr(self, "wardrive") and
+                    self.wardrive.settings.get("lora_protocol") == "reticulum")
+                else self._meshtastic.connected
                 if (hasattr(self, "wardrive") and
                     self.wardrive.settings.get("lora_protocol") == "meshtastic")
                 else self._lora.running and self._lora.mode == "meshcore"),
@@ -2431,6 +2521,29 @@ class WatchDogsGame(OtaMixin):
         # ── MeshCore Messenger ──
         if cmd == "_meshcore":
             protocol = self.wardrive.settings["lora_protocol"]
+            if protocol == "reticulum":
+                if not self._lora_enabled:
+                    self.msg("[RNS] Enable LoRa first", C_WARNING)
+                    return
+                if not self._reticulum_profile.confirmed:
+                    self.wardrive.open_reticulum_settings()
+                    self.msg("[RNS] Confirm RF settings first", C_WARNING)
+                    return
+                self._switch_lora_protocol(
+                    "reticulum", start_if_enabled=True)
+                self._mc_screen = True
+                self._mc_scroll = 0
+                self.menu_open = False
+                if not getattr(self, "_rns_help_shown", False):
+                    self._mc_log.append((
+                        "\x11 Reticulum/LXMF EXPERIMENTAL", C_HACK_CYAN))
+                    self._mc_log.append((
+                        "\x11 Ctrl+H=contacts  Ctrl+A=announce  "
+                        "Ctrl+P=prop-sync", 13))
+                    self._mc_log.append((
+                        "\x11 Ctrl+N=name  Ctrl+X=clear", 13))
+                    self._rns_help_shown = True
+                return
             if protocol == "meshtastic":
                 if not self._lora_enabled:
                     self.msg("[MT] Enable LoRa first", C_WARNING)
@@ -2880,6 +2993,34 @@ class WatchDogsGame(OtaMixin):
         self._lora_transition_threads = live
         return list(live)
 
+    def _active_direct_owner(self) -> tuple[str, object | None]:
+        """Return the one WDG process that may currently own direct SPI."""
+        reticulum = getattr(self, "_reticulum", None)
+        if (reticulum is not None and
+                (getattr(reticulum, "running", False)
+                 or getattr(reticulum, "worker_active", False)
+                 or getattr(reticulum, "radio_owned", False))):
+            return "reticulum", reticulum
+        lora = getattr(self, "_lora", None)
+        if (lora is not None and
+                (getattr(lora, "running", False)
+                 or getattr(lora, "worker_active", False)
+                 or getattr(lora, "radio_owned", False))):
+            return str(getattr(lora, "mode", "") or "direct"), lora
+        return "", None
+
+    def _stop_active_direct_owner(self) -> bool:
+        _mode, owner = self._active_direct_owner()
+        if owner is None:
+            return True
+        try:
+            return bool(owner.stop())
+        except Exception as exc:
+            self._term_add(
+                "[LoRa] Direct owner stop failed: " + str(exc)[:120],
+                raw=True)
+            return False
+
     def _cancel_pending_lora_start(self, *, collector_only: bool = False) -> bool:
         """Invalidate a pending direct or daemon start without racing its exit.
 
@@ -2890,13 +3031,14 @@ class WatchDogsGame(OtaMixin):
         """
         direct = getattr(self, "_lora_start_pending", "")
         handoff = getattr(self, "_lora_handoff_pending", None)
+        reticulum = getattr(self, "_reticulum_start_pending", None)
         direct_action = direct[0] if isinstance(direct, tuple) else direct
         handoff_action = handoff[0] if isinstance(handoff, tuple) else ""
         actions = {str(direct_action or ""), str(handoff_action or "")}
         if collector_only and not actions.intersection(("wardrive", "power_on")):
             return False
         pending = bool(
-            direct or handoff
+            direct or handoff or reticulum
             or self._live_lora_transition_threads())
         if not pending:
             return False
@@ -3044,6 +3186,7 @@ class WatchDogsGame(OtaMixin):
         detail = "LoRa power-off did not complete"
         direct_active = False
         prior_direct_mode = ""
+        prior_reticulum_profile = None
         prior_service_target = None
         service_suspended = False
         barrier = None
@@ -3062,10 +3205,12 @@ class WatchDogsGame(OtaMixin):
         # A displaced handoff can restore a direct owner as its final rollback
         # action.  Sample ownership only after every such worker has exited;
         # the values from before the join are no longer authoritative.
-        direct_active = (
-            self._lora.running or self._lora.worker_active
-            or self._lora.radio_owned)
-        prior_direct_mode = self._lora.mode if direct_active else ""
+        prior_direct_mode, direct_owner = self._active_direct_owner()
+        if prior_direct_mode == "reticulum":
+            prior_reticulum_profile = (
+                getattr(self._reticulum, "profile", None)
+                or self._reticulum_profile)
+        direct_active = direct_owner is not None
         try:
             prior_service_target = self._meshtastic.active_service_target()
         except Exception:
@@ -3074,7 +3219,7 @@ class WatchDogsGame(OtaMixin):
             bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
             if bluetooth_busy:
                 detail = "cannot stop services while " + bluetooth_busy
-            elif direct_active and not self._lora.stop():
+            elif direct_active and not self._stop_active_direct_owner():
                 detail = "direct LoRa worker did not release the SX1262"
             else:
                 # A successful direct-radio session retains the exact service
@@ -3090,7 +3235,8 @@ class WatchDogsGame(OtaMixin):
                     detail = "Meshtastic service did not release the SX1262"
                     if prior_direct_mode:
                         self._restore_lora_power_owner(
-                            prior_direct_mode, None)
+                            prior_direct_mode, None,
+                            reticulum_profile=prior_reticulum_profile)
                     elif prior_service_target:
                         try:
                             if (self._meshtastic.active_service_target()
@@ -3108,14 +3254,16 @@ class WatchDogsGame(OtaMixin):
                         barrier.acquire("WatchDogsGo LoRa power transition")
                     except RadioOwnershipBusy as exc:
                         restored = self._restore_lora_power_owner(
-                            prior_direct_mode, prior_service_target)
+                            prior_direct_mode, prior_service_target,
+                            reticulum_profile=prior_reticulum_profile)
                         detail = (
                             str(exc)[:120] + "; LoRa rail remains on; "
                             + ("previous owner restored" if restored else
                                "previous owner could not be restored"))
                     except Exception as exc:
                         restored = self._restore_lora_power_owner(
-                            prior_direct_mode, prior_service_target)
+                            prior_direct_mode, prior_service_target,
+                            reticulum_profile=prior_reticulum_profile)
                         detail = (
                             "could not acquire the SX1262 power barrier: "
                             + str(exc)[:100] + "; LoRa rail remains on; "
@@ -3135,7 +3283,9 @@ class WatchDogsGame(OtaMixin):
                                     "restart WatchDogsGo")
                             else:
                                 restored = self._restore_lora_power_owner(
-                                    prior_direct_mode, prior_service_target)
+                                    prior_direct_mode, prior_service_target,
+                                    reticulum_profile=
+                                    prior_reticulum_profile)
                                 detail = (
                                     "GPIO power-off failed; the LoRa rail remains "
                                     "on; "
@@ -3157,7 +3307,8 @@ class WatchDogsGame(OtaMixin):
             if ((service_suspended or prior_direct_mode or prior_service_target)
                     and barrier_released):
                 restored = self._restore_lora_power_owner(
-                    prior_direct_mode, prior_service_target)
+                    prior_direct_mode, prior_service_target,
+                    reticulum_profile=prior_reticulum_profile)
                 detail += ("; previous owner restored" if restored else
                            "; previous owner could not be restored")
             elif not barrier_released:
@@ -3199,7 +3350,8 @@ class WatchDogsGame(OtaMixin):
                 + str(error)[:120], raw=True)
 
     def _restore_lora_power_owner(
-            self, direct_mode: str, service_target: str | None) -> bool:
+            self, direct_mode: str, service_target: str | None, *,
+            reticulum_profile: ReticulumProfile | None = None) -> bool:
         """Restore the exact owner displaced before a failed rail cut."""
         def direct_start_accepted(start) -> bool:
             epoch = self._begin_lora_async_start("restore")
@@ -3228,6 +3380,20 @@ class WatchDogsGame(OtaMixin):
                 self._lora.set_mc_channels(self._mc_channels_list)
                 return direct_start_accepted(
                     lambda: self._lora.start_meshcore(self._mc_region))
+            if direct_mode == "reticulum":
+                epoch = self._begin_lora_async_start("restore")
+                marker = ("restore", epoch)
+                self._reticulum_start_pending = marker
+                accepted = bool(self._reticulum.start(
+                    reticulum_profile or self._reticulum_profile,
+                    action="restore"))
+                if accepted:
+                    wardrive = getattr(self, "wardrive", None)
+                    if wardrive is not None:
+                        wardrive._wdg_owned_lora = False
+                elif self._reticulum_start_pending == marker:
+                    self._reticulum_start_pending = None
+                return accepted
             if direct_mode == "meshtastic":
                 return direct_start_accepted(self._lora.start_meshtastic)
             if direct_mode == "scanner":
@@ -3302,20 +3468,17 @@ class WatchDogsGame(OtaMixin):
         safe_to_restore_direct = True
         if epoch is None:
             epoch = int(getattr(self, "_lora_start_epoch", 0))
-        prior_direct_mode = (
-            getattr(self._lora, "mode", "")
-            if (getattr(self._lora, "running", False)
-                or getattr(self._lora, "worker_active", False)
-                or getattr(self._lora, "radio_owned", False)) else "")
+        prior_direct_mode, prior_direct_owner = self._active_direct_owner()
         try:
             bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
             if bluetooth_busy:
                 detail = "Meshtastic start blocked by " + bluetooth_busy
-            elif not self._lora.stop():
+            elif not self._stop_active_direct_owner():
                 detail = (
                     "direct radio worker did not release the SX1262; "
                     "Meshtastic was not started")
-            elif self._lora.radio_owned:
+            elif (prior_direct_owner is not None
+                  and getattr(prior_direct_owner, "radio_owned", False)):
                 detail = (
                     "direct radio ownership remained held; Meshtastic was "
                     "not started")
@@ -3431,6 +3594,224 @@ class WatchDogsGame(OtaMixin):
             return False
         return True
 
+    def _run_direct_handoff(self, protocol: str, prior: str,
+                            action: str, epoch: int) -> None:
+        """Switch direct-SPI backends without replacing the service token."""
+        ok = False
+        detail = ""
+        prior_profile = None
+        if prior == "reticulum":
+            prior_profile = (getattr(self._reticulum, "profile", None)
+                             or self._reticulum_profile)
+        try:
+            if not self._stop_active_direct_owner():
+                detail = f"{prior or 'direct'} did not release the SX1262"
+                self._lora_power_ownership_uncertain = True
+            elif protocol == "reticulum":
+                self._direct_protocol_rollback = prior
+                self._direct_protocol_rollback_profile = prior_profile
+                self._reticulum.reuse_retained_service_snapshot_once()
+                marker = (action, epoch)
+                self._reticulum_start_pending = marker
+                ok = bool(self._reticulum.start(
+                    self._reticulum_profile, action=action))
+                if not ok and self._reticulum_start_pending == marker:
+                    self._reticulum_start_pending = None
+                detail = ("Reticulum sidecar starting" if ok else
+                          "Reticulum sidecar rejected the start")
+            else:
+                self._direct_protocol_rollback = prior
+                self._direct_protocol_rollback_profile = prior_profile
+                self._lora.reuse_retained_service_snapshot_once()
+                marker = (action, epoch)
+                self._lora_start_pending = marker
+                self._lora.set_mc_channels(self._mc_channels_list)
+                ok = bool(self._lora.start_meshcore(self._mc_region))
+                if not ok and self._lora_start_pending == marker:
+                    self._lora_start_pending = ""
+                detail = ("MeshCore radio starting" if ok else
+                          "MeshCore radio rejected the start")
+            if not ok and prior:
+                restored = self._restore_previous_direct_owner(
+                    prior, prior_profile)
+                detail += ("; previous direct radio restored" if restored else
+                           "; previous direct radio could not be restored")
+                if not restored:
+                    service_restored = self._restore_retained_service_snapshot()
+                    detail += (
+                        "; retained Meshtastic snapshot restored without a "
+                        "client" if service_restored else
+                        "; retained Meshtastic snapshot could not be restored")
+                    if not service_restored:
+                        self._lora_power_ownership_uncertain = True
+        except Exception as exc:
+            detail = "direct-radio handoff failed: " + str(exc)[:140]
+            if prior:
+                try:
+                    restored = self._restore_previous_direct_owner(
+                        prior, prior_profile)
+                except Exception:
+                    restored = False
+                detail += ("; previous direct radio restored" if restored else
+                           "; previous direct radio could not be restored")
+                if not restored:
+                    service_restored = self._restore_retained_service_snapshot()
+                    detail += (
+                        "; retained Meshtastic snapshot restored without a "
+                        "client" if service_restored else
+                        "; retained Meshtastic snapshot could not be restored")
+                    if not service_restored:
+                        self._lora_power_ownership_uncertain = True
+        queue = getattr(self, "_lora_transition_queue", None)
+        if queue is not None:
+            queue.put((ok, detail, "direct_handoff", epoch))
+
+    def _restore_previous_direct_owner(
+            self, mode: str,
+            profile: ReticulumProfile | None = None) -> bool:
+        """Rollback a direct-to-direct handoff without touching systemd."""
+        active, _owner = self._active_direct_owner()
+        if active == mode:
+            self._direct_protocol_rollback = ""
+            self._direct_protocol_rollback_profile = None
+            return True
+        self._direct_protocol_rollback = ""
+        self._direct_protocol_rollback_profile = None
+        epoch = self._begin_lora_async_start("direct_rollback")
+        if mode == "meshcore":
+            marker = ("direct_rollback", epoch)
+            self._lora_start_pending = marker
+            self._lora.reuse_retained_service_snapshot_once()
+            self._lora.set_mc_channels(self._mc_channels_list)
+            accepted = bool(self._lora.start_meshcore(self._mc_region))
+            if not accepted and self._lora_start_pending == marker:
+                self._lora_start_pending = ""
+            return accepted
+        if mode == "reticulum":
+            marker = ("direct_rollback", epoch)
+            self._reticulum_start_pending = marker
+            self._reticulum.reuse_retained_service_snapshot_once()
+            accepted = bool(self._reticulum.start(
+                profile or self._reticulum_profile,
+                action="direct_rollback"))
+            if not accepted and self._reticulum_start_pending == marker:
+                self._reticulum_start_pending = None
+            return accepted
+        return False
+
+    def _restore_retained_service_snapshot(self) -> bool:
+        """Restore only the exact retained service state, with no client."""
+        try:
+            if not self._meshtastic_service_restore_pending():
+                return True
+            return bool(self._meshtastic.resume_service(
+                timeout=15.0, connect=False))
+        except Exception:
+            return False
+
+    def _start_direct_rollback_service_fallback(self) -> bool:
+        """Restore the retained daemon snapshot after both direct owners fail."""
+        if self._lora_transition_active():
+            return False
+        epoch = self._begin_lora_async_start("direct_rollback_service")
+
+        def worker():
+            ok = self._restore_retained_service_snapshot()
+            detail = (
+                "Previous Meshtastic service snapshot restored"
+                if ok else
+                "Previous Meshtastic service snapshot could not be restored")
+            self._lora_transition_queue.put((
+                ok, detail, "direct_rollback_service", epoch))
+
+        try:
+            factory = getattr(
+                self, "_lora_transition_thread_factory", threading.Thread)
+            thread = factory(
+                target=worker, name="wdg-direct-rollback-service",
+                daemon=True)
+            self._lora_transition_thread = thread
+            self._track_lora_transition_thread(thread)
+            thread.start()
+            return True
+        except Exception as exc:
+            self._forget_lora_transition_thread(locals().get("thread"))
+            self._lora_transition_thread = None
+            self._lora_power_ownership_uncertain = True
+            self._term_add(
+                "[LoRa] Could not restore either direct backend or the "
+                "retained service snapshot: " + str(exc)[:120], raw=True)
+            return False
+
+    def _start_direct_handoff(self, protocol: str, prior: str,
+                              action: str) -> bool:
+        if self._lora_transition_active():
+            return False
+        epoch = self._begin_lora_async_start(action)
+        try:
+            factory = getattr(
+                self, "_lora_transition_thread_factory", threading.Thread)
+            thread = factory(
+                target=self._run_direct_handoff,
+                args=(protocol, prior, action, epoch),
+                name=f"wdg-lora-to-{protocol}", daemon=True)
+            self._lora_transition_thread = thread
+            self._track_lora_transition_thread(thread)
+            thread.start()
+            return True
+        except Exception as exc:
+            self._forget_lora_transition_thread(locals().get("thread"))
+            self._lora_transition_thread = None
+            self._term_add(
+                "[LoRa] Could not start direct handoff: " + str(exc)[:120],
+                raw=True)
+            return False
+
+    def _apply_reticulum_profile(self, profile: ReticulumProfile, *,
+                                 activate_protocol: bool = False) -> bool:
+        """Validate and apply a Reticulum profile without blocking Pyxel."""
+        try:
+            profile = profile.validate()
+        except ReticulumConfigError as exc:
+            self.msg("[RNS] " + str(exc)[:70], C_ERROR)
+            return False
+        thread = getattr(self, "_reticulum_profile_thread", None)
+        if thread is not None and thread.is_alive():
+            self.msg("[RNS] A profile update is already running", C_WARNING)
+            return False
+
+        def worker():
+            result_profile = profile
+            try:
+                if self._reticulum.running:
+                    ok = self._reticulum.restart_with_profile(profile)
+                else:
+                    save_reticulum_profile(self._app_dir, profile)
+                    ok = True
+                if ok:
+                    result_profile = load_reticulum_profile(
+                        self._app_dir, seed=profile)
+                detail = "Reticulum profile applied" if ok else (
+                    "Reticulum profile failed; previous configuration restored")
+            except Exception as exc:
+                ok = False
+                detail = "Reticulum profile failed: " + str(exc)[:140]
+            self._reticulum_profile_result.put(
+                (ok, result_profile, bool(activate_protocol), detail))
+
+        try:
+            thread = threading.Thread(
+                target=worker, name="wdg-reticulum-profile", daemon=True)
+            self._reticulum_profile_thread = thread
+            thread.start()
+            self.msg("[RNS] Applying profile...", C_DIM)
+            return True
+        except Exception as exc:
+            self._reticulum_profile_thread = None
+            self.msg("[RNS] Could not apply profile: " + str(exc)[:70],
+                     C_ERROR)
+            return False
+
     def _switch_lora_protocol(self, protocol: str,
                               *, start_if_enabled: bool = True,
                               _transition_owned: bool = False,
@@ -3458,7 +3839,7 @@ class WatchDogsGame(OtaMixin):
     def _switch_lora_protocol_locked(self, protocol: str,
                                      *, start_if_enabled: bool = True,
                                      transition_action: str = "handoff") -> bool:
-        if protocol not in ("meshcore", "meshtastic"):
+        if protocol not in ("meshcore", "meshtastic", "reticulum"):
             self._term_add(
                 "[LoRa] Unsupported protocol selection: " + str(protocol)[:40],
                 raw=True)
@@ -3475,12 +3856,25 @@ class WatchDogsGame(OtaMixin):
                 "[MT] Radio protocol changes are blocked during service update",
                 raw=True)
             return False
+        if protocol == "reticulum" and not self._reticulum_profile.confirmed:
+            self.msg("[RNS] Review and confirm RF settings first", C_WARNING)
+            open_settings = getattr(
+                getattr(self, "wardrive", None),
+                "open_reticulum_settings", None)
+            if open_settings:
+                open_settings()
+            return False
         if not start_if_enabled:
             # Changing the preferred protocol while automatic ownership is
             # disabled must not stop a daemon another app may be using.
             if self._lora.running and self._lora.mode == "meshcore":
                 if not self._lora.stop():
                     return False
+            if (getattr(self, "_reticulum", None) is not None
+                    and (self._reticulum.running
+                         or self._reticulum.worker_active)
+                    and not self._reticulum.stop()):
+                return False
             return bool(self._meshtastic.close())
         if protocol == "meshtastic":
             if self._lora_enabled and start_if_enabled:
@@ -3497,6 +3891,26 @@ class WatchDogsGame(OtaMixin):
                 "[MC] Waiting for the current radio handoff to finish",
                 raw=True)
             return False
+
+        prior_direct, _owner = self._active_direct_owner()
+        if prior_direct == protocol:
+            return True
+        if prior_direct:
+            return self._start_direct_handoff(
+                protocol, prior_direct, transition_action)
+
+        if protocol == "reticulum":
+            epoch = self._begin_lora_async_start(transition_action)
+            marker = (transition_action, epoch)
+            self._reticulum_start_pending = marker
+            started = self._reticulum.start(
+                self._reticulum_profile, action=transition_action)
+            if not started:
+                if self._reticulum_start_pending == marker:
+                    self._reticulum_start_pending = None
+                return False
+            self._term_add("[SYS] Reticulum sidecar starting", raw=True)
+            return True
 
         # LoRaManager performs the daemon handoff in its worker before it
         # acquires process ownership and touches SPI/GPIO.  This also covers
@@ -4399,6 +4813,46 @@ class WatchDogsGame(OtaMixin):
                         save_meshcore_config(name_val, self._mc_channels_list)
                         self.msg(f"[MC] Node name: {name_val}", C_SUCCESS)
                     return
+                if self._input_pending_cat == -9:  # Reticulum display name
+                    name_val = vals[0].strip() if vals else ""
+                    try:
+                        profile = self._reticulum_profile.with_updates(
+                            display_name=name_val)
+                    except ReticulumConfigError as exc:
+                        self.msg("[RNS] " + str(exc)[:70], C_ERROR)
+                    else:
+                        self._apply_reticulum_profile(profile)
+                    return
+                if self._input_pending_cat == -10:  # Reticulum IFAC
+                    network_name = vals[0].strip() if vals else ""
+                    passphrase = vals[1].strip() if len(vals) > 1 else ""
+                    self.wardrive.update_reticulum_draft(
+                        network_name=network_name,
+                        network_passphrase=passphrase)
+                    return
+                if self._input_pending_cat == -12:  # Reticulum frequency
+                    try:
+                        frequency = int(vals[0].strip())
+                    except (IndexError, TypeError, ValueError):
+                        self.msg("[RNS] Frequency must be an integer Hz value",
+                                 C_ERROR)
+                    else:
+                        self.wardrive.update_reticulum_draft(
+                            frequency_hz=frequency)
+                    return
+                if self._input_pending_cat == -13:  # Reticulum draft name
+                    name_val = vals[0].strip() if vals else ""
+                    self.wardrive.update_reticulum_draft(
+                        display_name=name_val)
+                    return
+                if self._input_pending_cat == -14:  # Propagation node hash
+                    node_hash = vals[0].strip() if vals else ""
+                    self.wardrive.update_reticulum_draft(
+                        propagation_node_hash=node_hash,
+                        propagated_outbound=(
+                            self.wardrive._reticulum_draft.propagated_outbound
+                            if node_hash else False))
+                    return
                 if self._input_pending_cat == -6:  # WPA-sec token
                     token = vals[0].strip() if vals else ""
                     if token:
@@ -5038,6 +5492,7 @@ class WatchDogsGame(OtaMixin):
                             self._lora_enabled = False
                             self._lora_power_intent = False
                             self._lora_start_pending = ""
+                            self._reticulum_start_pending = None
                             self._lora_handoff_pending = None
                             self.wardrive._wdg_owned_lora = False
                             self._mc_screen = False
@@ -5063,6 +5518,16 @@ class WatchDogsGame(OtaMixin):
                                 self._lora_handoff_pending = None
                             self.msg(f"[LoRa] {detail}", C_ERROR)
                         self._end_meshtastic_transition()
+                    elif action == "direct_handoff":
+                        if not ok:
+                            self._reticulum_protocol_commit_pending = False
+                            self.wardrive._wdg_owned_lora = False
+                            self.msg(f"[LoRa] {detail}", C_ERROR)
+                    elif action == "direct_rollback_service":
+                        self.wardrive._wdg_owned_lora = False
+                        if not ok:
+                            self._lora_power_ownership_uncertain = True
+                            self.msg(f"[LoRa] {detail}", C_ERROR)
                     elif action == "power_on":
                         allowed = self._lora_start_completion_allowed(
                             action, epoch)
@@ -5125,6 +5590,8 @@ class WatchDogsGame(OtaMixin):
                 if attr == "success" and text.startswith("Sniffer started:"):
                     if pending:
                         self._lora_start_pending = ""
+                        self._direct_protocol_rollback = ""
+                        self._direct_protocol_rollback_profile = None
                         allowed = self._lora_start_completion_allowed(
                             pending_action, pending_epoch)
                         self.wardrive._wdg_owned_lora = allowed
@@ -5143,7 +5610,25 @@ class WatchDogsGame(OtaMixin):
                     if pending:
                         self._lora_start_pending = ""
                         self.wardrive._wdg_owned_lora = False
-                        if pending_action == "power_on":
+                        rollback = getattr(
+                            self, "_direct_protocol_rollback", "")
+                        if rollback:
+                            rollback_profile = getattr(
+                                self, "_direct_protocol_rollback_profile",
+                                None)
+                            if self._restore_previous_direct_owner(
+                                    rollback, rollback_profile):
+                                self._term_add(
+                                    "[LoRa] Previous direct radio restored",
+                                    raw=True)
+                            else:
+                                self._term_add(
+                                    "[LoRa] Previous direct radio could not "
+                                    "be restored", raw=True)
+                                self._start_direct_rollback_service_fallback()
+                        elif pending_action == "direct_rollback":
+                            self._start_direct_rollback_service_fallback()
+                        elif pending_action == "power_on":
                             if (pending_epoch != int(getattr(
                                     self, "_lora_start_epoch", 0))
                                     and self._lora_power_intent):
@@ -5240,6 +5725,245 @@ class WatchDogsGame(OtaMixin):
         # Prune expired bubbles
         frame = pyxel.frame_count
         self._mc_bubbles = [(t, e) for t, e in self._mc_bubbles if e > frame]
+
+    def _poll_reticulum(self):
+        """Move authenticated sidecar events onto the Pyxel/main thread."""
+        manager = getattr(self, "_reticulum", None)
+        if manager is None:
+            return
+        result_queue = getattr(self, "_reticulum_profile_result", None)
+        if result_queue is not None:
+            try:
+                while True:
+                    ok, profile, activate, detail = result_queue.get_nowait()
+                    self._reticulum_profile_thread = None
+                    self._term_add("[RNS] " + detail, raw=True)
+                    self.msg("[RNS] " + detail[:66],
+                             C_SUCCESS if ok else C_ERROR)
+                    if not ok:
+                        if activate:
+                            self._reticulum_protocol_commit_pending = False
+                        continue
+                    self._reticulum_profile = profile
+                    if activate:
+                        active = bool(
+                            self._lora_enabled
+                            and self.wardrive.settings.get(
+                                "wardrive_lora", False))
+                        if active:
+                            self._reticulum_protocol_commit_pending = True
+                            if not self._switch_lora_protocol(
+                                    "reticulum", start_if_enabled=True):
+                                self._reticulum_protocol_commit_pending = False
+                                self.msg(
+                                    "[RNS] Profile saved; protocol switch "
+                                    "was not accepted", C_WARNING)
+                        else:
+                            # With automatic ownership inactive this is only a
+                            # preference change and must not claim SPI.
+                            self.wardrive.settings[
+                                "lora_protocol"] = "reticulum"
+                            self.wardrive.persist_settings()
+            except Empty:
+                pass
+        try:
+            events = manager.poll_events()
+        except Exception as exc:
+            self._term_add("[RNS] Event poll failed: " + str(exc)[:100],
+                           raw=True)
+            return
+        for event, data in events:
+            if event == "ready":
+                try:
+                    self._reticulum_profile = load_reticulum_profile(
+                        self._app_dir, seed=self._reticulum_profile)
+                except ReticulumConfigError:
+                    pass
+                pending = getattr(self, "_reticulum_start_pending", None)
+                if pending:
+                    action, epoch = pending
+                    self._reticulum_start_pending = None
+                    allowed = self._lora_start_completion_allowed(action, epoch)
+                    if allowed:
+                        self.wardrive._wdg_owned_lora = True
+                        self._direct_protocol_rollback = ""
+                        self._direct_protocol_rollback_profile = None
+                        if getattr(
+                                self,
+                                "_reticulum_protocol_commit_pending",
+                                False):
+                            self.wardrive.settings[
+                                "lora_protocol"] = "reticulum"
+                            self.wardrive.persist_settings()
+                            self._reticulum_protocol_commit_pending = False
+                        if action == "power_on":
+                            self._lora_power_on_pending = False
+                            self._end_meshtastic_transition()
+                    elif not self._lora_poweroff_handles_cleanup():
+                        self._reticulum_protocol_commit_pending = False
+                        manager.stop()
+                        if action == "power_on":
+                            self._lora_power_on_pending = False
+                            self._end_meshtastic_transition()
+                short_hash = str(data.get("identity_hash") or "")[:8]
+                self._term_add(
+                    f"[RNS] Ready as {data.get('display_name') or '?'} "
+                    f"({short_hash})", raw=True)
+                self.msg("[RNS] Reticulum ready", C_SUCCESS)
+            elif event == "contact":
+                destination = str(data.get("destination_hash") or "")
+                if not re.fullmatch(r"[0-9a-f]{32}", destination):
+                    continue
+                node_id = "reticulum:" + destination
+                now = float(data.get("last_seen") or time.time())
+                node = {
+                    "id": node_id,
+                    "protocol": "reticulum",
+                    "address": destination,
+                    "destination_hash": destination,
+                    "type": "LXMF",
+                    "name": str(data.get("display_name") or
+                                destination[:8])[:64],
+                    "lat": 0.0,
+                    "lon": 0.0,
+                    "hops": max(0, int(data.get("hops") or 0)),
+                    "rssi": data.get("rssi"),
+                    "snr": data.get("snr"),
+                    "last_seen": now,
+                }
+                existing = next(
+                    (item for item in self._mc_nodes
+                     if item.get("id") == node_id), None)
+                if existing:
+                    node["first_seen"] = existing.get("first_seen", now)
+                    node["note"] = existing.get("note", "")
+                    existing.update(node)
+                else:
+                    node["first_seen"] = now
+                    node["note"] = ""
+                    self._mc_nodes.append(node)
+                    self.gain_xp(20)
+                if self.loot:
+                    self.loot.save_contact(node_id, dict(node))
+                    save = getattr(self.loot, "save_reticulum_contact", None)
+                    if save:
+                        save(node, self.player_lat if self.gps_fix else 0.0,
+                             self.player_lon if self.gps_fix else 0.0)
+                self._term_add(
+                    f"[RNS] Contact {node['name']} ({destination[:8]}) "
+                    f"{node['hops']}hop", raw=True)
+            elif event == "message":
+                direction = str(data.get("direction") or "in")
+                text = str(data.get("text") or "").replace("\n", " ")
+                peer_hash = str(data.get("peer_hash") or "")
+                peer = str(data.get("peer_name") or peer_hash[:8] or "?")
+                correlation = str(data.get("correlation_id") or "")
+                state = str(data.get("state") or "queued").upper()
+                ts = time.strftime(
+                    "%H:%M", time.localtime(float(
+                        data.get("timestamp") or time.time())))
+                if direction == "out":
+                    index = len(self._mc_log)
+                    self._mc_log.append((
+                        f"\x11 [DM→{peer}] {text}", C_WARNING,
+                        f"{ts} {state}"))
+                    if correlation:
+                        self._rns_tx_rows[correlation] = index
+                        self._rns_tx_meta[correlation] = dict(data)
+                else:
+                    self._mc_log.append((
+                        f"\x10 [DM] {peer}: {text}", 12,
+                        f"{ts} DELIVERED"))
+                    self._mc_bubbles.append(
+                        (f"RNS: {text[:34]}", pyxel.frame_count + 300))
+                    self.msg(f"[RNS] {peer}: {text[:24]}", C_SUCCESS)
+                    self._play_mc_notify()
+                if self.loot:
+                    save = getattr(self.loot, "save_reticulum_message", None)
+                    if save:
+                        save(data)
+            elif event == "outbound_status":
+                correlation = str(data.get("correlation_id") or "")
+                state = str(data.get("state") or "queued").upper()
+                display_state = "QUEUED" if state == "SENDING" else state
+                index = self._rns_tx_rows.get(correlation)
+                if index is not None and index < len(self._mc_log):
+                    old = self._mc_log[index]
+                    tag = old[2] if len(old) > 2 else time.strftime("%H:%M")
+                    timestamp = str(tag).split()[0]
+                    color = (C_SUCCESS if display_state in (
+                                 "STORED", "DELIVERED") else
+                             C_ERROR if display_state == "FAILED" else
+                             C_WARNING)
+                    self._mc_log[index] = (old[0], color,
+                                           f"{timestamp} {display_state}")
+                if state in ("STORED", "DELIVERED", "FAILED"):
+                    self._rns_tx_rows.pop(correlation, None)
+                meta = dict(self._rns_tx_meta.get(correlation) or {})
+                meta.update(data)
+                meta["direction"] = "out"
+                meta["timestamp"] = time.time()
+                if self.loot:
+                    save = getattr(self.loot, "save_reticulum_message", None)
+                    if save:
+                        save(meta)
+                if state in ("STORED", "DELIVERED", "FAILED"):
+                    self._rns_tx_meta.pop(correlation, None)
+            elif event == "propagation_status":
+                state = str(data.get("state") or "unknown")
+                if state == "complete":
+                    count = data.get("message_count")
+                    duplicates = data.get("duplicate_count")
+                    detail = "Propagation sync complete"
+                    if isinstance(count, int):
+                        detail += f": {count} message(s)"
+                    if isinstance(duplicates, int) and duplicates:
+                        detail += f", {duplicates} duplicate(s)"
+                    self._term_add("[RNS] " + detail, raw=True)
+                    self.msg("[RNS] " + detail[:65], C_SUCCESS)
+                    self._mc_log.append(("\x11 " + detail, C_SUCCESS))
+                elif state in {
+                        "no_path", "link_failed", "transfer_failed",
+                        "identity_rejected", "access_denied", "failed"}:
+                    detail = "Propagation sync failed: " + state.replace(
+                        "_", " ")
+                    self._term_add("[RNS] " + detail, raw=True)
+                    self.msg("[RNS] " + detail[:65], C_ERROR)
+                    self._mc_log.append(("\x10 " + detail, C_ERROR))
+            elif event == "radio_status":
+                self._term_add(
+                    "[RNS] " + str(data.get("detail") or data)[:120],
+                    raw=True)
+            elif event == "error":
+                detail = str(data.get("detail") or "Reticulum error")[:160]
+                self._term_add("[RNS] " + detail, raw=True)
+                self.msg("[RNS] " + detail[:65], C_ERROR)
+                if data.get("fatal"):
+                    self._reticulum_protocol_commit_pending = False
+                    pending = getattr(
+                        self, "_reticulum_start_pending", None)
+                    self._reticulum_start_pending = None
+                    self.wardrive._wdg_owned_lora = False
+                    rollback = getattr(
+                        self, "_direct_protocol_rollback", "")
+                    if rollback:
+                        rollback_profile = getattr(
+                            self, "_direct_protocol_rollback_profile", None)
+                        if not self._restore_previous_direct_owner(
+                                rollback, rollback_profile):
+                            self._term_add(
+                                "[RNS] Previous direct radio could not be "
+                                "restored", raw=True)
+                            self._start_direct_rollback_service_fallback()
+                    elif (pending
+                          and pending[0] == "direct_rollback"):
+                        self._start_direct_rollback_service_fallback()
+                    elif pending and pending[0] == "power_on":
+                        self._start_failed_lora_power_on_rollback()
+                if data.get("code") in (
+                        "radio_close_uncertain", "shutdown_uncertain",
+                        "profile_rollback_failed"):
+                    self._lora_power_ownership_uncertain = True
 
     def _poll_meshtastic(self):
         """Move meshtasticd callbacks onto the Pyxel/main thread."""
@@ -5424,9 +6148,9 @@ class WatchDogsGame(OtaMixin):
             return reject("[MT] Enable the LoRa power rail before updating")
         if self._lora_transition_active():
             return reject("[MT] Wait for the current radio handoff to finish")
-        if (self._lora.running or self._lora.worker_active
-                or self._lora.radio_owned):
-            return reject("[MT] Stop MeshCore/direct LoRa before updating")
+        if self._active_direct_owner()[1] is not None:
+            return reject(
+                "[MT] Stop MeshCore/Reticulum direct LoRa before updating")
         bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
         if bluetooth_busy:
             return reject("[MT] Finish " + bluetooth_busy + " before updating")
@@ -5807,6 +6531,8 @@ class WatchDogsGame(OtaMixin):
                 "et_captures": t.get("et_captures", 0),
                 "mc_nodes":    t.get("mc_nodes", 0) + t.get("mt_nodes", 0),
                 "mc_msgs":     t.get("mc_messages", 0) + t.get("mt_messages", 0),
+                "rns_contacts": t.get("rns_contacts", 0),
+                "rns_msgs":     t.get("rns_messages", 0),
             }
         except Exception:
             pass
@@ -5871,6 +6597,8 @@ class WatchDogsGame(OtaMixin):
                 "et_captures": t.get("et_captures", 0),
                 "mc_nodes":    t.get("mc_nodes", 0) + t.get("mt_nodes", 0),
                 "mc_msgs":     t.get("mc_messages", 0) + t.get("mt_messages", 0),
+                "rns_contacts": t.get("rns_contacts", 0),
+                "rns_msgs":     t.get("rns_messages", 0),
             }
         except Exception:
             pass
@@ -6063,6 +6791,11 @@ class WatchDogsGame(OtaMixin):
                 transition.join()
         transition_pending = bool(self._live_lora_transition_threads())
         if not transition_pending:
+            if (getattr(self, "_reticulum", None) is not None
+                    and (self._reticulum.running
+                         or self._reticulum.worker_active)):
+                if not self._reticulum.stop():
+                    self._lora_power_ownership_uncertain = True
             if self._lora.running or self._lora.worker_active:
                 self._lora.stop()
             # Disconnect only WDG. Keep meshtasticd alive for the user's other
@@ -6104,6 +6837,8 @@ class WatchDogsGame(OtaMixin):
         self._draw_inner()
         self._draw_plugin_pin()
         self.wardrive.draw_overlay()
+        if self.input_mode and self.wardrive.settings_open:
+            self._draw_input_dialog()
 
     def _draw_inner(self):
         if self._boot_phase:
@@ -7177,7 +7912,8 @@ class WatchDogsGame(OtaMixin):
         else:
             gps_left = W - 60
         right_status_edge = gps_left - 6
-        if self._lora.running or self._lora_enabled:
+        if (self._lora.running or self._reticulum.running
+                or self._lora_enabled):
             right_status_edge = min(right_status_edge, W - 206)
         left_status_edge = cell_x + len(cell_txt) * HUD_FONT_W + 8
 
@@ -7226,7 +7962,9 @@ class WatchDogsGame(OtaMixin):
             pyxel.text(W - 60, y, "GPS offline", C_DIM)
 
         # LoRa status (left of GPS, same line). "LoRa:ON pkt:9999" = 16×5 = 80
-        if self._lora.running:
+        if self._reticulum.ready:
+            pyxel.text(W - 200, y, "LoRa:RNS", C_SUCCESS)
+        elif self._lora.running:
             pkts = self._lora.packets_received
             pyxel.text(W - 200, y, f"LoRa:ON pkt:{pkts}", C_SUCCESS)
         elif self._lora_enabled:
@@ -7304,7 +8042,7 @@ class WatchDogsGame(OtaMixin):
         pyxel.pset(rx, ry, C_TEXT)
 
         # MeshCore: CB radio sprite + message bubbles (under radar)
-        if self._lora.running:
+        if self._lora.running or self._reticulum.ready:
             # Radio sprite centered under radar
             rw = getattr(self, '_radio_w', 32)
             rh = getattr(self, '_radio_h', 48)
@@ -7339,7 +8077,7 @@ class WatchDogsGame(OtaMixin):
 
         # SDR indicator (under LoRa radio, or under radar if no LoRa)
         if self._sdr.running:
-            if self._lora.running:
+            if self._lora.running or self._reticulum.ready:
                 rw = getattr(self, '_radio_w', 32)
                 rh = getattr(self, '_radio_h', 48)
                 sy = ry + rr + 4 + rh + 4  # below radio sprite
@@ -8349,6 +9087,10 @@ class WatchDogsGame(OtaMixin):
             -5: "MeshCore",
             -6: "WPA-sec Token",
             -7: "Evil Portal",
+            -9: "Reticulum",
+            -10: "Reticulum IFAC",
+            -12: "Reticulum RF",
+            -13: "Reticulum Name",
         }
         if self._input_pending_cat < 0:
             name = _SPECIAL_TITLES.get(self._input_pending_cat, "Input")
@@ -9433,6 +10175,8 @@ class WatchDogsGame(OtaMixin):
                 if node.get("protocol", "meshcore") == protocol]
 
     def _mesh_channels(self):
+        if self._mesh_protocol() == "reticulum":
+            return []
         if self._mesh_protocol() == "meshtastic":
             return self._meshtastic.channels
         return self._mc_channels_list
@@ -9444,6 +10188,9 @@ class WatchDogsGame(OtaMixin):
         return getattr(channel, "name", "?")
 
     def _mesh_local_name(self):
+        if self._mesh_protocol() == "reticulum":
+            return (self._reticulum.local_name
+                    or self._reticulum_profile.display_name or "Reticulum")
         if self._mesh_protocol() == "meshtastic":
             return self._meshtastic.local_name
         return self._mc_node_name
@@ -9462,6 +10209,12 @@ class WatchDogsGame(OtaMixin):
 
     def _update_mc_screen(self):
         protocol = self._mesh_protocol()
+        if protocol == "reticulum":
+            self._mc_chan_picker = False
+        if (self._mc_dm_target is not None
+                and self._mc_dm_target.get("protocol", "meshcore")
+                != protocol):
+            self._mc_dm_target = None
         # Ctrl+H toggles contacts panel (always, even when panel is open)
         ctrl = pyxel.btn(pyxel.KEY_LCTRL) or pyxel.btn(pyxel.KEY_RCTRL)
         if ctrl and pyxel.btnp(pyxel.KEY_H):
@@ -9521,7 +10274,16 @@ class WatchDogsGame(OtaMixin):
             if text:
                 ts = time.strftime("%H:%M")
                 if self._mc_dm_target:
-                    if protocol == "meshtastic":
+                    if protocol == "reticulum":
+                        target = (self._mc_dm_target.get("destination_hash")
+                                  or self._mc_dm_target.get("address")
+                                  or self._mc_dm_target.get("id", "").removeprefix(
+                                      "reticulum:"))
+                        if not self._reticulum.send_text(target, text):
+                            self._mc_log.append((
+                                "\x10 Reticulum message was not queued",
+                                C_ERROR, ts))
+                    elif protocol == "meshtastic":
                         target = (self._mc_dm_target.get("address")
                                   or self._mc_dm_target.get("id", "").removeprefix(
                                       "meshtastic:"))
@@ -9553,7 +10315,11 @@ class WatchDogsGame(OtaMixin):
                         if dedup_key:
                             self._mc_tx_pending[dedup_key] = idx
                 else:
-                    if protocol == "meshtastic":
+                    if protocol == "reticulum":
+                        self._mc_log.append((
+                            "\x10 Select a contact with Ctrl+H before sending",
+                            C_WARNING))
+                    elif protocol == "meshtastic":
                         sent = self._meshtastic.send_text(
                             text, channel=self._mesh_active_channel_index())
                         self._mc_log.append((
@@ -9590,7 +10356,13 @@ class WatchDogsGame(OtaMixin):
         ctrl = pyxel.btn(pyxel.KEY_LCTRL) or pyxel.btn(pyxel.KEY_RCTRL)
         if ctrl:
             if pyxel.btnp(pyxel.KEY_A):
-                if protocol == "meshtastic":
+                if protocol == "reticulum":
+                    queued = self._reticulum.announce()
+                    self._mc_log.append((
+                        "\x11 LXMF destination announced"
+                        if queued else "\x10 Reticulum is not ready",
+                        C_HACK_CYAN if queued else C_WARNING))
+                elif protocol == "meshtastic":
                     queued = self._meshtastic.request_discovery()
                     self._mc_log.append((
                         "\x11 Zero-hop NodeInfo discovery queued"
@@ -9604,7 +10376,37 @@ class WatchDogsGame(OtaMixin):
                     self._mc_log.append((
                         f"\x11 Advert: {self._mc_node_name}", C_HACK_CYAN))
                 return
+            if pyxel.btnp(pyxel.KEY_P):
+                if protocol != "reticulum":
+                    return
+                active_states = {
+                    "path_requested", "link_establishing",
+                    "link_established", "request_sent", "receiving",
+                    "response_received",
+                }
+                if self._reticulum.propagation_state in active_states:
+                    queued = self._reticulum.cancel_propagation_sync()
+                    message = ("\x10 Propagation sync cancellation queued"
+                               if queued else
+                               "\x10 Propagation sync could not be cancelled")
+                else:
+                    queued = self._reticulum.sync_propagation()
+                    message = ("\x11 Propagation sync requested"
+                               if queued else
+                               "\x10 Configure a propagation node first")
+                self._mc_log.append((
+                    message, C_HACK_CYAN if queued else C_WARNING))
+                return
             if pyxel.btnp(pyxel.KEY_N):
+                if protocol == "reticulum":
+                    self.input_mode = True
+                    self.input_fields = [{
+                        "label": "Display Name",
+                        "value": self._mesh_local_name()}]
+                    self.input_field_idx = 0
+                    self._input_pending_cat = -9
+                    self._input_pending_item = -1
+                    return
                 if protocol == "meshtastic":
                     self._mc_log.append((
                         "\x10 Change the node name in Meshtastic settings",
@@ -9623,6 +10425,11 @@ class WatchDogsGame(OtaMixin):
                 self._mc_scroll = 0
                 return
             if pyxel.btnp(pyxel.KEY_C):
+                if protocol == "reticulum":
+                    self._mc_log.append((
+                        "\x10 Reticulum direct messages have no channels",
+                        C_DIM))
+                    return
                 self._mc_chan_picker = not self._mc_chan_picker
                 self._mc_chan_sel = self._mc_active_ch
                 return
@@ -9652,7 +10459,7 @@ class WatchDogsGame(OtaMixin):
 
         # Typing
         c = self._get_char_input()
-        if c and len(self._mc_input) < 120:
+        if (c and len((self._mc_input + c).encode("utf-8")) <= 120):
             self._mc_input += c
 
     def _update_mc_nodes_panel(self):
@@ -9697,7 +10504,7 @@ class WatchDogsGame(OtaMixin):
                 nd = nodes[self._mc_node_sel]
                 act = _actions[self._mc_node_action_sel]
                 if act == "DM":
-                    if self._mesh_protocol() == "meshtastic":
+                    if self._mesh_protocol() in ("meshtastic", "reticulum"):
                         self._mc_dm_target = nd
                         self._mc_input = ""
                         self._mc_log.append(
@@ -9780,25 +10587,47 @@ class WatchDogsGame(OtaMixin):
     def _draw_mc_screen(self):
         pyxel.cls(0)
         protocol = self._mesh_protocol()
-        protocol_name = "Meshtastic" if protocol == "meshtastic" else "MeshCore"
+        protocol_name = ("Reticulum" if protocol == "reticulum" else
+                         "Meshtastic" if protocol == "meshtastic" else
+                         "MeshCore")
         nodes = self._mesh_nodes()
         channels = self._mesh_channels()
-        manager = self._meshtastic if protocol == "meshtastic" else self._lora
+        manager = (self._reticulum if protocol == "reticulum" else
+                   self._meshtastic if protocol == "meshtastic" else
+                   self._lora)
         # Title bar — 14px tall for 5x8 font + padding
         BAR_H = 14
         pyxel.rect(0, 0, W, BAR_H, 1)
-        status = "ACTIVE" if manager.running else "OFF"
+        if protocol == "reticulum":
+            radio_state = "RADIO" if manager.radio_owned else "NO-RADIO"
+            drops = getattr(manager, "event_drops", 0)
+            status = f"{manager.state.upper()}/{radio_state}"
+            propagation_state = getattr(
+                manager, "propagation_state", "disabled")
+            if propagation_state != "disabled":
+                status += "/PN:" + propagation_state.upper()[:8]
+            if drops:
+                status += f"/DROP:{drops}"
+            identity = manager.local_hash[:8] or "????????"
+        else:
+            status = "ACTIVE" if manager.running else "OFF"
+            identity = ""
         pkts = getattr(manager, "packets_received", 0)
-        ch_name = "?"
+        ch_name = (("PROP" if getattr(
+                        self._reticulum_profile, "propagated_outbound", False)
+                    else "DIRECT") if protocol == "reticulum" else "?")
         if channels and self._mc_active_ch < len(channels):
             ch_name = self._mesh_channel_name(channels[self._mc_active_ch])
         if self._mc_dm_target:
             dm_name = self._mc_dm_target.get("name", "?")
             pyxel.text(4, 4, f"{protocol_name.upper()} [DM: {dm_name}] "
-                       f"[{status}] pkts:{pkts} node:{self._mesh_local_name()}", 12)
+                       f"[{status}] "
+                       f"{('id:' + identity + ' ') if identity else ''}"
+                       f"node:{self._mesh_local_name()}", 12)
         else:
             pyxel.text(4, 4, f"{protocol_name.upper()} [{ch_name}] [{status}] "
-                       f"pkts:{pkts} node:{self._mesh_local_name()} "
+                       f"{('id:' + identity + ' ') if identity else 'pkts:' + str(pkts) + ' '}"
+                       f"node:{self._mesh_local_name()} "
                        f"nodes:{len(nodes)}", C_HACK_CYAN)
 
         # Polish character transliteration (BDF/pyxel fonts are ASCII-only)
@@ -9870,7 +10699,7 @@ class WatchDogsGame(OtaMixin):
         pyxel.text(4, chat_bot + 3, f"{prefix}{inp}{cursor}", bar_fg)
 
         # Character counter above input bar (right side)
-        inp_len = len(self._mc_input)
+        inp_len = len(self._mc_input.encode("utf-8"))
         if inp_len > 0:
             at_max = inp_len >= 120
             cnt_c = C_ERROR if at_max else (
@@ -9927,7 +10756,7 @@ class WatchDogsGame(OtaMixin):
                     pass
                 icon = _type_icons.get(raw_type, "?")
                 name = nd.get("name", "?")[:14]
-                rssi = nd.get("rssi", 0)
+                rssi = nd.get("rssi")
                 snr = nd.get("snr", 0)
                 note = nd.get("note", "")
                 age = ""
@@ -9956,7 +10785,8 @@ class WatchDogsGame(OtaMixin):
                 pyxel.text(px_x + 14, ny, name, c_name)
                 if note:
                     pyxel.text(px_x + 120, ny, f'"{note[:10]}"', c_info)
-                pyxel.text(px_x + 185, ny, f"{rssi:.0f}dB", c_info)
+                rssi_text = "--" if rssi is None else f"{float(rssi):.0f}dB"
+                pyxel.text(px_x + 185, ny, rssi_text, c_info)
                 pyxel.text(px_x + 220, ny, age, c_info)
                 ny += row_h
 
@@ -10015,7 +10845,9 @@ class WatchDogsGame(OtaMixin):
 
         # Bottom hints
         pyxel.rect(0, H - 10, W, 10, 0)
-        if protocol == "meshtastic":
+        if protocol == "reticulum":
+            hints = "C-A Announce  C-N Name  C-H Contacts  C-X Clear  ESC Back"
+        elif protocol == "meshtastic":
             hints = "C-A Discover  C-H Nodes  C-C Chan  [/]Switch  C-X Clear  ESC Back"
         else:
             hints = "C-A Advert  C-N Name  C-H Nodes  C-C Chan  [/]Switch  C-X Clear  ESC Back"
@@ -10178,6 +11010,12 @@ class WatchDogsGame(OtaMixin):
         y += ROW_H
         pyxel.text(col1, y, f"Mesh Msgs", C_DIM)
         pyxel.text(col1 + 80, y, f"{t.get('mc_msgs', 0)}", C_WARNING)
+        y += ROW_H
+        pyxel.text(col1, y, "RNS Contacts", C_DIM)
+        pyxel.text(col1 + 80, y, f"{t.get('rns_contacts', 0)}", C_HACK_CYAN)
+        y += ROW_H
+        pyxel.text(col1, y, "RNS Msgs", C_DIM)
+        pyxel.text(col1 + 80, y, f"{t.get('rns_msgs', 0)}", C_HACK_CYAN)
         y += ROW_H
         n_contacts = len(self.loot.load_contacts()) if self.loot else 0
         pyxel.text(col1, y, f"Contacts", C_DIM)

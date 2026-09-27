@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from watchdogs.reticulum_config import ReticulumProfile
 from watchdogs.wardrive_settings import (
     DEFAULTS,
     load_settings,
@@ -115,7 +116,7 @@ def test_lora_settings_are_grouped_away_from_wardrive_capture_toggle():
     assert collector_keys == (
         "wardrive_lora", "wardrive_adsb", "wardrive_433")
     assert lora_keys == (
-        "lora_protocol", "_meshcore_region", "_meshtastic")
+        "lora_protocol", "_meshcore_region", "_meshtastic", "_reticulum")
 
     sniff_labels = next(items for name, items in MENU_CATS if name == "SNIFF")
     addon_commands = next(items for name, items in MENU_CATS if name == "ADDONS")
@@ -379,6 +380,46 @@ def test_lora_protocol_switch_rejection_does_not_persist_or_claim_owner():
     assert ui.settings["lora_protocol"] == "meshcore"
     assert ui._wdg_owned_lora
     ui.persist_settings.assert_not_called()
+
+
+def test_active_reticulum_selection_commits_only_after_ready():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    ui.persist_settings = Mock()
+    ui._wdg_owned_lora = True
+    ui.app = NS(
+        _lora_enabled=True,
+        _reticulum_profile=ReticulumProfile(confirmed=True),
+        _switch_lora_protocol=Mock(return_value=True),
+        _reticulum_protocol_commit_pending=False,
+    )
+
+    assert ui.cycle_lora_protocol(direction=-1)
+
+    assert ui.settings["lora_protocol"] == "meshcore"
+    assert ui.app._reticulum_protocol_commit_pending
+    ui.app._switch_lora_protocol.assert_called_once_with(
+        "reticulum", start_if_enabled=True)
+    ui.persist_settings.assert_not_called()
+
+
+def test_inactive_reticulum_selection_is_preference_only():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({})
+    ui.persist_settings = Mock()
+    ui._wdg_owned_lora = False
+    ui.app = NS(
+        _lora_enabled=False,
+        _reticulum_profile=ReticulumProfile(confirmed=True),
+        _switch_lora_protocol=Mock(return_value=True),
+    )
+
+    assert ui.cycle_lora_protocol(direction=-1)
+
+    assert ui.settings["lora_protocol"] == "reticulum"
+    ui.app._switch_lora_protocol.assert_called_once_with(
+        "reticulum", start_if_enabled=False)
+    ui.persist_settings.assert_called_once_with()
 
 
 def test_meshtastic_backend_switch_reconnects_existing_client_only():

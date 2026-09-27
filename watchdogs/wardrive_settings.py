@@ -23,7 +23,7 @@ from .map_display import (
 
 DOT_FADE_CHOICES = (15, 30, 60, 120)
 TRAIL_MODES = ("off", "solid", "heat")
-LORA_PROTOCOLS = ("meshcore", "meshtastic")
+LORA_PROTOCOLS = ("meshcore", "meshtastic", "reticulum")
 MESHTASTIC_BACKENDS = ("auto", "fork_socket", "legacy_tcp")
 
 _BLUETOOTH_MAC = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")

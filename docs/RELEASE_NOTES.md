@@ -1,5 +1,28 @@
 # Smethan WatchDogsGo
 
+## Unreleased — experimental Reticulum/LXMF endpoint
+
+- Add Reticulum as a third AIO SX1262 protocol alongside MeshCore and
+  Meshtastic. A supervised child owns the process-global RNS/LXMF lifecycle;
+  the Pyxel process communicates over credential-checked private
+  `SOCK_SEQPACKET` IPC.
+- Add an RNode-compatible direct-SPI external interface with 508-byte split
+  framing, pinned RNode CSMA timing, airtime limits, continuous receive, and
+  teardown-before-lock-release behavior.
+- Add a confirmation-first RF/IFAC/propagation settings page, persistent
+  independent identity, LXMF announces/contacts, direct or propagated
+  messages, explicit propagation-node inbox sync, delivery state, private
+  history, and Reticulum-specific session loot. Startup and All Wardrive are
+  quiet unless the user announces, sends, or explicitly requests a sync.
+- Generalize exact Meshtastic service-state retention and rollback for
+  MeshCore, Reticulum, and daemon ownership without changing existing
+  MeshCore or Meshtastic on-air behavior.
+
+This feature is explicitly experimental. The synthetic suite does not replace
+the AIO-to-RNode physical interoperability, busy-channel, 25-switch, power-cycle,
+and two-hour soak gate in `docs/RETICULUM.md`; release-ready status remains
+blocked until those checks pass.
+
 ## Unreleased — LoRa settings menu
 
 - Group LoRa protocol, MeshCore region, and Meshtastic service/phone controls

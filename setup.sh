@@ -373,6 +373,8 @@ run_as_target .venv/bin/python3 -c "from gi.repository import GLib" 2>/dev/null 
 run_as_target .venv/bin/python3 -c "import LoRaRF" 2>/dev/null || MISSING_OPT="$MISSING_OPT LoRaRF"
 run_as_target .venv/bin/python3 -c "import nacl" 2>/dev/null || MISSING_OPT="$MISSING_OPT PyNaCl"
 run_as_target .venv/bin/python3 -c "import meshtastic" 2>/dev/null || MISSING_OPT="$MISSING_OPT meshtastic"
+run_as_target .venv/bin/python3 -c "import re,RNS; from importlib.metadata import version; v=tuple(map(int,re.match(r'^(\d+)\.(\d+)\.(\d+)',version('rns')).groups())); assert (1,5,4)<=v<(1,6,0)" 2>/dev/null || MISSING_OPT="$MISSING_OPT rns>=1.5.4,<1.6"
+run_as_target .venv/bin/python3 -c "import re,LXMF; from importlib.metadata import version; v=tuple(map(int,re.match(r'^(\d+)\.(\d+)\.(\d+)',version('lxmf')).groups())); assert (1,1,1)<=v<(1,2,0)" 2>/dev/null || MISSING_OPT="$MISSING_OPT lxmf>=1.1.1,<1.2"
 
 if [ -z "$MISSING_OPT" ]; then
     ok "Optional Python imports verified (all attacks available)"

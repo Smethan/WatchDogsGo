@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import watchdogs.app as appmod
 from watchdogs.app import WatchDogsGame
+from watchdogs.reticulum_config import ReticulumProfile
 
 
 def _messenger():
@@ -122,3 +123,31 @@ def test_meshtastic_contact_action_opens_direct_message_without_meshcore_key(
     app._update_mc_nodes_panel()
     assert app._mc_dm_target is node
     assert not app._mc_nodes_panel
+
+
+def test_reticulum_ctrl_p_starts_and_cancels_propagation_sync(monkeypatch):
+    app = _messenger()
+    node_hash = "90ab9d448f17f3a121dc0f1230af39be"
+    app.wardrive = NS(settings={"lora_protocol": "reticulum"})
+    app._reticulum_profile = ReticulumProfile(
+        confirmed=True,
+        propagation_node_hash=node_hash,
+        propagated_outbound=True,
+    )
+    app._reticulum = NS(
+        propagation_state="idle",
+        sync_propagation=Mock(return_value=True),
+        cancel_propagation_sync=Mock(return_value=True),
+    )
+    pressed = {appmod.pyxel.KEY_LCTRL, appmod.pyxel.KEY_P}
+    monkeypatch.setattr(appmod.pyxel, "btn", lambda key: key in pressed)
+    monkeypatch.setattr(appmod.pyxel, "btnp", lambda key: key in pressed)
+
+    app._update_mc_screen()
+    app._reticulum.sync_propagation.assert_called_once_with()
+    assert "Propagation sync requested" in app._mc_log[-1][0]
+
+    app._reticulum.propagation_state = "receiving"
+    app._update_mc_screen()
+    app._reticulum.cancel_propagation_sync.assert_called_once_with()
+    assert "cancellation queued" in app._mc_log[-1][0]

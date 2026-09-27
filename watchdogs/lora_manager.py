@@ -303,6 +303,11 @@ class LoRaManager:
         # snapshot.  The direct-radio layer never reconstructs service state
         # from a preferred target or readiness probe.
         self._session_service_restore_pending = False
+        self._session_reused_snapshot = False
+        # A direct-to-direct protocol switch can safely reuse the exact
+        # retained Meshtastic snapshot.  Power-cycle and ordinary starts still
+        # restore then resnapshot, preserving the existing rollback contract.
+        self._reuse_retained_snapshot_once = False
         self._resource_close_uncertain = False
         self.running = False
         self.mode = ""  # "sniffer", "scanner", "tracker"
@@ -426,6 +431,11 @@ class LoRaManager:
         except Exception:
             return False
 
+    def reuse_retained_service_snapshot_once(self) -> None:
+        """Reuse the existing exact service token for one direct start."""
+        with self._state_lock:
+            self._reuse_retained_snapshot_once = True
+
     def _restore_service_after_failed_start(self) -> None:
         """Retry only the exact snapshot retained by MeshtasticManager."""
         if self._service_handoff is None or not self._service_restore_pending():
@@ -447,16 +457,19 @@ class LoRaManager:
     def _finish_radio_session(self, startup_complete: bool) -> None:
         """Restore a displaced service only when direct startup itself failed."""
         service_restore_pending = self._session_service_restore_pending
+        reused_snapshot = self._session_reused_snapshot
         self._session_service_restore_pending = False
+        self._session_reused_snapshot = False
         if (startup_complete or self._stop_event.is_set()
                 or self._radio_ownership.held):
             return
-        if service_restore_pending:
+        if service_restore_pending and not reused_snapshot:
             self._restore_service_after_failed_start()
 
     def _open_radio_session(self):
         """Suspend the daemon, claim process ownership, then initialize SPI."""
         self._session_service_restore_pending = False
+        self._session_reused_snapshot = False
         if self._stop_event.is_set():
             return None
         service_restore_pending = False
@@ -469,7 +482,13 @@ class LoRaManager:
                 # that snapshot without connecting a client, then take a fresh
                 # suspension snapshot.  This work runs in the direct worker,
                 # so bounded systemd waits never block the UI thread.
-                if self._service_restore_pending():
+                with self._state_lock:
+                    reuse_retained = self._reuse_retained_snapshot_once
+                    self._reuse_retained_snapshot_once = False
+                if self._service_restore_pending() and reuse_retained:
+                    service_restore_pending = True
+                    self._session_reused_snapshot = True
+                elif self._service_restore_pending():
                     if not handoff.resume_service(
                             timeout=15.0, connect=False):
                         self._emit(
@@ -482,14 +501,16 @@ class LoRaManager:
                             "Meshtastic service restore remained unresolved; "
                             "direct SX1262 access was not started", "error")
                         return None
-                if not handoff.suspend_service(timeout=10.0):
+                if (not service_restore_pending
+                        and not handoff.suspend_service(timeout=10.0)):
                     self._emit(
                         "Could not stop the selected Meshtastic service; "
                         "direct SX1262 access was not started", "error")
                     # suspend_service(False) is authoritative.  It may have
                     # retained a partially restored snapshot, in which case
                     # the only safe recovery is retrying that exact token.
-                    self._restore_service_after_failed_start()
+                    if not self._session_reused_snapshot:
+                        self._restore_service_after_failed_start()
                     return None
                 if not self._service_restore_pending():
                     self._emit(
@@ -502,13 +523,14 @@ class LoRaManager:
                 self._emit(
                     "Could not hand off the SX1262 from Meshtastic: "
                     + str(exc)[:120], "error")
-                self._restore_service_after_failed_start()
+                if not self._session_reused_snapshot:
+                    self._restore_service_after_failed_start()
                 return None
 
         # stop() may have been requested while the bounded service handoff was
         # waiting.  A cancelled worker must never claim GPIO/SPI afterward.
         if self._stop_event.is_set():
-            if service_restore_pending:
+            if service_restore_pending and not self._session_reused_snapshot:
                 self._restore_service_after_failed_start()
             return None
 
@@ -518,21 +540,22 @@ class LoRaManager:
         except RadioOwnershipBusy as exc:
             self._emit(
                 f"{exc}; stop the other radio user before retrying", "error")
-            if service_restore_pending:
+            if service_restore_pending and not self._session_reused_snapshot:
                 self._restore_service_after_failed_start()
             return None
         except Exception as exc:
             self._emit(
                 "Could not acquire the AIO SX1262 ownership lock: "
                 + str(exc)[:120], "error")
-            if service_restore_pending:
+            if service_restore_pending and not self._session_reused_snapshot:
                 self._restore_service_after_failed_start()
             return None
 
         if self._stop_event.is_set():
             self._cleanup_radio(None)
             if (not self._radio_ownership.held
-                    and service_restore_pending):
+                    and service_restore_pending
+                    and not self._session_reused_snapshot):
                 self._restore_service_after_failed_start()
             return None
 
@@ -547,7 +570,8 @@ class LoRaManager:
         # the hardware.
         self._cleanup_radio(None)
         if (not self._radio_ownership.held
-                and service_restore_pending):
+                and service_restore_pending
+                and not self._session_reused_snapshot):
             self._restore_service_after_failed_start()
         return None
 

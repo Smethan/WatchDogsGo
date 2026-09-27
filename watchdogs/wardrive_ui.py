@@ -62,6 +62,7 @@ LORA_SETTINGS = (
     ("lora_protocol", "LoRa protocol"),
     ("_meshcore_region", "MeshCore region"),
     ("_meshtastic", "Meshtastic service and phone BLE"),
+    ("_reticulum", "Reticulum RF and identity"),
 )
 
 class WardriveUI:
@@ -112,6 +113,9 @@ class WardriveUI:
         self.collector_selection = 0
         self.lora_selection = 0
         self.meshtastic_selection = 0
+        self.reticulum_selection = 0
+        self._reticulum_draft = None
+        self._reticulum_select_pending = False
         self._meshtastic_action_results = Queue()
         self._meshtastic_action_thread = None
         self._host_ble_retry_pending = False
@@ -132,9 +136,11 @@ class WardriveUI:
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
         lora = getattr(app, "_lora", None)
+        reticulum = getattr(app, "_reticulum", None)
         self._wdg_owned_lora = bool(
             (lora is not None and lora.running and lora.mode == "meshcore")
-            or (meshtastic is not None and meshtastic.running))
+            or (meshtastic is not None and meshtastic.running)
+            or (reticulum is not None and reticulum.running))
         self._wdg_owned_sdr = False
 
     def on_stop(self):
@@ -586,15 +592,52 @@ class WardriveUI:
 
         started = False
         protocol = self.settings["lora_protocol"]
-        protocol_label = "MeshCore" if protocol == "meshcore" else "Meshtastic"
+        protocol_label = {
+            "meshcore": "MeshCore", "meshtastic": "Meshtastic",
+            "reticulum": "Reticulum",
+        }.get(protocol, protocol.title())
         lora = getattr(app, "_lora", None)
         meshtastic = getattr(app, "_meshtastic", None)
+        reticulum = getattr(app, "_reticulum", None)
         if not self.settings["wardrive_lora"]:
             app._term_add(
                 "[ALL] LoRa disabled (Wardrive Settings > Collectors)",
                 raw=True)
         elif getattr(app, "_lora_enabled", False):
-            if protocol == "meshtastic":
+            if protocol == "reticulum":
+                if reticulum is None:
+                    app._term_add(
+                        "[ALL] Reticulum unavailable: manager missing",
+                        raw=True)
+                elif reticulum.ready:
+                    app._term_add(
+                        "[ALL] Reticulum passive collection active", raw=True)
+                elif not app._reticulum_profile.confirmed:
+                    app._term_add(
+                        "[ALL] Reticulum RF profile is not confirmed; "
+                        "WiFi/BLE continue", raw=True)
+                    app.msg("[ALL] Confirm Reticulum RF settings first", ORANGE)
+                else:
+                    try:
+                        switch = getattr(app, "_switch_lora_protocol", None)
+                        accepted = bool(switch and switch(
+                            "reticulum", start_if_enabled=True,
+                            _transition_action="wardrive"))
+                    except Exception as exc:
+                        accepted = False
+                        app._term_add(
+                            "[ALL] Reticulum start failed: "
+                            + str(exc)[:100], raw=True)
+                    if accepted:
+                        started = True
+                        app._term_add(
+                            "[ALL] Reticulum passive collection starting",
+                            raw=True)
+                    else:
+                        app.msg(
+                            "[ALL] Reticulum unavailable; WiFi/BLE continue",
+                            ORANGE)
+            elif protocol == "meshtastic":
                 if meshtastic is None:
                     app._term_add(
                         "[ALL] Meshtastic unavailable: client manager missing",
@@ -789,6 +832,11 @@ class WardriveUI:
 
         app = self.app
         protocol = self.settings["lora_protocol"]
+        if protocol == "reticulum":
+            # Quiet-start contract: All Wardrive listens and records but never
+            # transmits Reticulum discovery or periodic announces.
+            self.mc_discovery_next = float(now) + MT_DISCOVERY_INTERVAL
+            return False
         interval = (MC_DISCOVERY_INTERVAL if protocol == "meshcore"
                     else MT_DISCOVERY_INTERVAL)
         min_distance = (MC_DISCOVERY_MIN_DISTANCE_M if protocol == "meshcore"
@@ -1365,6 +1413,11 @@ class WardriveUI:
             elif key == "_meshtastic" and activate:
                 self.settings_page = "meshtastic"
                 self.meshtastic_selection = 0
+            elif key == "_reticulum" and activate:
+                self.open_reticulum_settings()
+            return
+        if self.settings_page == "reticulum":
+            self._update_reticulum_settings(px)
             return
         if self.settings_page == "collectors":
             if px.btnp(px.KEY_TAB):
@@ -1441,6 +1494,127 @@ class WardriveUI:
         self.app._mc_region_return_to_settings = True
         self.app._mc_region_screen = True
         self.settings_open = False
+
+    def open_reticulum_settings(self, *, select_on_confirm: bool = False):
+        """Open a transactional draft of the private Reticulum profile."""
+        self._reticulum_draft = self.app._reticulum_profile
+        self._reticulum_select_pending = bool(select_on_confirm)
+        self.reticulum_selection = 0
+        self.settings_page = "reticulum"
+        self.settings_open = True
+
+    def update_reticulum_draft(self, **updates):
+        try:
+            self._reticulum_draft = self._reticulum_draft.with_updates(
+                **updates)
+            return True
+        except Exception as exc:
+            self.app.msg("[RNS] " + str(exc)[:70], ORANGE)
+            return False
+
+    def _update_reticulum_settings(self, px):
+        from .reticulum_config import BANDWIDTH_CHOICES
+
+        if self._reticulum_draft is None:
+            self._reticulum_draft = self.app._reticulum_profile
+        if px.btnp(px.KEY_TAB):
+            self.settings_open = False
+            self.settings_page = "main"
+            self._reticulum_select_pending = False
+            return
+        if px.btnp(px.KEY_ESCAPE):
+            self.settings_page = "lora"
+            self._reticulum_select_pending = False
+            self._reticulum_draft = self.app._reticulum_profile
+            return
+        if px.btnp(px.KEY_UP):
+            self.reticulum_selection = max(0, self.reticulum_selection - 1)
+        if px.btnp(px.KEY_DOWN):
+            self.reticulum_selection = min(11, self.reticulum_selection + 1)
+        direction = (-1 if px.btnp(px.KEY_LEFT) else
+                     1 if px.btnp(px.KEY_RIGHT) else 0)
+        activate = px.btnp(px.KEY_RETURN)
+        row = self.reticulum_selection
+        profile = self._reticulum_draft
+        if row == 0 and activate:
+            self.app.input_mode = True
+            self.app.input_fields = [{
+                "label": "Display Name", "value": profile.display_name}]
+            self.app.input_field_idx = 0
+            self.app._input_pending_cat = -13
+            self.app._input_pending_item = -1
+        elif row == 1:
+            if activate:
+                self.app.input_mode = True
+                self.app.input_fields = [{
+                    "label": "Frequency Hz",
+                    "value": str(profile.frequency_hz)}]
+                self.app.input_field_idx = 0
+                self.app._input_pending_cat = -12
+                self.app._input_pending_item = -1
+            elif direction:
+                value = max(150_000_000, min(
+                    960_000_000,
+                    profile.frequency_hz + direction * 100_000))
+                self.update_reticulum_draft(frequency_hz=value)
+        elif row == 2 and direction:
+            index = BANDWIDTH_CHOICES.index(profile.bandwidth_hz)
+            self.update_reticulum_draft(
+                bandwidth_hz=BANDWIDTH_CHOICES[
+                    (index + direction) % len(BANDWIDTH_CHOICES)])
+        elif row == 3 and direction:
+            self.update_reticulum_draft(spreading_factor=max(
+                5, min(12, profile.spreading_factor + direction)))
+        elif row == 4 and direction:
+            self.update_reticulum_draft(coding_rate=max(
+                5, min(8, profile.coding_rate + direction)))
+        elif row == 5 and direction:
+            self.update_reticulum_draft(tx_power_dbm=max(
+                -9, min(22, profile.tx_power_dbm + direction)))
+        elif row == 6 and direction:
+            short = max(1.0, min(
+                100.0, profile.airtime_short_percent + direction))
+            long = min(profile.airtime_long_percent, short)
+            self.update_reticulum_draft(
+                airtime_short_percent=short,
+                airtime_long_percent=long)
+        elif row == 7 and direction:
+            self.update_reticulum_draft(airtime_long_percent=max(
+                1.0, min(profile.airtime_short_percent,
+                         profile.airtime_long_percent + direction)))
+        elif row == 8 and activate:
+            self.app.input_mode = True
+            self.app.input_fields = [
+                {"label": "Network Name", "value": profile.network_name},
+                {"label": "Passphrase", "value":
+                 profile.network_passphrase},
+            ]
+            self.app.input_field_idx = 0
+            self.app._input_pending_cat = -10
+            self.app._input_pending_item = -1
+        elif row == 9 and activate:
+            self.app.input_mode = True
+            self.app.input_fields = [{
+                "label": "Propagation Node Hash",
+                "value": profile.propagation_node_hash,
+            }]
+            self.app.input_field_idx = 0
+            self.app._input_pending_cat = -14
+            self.app._input_pending_item = -1
+        elif row == 10 and direction:
+            self.update_reticulum_draft(
+                propagated_outbound=not profile.propagated_outbound)
+        elif row == 11 and activate:
+            try:
+                confirmed = profile.with_updates(confirmed=True)
+            except Exception as exc:
+                self.app.msg("[RNS] " + str(exc)[:70], ORANGE)
+                return
+            activate_protocol = self._reticulum_select_pending
+            if self.app._apply_reticulum_profile(
+                    confirmed, activate_protocol=activate_protocol):
+                self.settings_page = "lora"
+                self._reticulum_select_pending = False
 
     def _map_policy_changed(self):
         self._refresh_notable_identities()
@@ -1542,20 +1716,40 @@ class WardriveUI:
         selected = LORA_PROTOCOLS[(index + step) % len(LORA_PROTOCOLS)]
         if selected == previous:
             return
-        switch = getattr(self.app, "_switch_lora_protocol", None)
-        if switch and switch(
-                selected,
-                start_if_enabled=self.settings["wardrive_lora"]) is False:
+        if (selected == "reticulum"
+                and not self.app._reticulum_profile.confirmed):
+            self.open_reticulum_settings(select_on_confirm=True)
+            self.app.msg(
+                "[RNS] Review RF settings before enabling Reticulum", ORANGE)
             return False
+        active = bool(
+            getattr(self.app, "_lora_enabled", False)
+            and self.settings["wardrive_lora"])
+        switch = getattr(self.app, "_switch_lora_protocol", None)
+        if switch and switch(selected, start_if_enabled=active) is False:
+            return False
+        if selected == "reticulum" and active:
+            # The app commits this preference only after the sidecar reports
+            # authenticated readiness and verified radio ownership.
+            reticulum = getattr(self.app, "_reticulum", None)
+            if reticulum is not None and reticulum.ready:
+                self.settings["lora_protocol"] = selected
+                self.persist_settings()
+                return True
+            self.app._reticulum_protocol_commit_pending = True
+            return True
         self.settings["lora_protocol"] = selected
         lora = getattr(self.app, "_lora", None)
         manager = getattr(self.app, "_meshtastic", None)
+        reticulum = getattr(self.app, "_reticulum", None)
         self._wdg_owned_lora = bool(
             (selected == "meshcore" and lora is not None
              and lora.running and lora.mode == "meshcore"
              and getattr(lora, "radio_owned", False))
             or (selected == "meshtastic" and manager is not None
-                and manager.connected))
+                and manager.connected)
+            or (selected == "reticulum" and reticulum is not None
+                and reticulum.ready))
         self.persist_settings()
         return True
 
@@ -1908,6 +2102,7 @@ class WardriveUI:
         if key == "wardrive_lora" and not self.settings[key]:
             lora = getattr(app, "_lora", None)
             meshtastic = getattr(app, "_meshtastic", None)
+            reticulum = getattr(app, "_reticulum", None)
             cancel = getattr(app, "_cancel_pending_lora_start", None)
             cancelled = bool(cancel and cancel(collector_only=True))
             direct_pending = getattr(app, "_lora_start_pending", "")
@@ -1946,6 +2141,28 @@ class WardriveUI:
                             notify(
                                 "[ALL] LoRa stop incomplete; ownership retained",
                                 ORANGE)
+                if (reticulum is not None
+                        and (reticulum.running or reticulum.worker_active
+                             or reticulum.radio_owned)):
+                    pending = getattr(app, "_reticulum_start_pending", None)
+                    pending_action = (
+                        pending[0] if isinstance(pending, tuple) else "")
+                    if pending_action not in ("", "wardrive"):
+                        release_ok = False
+                    else:
+                        try:
+                            reticulum_stopped = bool(reticulum.stop())
+                        except Exception as exc:
+                            reticulum_stopped = False
+                            app._term_add(
+                                "[ALL] Reticulum stop failed: "
+                                + str(exc)[:100], raw=True)
+                        if not reticulum_stopped:
+                            release_ok = False
+                            self._wdg_owned_lora = True
+                            app._term_add(
+                                "[ALL] Reticulum collector stop incomplete",
+                                raw=True)
                 # A pending daemon handoff will observe the cancelled epoch
                 # and close itself after its worker exits.  Do not race close
                 # against service selection here.
@@ -1994,6 +2211,14 @@ class WardriveUI:
                                     "[ALL] Meshtastic stop incomplete; "
                                     "ownership retained", ORANGE)
                 if release_ok:
+                    if getattr(
+                            app, "_meshtastic_service_restore_pending",
+                            lambda: False)():
+                        try:
+                            release_ok = bool(app._meshtastic.resume_service(
+                                timeout=15.0, connect=False))
+                        except Exception:
+                            release_ok = False
                     app._term_add("[ALL] WDG LoRa client stopped", raw=True)
             if release_ok:
                 self._wdg_owned_lora = False
@@ -2133,6 +2358,7 @@ class WardriveUI:
                     ("LoRa protocol", self.settings["lora_protocol"].upper()),
                     ("MeshCore region", region_label),
                     ("Meshtastic service and phone BLE", "OPEN..."),
+                    ("Reticulum RF and identity", "OPEN..."),
                 )
                 for i, (label, value) in enumerate(rows):
                     if (i == 1
@@ -2147,13 +2373,57 @@ class WardriveUI:
                 px.text(55, 138,
                         "Protocol selects the one owner of the AIO SX1262.", 13)
                 px.text(55, 154,
-                        "MeshCore uses direct SPI; Meshtastic uses meshtasticd.",
+                        "MeshCore/Reticulum use direct SPI; Meshtastic uses meshtasticd.",
                         13)
                 px.text(55, 176,
                         "Automatic LoRa capture remains under All Wardrive",
                         10)
                 px.text(55, 188, "collectors.", 10)
                 px.text(55, 300, "ESC returns   TAB closes settings", 10)
+                px.camera()
+                self.app._draw_mc_toast()
+                return
+            if self.settings_page == "reticulum":
+                profile = self._reticulum_draft or self.app._reticulum_profile
+                px.text(55, 40,
+                        "RETICULUM / LXMF (EXPERIMENTAL)   arrows / ENTER / ESC",
+                        7)
+                rows = (
+                    ("Display name", profile.display_name or "AUTO"),
+                    ("Frequency", f"{profile.frequency_hz / 1e6:.6f} MHz"),
+                    ("Bandwidth", f"{profile.bandwidth_hz / 1000:g} kHz"),
+                    ("Spreading factor", f"SF{profile.spreading_factor}"),
+                    ("Coding rate", f"4/{profile.coding_rate}"),
+                    ("TX power", f"{profile.tx_power_dbm} dBm"),
+                    ("Short airtime", f"{profile.airtime_short_percent:g}%"),
+                    ("Long airtime", f"{profile.airtime_long_percent:g}%"),
+                    ("IFAC", profile.network_name or "PUBLIC / UNFILTERED"),
+                    ("Propagation node",
+                     profile.propagation_node_hash[:12] + "..."
+                     if profile.propagation_node_hash else "NONE"),
+                    ("Outbound method",
+                     "PROPAGATED" if profile.propagated_outbound
+                     else "DIRECT"),
+                    ("Confirm and apply", "APPLY"),
+                )
+                for i, (label, value) in enumerate(rows):
+                    selected = i == self.reticulum_selection
+                    px.text(
+                        55, 58 + i * 18,
+                        (("> " if selected else "  ") + label + ": "
+                         + str(value))[:100],
+                        11 if selected else 7)
+                px.text(55, 282,
+                        "Peers must use the same RF and IFAC settings.", 13)
+                px.text(55, 294,
+                        "Check antenna, local band and duty-cycle rules yourself.",
+                        10)
+                px.text(55, 306,
+                        "Messages are encrypted in transit; WDG loot is plaintext.",
+                        10)
+                px.text(55, 318,
+                        "ENTER edits name/frequency/IFAC or applies; ESC cancels.",
+                        7)
                 px.camera()
                 self.app._draw_mc_toast()
                 return

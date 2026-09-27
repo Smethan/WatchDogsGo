@@ -475,6 +475,7 @@ class LootManager:
         counts = {"pcap": 0, "hccapx": 0, "hc22000": 0, "passwords": 0, "et_captures": 0,
                   "mc_nodes": 0, "mc_messages": 0,
                   "mt_nodes": 0, "mt_messages": 0,
+                  "rns_contacts": 0, "rns_messages": 0,
                   "bt_devices": 0, "bt_airtags": 0,
                   "bt_smarttags": 0, "bt_devices_gps": 0, "wardriving": 0, "adsb": 0,
                   "wardriving_wifi": 0, "wardriving_ble": 0,
@@ -542,6 +543,21 @@ class LootManager:
             try:
                 counts["mt_messages"] = sum(
                     1 for _ in open(mt_msgs_file, encoding="utf-8"))
+            except OSError:
+                pass
+        rns_contacts_file = session_path / "reticulum_contacts.csv"
+        if rns_contacts_file.is_file():
+            try:
+                counts["rns_contacts"] = max(
+                    0, sum(1 for _ in open(
+                        rns_contacts_file, encoding="utf-8")) - 1)
+            except OSError:
+                pass
+        rns_messages_file = session_path / "reticulum_messages.log"
+        if rns_messages_file.is_file():
+            try:
+                counts["rns_messages"] = sum(
+                    1 for _ in open(rns_messages_file, encoding="utf-8"))
             except OSError:
                 pass
         bt_dev_file = session_path / "bt_devices.csv"
@@ -624,6 +640,7 @@ class LootManager:
         """Recalculate totals from all session entries."""
         keys = ("pcap", "hccapx", "hc22000", "passwords", "et_captures",
                 "mc_nodes", "mc_messages", "mt_nodes", "mt_messages",
+                "rns_contacts", "rns_messages",
                 "bt_devices", "bt_airtags", "bt_smarttags",
                 "bt_devices_gps", "wardriving", "wardriving_wifi", "wardriving_ble",
                 "cell_observations", "cell_cells", "adsb")
@@ -1578,6 +1595,76 @@ class LootManager:
         self.update_session_loot()
 
     # ------------------------------------------------------------------
+    # Reticulum / LXMF
+    # ------------------------------------------------------------------
+
+    def save_reticulum_contact(self, contact: dict, observed_lat: float,
+                               observed_lon: float) -> None:
+        """Persist one LXMF delivery announce per destination and session."""
+        if not self._session_active:
+            return
+        destination = str(contact.get("destination_hash") or
+                          contact.get("address") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", destination):
+            return
+        path = self._session / "reticulum_contacts.csv"
+        try:
+            if path.is_file():
+                with open(path, newline="", encoding="utf-8") as fh:
+                    if any(row.get("destination_hash") == destination
+                           for row in csv.DictReader(fh)):
+                        return
+            else:
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    csv.writer(fh).writerow([
+                        "timestamp", "destination_hash", "display_name",
+                        "hops", "rssi", "snr", "observer_lat",
+                        "observer_lon"])
+                    _fsync_file(fh)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            rssi = contact.get("rssi")
+            snr = contact.get("snr")
+            with open(path, "a", encoding="utf-8", newline="") as fh:
+                csv.writer(fh).writerow([
+                    timestamp, destination,
+                    str(contact.get("name") or "")[:64],
+                    max(0, int(contact.get("hops") or 0)),
+                    "" if rssi is None else rssi,
+                    "" if snr is None else snr,
+                    float(observed_lat or 0.0), float(observed_lon or 0.0),
+                ])
+                _fsync_file(fh)
+            self.update_session_loot()
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def save_reticulum_message(self, message: dict) -> None:
+        """Append plaintext LXMF messages and delivery transitions."""
+        if not self._session_active:
+            return
+        timestamp = message.get("timestamp") or time.time()
+        try:
+            timestamp = datetime.fromtimestamp(
+                float(timestamp), timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            timestamp = datetime.now(timezone.utc).isoformat()
+        direction = str(message.get("direction") or "out")[:8]
+        peer = str(message.get("peer_hash") or
+                   message.get("peer_name") or "?")[:64]
+        state = str(message.get("state") or "queued")[:16]
+        message_hash = str(message.get("message_hash") or "")[:128]
+        text = str(message.get("text") or "").replace("\r", " ").replace(
+            "\n", " ").replace("\x00", "")
+        correlation = str(message.get("correlation_id") or "")[:64]
+        line = json.dumps({
+            "timestamp": timestamp, "direction": direction, "peer": peer,
+            "state": state, "message_hash": message_hash,
+            "correlation_id": correlation, "text": text,
+        }, ensure_ascii=False, sort_keys=True)
+        _sync_append(self._session / "reticulum_messages.log", line + "\n")
+        self.update_session_loot()
+
+    # ------------------------------------------------------------------
     # Bluetooth
     # ------------------------------------------------------------------
 
@@ -1786,6 +1873,13 @@ class LootManager:
                 summary = self._session / "session_info.txt"
                 with open(summary, "w", encoding="utf-8") as fh:
                     fh.write(f"Session ended: {datetime.now().isoformat()}\n")
+                    counts = self._scan_session_dir(self._session)
+                    fh.write(
+                        "Reticulum contacts: "
+                        f"{counts.get('rns_contacts', 0)}\n")
+                    fh.write(
+                        "Reticulum message/state records: "
+                        f"{counts.get('rns_messages', 0)}\n")
                     # List files in session
                     for f in sorted(self._session.rglob("*")):
                         if f.is_file() and f.name != "session_info.txt":

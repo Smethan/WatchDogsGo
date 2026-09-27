@@ -93,7 +93,8 @@ And these Python packages (in `.venv`):
 - `Pillow` — sprite generation
 - `scapy`, `netifaces` — packet manipulation (MITM, Dragon Drain)
 - `bleak`, `dbus-python` — BLE attacks (RACE, BLE HID)
-- `LoRaRF`, `cryptography`, `PyNaCl` — LoRa MeshCore radio
+- `LoRaRF`, `cryptography`, `PyNaCl` — direct-SPI LoRa radio
+- `rns`, `lxmf` — experimental Reticulum/LXMF endpoint messaging
 
 ### Known platform notes
 
@@ -329,7 +330,7 @@ Evil Twin target list, so duplicate SSIDs remain separate.
 |------|---------|-------------|
 | BLE HID | `bt_hid` | Enable BLE HID keyboard mode on ESP32 |
 | HID Type | `bt_hid_type` | Type text via BLE HID |
-| Mesh Messenger | Python-native | MeshCore direct-SPI or Meshtastic daemon-backed chat and discovery |
+| Mesh Messenger | Python-native | MeshCore, Meshtastic, or experimental Reticulum/LXMF chat and discovery |
 | Flipper Zero | USB serial | SubGHz RX/TX, NFC read/emulate, signal replay |
 
 ### SYSTEM
@@ -469,9 +470,10 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 
 ## Mesh Messenger
 
-The messenger supports two mutually exclusive owners for the AIO v2 SX1262.
-Choose **MeshCore** or **Meshtastic** under **SNIFF > Wardrive Settings > LoRa
-settings**. MeshCore uses WDG's direct LoRaRF/SPI implementation.
+The messenger supports three mutually exclusive owners for the AIO v2 SX1262.
+Choose **MeshCore**, **Meshtastic**, or experimental **Reticulum** under **SNIFF
+> Wardrive Settings > LoRa settings**. MeshCore and Reticulum use separate WDG
+direct LoRaRF/SPI implementations.
 Meshtastic leaves the radio entirely under a daemon; WDG never opens SPI while
 that protocol is selected. The preferred `meshtasticd-wdg` fork exposes a
 restricted `/run/meshtasticd/wdg.sock` API, so WDG can receive nodes and
@@ -480,9 +482,13 @@ service over BlueZ. An independently installed stock `meshtasticd` remains
 available through the legacy local Client API on `127.0.0.1:4403`. Closing WDG
 disconnects its client without stopping the selected daemon.
 
-Opening **ADDONS > Mesh Messenger** uses the selected protocol. Both backends
-provide channel messages, a heard-nodes panel, direct messages, background
-reception, map markers, and session loot. Meshtastic node observations are
+Opening **ADDONS > Mesh Messenger** uses the selected protocol. MeshCore and
+Meshtastic provide channels, heard nodes, direct messages, background reception,
+map markers, and session loot. Reticulum is an endpoint-only LXMF client with
+announced contacts, encrypted direct or propagated messages, and explicit
+propagation-node inbox sync; it has no channels or map markers. Its SX1262
+carries native Reticulum packets to an in-range RF transport, not TCP over
+LoRa, and WDG never routes third-party traffic. Meshtastic node observations are
 saved to `meshtastic_nodes.csv`, while received text is appended to
 `meshtastic_messages.log`. Node names and channel configuration come from the
 daemon; change them with a Meshtastic client.
@@ -492,7 +498,9 @@ the selected protocol. MeshCore sends a direct zero-hop `DISCOVER_REQ` at most
 every 30 seconds after moving 25 metres and listens seven seconds for tagged
 repeater/room responses. Meshtastic sends a zero-hop NodeInfo request at most
 every 60 seconds after moving 50 metres. The zero hop limit discovers nodes in
-direct radio range without routing the request across the mesh.
+direct radio range without routing the request across the mesh. Reticulum is
+quiet: All Wardrive listens for announces/messages but sends no discovery or
+periodic announce.
 
 **SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
 may automatically use the powered LoRa and SDR devices. Protocol, MeshCore
@@ -538,6 +546,7 @@ source change. See
 - **Node discovery** with GPS coordinates saved to loot (dedup by node ID)
 - **Persistent MeshCore config** — node name + channels saved to `~/.janos_meshcore.json`
 - **Meshtastic config reuse** — identity, channels, and node database come from `meshtasticd`
+- **Reticulum private state** — separate persistent identity, confirmed RF/IFAC and optional propagation profile, and newest-200-message UI history
 - **LoRa HUD status** in bottom bar (in line with GPS info)
 
 ### Messenger Controls
@@ -545,9 +554,10 @@ source change. See
 | Key | Action |
 |-----|--------|
 | `A-Z`, `0-9` | Type message |
-| `ENTER` | Send message on active channel |
-| `Ctrl+A` | MeshCore advert or zero-hop Meshtastic NodeInfo discovery |
-| `Ctrl+N` | Change MeshCore name; Meshtastic points to its own settings |
+| `ENTER` | Send on the active channel, or to the selected Reticulum contact |
+| `Ctrl+A` | MeshCore advert, Meshtastic discovery, or explicit LXMF announce |
+| `Ctrl+P` | Start/cancel an explicit Reticulum propagation-node inbox sync |
+| `Ctrl+N` | Change the MeshCore or Reticulum name; Meshtastic uses its own settings |
 | `Ctrl+H` | Toggle Heard Nodes panel |
 | `Ctrl+C` | Open channel picker |
 | `[` / `]` | Quick-switch channels |
@@ -565,6 +575,12 @@ WDG checkout and reboot once.
 |---------|-------------|-------------|
 | MeshCore Messenger | Regional preset | Direct-SPI mesh chat with adverts and speech bubbles |
 | Meshtastic Messenger | Daemon configuration | `meshtasticd` Client API chat, nodes, channels, and zero-hop discovery |
+| Reticulum/LXMF (experimental) | Confirmed RF profile | Direct-SPI endpoint announces, contacts, encrypted text, and optional propagation storage/sync |
+
+Reticulum is not release-ready until the documented AIO-to-RNode hardware gate
+passes. See [Reticulum/LXMF on the AIO SX1262](docs/RETICULUM.md) for scope,
+quiet-start behavior, storage/privacy, ownership, separate-license notices, and
+the complete physical acceptance checklist.
 
 ## Map
 

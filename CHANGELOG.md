@@ -8,6 +8,30 @@ minor versions.
 
 ---
 
+## Unreleased
+
+### Added
+
+- Add an experimental third LoRa protocol, Reticulum/LXMF, using a supervised
+  per-session RNS sidecar and an RNode-compatible direct-SPI SX1262 external
+  interface. Add persistent identity/profile/history, announces, discovered
+  contacts, encrypted direct or propagated text, explicit propagation-node
+  inbox sync, delivery states, session loot, quiet All Wardrive collection,
+  and a confirmation-first RF/IFAC/propagation settings page.
+- Extend SX1262 ownership and rollback across MeshCore, Reticulum, and both
+  Meshtastic service variants while retaining the exact pre-direct service
+  snapshot through direct-to-direct switches.
+
+### Security
+
+- Authenticate private `SOCK_SEQPACKET` IPC with `SO_PEERCRED`, keep Reticulum
+  state mode 0700/0600 with symlink rejection, and fail closed when no safe
+  per-user runtime directory or verified radio teardown is available.
+
+Reticulum remains experimental and is blocked from release-ready status until
+the AIO-to-RNode RF interoperability, quiet-mode, switching, and soak gate in
+`docs/RETICULUM.md` passes on target hardware.
+
 ## [0.9.42] — 2026-09-26
 
 ### Added
