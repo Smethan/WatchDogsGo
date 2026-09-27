@@ -10,6 +10,16 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.45] — 2026-09-27
+
+### Fixed
+
+- Fix MeshCore companion BLE adapter discovery on uConsole UART controllers
+  that BlueZ exposes as `hciX` without a readable
+  `/sys/class/bluetooth/hciX/address` file. WDG now supplements the conventional
+  sysfs inventory with `org.bluez.Adapter1.Address` from BlueZ's ObjectManager,
+  using a private D-Bus connection so later pairing-agent setup is unaffected.
+
 ## [0.9.44] — 2026-09-27
 
 ### Added

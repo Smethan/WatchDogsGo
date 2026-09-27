@@ -160,6 +160,13 @@ bluetoothctl list
 bluetoothctl show
 ```
 
+If WDG reports **No BlueZ adapter found** but `bluetoothctl list` shows an
+`hciX` controller, update to WDG 0.9.45 or newer. Some uConsole UART Bluetooth
+controllers omit `/sys/class/bluetooth/hciX/address` even though BlueZ exposes
+the controller normally. Current WDG releases supplement sysfs discovery with
+BlueZ's `org.bluez.Adapter1.Address`; manually creating a sysfs file or changing
+its ownership is not required.
+
 If the WDG settings page reports that no GATT server or advertising manager is
 available, confirm BlueZ is running and try the other controller. If MeshMapper
 connects but cannot complete setup, disconnect any other device on the

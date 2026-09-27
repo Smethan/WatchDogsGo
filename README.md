@@ -795,6 +795,11 @@ closes. Enter the six-digit passkey shown by WDG when the phone asks. Do not
 pre-pair from the generic Bluetooth settings screen. WDG retains one phone;
 use **Forget paired phone** before bonding a replacement.
 
+If WDG reports **No BlueZ adapter found** while `bluetoothctl list` still shows
+an `hciX` controller, install WDG 0.9.45 or newer. That release discovers UART
+controllers through BlueZ when their sysfs directory omits the `address` file;
+no manual sysfs repair or ownership change is needed.
+
 The retained phone must be the only connected BlueZ `Device1` on the selected
 companion adapter when it subscribes to notifications. Use a dedicated
 Bluetooth adapter for MeshMapper, or disconnect headphones, watches, and other

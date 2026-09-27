@@ -1,5 +1,24 @@
 # Smethan WatchDogsGo
 
+## 0.9.45 — uConsole MeshCore BLE adapter discovery — 2026-09-27
+
+- Fix the **No BlueZ adapter found** error on uConsole UART Bluetooth
+  controllers whose `hciX` directory does not contain a readable sysfs
+  `address` file.
+- Supplement the conventional `/sys/class/bluetooth/hciX/address` inventory
+  with each BlueZ `org.bluez.Adapter1.Address` reported by
+  `ObjectManager.GetManagedObjects`. Existing sysfs-visible and USB adapters
+  remain supported, and duplicate controller entries are collapsed by address.
+- Query BlueZ through a private D-Bus connection so discovery cannot leave a
+  shared dbus-python connection in a state that interferes with the later GLib
+  pairing-agent flow.
+
+The reported uConsole exposes `hci0` and its controller address through BlueZ
+while omitting the sysfs address file, which is the hardware layout this fix
+targets. Automated adapter-inventory, MeshCore BLE, and settings coverage
+passes; enabling and pairing the updated build on the physical uConsole remains
+an operator validation step.
+
 ## 0.9.44 — Authenticated MeshCore companion BLE for MeshMapper
 
 - Add an opt-in BlueZ GATT peripheral using the standard MeshCore service and
