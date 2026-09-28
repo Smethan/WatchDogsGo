@@ -199,6 +199,75 @@ def test_publishing_requires_explicit_confirmation_before_any_command():
     assert calls == []
 
 
+def test_publish_dispatch_pins_reviewed_workflow_branch_then_adopts():
+    tool = load_tool()
+    calls = []
+    release_views = 0
+
+    run = {
+        "id": 123,
+        "run_attempt": 1,
+        "event": "push",
+        "head_branch": "v2.8.0-wdg.6",
+        "head_sha": "b" * 40,
+        "status": "completed",
+        "conclusion": "success",
+        "path": ".github/workflows/wdg-native.yml",
+        "repository": {"full_name": "Smethan/meshtastic-firmware"},
+    }
+    artifact = {
+        "id": 456,
+        "name": "meshtasticd-wdg-arm64-123-1",
+        "expired": False,
+        "workflow_run": {"id": 123},
+    }
+
+    def runner(command, **_kwargs):
+        nonlocal release_views
+        calls.append(command)
+        if command[0] == "/usr/bin/gh" and command[1] == "api":
+            if "/attempts/" in command[2]:
+                return result(run)
+            return result({"artifacts": [artifact]})
+        if command[0] == "/usr/bin/gh" and command[1:3] == ["release", "view"]:
+            release_views += 1
+            return result({
+                "tagName": "v2.8.0-wdg.6",
+                "isDraft": release_views == 1,
+                "isPrerelease": False,
+                "publishedAt": None if release_views == 1 else "2026-09-28T00:00:00Z",
+                "url": "https://example.invalid/release",
+            })
+        if command[0] == "/usr/bin/gh" and command[1:3] == ["workflow", "run"]:
+            return result()
+        operation = command[3]
+        if operation == "status":
+            return result(service_payload(
+                command[4], active=False, installed=True))
+        if operation == "adopt-installed":
+            return result({
+                "ok": True,
+                "action": "adopt-installed",
+                "tag": "v2.8.0-wdg.6",
+                "package_version": "2.8.0+wdg6",
+                "health": "ready",
+            })
+        raise AssertionError(command)
+
+    manager = tool.ReleaseManager(
+        runner=runner, gh="/usr/bin/gh", sleeper=lambda _seconds: None,
+        monotonic=lambda: 0.0)
+    reply = manager.publish_adopt_draft(
+        tag="v2.8.0-wdg.6", run_id=123, attempt=1,
+        confirmed=True, timeout=30)
+
+    dispatch = next(
+        command for command in calls
+        if command[:3] == ["/usr/bin/gh", "workflow", "run"])
+    assert dispatch[dispatch.index("--ref") + 1] == "wdg-portduino-bluez"
+    assert reply["adoption"]["health"] == "ready"
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
 def test_positive_integer_rejects_invalid_cli_values(value):
     tool = load_tool()

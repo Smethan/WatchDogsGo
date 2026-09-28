@@ -10,6 +10,17 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.48] — 2026-09-28
+
+### Fixed
+
+- Dispatch draft publication against the reviewed `wdg-portduino-bluez`
+  workflow ref explicitly. The firmware fork's default `main` branch does not
+  contain the WDG workflow, so an unqualified GitHub dispatch was rejected
+  before publication with HTTP 422. The pinned ref retains the existing
+  tag/artifact/checksum comparison and does not add a contents-write workflow
+  to the default branch.
+
 ## [0.9.47] — 2026-09-28
 
 ### Added

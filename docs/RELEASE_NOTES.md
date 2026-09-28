@@ -1,5 +1,20 @@
 # Smethan WatchDogsGo
 
+## 0.9.48 — Pin the protected firmware publication workflow — 2026-09-28
+
+- Fix `publish-adopt-draft` on the Smethan firmware fork by explicitly
+  dispatching the existing reviewed workflow from `wdg-portduino-bluez`.
+  GitHub otherwise resolves the request against the default `main` branch,
+  which does not contain that workflow, and rejects it with HTTP 422 before
+  any release or service change.
+- Preserve the same permanent-action confirmation and exact repository, tag,
+  successful run, attempt, commit, unexpired artifact, five-file, checksum,
+  package, and installed-payload gates. No new release-writing workflow or
+  permission is added to the firmware default branch.
+
+Automated coverage reproduces the draft-to-public transition and asserts that
+the dispatch pins the reviewed workflow ref before protected adoption begins.
+
 ## 0.9.47 — Guided Meshtastic release adoption — 2026-09-28
 
 - Add `/usr/local/bin/watchdogs-meshtastic-release`, installed root-owned by

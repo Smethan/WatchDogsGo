@@ -26,6 +26,7 @@ from typing import Any
 REPOSITORY = "Smethan/meshtastic-firmware"
 WORKFLOW = "wdg-native.yml"
 WORKFLOW_PATH = ".github/workflows/wdg-native.yml"
+WORKFLOW_REF = "wdg-portduino-bluez"
 HELPER = Path("/usr/local/libexec/watchdogs-meshtastic")
 CACHE_ROOT = Path("/var/cache/watchdogs/meshtasticd-wdg")
 FIRST_INSTALL_INBOX = CACHE_ROOT / "first-install-inbox"
@@ -490,6 +491,7 @@ class ReleaseManager:
             gh = self._require_gh()
             self._run([
                 gh, "workflow", "run", WORKFLOW, "--repo", REPOSITORY,
+                "--ref", WORKFLOW_REF,
                 "-f", "operation=publish_draft",
                 "-f", f"package_tag={tag}",
                 "-f", f"tested_run_id={run_id}",
