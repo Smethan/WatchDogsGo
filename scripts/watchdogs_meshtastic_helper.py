@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 9
+HELPER_VERSION = 10
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -572,7 +572,7 @@ def _validated_semantic_baseline(value: Any) -> dict[str, Any]:
 def _parse_effective_mac(
         output: bytes, *, truncated: bool,
         semantic: dict[str, Any]) -> str:
-    """Parse the daemon's own effective MAC and bind it to its node ID."""
+    """Parse the daemon's effective MAC without re-deriving its identity."""
     if truncated:
         raise HelperError(
             "meshtasticd-wdg startup output exceeded the validation limit")
@@ -584,12 +584,13 @@ def _parse_effective_mac(
     octets = mac.split(":")
     if len(octets) != 6:
         raise HelperError("meshtasticd-wdg reported an invalid effective MAC")
-    node_id = semantic.get("node_id")
-    expected_node_id = "!" + "".join(octets[2:]).lower()
-    if node_id != expected_node_id:
-        raise HelperError(
-            "meshtasticd-wdg effective MAC does not map to its reported node ID; "
-            "set a stable General.MACAddress and retry")
+    # Meshtastic derives the node number from the MAC only when no persisted
+    # node number exists. A mature node deliberately retains its saved node
+    # number if the host interface or Bluetooth adapter later changes. The
+    # surrounding candidate checks bind the complete semantic identity to the
+    # copied state before and after pinning this strictly parsed effective MAC.
+    if not isinstance(semantic.get("node_id"), str):
+        raise HelperError("meshtasticd-wdg reported an invalid semantic identity")
     return mac
 
 
@@ -602,9 +603,6 @@ def _validation_baseline(
     if (not isinstance(mac, str)
             or re.fullmatch(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5}", mac) is None
             or type(pin_required) is not bool):
-        raise HelperError("Meshtastic semantic baseline metadata is malformed")
-    expected_node_id = "!" + "".join(mac.split(":")[2:]).lower()
-    if semantic["node_id"] != expected_node_id:
         raise HelperError("Meshtastic semantic baseline metadata is malformed")
     return semantic, mac, pin_required
 

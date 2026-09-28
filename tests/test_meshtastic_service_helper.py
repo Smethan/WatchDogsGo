@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 9})
+        return result({"ok": True, "helper_version": 10})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 9
+    assert controller.version() == 10
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -120,7 +120,7 @@ def test_controller_parses_status_and_preserves_helper_errors():
 
 def test_controller_rejects_pre_hardening_helper_version():
     controller = service.MeshtasticServiceController(
-        runner=lambda *a, **k: result({"ok": True, "helper_version": 8}),
+        runner=lambda *a, **k: result({"ok": True, "helper_version": 9}),
         geteuid=lambda: 0)
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 9
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 10
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -2447,7 +2447,7 @@ def test_semantic_status_rejects_missing_wrong_or_duplicate_fields(status):
         helper._semantic_status_snapshot(status)
 
 
-def test_effective_mac_parser_is_strict_and_cross_checks_node_identity():
+def test_effective_mac_parser_is_strict_and_allows_persisted_node_identity():
     helper = load_helper()
     semantic = helper._semantic_status_snapshot(semantic_status())
 
@@ -2463,14 +2463,24 @@ def test_effective_mac_parser_is_strict_and_cross_checks_node_identity():
         with pytest.raises(helper.HelperError, match="exactly one"):
             helper._parse_effective_mac(
                 output, truncated=False, semantic=semantic)
-    with pytest.raises(helper.HelperError, match="does not map"):
-        helper._parse_effective_mac(
-            b"MAC ADDRESS: 02:00:11:22:33:44\n",
-            truncated=False, semantic=semantic)
+    assert helper._parse_effective_mac(
+        b"MAC ADDRESS: 02:00:11:22:33:44\n",
+        truncated=False, semantic=semantic) == "02:00:11:22:33:44"
     with pytest.raises(helper.HelperError, match="exceeded"):
         helper._parse_effective_mac(
             b"MAC ADDRESS: 02:00:A1:B2:C3:D4\n",
             truncated=True, semantic=semantic)
+
+
+def test_validation_baseline_allows_mac_independent_persisted_node_id():
+    helper = load_helper()
+    semantic = helper._semantic_status_snapshot(
+        semantic_status(node_id="!43f0fbd9"))
+    assert helper._validation_baseline({
+        "semantic_baseline": semantic,
+        "effective_mac": "88:A2:9E:76:54:EA",
+        "mac_pin_required": True,
+    }) == (semantic, "88:A2:9E:76:54:EA", True)
 
 
 def test_mac_pin_rewrites_only_supported_general_mappings():

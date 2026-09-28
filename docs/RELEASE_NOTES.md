@@ -1,5 +1,19 @@
 # Smethan WatchDogsGo
 
+## 0.9.53 — Preserve mature Meshtastic node identities — 2026-09-28
+
+- Fix adoption of established Meshtastic nodes whose persisted node number no
+  longer equals the low 32 bits of the host's current effective MAC address.
+  Meshtastic derives a node number from the MAC only when the persisted number
+  is zero; afterward, preserving the saved node number is intentional.
+- Continue parsing exactly one canonical startup MAC, pin that stable value in
+  the live config only after an isolated second boot, and require the complete
+  node identity and channel semantics to remain identical across both boots.
+- Bump the installed helper contract to version 10.
+
+This avoids changing an established node ID merely to satisfy an invalid
+first-boot-only assumption in the adoption helper.
+
 ## 0.9.52 — Accept ordinary single-document Meshtastic YAML — 2026-09-28
 
 - Fix release adoption for standard Meshtastic configurations that place one

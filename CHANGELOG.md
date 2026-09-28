@@ -10,6 +10,21 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.53] — 2026-09-28
+
+### Fixed
+
+- Allow an established Meshtastic node to retain its persisted node number
+  when it differs from the current host MAC. Upstream derives the node number
+  from the MAC only on first initialization; treating that relationship as a
+  permanent invariant prevented safe release adoption.
+
+### Security
+
+- Retain strict startup-MAC parsing, isolated pin validation, full semantic
+  identity/channel comparison, state fingerprints, and transactional config
+  rollback. Bump the privileged helper contract to version 10.
+
 ## [0.9.52] — 2026-09-28
 
 ### Fixed
