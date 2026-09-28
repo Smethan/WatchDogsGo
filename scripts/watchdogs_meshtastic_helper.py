@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 7
+HELPER_VERSION = 8
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -1454,7 +1454,12 @@ def _meshtasticd_credentials() -> tuple[int, int, list[int]]:
         raise HelperError("meshtasticd system account is not installed") from exc
     uid = account.pw_uid
     gid = group.gr_gid
-    if uid <= 0 or gid <= 0 or account.pw_gid != gid:
+    # Stock or older packages may have created the daemon account with
+    # ``nogroup`` as its primary group before the dedicated meshtasticd group
+    # existed. Both systemd and the isolated candidate launcher set the
+    # reviewed meshtasticd group explicitly, so a different non-root legacy
+    # primary group is safe and does not need an account mutation.
+    if uid <= 0 or gid <= 0 or account.pw_gid <= 0:
         raise HelperError("meshtasticd system account has unsafe credentials")
     supplementary: list[int] = []
     for name in SERVICE_SUPPLEMENTARY_GROUPS:

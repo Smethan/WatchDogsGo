@@ -1,5 +1,21 @@
 # Smethan WatchDogsGo
 
+## 0.9.51 — Support legacy non-root daemon primary groups — 2026-09-28
+
+- Fix isolated candidate validation on systems where an older package created
+  the `meshtasticd` user with `nogroup` as its primary group. The systemd unit
+  and Python candidate launcher both explicitly select the dedicated
+  `meshtasticd` group, so adoption no longer requires mutating the existing
+  system account.
+- Continue rejecting root or invalid user, primary-group, service-group, and
+  supplementary-group IDs. Candidate files remain owned by the explicit
+  service UID/GID and the subprocess retains only the reviewed `spi`, `gpio`,
+  and `watchdogs` supplementary groups.
+- Bump the installed helper contract to version 8.
+
+Automated coverage includes the uConsole's legacy `nogroup` layout plus root
+and zero-ID rejection cases.
+
 ## 0.9.50 — Bridge older installed packages into protected updates — 2026-09-28
 
 - Allow only the adoption and rollback-cache validation paths to accept an

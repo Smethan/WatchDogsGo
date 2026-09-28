@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 7})
+        return result({"ok": True, "helper_version": 8})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 7
+    assert controller.version() == 8
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -120,7 +120,7 @@ def test_controller_parses_status_and_preserves_helper_errors():
 
 def test_controller_rejects_pre_hardening_helper_version():
     controller = service.MeshtasticServiceController(
-        runner=lambda *a, **k: result({"ok": True, "helper_version": 6}),
+        runner=lambda *a, **k: result({"ok": True, "helper_version": 7}),
         geteuid=lambda: 0)
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 7
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 8
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -1979,6 +1979,49 @@ def test_candidate_credentials_match_service_supplementary_groups(monkeypatch):
 
     assert helper._meshtasticd_credentials() == (
         612, 613, [614, 615, 616])
+
+
+def test_candidate_credentials_allow_nonroot_legacy_primary_group(monkeypatch):
+    helper = load_helper()
+    groups = {
+        "meshtasticd": NS(gr_gid=613),
+        "spi": NS(gr_gid=614),
+        "gpio": NS(gr_gid=615),
+        "watchdogs": NS(gr_gid=616),
+    }
+    monkeypatch.setattr(
+        helper.pwd, "getpwnam",
+        lambda name: NS(pw_uid=612, pw_gid=65534) if name == "meshtasticd"
+        else (_ for _ in ()).throw(KeyError(name)))
+    monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
+
+    assert helper._meshtasticd_credentials() == (
+        612, 613, [614, 615, 616])
+
+
+@pytest.mark.parametrize(("uid", "primary_gid", "service_gid"), [
+    (0, 65534, 613),
+    (612, 0, 613),
+    (612, 65534, 0),
+])
+def test_candidate_credentials_reject_root_or_invalid_ids(
+        monkeypatch, uid, primary_gid, service_gid):
+    helper = load_helper()
+    groups = {
+        "meshtasticd": NS(gr_gid=service_gid),
+        "spi": NS(gr_gid=614),
+        "gpio": NS(gr_gid=615),
+        "watchdogs": NS(gr_gid=616),
+    }
+    monkeypatch.setattr(
+        helper.pwd, "getpwnam",
+        lambda name: NS(pw_uid=uid, pw_gid=primary_gid)
+        if name == "meshtasticd"
+        else (_ for _ in ()).throw(KeyError(name)))
+    monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
+
+    with pytest.raises(helper.HelperError, match="unsafe credentials"):
+        helper._meshtasticd_credentials()
 
 
 def install_candidate_fakes(helper, monkeypatch, process, tmp_path):

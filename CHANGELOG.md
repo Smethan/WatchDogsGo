@@ -10,6 +10,22 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.51] — 2026-09-28
+
+### Fixed
+
+- Allow the isolated Meshtastic candidate check to use a pre-existing daemon
+  account whose non-root primary group differs from the dedicated
+  `meshtasticd` group. Stock/older installs commonly retain `nogroup`; systemd
+  and the candidate launcher both explicitly select `meshtasticd`, so changing
+  the account is unnecessary.
+
+### Security
+
+- Continue rejecting root or invalid daemon/account/group IDs, and retain the
+  exact reviewed supplementary-group set. Bump the helper contract to version
+  8 so candidate validation cannot run with the earlier false assumption.
+
 ## [0.9.50] — 2026-09-28
 
 ### Fixed
