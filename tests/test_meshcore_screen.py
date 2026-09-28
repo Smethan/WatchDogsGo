@@ -18,6 +18,7 @@ def _messenger():
     app._mc_note_editing = False
     app._mc_dm_target = None
     app._mc_log = []
+    app._mt_tx_rows = {}
     app._mc_input = ""
     app._mc_scroll = 0
     app._mc_chan_picker = False
@@ -85,7 +86,8 @@ def test_meshtastic_messenger_uses_daemon_channels_and_filters_contacts(
         local_name="WDG MT",
         channels=[{"index": 0, "name": "Primary"},
                   {"index": 2, "name": "Road"}],
-        send_text=Mock(return_value=True), request_discovery=Mock(return_value=True))
+        send_text=Mock(return_value="mt-1"),
+        request_discovery=Mock(return_value=True))
     app._mc_nodes = [
         {"id": "meshcore:1", "name": "MC", "protocol": "meshcore"},
         {"id": "meshtastic:!00000002", "address": "!00000002",
@@ -99,7 +101,27 @@ def test_meshtastic_messenger_uses_daemon_channels_and_filters_contacts(
 
     app._update_mc_screen()
     app._meshtastic.send_text.assert_called_once_with("hello", channel=2)
+    assert app._mt_tx_rows == {"mt-1": 0}
+    assert app._mc_log[0][2].endswith("QUEUED")
     assert app._mesh_nodes() == [app._mc_nodes[1]]
+
+
+def test_meshtastic_outbound_status_updates_existing_row():
+    app = _messenger()
+    app._mc_log = [("\x11 test: hello", 10, "12:34 QUEUED")]
+    app._mt_tx_rows = {"mt-1": 0}
+    app._meshtastic = NS(poll_events=Mock(return_value=[
+        ("outbound_status", {
+            "correlation_id": "mt-1", "state": "sent", "terminal": True,
+        }),
+    ]))
+    app._term_add = Mock()
+    app.msg = Mock()
+
+    app._poll_meshtastic()
+
+    assert app._mc_log[0][2] == "12:34 SENT"
+    assert "mt-1" not in app._mt_tx_rows
 
 
 def test_meshtastic_contact_action_opens_direct_message_without_meshcore_key(

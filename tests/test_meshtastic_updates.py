@@ -42,7 +42,10 @@ def _core_manifest(tag=TAG):
             + source_commit),
         "source_ref": tag,
         "license": "GPL-3.0-only",
-        "wdg_api": {"major": 1, "minor": 0},
+        "wdg_api": {
+            "major": updates.MESHTASTIC_WDG_API_MAJOR,
+            "minor": updates.MESHTASTIC_WDG_API_MINOR,
+        },
         "package": {
             "name": "meshtasticd-wdg",
             "version": updates.package_version_for_tag(tag),
@@ -440,6 +443,7 @@ def test_manifest_rejects_wrong_repo_api_arch_and_host(tmp_path):
     for mutate, message in (
         (lambda item: item.update(repository="Smethan/firmware"), "Smethan fork"),
         (lambda item: item["wdg_api"].update(major=2), "API major"),
+        (lambda item: item["wdg_api"].update(minor=0), "older WDG API"),
         (lambda item: item["package"].update(architecture="amd64"), "ARM64"),
         (lambda item: item.update(source_commit="not-a-commit"), "source commit"),
         (lambda item: item.update(source_ref="develop"), "source reference"),

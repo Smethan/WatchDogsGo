@@ -20,14 +20,28 @@ phone queues as the phone.
 
 ## Current release status
 
-The source branches add the build, package, updater, and rollback paths. They do
-not by themselves publish a Meshtastic release. After the one-time manual
-migration and adoption described below, **Update service** can install only a
-compatible, tagged ARM64 release from `Smethan/meshtastic-firmware`. It reports
-that no compatible release exists until those assets are actually published.
+WDG 0.9.46 is paired with firmware `v2.8.0-wdg.7`, which adds WDG local API 1.1
+delivery correlation and authenticated phone-bond controls. Upgrade and verify
+the firmware package first, then update WDG. That order gives WDG the required
+API on its first post-upgrade connection; API 1.0 lacks shared-bond adoption and
+cleanup even though its earlier node/message controls remain usable.
+
+The source branches and tags drive the build, package, updater, and rollback
+paths. After the one-time manual migration and adoption described below,
+**Update service** can install only a compatible, tagged ARM64 release from
+`Smethan/meshtastic-firmware`. It reports that no compatible release exists
+until those assets are actually published.
 Android phone interoperability and the uConsole radio/Bluetooth soak remain
 hardware acceptance work. No physical-device acceptance is claimed by these
 code changes.
+
+The daemon stores the retained phone address, exact controller address, and
+random-PIN authentication provenance as one bounded versioned identity record.
+An older address-only record is loaded as `unknown`, not inferred to be secure
+from the current Bluetooth setting. It may be inspected and explicitly adopted
+through WDG after exact BlueZ verification, but it cannot authorize GATT access
+until that upgrade succeeds. A record written for another controller is handled
+the same way.
 
 The firmware workflow keeps hardware acceptance separate from publication. A
 matching tag builds once and stages the verified files in a draft GitHub
@@ -299,17 +313,51 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 
 The fork exports the standard Meshtastic GATT service through BlueZ. The
 official phone app remains a normal Meshtastic client; WDG does not proxy the
-phone protocol. Open an explicit 120-second window with **Open pairing**. The
-six-digit BlueZ passkey appears in WDG status and the daemon journal. One phone
-bond is retained. Disconnect and choose **Forget paired phone** before pairing
-a replacement.
+phone protocol. WDG 0.9.46 treats the authenticated phone as one bond belonging
+to a stable controller MAC, not as separate MeshCore and Meshtastic bonds. If
+MeshCore already retained a phone on the controller Meshtastic is configured
+to use, WDG asks API 1.1 to adopt that exact BlueZ device. Adoption succeeds
+only when the controller and phone addresses match and BlueZ reports the device
+as paired, bonded, and trusted. It never creates a new bond or stores BlueZ key
+material.
 
-`NO_PIN` follows the upstream Just Works mode. `RANDOM_PIN` uses BlueZ's
-generated six-digit passkey. BlueZ Agent1 does not provide a supported way for
-a DisplayOnly Linux LE peripheral to force the upstream fixed PIN, so a
-configured `FIXED_PIN` fails closed with `fixed_pin_unsupported`; the daemon
-does not advertise or silently substitute another pairing mode. Select
-`RANDOM_PIN` or explicitly opt into `NO_PIN` before enabling phone BLE.
+With no retained phone, open an explicit 120-second window with **Open
+pairing**. WDG first requires the daemon's authenticated `RANDOM_PIN` policy.
+The six-digit BlueZ passkey appears in WDG status and the daemon journal. One
+phone bond is retained and shared with MeshCore on that controller. Disconnect
+and choose **Forget paired phone** before pairing a replacement. The
+Meshtastic forget flow removes the daemon identity and exact BlueZ device, then
+removes WDG's metadata; it never bulk-removes unrelated devices.
+
+`NO_PIN` remains an upstream Just Works mode, but it is not accepted by WDG's
+shared-bond workflow. `RANDOM_PIN` uses BlueZ's generated six-digit passkey.
+BlueZ Agent1 does not provide a supported way for a DisplayOnly Linux LE
+peripheral to force the upstream fixed PIN, so a configured `FIXED_PIN` fails
+closed with `fixed_pin_unsupported`; the daemon does not advertise or silently
+substitute another pairing mode. WDG explicitly selects `RANDOM_PIN` before
+opening or reconciling its pairing flow.
+
+The controller-keyed non-secret registry is the invoking user's
+`~/.watchdogs/bluetooth_bonds.json`. WDG securely opens the directory with
+`O_DIRECTORY|O_NOFOLLOW` and performs file operations relative to that verified
+descriptor. An owner-correct legacy `~/.watchdogs` directory created as `0755`
+is hardened in place to `0700` with `fchmod`; a symlinked or wrong-owner path
+still fails closed. The existing registry must be a real owner-correct file
+with exact mode `0600`. Writes are atomic. It stores only controller/phone
+addresses, display name, random-PIN authentication label, source backend,
+active/cleanup state, and timestamp. Passkeys and Bluetooth link keys remain
+exclusively under BlueZ.
+
+The prior MeshCore address/name settings are a one-release compatibility
+mirror. WDG migrates them only if a read-only BlueZ `Device1` lookup finds the
+exact address under the exact selected `Adapter1` and all of `Paired`,
+`Bonded`, and `Trusted` are true. Missing or ambiguous state is not guessed.
+
+If **Forget paired phone** is run while MeshCore owns the controller, BlueZ is
+cleaned immediately but the stopped daemon may still retain the old address.
+WDG records `cleanup_pending`; on the next Meshtastic API 1.1 connection it
+clears only a matching daemon identity, then removes the tombstone. A mismatch
+fails closed, and another phone cannot pair until the cleanup is resolved.
 
 Store adapter choices by controller MAC, not by `hci0`/`hci1`; Linux controller
 numbers can change after reboot or USB changes. **Phone BLE adapter** selects
@@ -320,6 +368,21 @@ queues. The owner is shown as `none`, `bluetooth`, `bluetooth_pending`, or
 `tcp`. The BLE and TCP transports coordinate that lease; the restricted WDG
 socket never consumes it. A phone may therefore coexist with WDG, but an
 arbitrary simultaneous TCP/serial PhoneAPI client is unsupported.
+
+## Message delivery state
+
+Mesh Messenger gives every accepted local send a correlation ID and updates
+that original row rather than appending a second result. Channel/broadcast
+messages use `want_ack=false`: once the daemon accepts one for transmission,
+its terminal display state is `SENT`. Direct messages use `want_ack=true` and
+remain non-terminal at `SENT` until API 1.1 reports `DELIVERED` or `FAILED`.
+The daemon bounds direct delivery tracking and reports failure if Meshtastic
+returns a routing error or no terminal result arrives within 120 seconds.
+
+This distinction matters on sparse meshes. Broadcast packets do not have one
+specific peer that can acknowledge them, so requesting an acknowledgement
+caused unnecessary retries and eventual failure messages; that behavior could
+look like a service crash even though `meshtasticd-wdg` remained running.
 
 With two powered Bluetooth controllers, assign distinct stable MACs to phone
 BLE and Host BLE scanning. With one controller and no connected phone, WDG asks
@@ -360,6 +423,16 @@ policy error disables only the socket/BLE surfaces, inspect
 `/etc/meshtasticd/wdg-portduino.yaml`, rerun `sudo bash setup.sh`, and restart
 the fork service. Radio operation is intentionally kept separate from those
 restricted interfaces.
+
+For an apparent app or worker crash, retain both
+`~/.watchdogs/last_run.log` and `~/.watchdogs/previous_run.log`. WDG 0.9.46
+adds fatal-signal dumps for Python, full unhandled-thread tracebacks, and an
+explicit clean/unclean game-exit line; the next launch rotates the failed run
+into `previous_run.log`.
+
+The API, storage, and UI paths have automated coverage. WDG 0.9.46 and firmware
+`v2.8.0-wdg.7` were not validated on a physical uConsole or phone/controller
+combination as part of this implementation.
 
 See [Meshtastic WDG local API](MESHTASTIC_WDG_API.md) for the JSON protocol and
 its security boundary.

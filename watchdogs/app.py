@@ -27,7 +27,11 @@ from .serial_manager import SerialManager, detect_esp32_port
 from .ota_ui import OtaMixin
 from .gps_manager import GpsManager
 from .wardrive_ui import WardriveUI
-from .wardrive_settings import load_settings as load_wardrive_settings
+from .wardrive_settings import (
+    load_settings as load_wardrive_settings,
+    migrate_legacy_meshcore_bond,
+    mirror_meshcore_bond_settings,
+)
 from .loot_manager import LootManager
 from .app_state import AppState
 from .network_manager import NetworkManager
@@ -49,6 +53,15 @@ from .whitelist_manager import WhitelistManager
 from .lora_manager import LoRaManager
 from .meshcore_ble import MeshCoreBleManager, MeshCoreCompanionProtocol
 from .bluetooth_pairing import BluetoothPairingCoordinator
+from .bluetooth_bonds import (
+    BluetoothBondStoreError,
+    BluetoothPhoneBondStore,
+    STATE_ACTIVE,
+    STATE_CLEANUP_PENDING,
+    canonical_controller,
+    verify_bluez_bond,
+)
+from .host_ble import list_ble_adapters
 from .reticulum_config import (
     ReticulumConfigError,
     ReticulumProfile,
@@ -646,6 +659,20 @@ class WatchDogsGame(OtaMixin):
             self._meshtastic.acquire_pairing_agent_lease,
             self._meshtastic.release_pairing_agent_lease,
         )
+        self._bluetooth_bonds = None
+        self._bluetooth_bond_error = ""
+        try:
+            bond_store = BluetoothPhoneBondStore.default()
+            # Validate an existing store before any radio backend depends on
+            # it.  A missing store is expected and is not created until the
+            # first authenticated phone is committed.
+            bond_store.load()
+            self._bluetooth_bonds = bond_store
+        except (BluetoothBondStoreError, OSError) as exc:
+            self._bluetooth_bond_error = str(exc)
+        self._bluetooth_bond_results: Queue = Queue(maxsize=4)
+        self._bluetooth_bond_thread = None
+        self._bluetooth_bond_thread_factory = threading.Thread
         self._meshtastic_update_running = False
         self._meshtastic_update_result: Queue = Queue()
         self._meshtastic_update_thread = None
@@ -727,6 +754,7 @@ class WatchDogsGame(OtaMixin):
         self._mc_screen = False
         self._mc_log: list = []  # [(text, color, tag?)]
         self._mc_tx_pending: dict[bytes, int] = {}  # dedup_key → log index
+        self._mt_tx_rows: dict[str, int] = {}
         self._rns_tx_rows: dict[str, int] = {}
         self._rns_tx_meta: dict[str, dict] = {}
         self._mc_input = ""
@@ -5497,6 +5525,234 @@ class WatchDogsGame(OtaMixin):
     # LoRa / MeshCore polling + callbacks
     # ------------------------------------------------------------------
 
+    def _bluetooth_controller_key(self, selection="auto", *, applied=""):
+        """Resolve a controller selection to the stable BlueZ MAC key."""
+        selected = str(selection or "auto").strip()
+        if selected.lower() != "auto":
+            return canonical_controller(selected)
+        candidate = str(applied or "").strip()
+        if candidate:
+            return canonical_controller(candidate)
+        adapters = list_ble_adapters()
+        if not adapters:
+            raise RuntimeError("No BlueZ Bluetooth adapter is available")
+        return canonical_controller(adapters[0][0])
+
+    def _shared_phone_bond(self, protocol="meshcore"):
+        """Return this backend's controller-keyed retained phone, if any."""
+        store = getattr(self, "_bluetooth_bonds", None)
+        if store is None:
+            return None
+        settings = self._meshcore_companion_settings()
+        if protocol == "meshtastic":
+            manager = getattr(self, "_meshtastic", None)
+            selection = settings.get("meshtastic_phone_adapter", "auto")
+            applied = getattr(manager, "phone_ble_adapter_applied", "")
+        else:
+            manager = getattr(self, "_meshcore_ble", None)
+            selection = settings.get("meshcore_ble_adapter", "auto")
+            applied = getattr(manager, "controller_address", "")
+        try:
+            controller = self._bluetooth_controller_key(
+                selection, applied=applied)
+            return store.get(controller)
+        except (BluetoothBondStoreError, OSError, RuntimeError) as exc:
+            self._bluetooth_bond_error = str(exc)
+            return None
+
+    def _persist_legacy_bond_mirror(self, record=None):
+        """Keep the one-release MeshCore settings mirror synchronized."""
+        settings = self._meshcore_companion_settings()
+        mirror_meshcore_bond_settings(settings, record)
+        wardrive = getattr(self, "wardrive", None)
+        if wardrive is not None:
+            wardrive.persist_settings()
+
+    def _record_shared_phone_bond(
+            self, controller, address, name="", *, source="meshcore"):
+        store = getattr(self, "_bluetooth_bonds", None)
+        if store is None:
+            raise BluetoothBondStoreError(
+                self._bluetooth_bond_error
+                or "Shared Bluetooth bond storage is unavailable")
+        record = store.commit(controller, address, name, source=source)
+        self._persist_legacy_bond_mirror(record)
+        return record
+
+    def _mark_shared_phone_cleanup(
+            self, controller, address, name="", *, source="meshcore"):
+        store = getattr(self, "_bluetooth_bonds", None)
+        if store is None:
+            raise BluetoothBondStoreError(
+                self._bluetooth_bond_error
+                or "Shared Bluetooth bond storage is unavailable")
+        record = store.mark_cleanup_pending(
+            controller, address, name, source=source)
+        self._persist_legacy_bond_mirror(None)
+        return record
+
+    def _meshtastic_bond_reconcile_worker(self):
+        """Apply the controller's shared phone policy to meshtasticd."""
+        manager = self._meshtastic
+        store = getattr(self, "_bluetooth_bonds", None)
+        if store is None:
+            return False, (self._bluetooth_bond_error
+                           or "Shared Bluetooth bond storage is unavailable")
+        settings = self._meshcore_companion_settings()
+        controller = self._bluetooth_controller_key(
+            settings.get("meshtastic_phone_adapter", "auto"),
+            applied=manager.phone_ble_adapter_applied)
+        pairing_mode = str(getattr(
+            manager, "phone_pairing_mode", "unknown")).lower()
+        if pairing_mode != "random_pin":
+            if not manager.set_phone_pairing_mode("random_pin"):
+                return False, (manager.last_error
+                               or "random-PIN policy was rejected")
+        record = store.get(controller)
+        if record is None:
+            return True, "Random-PIN phone policy ready"
+        if record.state == STATE_CLEANUP_PENDING:
+            daemon_address = str(manager.phone_bond_address or "").upper()
+            if daemon_address and daemon_address != record.phone_address:
+                return False, (
+                    "Daemon phone identity differs from pending cleanup; "
+                    "refusing to clear either identity")
+            if daemon_address and not manager.clear_phone_identity(
+                    record.phone_address):
+                return False, (manager.last_error
+                               or "daemon phone identity was not cleared")
+            if not store.remove(controller, record.phone_address):
+                return False, "Pending phone cleanup changed concurrently"
+            return True, "Stale shared phone identity cleared"
+        if verify_bluez_bond(controller, record.phone_address) is None:
+            return False, (
+                "Retained phone is no longer a paired, bonded, trusted "
+                "BlueZ device on the selected controller")
+        daemon_bond = getattr(manager, "phone_bond", {})
+        if (isinstance(daemon_bond, dict)
+                and daemon_bond.get("present")
+                and str(daemon_bond.get("address") or "").upper()
+                == record.phone_address
+                and str(daemon_bond.get("controller") or "").upper()
+                == controller
+                and str(daemon_bond.get("authentication") or "").lower()
+                == "random_pin"
+                and all(bool(daemon_bond.get(key)) for key in (
+                    "paired", "bonded", "trusted", "service_authorized"))):
+            return True, "Shared phone already active in Meshtastic"
+        if not manager.adopt_phone_bond(
+                record.phone_address, controller):
+            return False, (manager.last_error
+                           or "daemon did not adopt the shared phone")
+        return True, "Shared phone adopted by Meshtastic"
+
+    def _start_meshtastic_bond_reconcile(self):
+        """Reconcile shared phone state off the Pyxel thread."""
+        manager = getattr(self, "_meshtastic", None)
+        if (manager is None or not manager.connected
+                or manager.backend != "fork_socket"):
+            return False
+        required = {
+            "set_phone_pairing_mode", "adopt_phone_bond",
+            "clear_phone_identity", "phone_bond",
+        }
+        if not required.issubset(manager.capabilities):
+            return False
+        thread = getattr(self, "_bluetooth_bond_thread", None)
+        if thread is not None and thread.is_alive():
+            return False
+        if not self._begin_meshtastic_transition("phone-bond-reconcile"):
+            return False
+
+        def worker():
+            try:
+                try:
+                    result = self._meshtastic_bond_reconcile_worker()
+                except Exception as exc:
+                    result = (False, str(exc)[:180])
+            finally:
+                self._end_meshtastic_transition()
+            try:
+                self._bluetooth_bond_results.put_nowait(result)
+            except Full:
+                # Only reconciliation summaries use this queue.  Keep the
+                # newest outcome; message and delivery events use the manager
+                # queue and are never evicted here.
+                try:
+                    self._bluetooth_bond_results.get_nowait()
+                except Empty:
+                    pass
+                self._bluetooth_bond_results.put_nowait(result)
+
+        try:
+            factory = getattr(
+                self, "_bluetooth_bond_thread_factory", threading.Thread)
+            thread = factory(
+                target=worker, name="wdg-phone-bond-reconcile", daemon=True)
+            self._bluetooth_bond_thread = thread
+            thread.start()
+        except Exception:
+            self._bluetooth_bond_thread = None
+            self._end_meshtastic_transition()
+            raise
+        return True
+
+    def _poll_bluetooth_bond_reconcile(self):
+        queue = getattr(self, "_bluetooth_bond_results", None)
+        if queue is not None:
+            while True:
+                try:
+                    ok, detail = queue.get_nowait()
+                except Empty:
+                    break
+                prefix = "[BLE] "
+                self._term_add(prefix + str(detail)[:180], raw=True)
+                if not ok:
+                    self.msg(prefix + str(detail)[:70], C_ERROR)
+        thread = getattr(self, "_bluetooth_bond_thread", None)
+        if thread is not None and not thread.is_alive():
+            self._bluetooth_bond_thread = None
+
+    def _open_meshtastic_shared_pairing(self, manager):
+        """Open only the authenticated random-PIN daemon pairing flow."""
+        if getattr(self, "_bluetooth_bonds", None) is None:
+            manager.last_error = (self._bluetooth_bond_error
+                                  or "Shared Bluetooth bond storage is unavailable")
+            return False
+        record = self._shared_phone_bond("meshtastic")
+        if record is not None and record.state == STATE_ACTIVE:
+            manager.last_error = (
+                "A phone is already bonded on this controller; forget it "
+                "before pairing another")
+            return False
+        if record is not None and record.state == STATE_CLEANUP_PENDING:
+            if (manager.phone_bond_address
+                    and not manager.clear_phone_identity(
+                        record.phone_address)):
+                return False
+            store = getattr(self, "_bluetooth_bonds", None)
+            if store is None or not store.remove(
+                    record.controller, record.phone_address):
+                manager.last_error = "Pending shared phone cleanup failed"
+                return False
+        return (manager.set_phone_pairing_mode("random_pin")
+                and manager.open_pairing(120))
+
+    def _forget_meshtastic_shared_phone(self, manager):
+        """Forget the daemon/BlueZ identity, then its WDG metadata."""
+        record = self._shared_phone_bond("meshtastic")
+        if not manager.forget_phone():
+            return False
+        if record is not None:
+            store = getattr(self, "_bluetooth_bonds", None)
+            if store is None or not store.remove(
+                    record.controller, record.phone_address):
+                manager.last_error = (
+                    "Phone was removed from BlueZ but shared metadata could "
+                    "not be cleared")
+                return False
+        return True
+
     def _meshcore_companion_settings(self):
         wardrive = getattr(self, "wardrive", None)
         if wardrive is not None:
@@ -5541,12 +5797,35 @@ class WatchDogsGame(OtaMixin):
             return False
         if manager.running:
             return True
+        paired_address = settings.get("meshcore_ble_paired_address", "")
+        paired_name = settings.get("meshcore_ble_paired_name", "")
+        store = getattr(self, "_bluetooth_bonds", None)
+        if store is not None:
+            try:
+                controller = manager.resolve_controller_key(
+                    settings.get("meshcore_ble_adapter", "auto"))
+                record = store.get(controller)
+                if record is None:
+                    record = migrate_legacy_meshcore_bond(
+                        settings, store, controller, verify_bluez_bond)
+                if record is not None and record.state == STATE_ACTIVE:
+                    paired_address = record.phone_address
+                    paired_name = record.phone_name
+                else:
+                    # A cleanup tombstone must not silently regain access to
+                    # the MeshCore GATT service.
+                    paired_address = ""
+                    paired_name = ""
+            except (BluetoothBondStoreError, OSError, RuntimeError) as exc:
+                self._bluetooth_bond_error = str(exc)
+                raise RuntimeError(
+                    "Shared Bluetooth phone state is unavailable: "
+                    + str(exc)) from exc
         accepted = manager.start(
             settings.get("meshcore_ble_adapter", "auto"),
             self._mc_node_name,
-            paired_address=settings.get(
-                "meshcore_ble_paired_address", ""),
-            paired_name=settings.get("meshcore_ble_paired_name", ""),
+            paired_address=paired_address,
+            paired_name=paired_name,
         )
         if not accepted and manager.last_error:
             raise RuntimeError(manager.last_error)
@@ -5595,23 +5874,45 @@ class WatchDogsGame(OtaMixin):
                 body = detail if isinstance(detail, dict) else {}
                 address = str(body.get("address", "")).upper()
                 name = str(body.get("name", "")).strip()
-                wardrive = getattr(self, "wardrive", None)
-                if wardrive is not None and address:
-                    wardrive.settings[
-                        "meshcore_ble_paired_address"] = address
-                    wardrive.settings["meshcore_ble_paired_name"] = name
-                    wardrive.persist_settings()
+                controller = str(
+                    getattr(manager, "controller_address", "") or "")
+                if address and controller:
+                    try:
+                        self._record_shared_phone_bond(
+                            controller, address, name, source="meshcore")
+                    except (BluetoothBondStoreError, OSError) as exc:
+                        self._bluetooth_bond_error = str(exc)
+                        self._term_add(
+                            "[MC-BLE] Bonded phone could not be retained: "
+                            + str(exc)[:120], raw=True)
+                        self.msg(
+                            "[MC-BLE] Could not retain paired phone",
+                            C_ERROR)
                 label = name or address or "phone"
                 self._term_add(
                     "[MC-BLE] Authenticated phone bonded: " + label,
                     raw=True)
                 self.msg("[MC-BLE] Paired " + label[:45], C_SUCCESS)
             elif event == "bond_removed":
-                wardrive = getattr(self, "wardrive", None)
-                if wardrive is not None:
-                    wardrive.settings["meshcore_ble_paired_address"] = ""
-                    wardrive.settings["meshcore_ble_paired_name"] = ""
-                    wardrive.persist_settings()
+                body = detail if isinstance(detail, dict) else {}
+                address = str(body.get("address", "") or "").upper()
+                name = str(body.get("name", "") or "").strip()
+                controller = str(
+                    getattr(manager, "controller_address", "") or "")
+                try:
+                    if controller and address:
+                        # BlueZ is clean, but the stopped daemon may still
+                        # retain this identity.  The tombstone makes the next
+                        # socket session clear it before allowing re-pairing.
+                        self._mark_shared_phone_cleanup(
+                            controller, address, name, source="meshcore")
+                    else:
+                        self._persist_legacy_bond_mirror(None)
+                except (BluetoothBondStoreError, OSError) as exc:
+                    self._bluetooth_bond_error = str(exc)
+                    self._term_add(
+                        "[MC-BLE] Shared cleanup state could not be saved: "
+                        + str(exc)[:120], raw=True)
                 self._term_add(
                     "[MC-BLE] MeshMapper phone bond removed", raw=True)
                 self.msg("[MC-BLE] Paired phone forgotten", C_SUCCESS)
@@ -6134,8 +6435,26 @@ class WatchDogsGame(OtaMixin):
                         "profile_rollback_failed"):
                     self._lora_power_ownership_uncertain = True
 
+    def _queue_meshtastic_text(self, text, destination=None, channel=0):
+        """Queue a message only while daemon ownership is stable."""
+        if getattr(self, "_meshtastic_update_running", False):
+            reason = "Service update is running"
+        elif self._meshtastic_transition_busy():
+            reason = "Radio or Bluetooth policy transition is running"
+        elif not getattr(self._meshtastic, "connected", False):
+            reason = "meshtasticd control socket is disconnected"
+        else:
+            if destination is None:
+                return self._meshtastic.send_text(text, channel=channel)
+            return self._meshtastic.send_text(
+                text, destination, channel)
+        self._term_add("[MT] Message not sent: " + reason, raw=True)
+        self.msg("[MT] Message not sent: " + reason[:55], C_WARNING)
+        return None
+
     def _poll_meshtastic(self):
         """Move meshtasticd callbacks onto the Pyxel/main thread."""
+        self._poll_bluetooth_bond_reconcile()
         try:
             events = self._meshtastic.poll_events()
         except Exception:
@@ -6151,6 +6470,7 @@ class WatchDogsGame(OtaMixin):
                     f"[MT] Connected as {data.get('name') or data.get('node_id')}",
                     raw=True)
                 self.msg("[MT] meshtasticd connected", C_SUCCESS)
+                self._start_meshtastic_bond_reconcile()
             elif event == "disconnected":
                 self._term_add(f"[MT] {data}", raw=True)
                 self.msg("[MT] meshtasticd disconnected", C_WARNING)
@@ -6172,6 +6492,50 @@ class WatchDogsGame(OtaMixin):
                         float(data.get("rssi") or 0))
             elif event == "node":
                 self._remember_meshtastic_node(data)
+            elif event == "phone_bond":
+                body = data if isinstance(data, dict) else {}
+                if (body.get("present")
+                        and str(body.get("authentication", "")).lower()
+                        == "random_pin"
+                        and all(bool(body.get(key)) for key in (
+                            "paired", "bonded", "trusted"))):
+                    controller = str(
+                        body.get("controller")
+                        or self._meshtastic.phone_ble_adapter_applied
+                        or "").upper()
+                    address = str(body.get("address") or "").upper()
+                    if (controller and address
+                            and verify_bluez_bond(controller, address)
+                            is not None):
+                        try:
+                            self._record_shared_phone_bond(
+                                controller, address,
+                                str(body.get("name") or ""),
+                                source="meshtastic")
+                        except (BluetoothBondStoreError, OSError) as exc:
+                            self._bluetooth_bond_error = str(exc)
+                            self._term_add(
+                                "[MT] Paired phone could not be retained: "
+                                + str(exc)[:120], raw=True)
+            elif event == "outbound_status":
+                body = data if isinstance(data, dict) else {}
+                correlation = str(body.get("correlation_id") or "")
+                state = str(body.get("state") or "queued").upper()
+                index = self._mt_tx_rows.get(correlation)
+                if index is not None and index < len(self._mc_log):
+                    old = self._mc_log[index]
+                    stamp = str(old[2] if len(old) > 2 else "").split()[0]
+                    color = (C_SUCCESS if state == "DELIVERED" else
+                             C_ERROR if state == "FAILED" else C_WARNING)
+                    self._mc_log[index] = (
+                        old[0], color, f"{stamp} {state}".strip())
+                if state == "FAILED":
+                    detail = str(body.get("detail") or
+                                 "Meshtastic delivery failed")
+                    self._term_add("[MT] " + detail[:140], raw=True)
+                    self.msg("[MT] " + detail[:70], C_ERROR)
+                if state in ("DELIVERED", "FAILED") or body.get("terminal"):
+                    self._mt_tx_rows.pop(correlation, None)
 
     def _poll_watch_autoconnect(self):
         """Reconnect a known watch only after BlueZ coordination is safe."""
@@ -6957,6 +7321,20 @@ class WatchDogsGame(OtaMixin):
                     self._meshtastic_update_running = False
             except Exception:
                 pass
+        bond_thread = getattr(self, "_bluetooth_bond_thread", None)
+        if (bond_thread is not None
+                and bond_thread is not threading.current_thread()):
+            # Reconciliation uses the restricted daemon socket.  Let its
+            # bounded control calls finish before deciding whether that
+            # socket can be closed.
+            bond_thread.join(timeout=10.0)
+            if bond_thread.is_alive():
+                watch_stopped = False
+                self._term_add(
+                    "[BLE] Shared phone reconciliation did not stop; "
+                    "preserving the Meshtastic socket", raw=True)
+            else:
+                self._bluetooth_bond_thread = None
         if self.serial and self.serial.is_open:
             try:
                 self.serial.send_command("stop")
@@ -10473,13 +10851,17 @@ class WatchDogsGame(OtaMixin):
                         target = (self._mc_dm_target.get("address")
                                   or self._mc_dm_target.get("id", "").removeprefix(
                                       "meshtastic:"))
-                        sent = self._meshtastic.send_text(
+                        correlation = self._queue_meshtastic_text(
                             text, target, self._mesh_active_channel_index())
                         tgt = self._mc_dm_target["name"]
+                        index = len(self._mc_log)
                         self._mc_log.append((
                             f"\x11 [DM\u2192{tgt}] {text}",
-                            C_WARNING if sent else C_ERROR,
-                            ts if sent else f"{ts} NOT SENT"))
+                            C_WARNING if correlation else C_ERROR,
+                            (f"{ts} QUEUED" if correlation else
+                             f"{ts} NOT SENT")))
+                        if correlation:
+                            self._mt_tx_rows[str(correlation)] = index
                     else:
                         # Encrypted MeshCore DM
                         pk_hex = self._mc_dm_target.get("pubkey", "")
@@ -10506,12 +10888,16 @@ class WatchDogsGame(OtaMixin):
                             "\x10 Select a contact with Ctrl+H before sending",
                             C_WARNING))
                     elif protocol == "meshtastic":
-                        sent = self._meshtastic.send_text(
+                        correlation = self._queue_meshtastic_text(
                             text, channel=self._mesh_active_channel_index())
+                        index = len(self._mc_log)
                         self._mc_log.append((
                             f"\x11 {self._mesh_local_name()}: {text}",
-                            C_WARNING if sent else C_ERROR,
-                            ts if sent else f"{ts} NOT SENT"))
+                            C_WARNING if correlation else C_ERROR,
+                            (f"{ts} QUEUED" if correlation else
+                             f"{ts} NOT SENT")))
+                        if correlation:
+                            self._mt_tx_rows[str(correlation)] = index
                     # MeshCore channel message — AIO LoRa or watch fallback
                     elif self._lora.running and self._lora.mode == "meshcore":
                         dedup_key = self._lora.send_meshcore_message(

@@ -493,6 +493,13 @@ saved to `meshtastic_nodes.csv`, while received text is appended to
 `meshtastic_messages.log`. Node names and channel configuration come from the
 daemon; change them with a Meshtastic client.
 
+WDG 0.9.46 expects `meshtasticd-wdg` `v2.8.0-wdg.7` and its local API 1.1.
+Upgrade the firmware package first, then WDG. Channel/broadcast messages are
+sent with `want_ack=false` and finish at `SENT` once accepted; direct messages
+use `want_ack=true` and progress through the same correlated row to
+`DELIVERED` or `FAILED`. This avoids broadcast retries being mistaken for a
+daemon crash.
+
 When MeshCore is selected, WDG can also expose the AIO SX1262 to
 [MeshMapper](https://github.com/MeshMapper/MeshMapper_Flutter_App) over the
 standard MeshCore Nordic-UART BLE service. Enable it under **LoRa settings >
@@ -505,7 +512,9 @@ remains the only SX1262/SPI owner; the BLE service only queues
 work onto its existing radio thread. The peripheral is opt-in and requires an
 explicit 120-second authenticated pairing window. BlueZ generates a six-digit
 passkey that WDG displays; enter it on the phone to retain that one MeshMapper
-device as paired, bonded, and trusted. See
+device as paired, bonded, and trusted. That random-PIN bond belongs to the
+selected controller and is shared with Meshtastic: switching protocols adopts
+the same exact BlueZ phone instead of creating a second pairing. See
 [MeshCore companion BLE](docs/MESHCORE_BLE.md) for setup, the exact forget
 flow, controller-coexistence rules, and current limitations.
 
@@ -703,6 +712,8 @@ watchdogs/
   lora_manager.py     LoRa SX1262 (sniffer, MeshCore multi-channel)
   meshcore_ble.py     MeshCore companion protocol + BlueZ GATT peripheral
   bluetooth_pairing.py Shared bounded BlueZ pairing-agent arbitration
+  bluetooth_bonds.py  Private controller-keyed shared phone identity registry
+  meshtastic_manager.py Restricted daemon API + correlated delivery state
   flipper_manager.py  Flipper Zero serial CLI (SubGHz, NFC, storage)
   aio_manager.py      AIO v2 GPIO control
   upload_manager.py   WPA-sec upload (pcap) + download (potfile)
@@ -717,6 +728,7 @@ watchdogs/
 | `secrets.conf` | Project root | WPA-sec + WiGLE + WDGoWars API keys |
 | `.watchdogs_meshcore.json` | `~/` | MeshCore node name + channels |
 | `.watchdogs_meshcore_key` | `~/` | Ed25519 keypair for MeshCore signing |
+| `bluetooth_bonds.json` | `~/.watchdogs/` | Non-secret controller-keyed phone identity metadata (`0700` directory, `0600` file) |
 | `loot_db.json` | `loot/` | Aggregate stats, XP, badges |
 | `.wpasec_uploads.json` | `loot/` | SHA-256 receipts for per-account WPA-sec acceptance and global permanent capture rejection |
 | `last_run.log` | `~/.watchdogs/` | Game log (rotated to `previous_run.log`) |
@@ -730,8 +742,9 @@ The game writes a full log to `~/.watchdogs/last_run.log` on every launch
   (OS, hardware model, Python version, detected USB serial devices,
   game version, display environment)
 - All log messages from game subsystems (serial, GPS, LoRa, plugins)
-- Full Python tracebacks for any unhandled exception, captured before
-  the process dies
+- Full Python tracebacks for unhandled main-thread and worker-thread exceptions
+- Python fatal-signal diagnostics when the runtime can capture them, plus an
+  explicit clean/unclean game-exit marker
 
 ### Reporting a bug
 
@@ -793,7 +806,10 @@ Choose **Open authenticated pairing** in WDG, then connect to
 `MeshCore-<node name>` from inside MeshMapper before the 120-second window
 closes. Enter the six-digit passkey shown by WDG when the phone asks. Do not
 pre-pair from the generic Bluetooth settings screen. WDG retains one phone;
-use **Forget paired phone** before bonding a replacement.
+use **Forget paired phone** before bonding a replacement. If Meshtastic is
+configured for the same controller, it adopts this exact random-PIN bond. WDG
+requires the BlueZ device to be paired, bonded, and trusted; it never stores
+the passkey or link key itself.
 
 If WDG reports **No BlueZ adapter found** while `bluetoothctl list` still shows
 an `hciX` controller, install WDG 0.9.45 or newer. That release discovers UART
@@ -817,6 +833,12 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
 ls -l /run/meshtasticd/wdg.sock
 ```
+WDG 0.9.46's delivery and shared-phone workflow requires local API 1.1 from
+firmware `v2.8.0-wdg.7`. Update/adopt that firmware package first, confirm the
+fork socket, and then update WDG. If a MeshCore forget reports pending cleanup,
+start Meshtastic once so API 1.1 can clear only the matching stopped-daemon
+identity before opening a replacement pairing window.
+
 `AUTO` prefers the restricted fork socket. `LEGACY_TCP` is the explicit stock
 daemon fallback. Setup installs the helper and policy but leaves package
 installation to an explicit action after a compatible release exists. The

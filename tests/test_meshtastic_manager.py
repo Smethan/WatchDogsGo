@@ -12,8 +12,11 @@ import pytest
 
 from watchdogs.meshtastic_manager import (
     MeshtasticManager,
+    WDG_MAX_COMMANDS,
+    WDG_MAX_EVENTS,
     WDG_MAX_PACKET,
     WDG_PROTOCOL_MAJOR,
+    WDG_PROTOCOL_MINOR,
     _ControlWaiter,
     _ServiceSnapshot,
 )
@@ -104,14 +107,21 @@ class FakeWdgDaemon:
     """
 
     def __init__(self, path, *, protocol_version=WDG_PROTOCOL_MAJOR,
-                 minimal=False):
+                 api_minor=WDG_PROTOCOL_MINOR, minimal=False):
         self.path = str(path)
         self.protocol_version = protocol_version
+        self.api_minor = api_minor
         self.minimal = minimal
         self.commands = []
         self.connections = 0
         self.fail_commands = {}
         self.lease_granted = True
+        self.phone_bond = {
+            "present": False, "address": "", "name": "",
+            "controller": "", "paired": False, "bonded": False,
+            "trusted": False, "connected": False,
+            "service_authorized": False, "authentication": "unknown",
+        }
         self._client = None
         self._client_lock = threading.Lock()
 
@@ -180,12 +190,20 @@ class FakeWdgDaemon:
                 "send_text", "request_node_info", "set_phone_ble",
                 "open_pairing", "forget_phone", "ble_scan_lease_acquire",
                 "ble_scan_lease_release", "pairing_agent_lease_acquire",
-                "pairing_agent_lease_release", "retry_shared_adapter"]
-            self._reply(client, request, {
+                "pairing_agent_lease_release", "retry_shared_adapter",
+                "set_phone_pairing_mode", "adopt_phone_bond",
+                "clear_phone_identity", "phone_bond", "send_status"]
+            body = {
                 "protocol_version": self.protocol_version,
                 "max_packet_bytes": WDG_MAX_PACKET,
                 "capabilities": capabilities,
-            })
+            }
+            if self.api_minor is not None:
+                body["api"] = {
+                    "major": self.protocol_version,
+                    "minor": self.api_minor,
+                }
+            self._reply(client, request, body)
         elif name == "get_status":
             if self.minimal:
                 self._reply(client, request, {
@@ -202,6 +220,7 @@ class FakeWdgDaemon:
                 "phone_connected": False,
                 "radio_status": "ready",
                 "full_client_owner": "none",
+                "phone_bond": dict(self.phone_bond),
             })
         elif name == "snapshot_nodes" and not self.minimal:
             self._reply(client, request)
@@ -220,6 +239,27 @@ class FakeWdgDaemon:
         elif name == "request_node_info":
             self._reply(client, request, {
                 "message": "Zero-hop NodeInfo request sent"})
+        elif name == "set_phone_pairing_mode":
+            self._reply(client, request, {"mode": request["body"]["mode"]})
+        elif name == "adopt_phone_bond":
+            self.phone_bond = {
+                "present": True,
+                "address": request["body"]["address"],
+                "name": "Mapper",
+                "controller": request["body"]["controller"],
+                "paired": True, "bonded": True, "trusted": True,
+                "connected": False, "service_authorized": True,
+                "authentication": "random_pin",
+            }
+            self._reply(client, request, {"phone_bond": self.phone_bond})
+        elif name == "clear_phone_identity":
+            self.phone_bond = {
+                **self.phone_bond, "present": False, "address": "",
+                "name": "", "paired": False, "bonded": False,
+                "trusted": False, "connected": False,
+                "service_authorized": False, "authentication": "unknown",
+            }
+            self._reply(client, request, {"phone_bond": self.phone_bond})
         elif name == "ble_scan_lease_acquire":
             self._reply(client, request, {
                 "granted": self.lease_granted,
@@ -318,6 +358,63 @@ def test_send_and_zero_hop_discovery_use_official_client_api():
         b"", destinationId="^all", portNum=4,
         wantAck=False, wantResponse=True, hopLimit=0)
     mt.close()
+
+
+def test_legacy_send_returns_correlation_and_only_direct_requests_ack():
+    mt, _pub = manager()
+    mt.start()
+    wait_for(lambda: mt.connected)
+    iface = FakeInterface.instances[-1]
+
+    direct = mt.send_text("direct", "!00000002", channel=1)
+    broadcast = mt.send_text("channel", None, channel=2)
+
+    assert isinstance(direct, str) and direct.startswith("mt-1-")
+    assert isinstance(broadcast, str) and broadcast.startswith("mt-1-")
+    wait_for(lambda: iface.sendText.call_count == 2)
+    assert iface.sendText.call_args_list == [
+        (("direct",), {
+            "channelIndex": 1, "wantAck": True,
+            "destinationId": "!00000002",
+        }),
+        (("channel",), {"channelIndex": 2, "wantAck": False}),
+    ]
+
+    statuses = [value for kind, value in mt.poll_events()
+                if kind == "outbound_status"]
+    by_correlation = {}
+    for value in statuses:
+        by_correlation.setdefault(value["correlation_id"], []).append(value)
+    assert [item["state"] for item in by_correlation[direct]] == [
+        "queued", "sent"]
+    assert by_correlation[direct][-1]["terminal"] is False
+    assert [item["state"] for item in by_correlation[broadcast]] == [
+        "queued", "sent"]
+    assert by_correlation[broadcast][-1]["terminal"] is True
+    mt.close()
+
+
+def test_legacy_send_race_after_disconnect_emits_terminal_failure():
+    mt = MeshtasticManager(backend_mode="legacy_tcp")
+    data = {
+        "correlation_id": "mt-1-1",
+        "connection_epoch": 1,
+        "text": "queued before disconnect",
+        "destination": None,
+        "channel": 0,
+        "want_ack": False,
+        "direct": False,
+    }
+
+    mt._send_now(data)
+
+    failed = next(
+        value for kind, value in mt.poll_events()
+        if kind == "outbound_status")
+    assert failed["correlation_id"] == "mt-1-1"
+    assert failed["state"] == "failed"
+    assert failed["terminal"] is True
+    assert failed["detail"] == "Meshtastic is not connected"
 
 
 def test_manager_starts_service_only_when_tcp_is_unavailable():
@@ -480,6 +577,8 @@ def test_fork_socket_negotiates_snapshots_and_normalizes_commands(tmp_path):
         wait_for(lambda: mt.connected and "!00000002" in mt.nodes)
 
         assert mt.active_backend == "fork_socket"
+        assert mt.api_minor == 1
+        assert "send_status" in mt.capabilities
         assert mt.local_node_id == "!00000001"
         assert mt.local_name == "WDG"
         assert mt.channels == [{"index": 0, "name": "LongFast"}]
@@ -524,6 +623,155 @@ def test_fork_socket_negotiates_snapshots_and_normalizes_commands(tmp_path):
         daemon.close()
 
 
+def test_old_minor_zero_daemon_remains_compatible(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock", api_minor=None)
+    daemon.minimal = True
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+
+        assert mt.api_minor == 0
+        assert mt.connection_epoch == 1
+        assert not mt.set_phone_pairing_mode(True)
+        assert not mt.adopt_phone_bond(
+            "11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF")
+        assert not mt.clear_phone_identity("11:22:33:44:55:66")
+        assert not any(command["name"] in {
+            "set_phone_pairing_mode", "adopt_phone_bond",
+            "clear_phone_identity",
+        } for command in daemon.commands)
+        assert mt.connected
+    finally:
+        mt.close()
+        daemon.close()
+
+
+@pytest.mark.parametrize(("body", "expected"), (
+    ({"protocol_version": 1, "api": {"major": 1, "minor": 1}}, (1, 1)),
+    ({"protocol_version": 1, "api_major": 1, "api_minor": 1}, (1, 1)),
+    ({"protocol_version": 1, "api_version": "1.1"}, (1, 1)),
+    ({"protocol_version": 1}, (1, 0)),
+))
+def test_api_minor_negotiation_accepts_canonical_and_transition_shapes(
+        body, expected):
+    assert MeshtasticManager._api_version(body) == expected
+
+
+def test_fork_send_status_preserves_correlation_and_terminal_state(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+        correlation = mt.send_text("direct", "!00000002", channel=1)
+        assert isinstance(correlation, str)
+        wait_for(lambda: any(command["name"] == "send_text"
+                             for command in daemon.commands))
+        send = next(command for command in daemon.commands
+                    if command["name"] == "send_text")
+        assert send["body"]["want_ack"] is True
+
+        daemon.emit("send_status", {
+            "request_id": send["request_id"],
+            "packet_id": 123,
+            "destination": "!00000002",
+            "state": "delivered",
+            "message": "routing acknowledgement received",
+        })
+        wait_for(lambda: any(
+            kind == "outbound_status"
+            and value["correlation_id"] == correlation
+            and value["state"] == "delivered"
+            for kind, value in mt.queue.queue))
+
+        states = [value for kind, value in mt.poll_events()
+                  if kind == "outbound_status"
+                  and value["correlation_id"] == correlation]
+        assert [value["state"] for value in states] == [
+            "queued", "sent", "delivered"]
+        assert states[1]["terminal"] is False
+        assert states[2]["terminal"] is True
+        assert states[2]["packet_id"] == 123
+    finally:
+        mt.close()
+        daemon.close()
+
+
+def test_fork_broadcast_send_is_terminal_when_accepted(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+        correlation = mt.send_text("channel", None, channel=2)
+        wait_for(lambda: any(command["name"] == "send_text"
+                             for command in daemon.commands))
+        send = next(command for command in daemon.commands
+                    if command["name"] == "send_text")
+        assert send["body"]["want_ack"] is False
+        wait_for(lambda: any(
+            kind == "outbound_status"
+            and value["correlation_id"] == correlation
+            and value["state"] == "sent"
+            for kind, value in mt.queue.queue))
+        sent = next(value for kind, value in mt.poll_events()
+                    if kind == "outbound_status"
+                    and value["correlation_id"] == correlation
+                    and value["state"] == "sent")
+        assert sent["terminal"] is True
+        assert mt.close()
+        assert not any(
+            kind == "outbound_status"
+            and value["correlation_id"] == correlation
+            and value["state"] == "failed"
+            for kind, value in mt.poll_events())
+    finally:
+        mt.close()
+        daemon.close()
+
+
+def test_fork_send_failure_is_normalized_with_error_detail(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+        correlation = mt.send_text("direct", "!00000002")
+        wait_for(lambda: any(command["name"] == "send_text"
+                             for command in daemon.commands))
+        send = next(command for command in daemon.commands
+                    if command["name"] == "send_text")
+        daemon.emit("send_status", {
+            "request_id": send["request_id"], "packet_id": 123,
+            "destination": "!00000002", "state": "failed",
+            "error": 3, "error_name": "NO_ROUTE",
+            "detail": "No route to destination",
+        })
+        wait_for(lambda: any(
+            kind == "outbound_status" and value["state"] == "failed"
+            for kind, value in mt.queue.queue))
+        failed = next(value for kind, value in mt.poll_events()
+                      if kind == "outbound_status"
+                      and value["correlation_id"] == correlation
+                      and value["state"] == "failed")
+        assert failed["terminal"] is True
+        assert failed["error"] == 3
+        assert failed["error_name"] == "NO_ROUTE"
+        assert failed["detail"] == "No route to destination"
+    finally:
+        mt.close()
+        daemon.close()
+
+
 def test_socket_overflow_requests_one_fresh_snapshot(tmp_path):
     daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
     mt = MeshtasticManager(
@@ -541,6 +789,78 @@ def test_socket_overflow_requests_one_fresh_snapshot(tmp_path):
     finally:
         mt.close()
         daemon.close()
+
+
+def test_malformed_event_isolated_without_reconnecting_socket(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+        epoch = mt.connection_epoch
+        daemon.emit("message", "not-an-object")
+        daemon.emit("message", {
+            "text": "still alive", "sender_id": "!00000002",
+            "channel": 0,
+        })
+        wait_for(lambda: any(
+            kind == "message" and value["text"] == "still alive"
+            for kind, value in mt.queue.queue))
+
+        assert mt.connected
+        assert mt.connection_epoch == epoch
+        assert daemon.connections == 1
+        assert any("Ignored malformed Meshtastic event" in str(value)
+                   for kind, value in mt.poll_events() if kind == "error")
+    finally:
+        mt.close()
+        daemon.close()
+
+
+def test_bounded_event_queue_preserves_message_and_reports_drop():
+    mt = MeshtasticManager()
+    for index in range(WDG_MAX_EVENTS):
+        mt._emit("status", f"status-{index}")
+
+    mt._emit("message", {"text": "critical"})
+
+    assert mt.queue.qsize() == WDG_MAX_EVENTS
+    assert any(kind == "message" for kind, _value in mt.queue.queue)
+    assert mt.event_drop_count == 1
+    events = mt.poll_events()
+    assert any(kind == "error" and "event queue overflow" in value
+               for kind, value in events)
+
+
+def test_bounded_command_queue_rejects_send_without_correlation():
+    mt = MeshtasticManager()
+    mt.connected = True
+    for _index in range(WDG_MAX_COMMANDS):
+        mt._commands.put_nowait(("discover", {"connection_epoch": 0}))
+
+    assert mt.send_text("cannot queue") is None
+    assert "command queue is full" in mt.last_error
+
+
+def test_worker_boundary_logs_unexpected_exception():
+    mt = MeshtasticManager()
+    mt.running = True
+    mt._thread = threading.current_thread()
+    mt._select_backend = Mock(side_effect=RuntimeError("unexpected failure"))
+
+    mt._run()
+
+    assert "client worker failed: unexpected failure" in mt.last_error
+    assert not mt.running
+
+
+def test_backend_switch_broken_pipe_is_classified_as_intentional():
+    mt = MeshtasticManager()
+    mt._closing = True
+    assert mt._socket_failure_is_intentional(BrokenPipeError())
+    assert not mt._socket_failure_is_intentional(OSError("unrelated"))
 
 
 def test_minimal_firmware_skeleton_status_keeps_connection_alive(tmp_path):
@@ -616,6 +936,81 @@ def test_socket_control_commands_have_correlated_results_and_status(tmp_path):
         mt.close()
         daemon.close()
     assert mt.full_client_owner == "unknown"
+
+
+def test_phone_bond_controls_status_and_events_are_normalized(tmp_path):
+    daemon = FakeWdgDaemon(tmp_path / "wdg.sock")
+    mt = MeshtasticManager(
+        backend_mode="fork_socket", socket_path=daemon.path,
+        socket_probe=lambda _path: True, socket_connector=daemon.connect)
+    phone = "11:22:33:44:55:66"
+    controller = "AA:BB:CC:DD:EE:FF"
+    try:
+        assert mt.start()
+        wait_for(lambda: mt.connected)
+        assert not mt.phone_bond_present
+
+        assert mt.set_phone_pairing_mode(random_pin=True)
+        assert mt.phone_pairing_mode == "random_pin"
+        assert mt.adopt_phone_bond(phone.lower(), controller.lower())
+        assert mt.phone_bond_present
+        assert mt.phone_bond_address == phone
+        assert mt.phone_bond_name == "Mapper"
+        assert mt.phone_bond_controller == controller
+        assert mt.phone_service_authorized
+        assert mt.phone_bond_paired
+        assert mt.phone_bond_bonded
+        assert mt.phone_bond_trusted
+        assert not mt.phone_bond_connected
+        assert mt.phone_bond_authentication == "random_pin"
+
+        commands = {command["name"]: command for command in daemon.commands}
+        assert commands["set_phone_pairing_mode"]["body"] == {
+            "mode": "random_pin"}
+        assert commands["adopt_phone_bond"]["body"] == {
+            "address": phone, "controller": controller}
+
+        daemon.emit("phone_bonded", {
+            **daemon.phone_bond, "connected": True,
+            "message": "phone bond adopted",
+        })
+        wait_for(lambda: mt.phone_bond["connected"] is True)
+        assert any(kind == "phone_bond" and value["present"]
+                   for kind, value in mt.poll_events())
+
+        # Firmware API 1.1 publishes the complete snapshot as phone_bond;
+        # retain aliases for older development builds as well.
+        daemon.emit("phone_bond", {
+            "identity_present": True,
+            "address": phone,
+            "name": "Mapper",
+            "controller": controller,
+            "paired": True,
+            "bonded": True,
+            "trusted": True,
+            "connected": False,
+            "authorized": True,
+            "authentication": "random_pin",
+        })
+        wait_for(lambda: mt.phone_bond["connected"] is False)
+        assert mt.phone_bond_present
+        assert mt.phone_service_authorized
+
+        assert mt.clear_phone_identity(phone.lower())
+        assert not mt.phone_bond_present
+        clear = next(command for command in daemon.commands
+                     if command["name"] == "clear_phone_identity")
+        assert clear["body"] == {"expected_address": phone}
+
+        daemon.emit("phone_bond_cleared", {
+            **daemon.phone_bond, "expected_address": phone,
+        })
+        wait_for(lambda: any(
+            kind == "phone_bond" and not value["present"]
+            for kind, value in mt.queue.queue))
+    finally:
+        mt.close()
+        daemon.close()
 
 
 def test_scan_lease_on_stopped_manager_connects_without_mutex_timeout(tmp_path):
@@ -1446,11 +1841,14 @@ def test_socket_reconnects_and_resnapshots_without_tcp_fallback(tmp_path):
     try:
         mt.start()
         wait_for(lambda: mt.connected and daemon.connections == 1)
+        first_epoch = mt.connection_epoch
         daemon.disconnect()
         wait_for(lambda: daemon.connections >= 2 and mt.connected, timeout=3)
         wait_for(lambda: sum(c["name"] == "snapshot_nodes"
                              for c in daemon.commands) >= 2)
         tcp_loader.assert_not_called()
+        assert first_epoch == 1
+        assert mt.connection_epoch == 2
         assert sum(kind == "connected" for kind, _ in mt.poll_events()) >= 2
     finally:
         mt.close()

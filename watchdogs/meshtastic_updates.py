@@ -38,7 +38,7 @@ MESHTASTIC_CACHE_ROOT = Path("/var/cache/watchdogs/meshtasticd-wdg")
 MESHTASTIC_PACKAGE_NAME = "meshtasticd-wdg"
 MESHTASTIC_ARCHITECTURE = "arm64"
 MESHTASTIC_WDG_API_MAJOR = 1
-MESHTASTIC_WDG_API_MINOR = 0
+MESHTASTIC_WDG_API_MINOR = 1
 DPKG_DEB = "/usr/bin/dpkg-deb"
 GETCONF = "/usr/bin/getconf"
 

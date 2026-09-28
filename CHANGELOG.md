@@ -10,6 +10,39 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.46] — 2026-09-28
+
+### Added
+
+- Add Meshtastic WDG local API 1.1 support, including correlated outbound
+  `queued`, `sent`, `delivered`, and `failed` state, plus authenticated phone
+  bond inspection, adoption, cleanup, and random-PIN policy commands. This
+  release must be paired with `meshtastic-firmware` `v2.8.0-wdg.7`; update the
+  firmware package before WDG.
+- Add one private, controller-MAC-keyed phone registry shared by MeshCore and
+  Meshtastic at `~/.watchdogs/bluetooth_bonds.json`. The registry stores only
+  non-secret identity metadata, uses directory/file modes `0700`/`0600`, and
+  never stores a passkey or BlueZ link key.
+- Add fatal-signal and unhandled-thread diagnostics to the existing
+  `last_run.log`/`previous_run.log` rotation, plus an explicit clean or unclean
+  session-exit marker.
+
+### Changed
+
+- Send Meshtastic channel/broadcast text with `want_ack=false`; direct text
+  alone requests an acknowledgement with `want_ack=true`. Broadcast sends
+  become terminal when accepted by the daemon, while direct sends remain
+  pending for the firmware's delivered/failed routing result.
+- Reuse the same authenticated random-PIN BlueZ bond when switching between
+  MeshCore and Meshtastic on one controller. Legacy MeshCore address/name
+  settings migrate only after the exact BlueZ device is independently verified
+  as paired, bonded, and trusted.
+- Make phone replacement a shared action. Meshtastic adopts an existing exact
+  controller bond; its forget flow removes the daemon identity, exact BlueZ
+  device, and WDG metadata. A MeshCore-side forget leaves a cleanup tombstone
+  until the next Meshtastic socket connection clears any stopped-daemon
+  identity before a replacement can pair.
+
 ### Fixed
 
 - Accept BlueZ's documented LE privacy transition from a temporary connection
@@ -22,6 +55,27 @@ minor versions.
   ten seconds, and unregisters only objects BlueZ confirmed, avoiding the
   `client_ready_cb() No object received` startup failure and misleading
   peripheral-cleanup uncertainty seen in 0.9.45.
+- Stop broadcast/channel messages from looking like daemon crashes while they
+  retry for an acknowledgement that no broadcast peer is expected to return.
+  The UI now updates the original row through its correlation ID instead of
+  adding ambiguous send-result rows.
+
+### Security
+
+- Fail closed unless an adopted or migrated phone is the exact `Device1` on
+  the selected controller and BlueZ reports all three of `Paired`, `Bonded`,
+  and `Trusted`. Firmware persists the authenticated controller and random-PIN
+  provenance with its retained identity; legacy address-only identities and
+  records from another controller remain visible for explicit reconciliation
+  but cannot authorize the Meshtastic GATT service. WDG opens `~/.watchdogs`
+  without following links and hardens
+  an owner-correct legacy `0755` directory to `0700` through its verified file
+  descriptor. Symlinked or wrong-owner paths, corrupt data, and an existing
+  registry file without exact mode `0600` still fail closed.
+
+Automated coverage exercises the API, delivery-state, shared-bond, migration,
+cleanup, UI, and diagnostic paths. Per the requested scope, this release was
+not tested on a physical uConsole, SX1262, or phone/controller combination.
 
 ## [0.9.45] — 2026-09-27
 

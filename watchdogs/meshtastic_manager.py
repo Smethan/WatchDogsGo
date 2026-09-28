@@ -10,6 +10,7 @@ for both transports so the Pyxel UI never has to know which daemon is running.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
@@ -18,16 +19,22 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable
+
+
+log = logging.getLogger(__name__)
 
 
 MESHTASTIC_HOST = "127.0.0.1"
 MESHTASTIC_PORT = 4403
 WDG_SOCKET_PATH = "/run/meshtasticd/wdg.sock"
 WDG_PROTOCOL_MAJOR = 1
-WDG_PROTOCOL_MINOR = 0
+WDG_PROTOCOL_MINOR = 1
 WDG_MAX_PACKET = 64 * 1024
+WDG_MAX_COMMANDS = 128
+WDG_MAX_EVENTS = 512
+WDG_MAX_PENDING = 256
 WDG_SERVICE = "meshtasticd-wdg.service"
 LEGACY_SERVICE = "meshtasticd.service"
 BACKEND_MODES = ("auto", "fork_socket", "legacy_tcp")
@@ -250,7 +257,7 @@ class MeshtasticManager:
         self.backend_mode = backend_mode
         self.socket_path = socket_path
         self.active_backend = ""
-        self.queue: Queue = Queue()
+        self.queue: Queue = Queue(maxsize=WDG_MAX_EVENTS)
         self.running = False
         self.connected = False
         self.nodes: dict[str, dict] = {}
@@ -265,6 +272,9 @@ class MeshtasticManager:
         self.host_ble_pause_reason = ""
         self.radio_status = "unknown"
         self.full_client_owner = "unknown"
+        self.phone_bond: dict[str, Any] = self._empty_phone_bond()
+        self.phone_pairing_mode = "unknown"
+        self.event_drop_count = 0
         # Service lifetime and client transport lifetime are deliberately
         # distinct.  A daemon can remain active while its local socket is
         # restarting, so the UI must not infer systemd state from connected.
@@ -285,7 +295,7 @@ class MeshtasticManager:
         self._pub = None
         self._portnums = None
         self._broadcast_addr = "^all"
-        self._commands: Queue = Queue()
+        self._commands: Queue = Queue(maxsize=WDG_MAX_COMMANDS)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._fork_connected_event = threading.Event()
@@ -301,6 +311,16 @@ class MeshtasticManager:
         self._snapshot_seen: set[str] = set()
         self._fork_identified = False
         self._socket_capabilities: set[str] = set()
+        self._socket_api_minor = 0
+        self._connection_epoch = 0
+        self._correlation_counter = 0
+        self._outbound_by_request: dict[str, dict] = {}
+        self._outbound_by_packet: dict[str, dict] = {}
+        self._outbound_contexts: dict[str, dict] = {}
+        self._outbound_states: dict[str, str] = {}
+        self._outbound_terminal: set[str] = set()
+        self._event_overflow_pending = False
+        self._event_overflow_lock = threading.Lock()
         self._phone_ble_enabled = phone_ble_enabled
         self._phone_ble_adapter = str(phone_ble_adapter or "auto")
         self.phone_ble_enabled_applied: bool | None = None
@@ -322,7 +342,48 @@ class MeshtasticManager:
     def _emit(self, kind: str, value: Any) -> None:
         if kind == "error":
             self.last_error = str(value)
-        self.queue.put((kind, value))
+        item = (kind, value)
+        try:
+            self.queue.put_nowait(item)
+            return
+        except Full:
+            pass
+
+        # Messages and delivery-state transitions must survive ordinary UI
+        # status/node churn whenever there is anything non-critical to evict.
+        critical = kind in {"message", "outbound_status", "phone_bond"}
+        replaced = False
+        if critical:
+            with self.queue.mutex:
+                for index, old in enumerate(self.queue.queue):
+                    if old[0] in {"node", "status", "connected",
+                                  "disconnected", "discovery"}:
+                        del self.queue.queue[index]
+                        self.queue.queue.append(item)
+                        self.queue.not_empty.notify()
+                        self.queue.not_full.notify()
+                        replaced = True
+                        break
+        with self._event_overflow_lock:
+            self.event_drop_count += 1
+            self._event_overflow_pending = True
+        if replaced:
+            return
+
+    @staticmethod
+    def _empty_phone_bond() -> dict[str, Any]:
+        return {
+            "present": False,
+            "address": "",
+            "name": "",
+            "controller": "",
+            "paired": False,
+            "bonded": False,
+            "trusted": False,
+            "connected": False,
+            "service_authorized": False,
+            "authentication": "unknown",
+        }
 
     def _operation_blocked(self) -> bool:
         if self._operation_guard is None:
@@ -337,6 +398,60 @@ class MeshtasticManager:
     def backend(self) -> str:
         """The active backend, or configured backend before startup."""
         return self.active_backend or self.backend_mode
+
+    @property
+    def connection_epoch(self) -> int:
+        """Monotonic local generation for the currently connected client."""
+        return self._connection_epoch
+
+    @property
+    def api_minor(self) -> int:
+        """Negotiated fork API minor, or zero for legacy/older daemons."""
+        return self._socket_api_minor
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return frozenset(self._socket_capabilities)
+
+    @property
+    def phone_bond_present(self) -> bool:
+        return bool(self.phone_bond.get("present"))
+
+    @property
+    def phone_bond_address(self) -> str:
+        return str(self.phone_bond.get("address") or "")
+
+    @property
+    def phone_bond_name(self) -> str:
+        return str(self.phone_bond.get("name") or "")
+
+    @property
+    def phone_bond_controller(self) -> str:
+        return str(self.phone_bond.get("controller") or "")
+
+    @property
+    def phone_service_authorized(self) -> bool:
+        return bool(self.phone_bond.get("service_authorized"))
+
+    @property
+    def phone_bond_paired(self) -> bool:
+        return bool(self.phone_bond.get("paired"))
+
+    @property
+    def phone_bond_bonded(self) -> bool:
+        return bool(self.phone_bond.get("bonded"))
+
+    @property
+    def phone_bond_trusted(self) -> bool:
+        return bool(self.phone_bond.get("trusted"))
+
+    @property
+    def phone_bond_connected(self) -> bool:
+        return bool(self.phone_bond.get("connected"))
+
+    @property
+    def phone_bond_authentication(self) -> str:
+        return str(self.phone_bond.get("authentication") or "unknown")
 
     @property
     def ble_scan_lease_active(self) -> bool:
@@ -596,7 +711,12 @@ class MeshtasticManager:
                 self.release_pairing_agent_lease()
             self._stop_event.set()
             if self.running or (self._thread and self._thread.is_alive()):
-                self._commands.put(("stop", None))
+                try:
+                    self._commands.put_nowait(("stop", None))
+                except Full:
+                    # The stop event and transport close below are the primary
+                    # barrier; a saturated command queue must not block close.
+                    pass
             interface = self._interface
             if interface is not None:
                 try:
@@ -683,8 +803,11 @@ class MeshtasticManager:
         self.full_client_owner = "unknown"
         self.host_ble_degraded = False
         self.host_ble_pause_reason = ""
+        self.phone_bond = self._empty_phone_bond()
+        self.phone_pairing_mode = "unknown"
         self._phone_scan_disconnects.clear()
         self._socket_capabilities.clear()
+        self._socket_api_minor = 0
         self._reset_applied_phone_ble()
         self._reset_local_leases()
         self._snapshot_pending = False
@@ -904,22 +1027,62 @@ class MeshtasticManager:
                 return False
         return True
 
-    def send_text(self, text: str, destination: str | int | None = None,
-                  channel: int = 0) -> bool:
-        if not self.connected or not text.strip():
+    def _enqueue_command(self, command: str, data: Any) -> bool:
+        try:
+            self._commands.put_nowait((command, data))
+            return True
+        except Full:
+            self._emit("error", "Meshtastic command queue is full")
             return False
-        self._commands.put(("send", {
-            "text": text.strip(), "destination": destination,
+
+    def _next_correlation_id(self) -> str:
+        with self._lock:
+            self._correlation_counter += 1
+            return (f"mt-{self._connection_epoch}-"
+                    f"{self._correlation_counter}")
+
+    @staticmethod
+    def _is_direct_destination(destination: str | int | None) -> bool:
+        if destination is None:
+            return False
+        value = str(destination).strip().lower()
+        return value not in {
+            "", "^all", "broadcast", "0xffffffff", "4294967295",
+            "!ffffffff",
+        }
+
+    def send_text(self, text: str, destination: str | int | None = None,
+                  channel: int = 0) -> str | None:
+        if not self.connected or not text.strip():
+            return None
+        correlation_id = self._next_correlation_id()
+        direct = self._is_direct_destination(destination)
+        value = {
+            "correlation_id": correlation_id,
+            "connection_epoch": self._connection_epoch,
+            "text": text.strip(),
+            "destination": destination,
             "channel": max(0, int(channel)),
-        }))
-        return True
+            "want_ack": direct,
+            "direct": direct,
+        }
+        if not self._enqueue_command("send", value):
+            return None
+        self._outbound_contexts[correlation_id] = value
+        if len(self._outbound_contexts) > 512:
+            removable = next((key for key in self._outbound_contexts
+                              if key in self._outbound_terminal), None)
+            self._outbound_contexts.pop(
+                removable or next(iter(self._outbound_contexts)), None)
+        self._emit_outbound_status(value, "queued", terminal=False)
+        return correlation_id
 
     def request_discovery(self) -> bool:
         """Ask only directly heard nodes for NodeInfo (zero routed hops)."""
         if not self.connected:
             return False
-        self._commands.put(("discover", None))
-        return True
+        return self._enqueue_command("discover", {
+            "connection_epoch": self._connection_epoch})
 
     def _control_command(self, name: str, body: dict | None = None,
                          *, timeout: float | None = None,
@@ -938,7 +1101,10 @@ class MeshtasticManager:
             float(self._control_timeout if timeout is None else timeout),
         )
         waiter = _ControlWaiter(deadline=self._monotonic() + timeout)
-        self._commands.put(("control", (name, dict(body or {}), waiter)))
+        if not self._enqueue_command(
+                "control", (name, dict(body or {}), waiter)):
+            waiter.resolve(False, "Meshtastic command queue is full")
+            return waiter.result()
         if not waiter.event.wait(timeout):
             timed_out = waiter.timeout(name)
             if timed_out is not None:
@@ -1059,6 +1225,72 @@ class MeshtasticManager:
 
     def forget_phone(self) -> bool:
         ok, _reason, _body = self._control_command("forget_phone")
+        return ok
+
+    def _require_socket_capability(self, capability: str) -> bool:
+        if capability in self._socket_capabilities:
+            return True
+        self._emit(
+            "error",
+            "Connected meshtasticd-wdg does not support " + capability,
+        )
+        return False
+
+    def set_phone_pairing_mode(self, random_pin: bool | str = True) -> bool:
+        """Require the authenticated random-PIN phone pairing policy."""
+        enabled = (str(random_pin).strip().lower() == "random_pin"
+                   if isinstance(random_pin, str) else bool(random_pin))
+        if not enabled:
+            self._emit("error", "Only random_pin phone pairing is supported")
+            return False
+        if not self._require_socket_capability("set_phone_pairing_mode"):
+            return False
+        ok, _reason, body = self._control_command(
+            "set_phone_pairing_mode", {"mode": "random_pin"})
+        if ok:
+            self.phone_pairing_mode = str(
+                body.get("mode") or body.get("authentication")
+                or "random_pin")
+            self.phone_bond["authentication"] = self.phone_pairing_mode
+        return ok
+
+    def adopt_phone_bond(self, address: str, controller: str) -> bool:
+        """Adopt one already-authenticated BlueZ bond into daemon policy."""
+        address = str(address or "").strip().upper()
+        controller = str(controller or "").strip().upper()
+        if not address or not controller:
+            self._emit("error", "Phone and controller addresses are required")
+            return False
+        if not self._require_socket_capability("adopt_phone_bond"):
+            return False
+        ok, _reason, body = self._control_command("adopt_phone_bond", {
+            "address": address,
+            "controller": controller,
+        })
+        if ok:
+            bond = body.get("phone_bond", body)
+            if isinstance(bond, dict) and bond:
+                self._apply_phone_bond(bond)
+        return ok
+
+    def clear_phone_identity(self, expected_address: str) -> bool:
+        """Clear the daemon identity only if the expected phone still owns it."""
+        expected_address = str(expected_address or "").strip().upper()
+        if not expected_address:
+            self._emit("error", "Expected phone address is required")
+            return False
+        if not self._require_socket_capability("clear_phone_identity"):
+            return False
+        ok, _reason, body = self._control_command("clear_phone_identity", {
+            "expected_address": expected_address,
+        })
+        if ok:
+            bond = body.get("phone_bond")
+            if isinstance(bond, dict):
+                self._apply_phone_bond(bond)
+            else:
+                self.phone_bond = self._empty_phone_bond()
+                self.phone_pairing_mode = "unknown"
         return ok
 
     def acquire_ble_scan_lease(
@@ -1254,7 +1486,17 @@ class MeshtasticManager:
             try:
                 events.append(self.queue.get_nowait())
             except Empty:
-                return events
+                break
+        with self._event_overflow_lock:
+            overflow = self._event_overflow_pending
+            dropped = self.event_drop_count
+            self._event_overflow_pending = False
+        if overflow:
+            text = ("Meshtastic local event queue overflow; "
+                    f"{dropped} event(s) dropped")
+            self.last_error = text
+            events.append(("error", text))
+        return events
 
     def _run_service(self, action: str, service: str):
         return self._service_runner(
@@ -1835,6 +2077,13 @@ class MeshtasticManager:
                         or self._stop_event.is_set()):
                     return
                 self._run_legacy_backend()
+        except Exception as exc:
+            if not self._stop_event.is_set() and not self._closing:
+                log.exception("Meshtastic client worker failed")
+                self._emit(
+                    "error",
+                    "Meshtastic client worker failed: " + str(exc)[:160],
+                )
         finally:
             self.connected = False
             self._connected_event.clear()
@@ -1868,6 +2117,7 @@ class MeshtasticManager:
                 return
 
             self.connected = True
+            self._connection_epoch += 1
             self._connected_event.set()
             self._refresh_identity_and_channels()
             self._snapshot_nodes(cached=True)
@@ -1875,6 +2125,7 @@ class MeshtasticManager:
                 "node_id": self.local_node_id,
                 "name": self.local_name,
                 "channels": list(self.channels),
+                "connection_epoch": self._connection_epoch,
             })
 
             while not self._stop_event.is_set():
@@ -1885,14 +2136,21 @@ class MeshtasticManager:
                 if command == "stop":
                     break
                 if command == "send":
-                    self._send_now(data)
+                    if data.get("connection_epoch") == self._connection_epoch:
+                        self._send_now(data)
+                    else:
+                        self._emit_outbound_status(
+                            data, "failed", terminal=True,
+                            detail="Connection changed before send")
                 elif command == "discover":
-                    self._discover_now()
+                    if data.get("connection_epoch") == self._connection_epoch:
+                        self._discover_now()
         finally:
             interface = self._interface
             self._interface = None
             self.connected = False
             self._connected_event.clear()
+            self._fail_pending_outbound("Meshtastic TCP connection closed")
             self._unsubscribe_all()
             if interface is not None:
                 try:
@@ -1916,6 +2174,7 @@ class MeshtasticManager:
                 self._socket_negotiate(client)
                 if self._stop_event.is_set():
                     break
+                self._connection_epoch += 1
                 self.connected = True
                 self._fork_connected_event.set()
                 self._connected_event.set()
@@ -1926,6 +2185,7 @@ class MeshtasticManager:
                     "name": self.local_name,
                     "channels": list(self.channels),
                     "backend": "fork_socket",
+                    "connection_epoch": self._connection_epoch,
                 })
                 self._request_snapshot(client)
                 self._socket_event_loop(client)
@@ -1934,12 +2194,26 @@ class MeshtasticManager:
                 return
             except (OSError, WdgProtocolError) as exc:
                 if not self._stop_event.is_set():
-                    if was_connected:
+                    if self._socket_failure_is_intentional(exc):
+                        self._emit(
+                            "status",
+                            "Meshtastic socket closed for backend switch",
+                        )
+                    elif was_connected:
                         self._emit("error", "meshtasticd-wdg socket failed: "
                                    + str(exc)[:120])
                     else:
                         self._emit("status", "Waiting for meshtasticd-wdg socket: "
                                    + str(exc)[:100])
+            except Exception as exc:
+                if not self._stop_event.is_set() and not self._closing:
+                    log.exception(
+                        "meshtasticd-wdg socket worker boundary failed")
+                    self._emit(
+                        "error",
+                        "meshtasticd-wdg worker boundary failed: "
+                        + str(exc)[:160],
+                    )
             finally:
                 client = self._socket
                 self._socket = None
@@ -1952,6 +2226,8 @@ class MeshtasticManager:
                     self._emit("disconnected", "meshtasticd-wdg connection lost")
                 self._fail_control_waiters(
                     "meshtasticd-wdg connection closed")
+                self._fail_pending_outbound(
+                    "meshtasticd-wdg connection closed")
                 self._pending_requests.clear()
                 self._reset_socket_session_state()
             if self._stop_event.is_set():
@@ -1960,6 +2236,11 @@ class MeshtasticManager:
             # churn if the daemon is restarting.
             self._stop_event.wait(delay)
             delay = min(2.0, delay * 2.0)
+
+    def _socket_failure_is_intentional(self, exc: BaseException) -> bool:
+        """Classify a local close/switch BrokenPipe without alarming the UI."""
+        return (isinstance(exc, (BrokenPipeError, ConnectionResetError))
+                and (self._stop_event.is_set() or self._closing))
 
     def _next_request_id(self) -> str:
         self._request_counter += 1
@@ -2006,6 +2287,8 @@ class MeshtasticManager:
 
     def _socket_command(self, client: socket.socket, name: str,
                         body: dict | None = None, *, pending: Any = None) -> str:
+        if pending is not None and len(self._pending_requests) >= WDG_MAX_PENDING:
+            raise WdgProtocolError("Too many pending WDG API requests")
         request_id = self._next_request_id()
         self._socket_send(client, {
             "v": WDG_PROTOCOL_MAJOR,
@@ -2030,7 +2313,14 @@ class MeshtasticManager:
         request_id = self._socket_command(client, name, body)
         deadline = self._monotonic() + timeout
         while not self._stop_event.is_set() and self._monotonic() < deadline:
-            message = self._socket_receive(client)
+            try:
+                message = self._socket_receive(client)
+            except WdgVersionError:
+                raise
+            except WdgProtocolError as exc:
+                self._emit("error", "Ignored malformed Meshtastic packet: "
+                           + str(exc)[:160])
+                continue
             if message is None:
                 continue
             if (message.get("type") == "reply"
@@ -2043,24 +2333,77 @@ class MeshtasticManager:
                 if not isinstance(result, dict):
                     raise WdgProtocolError(f"{name} returned a non-object body")
                 return result
-            self._handle_socket_message(client, message)
+            try:
+                self._handle_socket_message(client, message)
+            except WdgVersionError:
+                raise
+            except Exception as exc:
+                self._emit("error", "Ignored malformed Meshtastic event: "
+                           + str(exc)[:160])
         if self._stop_event.is_set():
             raise OSError("Meshtastic socket connection stopped")
         raise OSError(f"Timed out waiting for WDG API {name} reply")
 
     @staticmethod
     def _api_major(body: dict) -> int | None:
-        value: Any = body.get("protocol_version")
+        return MeshtasticManager._api_version(body)[0]
+
+    @staticmethod
+    def _api_version(body: dict) -> tuple[int | None, int]:
+        api = body.get("api")
+        if isinstance(api, dict):
+            major_value: Any = api.get("major")
+            minor_value: Any = api.get("minor", 0)
+            try:
+                major = (int(major_value)
+                         if major_value is not None else None)
+            except (TypeError, ValueError):
+                major = None
+            try:
+                minor = max(0, int(minor_value))
+            except (TypeError, ValueError):
+                minor = 0
+            if major is not None:
+                return major, minor
+
+        # Early API 1.1 development builds exposed scalar fields instead of
+        # the canonical nested object.  Prefer them over wire
+        # protocol_version, whose value remains 1 for every API 1.x revision.
+        if body.get("api_major") is not None:
+            try:
+                major = int(body["api_major"])
+            except (TypeError, ValueError):
+                major = None
+            try:
+                minor = max(0, int(body.get("api_minor", 0)))
+            except (TypeError, ValueError):
+                minor = 0
+            if major is not None:
+                return major, minor
+
+        value: Any = body.get("api_version", body.get("wdg_api"))
         if value is None:
-            value = body.get("api_version", body.get("wdg_api"))
+            value = body.get("protocol_version")
         if isinstance(value, dict):
-            value = value.get("major")
+            major_value = value.get("major")
+            minor_value = value.get("minor", 0)
+            try:
+                return (int(major_value), max(0, int(minor_value)))
+            except (TypeError, ValueError):
+                return None, 0
+        minor = 0
         if isinstance(value, str):
-            value = value.split(".", 1)[0]
+            pieces = value.split(".", 1)
+            value = pieces[0]
+            if len(pieces) == 2:
+                try:
+                    minor = max(0, int(pieces[1]))
+                except ValueError:
+                    minor = 0
         try:
-            return int(value) if value is not None else None
+            return (int(value) if value is not None else None), minor
         except (TypeError, ValueError):
-            return None
+            return None, 0
 
     def _socket_negotiate(self, client: socket.socket) -> None:
         hello = self._socket_request(client, "hello", {
@@ -2069,11 +2412,12 @@ class MeshtasticManager:
             "api": {"major": WDG_PROTOCOL_MAJOR,
                     "minor": WDG_PROTOCOL_MINOR},
         })
-        major = self._api_major(hello)
+        major, minor = self._api_version(hello)
         if major != WDG_PROTOCOL_MAJOR:
             raise WdgVersionError(
                 f"meshtasticd-wdg API major {major!r} is incompatible; "
                 f"expected {WDG_PROTOCOL_MAJOR}")
+        self._socket_api_minor = minor
         maximum = hello.get("max_packet_bytes", WDG_MAX_PACKET)
         try:
             maximum = int(maximum)
@@ -2111,13 +2455,24 @@ class MeshtasticManager:
                 if command == "stop":
                     return
                 if command == "send":
-                    self._socket_command(client, "send_text", {
+                    if data.get("connection_epoch") != self._connection_epoch:
+                        self._emit_outbound_status(
+                            data, "failed", terminal=True,
+                            detail="Connection changed before send")
+                        continue
+                    request_id = self._socket_command(client, "send_text", {
                         "text": data["text"],
                         "destination": data["destination"],
                         "channel": data["channel"],
-                        "want_ack": True,
+                        "want_ack": bool(data["want_ack"]),
                     }, pending=data)
+                    self._outbound_by_request[request_id] = dict(data)
+                    if len(self._outbound_by_request) > 512:
+                        self._outbound_by_request.pop(
+                            next(iter(self._outbound_by_request)))
                 elif command == "discover":
+                    if data.get("connection_epoch") != self._connection_epoch:
+                        continue
                     # The daemon independently enforces zero-hop discovery;
                     # including the value documents and tests the client intent.
                     self._socket_command(client, "request_node_info", {
@@ -2127,9 +2482,22 @@ class MeshtasticManager:
                     name, body, waiter = data
                     self._dispatch_control_command(
                         client, name, body, waiter)
-            message = self._socket_receive(client)
+            try:
+                message = self._socket_receive(client)
+            except WdgVersionError:
+                raise
+            except WdgProtocolError as exc:
+                self._emit("error", "Ignored malformed Meshtastic packet: "
+                           + str(exc)[:160])
+                continue
             if message is not None:
-                self._handle_socket_message(client, message)
+                try:
+                    self._handle_socket_message(client, message)
+                except WdgVersionError:
+                    raise
+                except Exception as exc:
+                    self._emit("error", "Ignored malformed Meshtastic event: "
+                               + str(exc)[:160])
 
     def _dispatch_control_command(
             self, client: socket.socket, name: str, body: dict,
@@ -2143,6 +2511,103 @@ class MeshtasticManager:
             waiter.resolve(False, str(exc))
             return False
         return True
+
+    def _emit_outbound_status(
+            self, context: dict, state: str, *, terminal: bool,
+            detail: str = "", packet_id: Any = None,
+            error: Any = None, error_name: Any = None,
+    ) -> None:
+        state = str(state or "failed").lower()
+        if state not in {"queued", "sent", "delivered", "failed"}:
+            state = "failed"
+        correlation_id = str(
+            context.get("correlation_id")
+            or context.get("request_id")
+            or context.get("packet_id")
+            or "")
+        if not correlation_id:
+            return
+        if correlation_id in self._outbound_terminal:
+            return
+        previous = self._outbound_states.get(correlation_id)
+        if previous in {"delivered", "failed"}:
+            return
+        if previous == state:
+            return
+        if previous == "sent" and state == "queued":
+            return
+        self._outbound_states[correlation_id] = state
+        self._outbound_contexts[correlation_id] = context
+        if terminal:
+            self._outbound_terminal.add(correlation_id)
+        if len(self._outbound_states) > 1024:
+            removable = next((key for key in self._outbound_states
+                              if key in self._outbound_terminal), None)
+            oldest = removable or next(iter(self._outbound_states))
+            self._outbound_states.pop(oldest, None)
+            self._outbound_terminal.discard(oldest)
+            self._outbound_contexts.pop(oldest, None)
+
+        resolved_packet = (packet_id if packet_id is not None
+                           else context.get("packet_id", context.get("id")))
+        if resolved_packet not in (None, ""):
+            context["packet_id"] = resolved_packet
+            self._outbound_by_packet[str(resolved_packet)] = context
+            if len(self._outbound_by_packet) > 512:
+                self._outbound_by_packet.pop(next(iter(self._outbound_by_packet)))
+        payload = {
+            "correlation_id": correlation_id,
+            "connection_epoch": context.get(
+                "connection_epoch", self._connection_epoch),
+            "packet_id": resolved_packet,
+            "destination": context.get("destination"),
+            "channel": context.get("channel", 0),
+            "text": str(context.get("text") or ""),
+            "state": state,
+            "terminal": bool(terminal),
+            "detail": str(detail or ""),
+        }
+        if error not in (None, ""):
+            payload["error"] = error
+        if error_name not in (None, ""):
+            payload["error_name"] = str(error_name)
+        self._emit("outbound_status", payload)
+
+    def _outbound_context(self, body: dict) -> dict:
+        request_id = str(body.get("request_id") or "")
+        packet_id = body.get("packet_id", body.get("id"))
+        context = (self._outbound_by_request.get(request_id)
+                   if request_id else None)
+        if context is None and packet_id not in (None, ""):
+            context = self._outbound_by_packet.get(str(packet_id))
+        if context is None:
+            context = {
+                "correlation_id": (body.get("correlation_id")
+                                   or request_id or packet_id),
+                "connection_epoch": self._connection_epoch,
+                "text": body.get("text", ""),
+                "destination": body.get("destination"),
+                "channel": body.get("channel", 0),
+                "direct": self._is_direct_destination(
+                    body.get("destination")),
+            }
+        if packet_id not in (None, ""):
+            context["packet_id"] = packet_id
+            self._outbound_by_packet[str(packet_id)] = context
+        return context
+
+    def _fail_pending_outbound(self, reason: str) -> None:
+        seen: set[str] = set()
+        for context in list(self._outbound_contexts.values()):
+            correlation_id = str(context.get("correlation_id") or "")
+            if not correlation_id or correlation_id in seen:
+                continue
+            seen.add(correlation_id)
+            if correlation_id not in self._outbound_terminal:
+                self._emit_outbound_status(
+                    context, "failed", terminal=True, detail=reason)
+        self._outbound_by_request.clear()
+        self._outbound_by_packet.clear()
 
     def _handle_socket_message(self, client: socket.socket,
                                message: dict) -> None:
@@ -2189,10 +2654,46 @@ class MeshtasticManager:
         elif name in ("send_accepted", "sent"):
             request_id = str(body.get("request_id") or "")
             if not request_id or request_id not in self._completed_requests:
-                self._emit("sent", self._socket_sent_dict(body))
+                context = self._outbound_context(body)
+                sent = self._socket_sent_dict(body)
+                sent["correlation_id"] = context.get("correlation_id")
+                self._emit("sent", sent)
+                self._emit_outbound_status(
+                    context, "sent", terminal=not bool(
+                        context.get("direct")),
+                    detail=str(body.get("message") or ""),
+                    packet_id=body.get("packet_id", body.get("id")),
+                )
                 if request_id:
                     self._mark_request_completed(request_id)
-        elif name in ("send_failed", "error"):
+        elif name == "send_status":
+            context = self._outbound_context(body)
+            state = str(body.get("state") or "failed").lower()
+            detail = str(body.get("detail") or body.get("message") or "")
+            self._emit_outbound_status(
+                context, state,
+                terminal=state in {"delivered", "failed"},
+                detail=detail,
+                packet_id=body.get("packet_id", body.get("id")),
+                error=body.get("error"),
+                error_name=body.get("error_name"),
+            )
+            if state == "failed":
+                text = (body.get("detail") or body.get("message")
+                        or body.get("error_name")
+                        or body.get("error") or "Meshtastic send failed")
+                self._emit("error", str(text))
+        elif name == "send_failed":
+            context = self._outbound_context(body)
+            text = body.get("message") or body.get("error") or name
+            self._emit_outbound_status(
+                context, "failed", terminal=True, detail=str(text),
+                packet_id=body.get("packet_id", body.get("id")),
+                error=body.get("error"),
+                error_name=body.get("error_name"),
+            )
+            self._emit("error", str(text))
+        elif name == "error":
             text = body.get("message") or body.get("error") or name
             self._emit("error", str(text))
         elif name in ("discovery_sent", "discovery"):
@@ -2204,7 +2705,9 @@ class MeshtasticManager:
             self._request_snapshot(client)
         elif name in ("phone_connected", "phone_disconnected", "ble_status",
                       "pairing_passkey", "pairing_pin",
-                      "full_client_owner", "full_client_status"):
+                      "full_client_owner", "full_client_status",
+                      "phone_bond", "phone_bonded",
+                      "phone_bond_cleared"):
             if name == "phone_connected":
                 self.phone_connected = True
                 self.pairing_pin = ""
@@ -2237,6 +2740,28 @@ class MeshtasticManager:
                     body.get("pin") or body.get("passkey") or "")
             elif name in ("full_client_owner", "full_client_status"):
                 self._record_full_client_owner(body)
+            elif name == "phone_bond":
+                bond = body.get("phone_bond", body)
+                if isinstance(bond, dict):
+                    self._apply_phone_bond(bond)
+                    self._emit("phone_bond", dict(self.phone_bond))
+            elif name == "phone_bonded":
+                bond = body.get("phone_bond", body)
+                if isinstance(bond, dict):
+                    self._apply_phone_bond(bond)
+                    self._emit("phone_bond", dict(self.phone_bond))
+            elif name == "phone_bond_cleared":
+                bond = body.get("phone_bond", body)
+                if isinstance(bond, dict):
+                    self._apply_phone_bond(bond)
+                else:
+                    self.phone_bond = self._empty_phone_bond()
+                    self.phone_pairing_mode = "unknown"
+                cleared = dict(self.phone_bond)
+                if body.get("expected_address"):
+                    cleared["expected_address"] = str(
+                        body["expected_address"]).upper()
+                self._emit("phone_bond", cleared)
             text = body.get("message") or name.replace("_", " ")
             if self.pairing_pin and name in ("pairing_passkey", "pairing_pin"):
                 text = f"Meshtastic phone PIN: {self.pairing_pin}"
@@ -2254,6 +2779,11 @@ class MeshtasticManager:
                     or f"{name} failed")
             if isinstance(context, _ControlWaiter):
                 context.resolve(False, str(text))
+            elif name == "send_text" and isinstance(context, dict):
+                self._emit_outbound_status(
+                    context, "failed", terminal=True, detail=str(text),
+                    error_name=message.get("error_code"))
+                self._emit("error", str(text))
             else:
                 self._emit("error", str(text))
             if name == "snapshot_nodes":
@@ -2268,7 +2798,17 @@ class MeshtasticManager:
             value = dict(context)
             value.update({key: body[key] for key in ("packet_id", "id")
                           if key in body})
+            packet_id = body.get("packet_id", body.get("id"))
+            if packet_id not in (None, ""):
+                context["packet_id"] = packet_id
+                self._outbound_by_packet[str(packet_id)] = context
+            value["correlation_id"] = context.get("correlation_id")
             self._emit("sent", value)
+            self._emit_outbound_status(
+                context, "sent", terminal=not bool(context.get("direct")),
+                detail=str(body.get("message") or ""),
+                packet_id=packet_id,
+            )
             self._mark_request_completed(request_id)
         elif name == "request_node_info":
             self._emit("discovery", body.get("message")
@@ -2334,6 +2874,9 @@ class MeshtasticManager:
             self.ble_status = str(body.get("ble_status") or "unknown")
         if "phone_connected" in body:
             self.phone_connected = bool(body["phone_connected"])
+        bond = body.get("phone_bond")
+        if isinstance(bond, dict):
+            self._apply_phone_bond(bond)
         self._record_applied_phone_ble(body)
         self._record_full_client_owner(body)
         radio = body.get("radio")
@@ -2342,6 +2885,25 @@ class MeshtasticManager:
                                     radio.get("status") or self.radio_status)
         if "radio_status" in body:
             self.radio_status = str(body.get("radio_status") or "unknown")
+
+    def _apply_phone_bond(self, body: dict) -> None:
+        normalized = self._empty_phone_bond()
+        normalized["present"] = bool(
+            body.get("present", body.get("identity_present")))
+        for key in ("address", "name", "controller"):
+            normalized[key] = str(body.get(key) or "")
+        normalized["address"] = normalized["address"].upper()
+        normalized["controller"] = normalized["controller"].upper()
+        for key in ("paired", "bonded", "trusted", "connected"):
+            normalized[key] = bool(body.get(key))
+        normalized["service_authorized"] = bool(
+            body.get("service_authorized", body.get("authorized")))
+        authentication = str(body.get("authentication") or "unknown").lower()
+        normalized["authentication"] = (
+            authentication if authentication in {"random_pin", "unknown"}
+            else "unknown")
+        self.phone_bond = normalized
+        self.phone_pairing_mode = normalized["authentication"]
 
     def _apply_socket_identity(self, body: dict) -> None:
         node_id = body.get("node_id", body.get("id"))
@@ -2550,6 +3112,13 @@ class MeshtasticManager:
         return self._node_dict(raw, node_id=f"!{number:08x}")
 
     def _on_receive(self, packet=None, interface=None, **_kwargs) -> None:
+        try:
+            self._process_receive(packet=packet, interface=interface)
+        except Exception as exc:
+            self._emit("error", "Ignored malformed Meshtastic packet: "
+                       + str(exc)[:160])
+
+    def _process_receive(self, packet=None, interface=None) -> None:
         if interface is not None and interface is not self._interface:
             return
         if not isinstance(packet, dict):
@@ -2586,9 +3155,13 @@ class MeshtasticManager:
     def _on_node(self, node=None, **_kwargs) -> None:
         if not self.connected:
             return
-        normalized = self._node_dict(node, cached=False)
-        if normalized:
-            self._remember_node(normalized, "update")
+        try:
+            normalized = self._node_dict(node, cached=False)
+            if normalized:
+                self._remember_node(normalized, "update")
+        except Exception as exc:
+            self._emit("error", "Ignored malformed Meshtastic node update: "
+                       + str(exc)[:160])
 
     def _on_connection_lost(self, interface=None, **_kwargs) -> None:
         if interface is not None and interface is not self._interface:
@@ -2600,19 +3173,32 @@ class MeshtasticManager:
     def _send_now(self, data: dict) -> None:
         interface = self._interface
         if interface is None or not self.connected:
-            self._emit("error", "Meshtastic is not connected")
+            detail = "Meshtastic is not connected"
+            self._emit_outbound_status(
+                data, "failed", terminal=True, detail=detail)
+            self._emit("error", detail)
             return
-        kwargs = {"channelIndex": data["channel"], "wantAck": True}
+        kwargs = {
+            "channelIndex": data["channel"],
+            "wantAck": bool(data.get("want_ack")),
+        }
         if data["destination"] not in (None, ""):
             kwargs["destinationId"] = data["destination"]
         try:
             packet = interface.sendText(data["text"], **kwargs)
-            self._emit("sent", {
+            sent = {
                 "text": data["text"], "destination": data["destination"],
                 "channel": data["channel"],
                 "packet_id": getattr(packet, "id", None),
-            })
+                "correlation_id": data.get("correlation_id"),
+            }
+            self._emit("sent", sent)
+            self._emit_outbound_status(
+                data, "sent", terminal=not bool(data.get("direct")),
+                packet_id=getattr(packet, "id", None))
         except Exception as exc:
+            self._emit_outbound_status(
+                data, "failed", terminal=True, detail=str(exc))
             self._emit("error", f"Meshtastic send failed: {exc}")
 
     def _discover_now(self) -> None:

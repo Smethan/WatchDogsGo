@@ -318,7 +318,9 @@ def _setup_logging():
     in the README to copy from this marker to the end and paste into a
     GitHub issue when reporting a bug.
     """
+    import faulthandler
     import logging
+    import threading
     import traceback
     from datetime import datetime
 
@@ -359,6 +361,10 @@ def _setup_logging():
         root = logging.getLogger()
         root.setLevel(logging.INFO)
         root.addHandler(handler)
+        try:
+            faulthandler.enable(file=handler.stream, all_threads=True)
+        except (OSError, RuntimeError, ValueError):
+            logging.exception("Could not enable fatal-signal diagnostics")
         # Make sure log file is owned by the real user
         if sudo_user:
             try:
@@ -394,6 +400,19 @@ def _setup_logging():
         )
         sys.__excepthook__(exc_type, exc_value, exc_tb)
     sys.excepthook = _excepthook
+
+    previous_thread_hook = threading.excepthook
+
+    def _thread_excepthook(args):
+        logging.critical(
+            "Unhandled thread exception in %s:\n%s",
+            getattr(args.thread, "name", "unknown"),
+            "".join(traceback.format_exception(
+                args.exc_type, args.exc_value, args.exc_traceback)),
+        )
+        previous_thread_hook(args)
+
+    threading.excepthook = _thread_excepthook
 
 
 def _print_bugreport():
@@ -465,13 +484,15 @@ def main():
     import logging
     logging.info("Starting game: serial=%s loot=%s",
                  serial_port, loot_path)
+    clean_exit = False
     try:
         WatchDogsGame(serial_port=serial_port, loot_path=loot_path)
-    except Exception:
+        clean_exit = True
+    except BaseException:
         logging.exception("Game crashed")
         raise
     finally:
-        logging.info("Game exited cleanly")
+        logging.info("Game exited %s", "cleanly" if clean_exit else "uncleanly")
 
 
 if __name__ == "__main__":

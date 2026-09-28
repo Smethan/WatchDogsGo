@@ -1,5 +1,52 @@
 # Smethan WatchDogsGo
 
+## 0.9.46 — Shared authenticated phone bond and reliable Meshtastic sends — 2026-09-28
+
+- Pair WDG 0.9.46 with `Smethan/meshtastic-firmware` `v2.8.0-wdg.7`. The fork
+  provides WDG local API 1.1, correlated Meshtastic delivery results, and the
+  authenticated-bond controls this release needs. Upgrade and verify the
+  firmware package first, then update WDG; older API 1.0 daemons remain
+  observable but cannot provide the new shared-bond workflow.
+- Send channel/broadcast text without an acknowledgement request and direct
+  text with one. The existing Mesh Messenger row now moves through `QUEUED`
+  and `SENT`; direct sends then end as `DELIVERED` or `FAILED`, while an
+  accepted broadcast is terminal at `SENT`. This removes the needless retry
+  and failure cycle that looked like `meshtasticd-wdg` was crashing.
+- Share one BlueZ random-PIN phone bond between MeshCore and Meshtastic when
+  both select the same controller. The controller MAC keys a private
+  `~/.watchdogs/bluetooth_bonds.json` registry; switching protocols adopts the
+  already authenticated phone instead of asking Android to create a competing
+  backend-specific bond.
+- Require the exact phone on the exact controller to be simultaneously paired,
+  bonded, and trusted before migration or adoption. The one-release legacy
+  MeshCore address/name fields migrate only after that independent BlueZ
+  verification. The daemon also persists the exact controller and random-PIN
+  provenance with its own retained identity. Legacy address-only identities
+  and records from another controller stay unauthorized until WDG explicitly
+  reconciles them against BlueZ. WDG stores no Bluetooth link key or passkey;
+  the registry
+  contains only address/name, controller, state, source, authentication type,
+  and timestamp, under directory/file modes `0700`/`0600`. An owner-correct
+  legacy `0755` `~/.watchdogs` directory is securely opened without following
+  links and hardened in place; symlinked or wrong-owner paths still fail
+  closed.
+- Make replacement and cleanup conservative. Meshtastic's forget action clears
+  the daemon identity and exact BlueZ device before WDG removes its registry
+  entry. If MeshCore removes the device while the daemon is stopped, WDG keeps
+  a cleanup tombstone and clears the daemon's matching identity on its next
+  API connection before another phone may pair.
+- Retain the 0.9.45 follow-up repairs for BlueZ LE identity-address transitions
+  and asynchronous GATT/advertisement registration, avoiding both false
+  pairing rejection and `client_ready_cb() No object received` startup errors.
+- Extend `~/.watchdogs/last_run.log` diagnostics to record fatal Python signals,
+  unhandled worker-thread exceptions, and an explicit clean/unclean exit. The
+  file still rotates to `previous_run.log` at the next launch.
+
+Automated coverage validates the new API, message-state, bond-store, migration,
+cleanup, UI, and crash-diagnostic paths. Per the requested delivery scope, no
+physical uConsole, SX1262, BlueZ-controller, or phone interoperability test was
+performed for this release.
+
 ## 0.9.45 — uConsole MeshCore BLE adapter discovery — 2026-09-27
 
 - Fix the **No BlueZ adapter found** error on uConsole UART Bluetooth

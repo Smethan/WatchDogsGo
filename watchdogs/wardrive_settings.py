@@ -10,7 +10,7 @@ import json
 import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 from .map_display import (
     DEFAULT_LAYER_MODES,
@@ -68,6 +68,51 @@ DEFAULTS = {
 
 def settings_path(app_dir: str | Path) -> Path:
     return Path(app_dir) / "wardrive_settings.json"
+
+
+def legacy_meshcore_bond(
+        settings: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the normalized one-release MeshCore bond mirror."""
+    address = str(settings.get(
+        "meshcore_ble_paired_address", "") or "").strip()
+    if not _BLUETOOTH_MAC.fullmatch(address):
+        return None
+    name = str(settings.get("meshcore_ble_paired_name", "") or "").strip()
+    raw = name.encode("utf-8")[:80]
+    return address.upper(), raw.decode("utf-8", errors="ignore")
+
+
+def mirror_meshcore_bond_settings(
+        settings: MutableMapping[str, Any], bond=None) -> None:
+    """Mirror a bond record into legacy settings for one release.
+
+    Passing ``None`` clears the compatibility fields. Cryptographic material
+    and transient passkeys are never represented in wardrive settings.
+    """
+    if bond is None:
+        address = ""
+        name = ""
+    else:
+        address = str(getattr(bond, "phone_address", "") or "")
+        name = str(getattr(bond, "phone_name", "") or "")
+    settings["meshcore_ble_paired_address"] = address
+    settings["meshcore_ble_paired_name"] = name
+
+
+def migrate_legacy_meshcore_bond(
+        settings: MutableMapping[str, Any], store, controller: str,
+        verifier):
+    """Verifier-gated migration into the shared controller bond store."""
+    legacy = legacy_meshcore_bond(settings)
+    if legacy is None:
+        return store.get(controller)
+    address, name = legacy
+    record = store.migrate_legacy(
+        controller, address, name, verifier, source="meshcore")
+    if record is not None:
+        # Keep these compatibility fields synchronized for this release.
+        mirror_meshcore_bond_settings(settings, record)
+    return record
 
 
 def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:

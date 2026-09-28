@@ -1335,6 +1335,9 @@ class MeshCoreBleManager:
         self.state = "stopped"
         self.last_error = ""
         self.adapter = ""
+        # Stable controller MAC used by the controller-keyed phone bond store.
+        # ``adapter`` remains the volatile hci name for existing callers.
+        self.controller_address = ""
         self.connected = False
         self.drop_count = 0
         self.event_drop_count = 0
@@ -1468,14 +1471,35 @@ class MeshCoreBleManager:
                             (self.last_error + "; ") if self.last_error else ""
                         ) + overflow
 
-    def _resolve_adapter(self, selection: str) -> str:
+    def _resolve_adapter_identity(self, selection: str) -> tuple[str, str]:
         resolved = self.adapter_resolver(selection)
         if resolved:
-            return resolved
+            selected = _normalize_ble_address(selection)
+            if selected:
+                return resolved, selected
+            try:
+                choices = self.adapter_lister()
+            except OSError:
+                choices = []
+            for address, adapter in choices:
+                if adapter == resolved:
+                    return resolved, _normalize_ble_address(address)
+            return resolved, ""
         choices = self.adapter_lister()
         if not choices:
             raise RuntimeError("No BlueZ Bluetooth adapter is available")
-        return choices[0][1]
+        return choices[0][1], _normalize_ble_address(choices[0][0])
+
+    def _resolve_adapter(self, selection: str) -> str:
+        return self._resolve_adapter_identity(selection)[0]
+
+    def resolve_controller_key(self, selection: str = "auto") -> str:
+        """Resolve a saved adapter choice to its stable controller MAC."""
+        _adapter, controller = self._resolve_adapter_identity(selection)
+        if not controller:
+            raise RuntimeError(
+                "The selected BlueZ adapter has no stable controller address")
+        return controller
 
     def start(self, adapter: str = "auto", node_name: str = "WDG", *,
               paired_address: str = "", paired_name: str = "") -> bool:
@@ -1486,6 +1510,7 @@ class MeshCoreBleManager:
             self._stop_event = threading.Event()
             self.state = "starting"
             self.last_error = ""
+            self.controller_address = ""
             self.paired_address = _normalize_ble_address(paired_address)
             if paired_address and not self.paired_address:
                 self.state = "error"
@@ -1498,7 +1523,8 @@ class MeshCoreBleManager:
             self.pairing_pin = ""
             self.pairing_cleanup_pending = False
             try:
-                resolved = self._resolve_adapter(adapter)
+                resolved, controller = self._resolve_adapter_identity(adapter)
+                self.controller_address = controller
                 local_name = _utf8_prefix(
                     "MeshCore-" + str(node_name), 29).decode("utf-8")
                 backend = self.backend_factory(

@@ -1396,14 +1396,9 @@ class WardriveUI:
                 self.cycle_bluetooth_adapter(
                     "host_ble_adapter", direction or 1)
             elif row == 4 and activate:
-                self._start_meshtastic_action(
-                    "Pairing window",
-                    lambda manager: manager.open_pairing(120),
-                    "open for 120 seconds")
+                self.open_meshtastic_phone_pairing()
             elif row == 5 and activate:
-                self._start_meshtastic_action(
-                    "Forget phone", lambda manager: manager.forget_phone(),
-                    "bond removed")
+                self.forget_meshtastic_phone()
             elif row == 6 and activate:
                 self.retry_meshtastic_shared_adapter()
             elif row == 7 and activate:
@@ -2268,6 +2263,20 @@ class WardriveUI:
 
     def open_meshcore_pairing(self):
         """Open one authenticated MeshMapper pairing window."""
+        lookup = getattr(self.app, "_shared_phone_bond", None)
+        record = lookup("meshcore") if lookup is not None else None
+        if record is not None:
+            state = str(getattr(record, "state", "") or "")
+            if state == "cleanup_pending":
+                self.app.msg(
+                    "[MC-BLE] Start Meshtastic once to finish phone cleanup",
+                    ORANGE)
+                return False
+            if state == "active":
+                self.app.msg(
+                    "[MC-BLE] Forget the shared phone before bonding another",
+                    ORANGE)
+                return False
         manager = getattr(self.app, "_meshcore_ble", None)
         if manager is not None and getattr(manager, "paired_address", ""):
             self.app.msg(
@@ -2328,6 +2337,37 @@ class WardriveUI:
             "Shared adapter",
             lambda value: value.retry_shared_adapter(),
             "retry enabled")
+
+    def open_meshtastic_phone_pairing(self):
+        """Open the shared controller's authenticated random-PIN window."""
+        lookup = getattr(self.app, "_shared_phone_bond", None)
+        record = lookup("meshtastic") if lookup is not None else None
+        if record is not None and getattr(record, "state", "") == "active":
+            label = (getattr(record, "phone_name", "")
+                     or getattr(record, "phone_address", "") or "phone")
+            self.app.msg(
+                "[MT] " + str(label)[:35]
+                + " is already shared; forget it first", ORANGE)
+            return False
+        operation = getattr(self.app, "_open_meshtastic_shared_pairing", None)
+        if operation is None:
+            self.app.msg("[MT] Shared phone pairing is unavailable", ORANGE)
+            return False
+        return self._start_meshtastic_action(
+            "Pairing window", lambda manager: operation(manager),
+            "random-PIN pairing open for 120 seconds")
+
+    def forget_meshtastic_phone(self):
+        """Remove the one shared phone from daemon, BlueZ, and WDG state."""
+        operation = getattr(self.app, "_forget_meshtastic_shared_phone", None)
+        mirror = getattr(self.app, "_persist_legacy_bond_mirror", None)
+        if operation is None:
+            self.app.msg("[MT] Shared phone removal is unavailable", ORANGE)
+            return False
+        return self._start_meshtastic_action(
+            "Forget phone", lambda manager: operation(manager),
+            "shared bond removed",
+            on_success=(lambda: mirror(None)) if mirror is not None else None)
 
     def _start_meshtastic_action(self, label, operation, success_detail,
                                  *, on_success=None):
@@ -2635,6 +2675,14 @@ class WardriveUI:
                 if manager is not None and manager.pairing_pin:
                     px.text(55,258,
                             "Pairing PIN: " + manager.pairing_pin,11)
+                elif (manager is not None
+                      and getattr(manager, "phone_bond_present", False)):
+                    phone = (getattr(manager, "phone_bond_name", "")
+                             or getattr(manager, "phone_bond_address", "")
+                             or "authenticated phone")
+                    px.text(
+                        55,258,
+                        ("Shared random-PIN bond: " + str(phone))[:100],11)
                 elif manager is not None and manager.last_error:
                     px.text(55,258,
                             ("Last error: " + manager.last_error)[:100],8)

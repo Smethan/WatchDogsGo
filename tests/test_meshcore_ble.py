@@ -606,6 +606,24 @@ def test_manager_reports_missing_adapter_without_starting_worker():
     assert not manager.worker_active
 
 
+def test_manager_exposes_stable_controller_key_for_bond_store():
+    protocol, _lora, _state = _protocol()
+    manager = MeshCoreBleManager(
+        protocol, adapter_resolver=lambda _selection: None,
+        adapter_lister=lambda: [("11:22:33:44:55:66", "hci7")],
+    )
+
+    assert manager.resolve_controller_key("auto") == "11:22:33:44:55:66"
+
+    explicit = MeshCoreBleManager(
+        protocol,
+        adapter_resolver=lambda _selection: "hci9",
+        adapter_lister=lambda: [],
+    )
+    assert explicit.resolve_controller_key(
+        "aa:bb:cc:dd:ee:ff") == "AA:BB:CC:DD:EE:FF"
+
+
 def test_manager_pairing_lease_lifecycle_retains_and_forgets_phone():
     protocol, _lora, _state = _protocol()
     started = threading.Event()

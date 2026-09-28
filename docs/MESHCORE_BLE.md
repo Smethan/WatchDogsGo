@@ -48,7 +48,9 @@ objects that BlueZ confirmed it accepted.
 4. BlueZ generates a six-digit passkey and WDG shows it as **Pairing PIN**.
    Enter that passkey on the phone. The first device to claim the window is the
    only device WDG will accept; a successful exchange is retained as one
-   paired, bonded, and trusted phone.
+   paired, bonded, and trusted phone. WDG keys that non-secret identity record
+   by the selected controller MAC so Meshtastic can reuse the same BlueZ bond
+   instead of creating a competing phone pairing.
 5. Let MeshMapper finish device query, self-identity, clock sync, API
    authentication, and channel setup. On first connection it can create the
    standard `#wardriving` channel in the first free slot.
@@ -59,9 +61,12 @@ objects that BlueZ confirmed it accepted.
 Later connections reuse the retained BlueZ bond. To replace the phone,
 disconnect it, choose **Forget paired phone** in WDG, and wait for the success
 message. WDG asks BlueZ to remove only the exact retained device from the
-selected adapter and clears the saved address/name only after that succeeds.
-It never bulk-removes unrelated bonds. Open a new 120-second window after the
-old bond is gone.
+selected adapter. It never bulk-removes unrelated bonds. Because the stopped
+Meshtastic daemon may still retain that address, a successful MeshCore-side
+forget records a cleanup tombstone rather than silently declaring every owner
+clean. Start Meshtastic once: WDG local API 1.1 clears only the matching daemon
+identity, removes the tombstone, and then allows a new 120-second window. An
+identity mismatch fails closed.
 
 WDG supports the companion operations MeshMapper uses for normal mapping:
 
@@ -98,7 +103,10 @@ rule:
 
 Meshtastic phone BLE does not run at the same time: selecting direct MeshCore
 stops the Meshtastic daemon according to the existing exact service-state
-handoff rules.
+handoff rules. The two backends nevertheless share one random-PIN bond when
+they use the same controller. On the next Meshtastic connection, WDG verifies
+that exact controller/device pair and asks the daemon to adopt it without
+opening another pairing window.
 
 WDG also serializes temporary BlueZ pairing-agent ownership. A MeshMapper
 window, PipBoy-watch pairing, and the Meshtastic daemon's pairing agent cannot
@@ -150,6 +158,18 @@ MeshCore config and the Ed25519 key live at
 `~/.watchdogs_meshcore.json` and `~/.watchdogs_meshcore_key`. WDG writes them as
 mode `0600`; when launched through `sudo`, it assigns them to the invoking
 desktop user (normally `pi`), not `root`.
+
+The shared phone registry lives at
+`~/.watchdogs/bluetooth_bonds.json` under a `~/.watchdogs` directory. WDG
+opens that directory with `O_DIRECTORY|O_NOFOLLOW` and uses descriptor-relative
+file operations. An owner-correct legacy `0755` directory is hardened to
+`0700` with `fchmod`; a symlink or wrong owner fails closed. The registry file
+must be a real owner-correct file with exact mode `0600`. It stores controller
+and phone addresses, display name, random-PIN authentication label, source,
+cleanup state, and timestamp only. BlueZ remains the sole owner of passkeys and
+link keys. Legacy MeshCore address/name fields migrate into this registry only
+when a read-only lookup verifies the exact device on the exact controller with
+all three of `Paired`, `Bonded`, and `Trusted` set.
 
 Authenticated BLE protects the phone-to-WDG link; it does not encrypt local
 files. MeshCore messages that WDG decodes are still written as plaintext to the

@@ -9,7 +9,10 @@ import pytest
 from watchdogs.reticulum_config import ReticulumProfile
 from watchdogs.wardrive_settings import (
     DEFAULTS,
+    legacy_meshcore_bond,
     load_settings,
+    migrate_legacy_meshcore_bond,
+    mirror_meshcore_bond_settings,
     normalize_settings,
     save_settings,
 )
@@ -193,6 +196,31 @@ def test_meshtastic_backend_and_adapter_settings_are_normalized():
     assert invalid["meshcore_ble_paired_address"] == ""
     assert invalid["meshcore_ble_paired_name"] == "x" * 80
     assert invalid["host_ble_adapter"] == "auto"
+
+
+def test_legacy_meshcore_bond_migration_requires_verifier_and_stays_mirrored():
+    settings = normalize_settings({
+        "meshcore_ble_paired_address": "aa:bb:cc:dd:ee:ff",
+        "meshcore_ble_paired_name": "Pixel",
+    })
+    record = NS(
+        phone_address="AA:BB:CC:DD:EE:FF", phone_name="Verified Pixel")
+    store = NS(
+        migrate_legacy=Mock(return_value=record), get=Mock())
+    verifier = Mock()
+
+    result = migrate_legacy_meshcore_bond(
+        settings, store, "11:22:33:44:55:66", verifier)
+
+    assert result is record
+    store.migrate_legacy.assert_called_once_with(
+        "11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF", "Pixel", verifier,
+        source="meshcore")
+    assert legacy_meshcore_bond(settings) == (
+        "AA:BB:CC:DD:EE:FF", "Verified Pixel")
+
+    mirror_meshcore_bond_settings(settings, None)
+    assert legacy_meshcore_bond(settings) is None
 
 
 def test_meshcore_companion_ble_is_opt_in_and_starts_with_active_radio():
