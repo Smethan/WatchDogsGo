@@ -10,6 +10,24 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.50] — 2026-09-28
+
+### Fixed
+
+- Permit the protected adoption and rollback-cache paths to validate an
+  already-installed package from an older WDG API minor revision. This is
+  required to seed a v6/API-1.0 rollback baseline before transactionally
+  upgrading it to v7/API-1.1.
+
+### Security
+
+- Keep the normal first-install and update paths pinned to the current API
+  minimum. The older-minor exception is explicit, internal, and limited to
+  exact installed/rollback package validation; the API major, repository,
+  release, checksum, payload, identity, channel, state, and host checks remain
+  unchanged. Bump the protected helper interface to version 7 so older helpers
+  cannot silently omit this rollback behavior.
+
 ## [0.9.49] — 2026-09-28
 
 ### Fixed

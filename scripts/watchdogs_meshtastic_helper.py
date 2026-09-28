@@ -28,7 +28,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 6
+HELPER_VERSION = 7
+ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)-wdg\.(0|[1-9][0-9]*)$")
@@ -743,7 +744,8 @@ def _validate_transaction_metadata(
         rollback_dir = backup / "rollback-release" / rollback_identity["tag"]
         prepared = validator.validate_prepared_release(
             rollback_dir, expected_tag=rollback_identity["tag"],
-            require_secure=True, check_host=False)
+            require_secure=True, check_host=False,
+            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
         if _release_identity(prepared) != rollback_identity:
             raise HelperError(
                 "Verified rollback release differs from transaction metadata")
@@ -1065,7 +1067,8 @@ def _find_cached_release(version: str, validator) -> Any | None:
         try:
             prepared = validator.validate_prepared_release(
                 candidate, expected_tag=candidate.name, require_secure=True,
-                check_host=False)
+                check_host=False,
+                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             continue
         if prepared.package_version == version:
@@ -1073,13 +1076,18 @@ def _find_cached_release(version: str, validator) -> Any | None:
     return None
 
 
-def _prepare_exact_release(tag: str, validator) -> Any:
+def _prepare_exact_release(
+    tag: str, validator, *, minimum_api_minor: int | None = None,
+) -> Any:
     """Load or download one exact, protected-validator-approved release."""
+    compatibility = (
+        {} if minimum_api_minor is None
+        else {"minimum_api_minor": minimum_api_minor})
     release_dir = CACHE_ROOT / tag
     if release_dir.exists():
         prepared = validator.validate_prepared_release(
             release_dir, expected_tag=tag, require_secure=True,
-            check_host=True)
+            check_host=True, **compatibility)
     else:
         releases = validator.meshtastic_releases()
         release = next(
@@ -1090,7 +1098,7 @@ def _prepare_exact_release(tag: str, validator) -> Any:
                 "The requested Smethan Meshtastic release was not found")
         prepared = validator.prepare_meshtastic_release(
             cache_root=CACHE_ROOT, release=release, require_root=True,
-            check_host=True)
+            check_host=True, **compatibility)
     if (prepared.tag != tag
             or prepared.directory != release_dir
             or not isinstance(prepared.package_version, str)):
@@ -1218,7 +1226,8 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
             rollback_identity = metadata["rollback_release"]
             prepared = validator.validate_prepared_release(
                 prepared.directory, expected_tag=rollback_identity["tag"],
-                require_secure=True, check_host=False)
+                require_secure=True, check_host=False,
+                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
             if _release_identity(prepared) != rollback_identity:
                 raise HelperError(
                     "Rollback release changed after restore preflight")
@@ -1244,7 +1253,8 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
             checked = validator.validate_prepared_release(
                 prepared.directory,
                 expected_tag=metadata["rollback_release"]["tag"],
-                require_secure=True, check_host=False)
+                require_secure=True, check_host=False,
+                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
             if _release_identity(checked) != metadata["rollback_release"]:
                 raise HelperError(
                     "Rollback release identity changed during installation")
@@ -2202,7 +2212,8 @@ def _cache_installed_release(prepared: Any) -> bool:
         validator = _load_validator()
         cached = validator.validate_prepared_release(
             target, expected_tag=prepared.tag, require_secure=True,
-            check_host=False)
+            check_host=False,
+            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
         if (cached.package_version != prepared.package_version
                 or cached.manifest != prepared.manifest):
             raise HelperError(
@@ -2220,7 +2231,8 @@ def _cache_installed_release(prepared: Any) -> bool:
         validator = _load_validator()
         cached = validator.validate_prepared_release(
             staging, expected_tag=prepared.tag, require_secure=True,
-            check_host=False)
+            check_host=False,
+            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
         if (cached.package_version != prepared.package_version
                 or cached.manifest != prepared.manifest):
             raise HelperError(
@@ -2385,7 +2397,8 @@ def _adopt_installed(tag: str) -> dict[str, Any]:
         raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
     _secure_root_directory(CACHE_ROOT)
     validator = _load_validator()
-    prepared = _prepare_exact_release(tag, validator)
+    prepared = _prepare_exact_release(
+        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
     with _lock_transaction():
         installed_version = _installed_version()
         if installed_version != prepared.package_version:

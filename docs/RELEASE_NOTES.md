@@ -1,5 +1,22 @@
 # Smethan WatchDogsGo
 
+## 0.9.50 — Bridge older installed packages into protected updates — 2026-09-28
+
+- Allow only the adoption and rollback-cache validation paths to accept an
+  exact installed package with an older WDG API minor revision. This lets an
+  already-tested v6/API-1.0 package become the verified rollback baseline
+  required for the transactional v7/API-1.1 update.
+- Continue rejecting older API revisions as new first-install or update
+  candidates. The exception does not relax the API major, source repository,
+  tag, asset URL, checksum, package payload, privileged policy, identity,
+  channel, state, architecture, or host validation.
+- Bump the root-owned helper contract to version 7 and require setup to install
+  it before WDG performs service/package operations.
+
+Automated coverage proves that the ordinary validator rejects API 1.0 while an
+explicit rollback-minimum of zero accepts it, and that adoption alone requests
+that narrow compatibility mode.
+
 ## 0.9.49 — Accept canonical GitHub package URLs — 2026-09-28
 
 - Fix protected Meshtastic release discovery for real GitHub release metadata.

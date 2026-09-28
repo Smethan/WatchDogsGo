@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 6})
+        return result({"ok": True, "helper_version": 7})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 6
+    assert controller.version() == 7
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -120,7 +120,7 @@ def test_controller_parses_status_and_preserves_helper_errors():
 
 def test_controller_rejects_pre_hardening_helper_version():
     controller = service.MeshtasticServiceController(
-        runner=lambda *a, **k: result({"ok": True, "helper_version": 5}),
+        runner=lambda *a, **k: result({"ok": True, "helper_version": 6}),
         geteuid=lambda: 0)
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 6
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 7
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -810,7 +810,7 @@ def test_adopt_installed_rejects_package_version_mismatch_before_state_access(
     validator = NS(validate_installed_package_payload=Mock())
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: "2.8.0+wdg.9")
@@ -860,7 +860,7 @@ def test_adopt_installed_cleans_snapshot_after_unhealthy_binary(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -898,7 +898,7 @@ def test_adoption_restores_live_state_changed_by_failing_candidate(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -940,7 +940,7 @@ def test_adoption_rejects_and_restores_successful_candidate_live_write(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -989,7 +989,7 @@ def test_adoption_retains_snapshot_when_candidate_state_restore_fails(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -1066,7 +1066,8 @@ def test_adopt_installed_validates_copy_then_seeds_only_rollback_cache(
         "package_version": prepared.package_version,
         "health": "ready",
     }
-    prepare.assert_called_once_with(tag, validator)
+    prepare.assert_called_once_with(
+        tag, validator, minimum_api_minor=helper.ROLLBACK_MINIMUM_API_MINOR)
     validator.validate_installed_package_payload.assert_called_once_with(
         prepared.package_path, prepared.manifest)
     candidate.assert_called_once_with(snapshot)
@@ -1093,7 +1094,7 @@ def test_adopt_installed_rejects_payload_mismatch_before_execution_or_cache(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -1156,7 +1157,7 @@ def test_adopt_installed_persists_verified_missing_mac_before_caching(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -1221,7 +1222,7 @@ def test_failed_adoption_rolls_back_verified_mac_pin_before_returning(
     monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
     monkeypatch.setattr(helper, "_load_validator", lambda: validator)
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)
@@ -1298,7 +1299,7 @@ def test_adoption_rolls_back_when_pin_replacement_raises_after_write(
         helper, "_load_validator",
         lambda: NS(validate_installed_package_payload=Mock()))
     monkeypatch.setattr(
-        helper, "_prepare_exact_release", lambda *_args: prepared)
+            helper, "_prepare_exact_release", lambda *_args, **_kwargs: prepared)
     monkeypatch.setattr(helper, "_lock_transaction", nullcontext)
     monkeypatch.setattr(
         helper, "_installed_version", lambda: prepared.package_version)

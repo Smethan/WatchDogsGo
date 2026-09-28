@@ -472,6 +472,19 @@ def test_manifest_rejects_wrong_repo_api_arch_and_host(tmp_path):
         updates.check_host_compatibility(manifest, machine="aarch64", glibc_version="2.35")
 
 
+def test_older_api_is_allowed_only_for_explicit_rollback_validation(tmp_path):
+    _, manifest = stage_release(tmp_path)
+    manifest["wdg_api"]["minor"] = 0
+
+    with pytest.raises(ValueError, match="older WDG API"):
+        updates.validate_compatibility_manifest(manifest, expected_tag=TAG)
+    assert updates.validate_compatibility_manifest(
+        manifest, expected_tag=TAG, minimum_api_minor=0) is manifest
+    with pytest.raises(ValueError, match="cannot be negative"):
+        updates.validate_compatibility_manifest(
+            manifest, expected_tag=TAG, minimum_api_minor=-1)
+
+
 def test_prepare_downloads_verified_release_assets_into_private_cache(tmp_path):
     built = tmp_path / "built"
     built.mkdir()
