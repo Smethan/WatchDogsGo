@@ -10,6 +10,33 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.47] — 2026-09-28
+
+### Added
+
+- Install the root-owned `watchdogs-meshtastic-release` operator tool. It
+  provides closed commands to inspect daemon state, adopt an already-installed
+  public package, install a first public package for testing, install an immutable
+  draft Actions artifact for hardware testing, publish and adopt that exact
+  tested draft, and run later transactional updates.
+
+### Changed
+
+- Preserve the protected helper as the privileged trust boundary while the new
+  tool snapshots, stops, and restores only the daemon that was active before an
+  adoption. Exact enabled/disabled state is left untouched.
+- Replace the error-prone manual five-file draft staging sequence with strict
+  workflow-run, attempt, tag, repository, commit, artifact-name, expiry, and
+  file-set checks. Draft publication remains an explicit `--yes` operation and
+  adoption still cannot occur until GitHub reports an ordinary public release.
+
+### Security
+
+- Keep caller-controlled URLs and package paths out of the privileged helper.
+  Draft bytes are downloaded unprivileged from one authenticated, successful
+  tag-push Actions run, copied into the fixed root-only inbox, and independently
+  revalidated by the existing helper before `apt` can see the sealed package.
+
 ## [0.9.46] — 2026-09-28
 
 ### Added

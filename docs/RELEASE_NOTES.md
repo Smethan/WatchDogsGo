@@ -1,5 +1,32 @@
 # Smethan WatchDogsGo
 
+## 0.9.47 — Guided Meshtastic release adoption — 2026-09-28
+
+- Add `/usr/local/bin/watchdogs-meshtastic-release`, installed root-owned by
+  `setup.sh`, so first adoption no longer requires manually coordinating two
+  services and copying five release files command by command.
+- `status` reports both daemon states; `adopt TAG` temporarily stops and then
+  restores only the daemon that was active; `install-public TAG` performs a
+  first public install for hardware testing; and `update TAG` uses the existing
+  transactional update/rollback helper. First installs remain unadopted until
+  the operator completes the required local hardware check.
+- `install-draft TAG --run-id ID --attempt N` accepts only the immutable
+  artifact from the exact successful tag-push workflow and starts the candidate
+  for the required hardware check. It does not call the mutable draft adopted.
+- `publish-adopt-draft TAG --run-id ID --attempt N --yes` explicitly publishes
+  that same tested artifact, waits for GitHub to expose a non-draft,
+  non-prerelease release, and only then performs the protected adoption.
+- Keep all package, payload, identity, channel, effective-MAC, state, and
+  rollback checks in the root-owned helper. The operator tool does not add a
+  URL/path sudo interface and refuses overlapping or transitioning daemon
+  ownership before mutation.
+
+Automated coverage exercises provenance and file-set validation, service
+snapshot/restoration, failure recovery, the explicit publication confirmation,
+setup installation, and the existing privileged helper suite. The live
+uConsole adoption performed for this release is reported separately from those
+automated tests.
+
 ## 0.9.46 — Shared authenticated phone bond and reliable Meshtastic sends — 2026-09-28
 
 - Pair WDG 0.9.46 with `Smethan/meshtastic-firmware` `v2.8.0-wdg.7`. The fork

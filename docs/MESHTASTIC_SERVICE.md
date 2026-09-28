@@ -145,75 +145,61 @@ to establish an authoritative baseline. The protected updater refuses to
 install the first fork package and will not validate a new package against
 itself. For that one migration:
 
-1. Download the immutable Actions artifact from the successful tag workflow,
-   not the mutable draft-release attachment. Record the run ID and producer
-   attempt printed in the draft release notes and verify that exact attempt.
-   Then copy the five expected files into the helper's fixed root-only inbox.
-   The helper accepts only the canonical tag, validates the protected copy, and
-   seals it in the root-owned release cache before `apt` sees it:
+1. Install WDG normally so `setup.sh` places the root-owned operator command at
+   `/usr/local/bin/watchdogs-meshtastic-release`. Run it as the desktop user,
+   not through `sudo`, because draft commands use that user's authenticated
+   GitHub CLI session. For an ordinary public first release:
 
    ```bash
-   TAG=vX.Y.Z-wdg.N
-   RUN_ID=123456789
-   ATTEMPT=1
-   ARTIFACT="meshtasticd-wdg-arm64-${RUN_ID}-${ATTEMPT}"
-   CANDIDATE="$HOME/meshtastic-candidate-$TAG"
-   WDG_CHECKOUT="$HOME/python/WatchDogsGo"
-   INBOX="/var/cache/watchdogs/meshtasticd-wdg/first-install-inbox/$TAG"
-   DEB_VERSION="${TAG#v}"
-   DEB_VERSION="${DEB_VERSION/-wdg./+wdg}"
-   DEB_NAME="meshtasticd-wdg_${DEB_VERSION}_arm64.deb"
-
-   gh run view "$RUN_ID" --attempt "$ATTEMPT" \
-     --repo Smethan/meshtastic-firmware --exit-status \
-     --json attempt,conclusion,event,headBranch,headSha,status
-   mkdir -m 0700 "$CANDIDATE"
-   gh run download "$RUN_ID" --repo Smethan/meshtastic-firmware \
-     --name "$ARTIFACT" --dir "$CANDIDATE"
-   cd "$WDG_CHECKOUT"
-   sudo bash scripts/setup_meshtastic.sh \
-     --install-support "$USER" "$(id -u)"
-   sudo install -d -o root -g root -m 0700 "$INBOX"
-   for NAME in compatibility.json SHA256SUMS SOURCE.txt copyright "$DEB_NAME"; do
-     sudo install -o root -g root -m 0600 "$CANDIDATE/$NAME" "$INBOX/$NAME"
-   done
-   PREPARED=$(sudo /usr/local/libexec/watchdogs-meshtastic \
-     prepare-first-tag "$TAG")
-   PACKAGE=$(printf '%s\n' "$PREPARED" | python3 -c \
-     'import json,sys; print(json.load(sys.stdin)["package_path"])')
-   sudo apt-get install "$PACKAGE"
+   watchdogs-meshtastic-release install-public vX.Y.Z-wdg.N
    ```
 
-   Confirm that `event` is `push`, `headBranch` is exactly `$TAG`, `status` is
-   `completed`, `conclusion` is `success`, and `attempt` matches `$ATTEMPT`.
-   `prepare-first-tag` never accepts a path. It reads only the fixed root-owned
-   inbox for that tag, rejects extra/missing files and unsafe ownership or
-   modes, repeats the release manifest, checksums, package, dependency,
-   maintainer-script, privileged-policy, ARM64, and host checks, then copies the
-   validated bytes into a private immutable-by-unprivileged-users cache. The
-   package path returned to `apt` therefore cannot be replaced by the login user
-   between validation and installation.
+   For a draft that still needs the first physical hardware test, record the
+   successful tag-push workflow run ID and producer attempt from the draft
+   notes, authenticate `gh`, and run:
+
+   ```bash
+   watchdogs-meshtastic-release install-draft vX.Y.Z-wdg.N \
+     --run-id 123456789 --attempt 1
+   ```
+
+   Both first-install commands start the new fork for the mandatory local
+   hardware check but leave it unadopted. The draft tool additionally requires
+   the exact repository, workflow path, tag, run ID, attempt,
+   successful push conclusion, source commit, unexpired canonical artifact
+   name, and five-file set. It downloads as the unprivileged user, copies those
+   files into the fixed root-only inbox, then the protected helper independently
+   repeats the release manifest, checksums, package, dependency,
+   maintainer-script, privileged-policy, ARM64, and host checks before `apt`
+   sees the sealed package. It never downloads the mutable draft attachment.
 2. Verify the phone, radio, identity, and channels on the uConsole.
-3. Publish that already-tested draft through the explicit `publish_draft`
-   workflow operation, passing the same run ID and producer attempt:
+3. Publish and adopt that already-tested draft using the same run ID and
+   producer attempt:
 
    ```bash
-   gh workflow run wdg-native.yml --repo Smethan/meshtastic-firmware \
-     -f operation=publish_draft -f package_tag="$TAG" \
-     -f tested_run_id="$RUN_ID" -f tested_artifact_attempt="$ATTEMPT"
+   watchdogs-meshtastic-release publish-adopt-draft vX.Y.Z-wdg.N \
+     --run-id 123456789 --attempt 1 --yes
    ```
 
-   Publication independently requires a successful tag-push workflow, fetches
-   the exact non-expired artifact named by those values, rejects any extra or
-   non-regular entries, and byte-compares all five draft assets before reading
-   their checksums. If the Actions artifact has expired, create and test a new
-   candidate tag; the draft alone is not sufficient provenance.
-4. Stop both `meshtasticd.service` and `meshtasticd-wdg.service`.
-5. Adopt the exact installed tag:
+   `--yes` makes the permanent publication action explicit. The publishing
+   workflow independently fetches the same non-expired artifact, rejects extra
+   or non-regular entries, and byte-compares all five draft assets. The command
+   waits for a public, non-prerelease release before adoption. If the artifact
+   expired, create and test a new candidate tag; the draft alone is not
+   sufficient provenance.
+4. To adopt a public package that is already installed, or perform a later
+   protected update, use:
 
    ```bash
-   sudo /usr/local/libexec/watchdogs-meshtastic adopt-installed vX.Y.Z-wdg.N
+   watchdogs-meshtastic-release adopt vX.Y.Z-wdg.N
+   watchdogs-meshtastic-release update vX.Y.Z-wdg.N
    ```
+
+   `adopt` snapshots both daemon states, rejects overlapping or transitioning
+   ownership, stops only the active daemon, runs the protected adoption, and
+   restores exactly the daemon that had been active. It does not alter the
+   enabled/disabled selection. `status` shows both service states without
+   mutation.
 
 Adoption resolves and validates that exact Smethan release, requires its
 package version and every installed package payload to match the verified

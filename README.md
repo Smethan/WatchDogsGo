@@ -840,20 +840,24 @@ start Meshtastic once so API 1.1 can clear only the matching stopped-daemon
 identity before opening a replacement pairing window.
 
 `AUTO` prefers the restricted fork socket. `LEGACY_TCP` is the explicit stock
-daemon fallback. Setup installs the helper and policy but leaves package
-installation to an explicit action after a compatible release exists. The
-first stock-to-fork migration must be installed from the exact successful
-tag-workflow Actions artifact and verified manually; do not install the
-mutable draft-release attachment. After testing, publish the draft with that
-artifact's workflow run ID and producer attempt, stop both services, and run:
+daemon fallback. Setup installs the protected helper, policy, and the
+root-owned release workflow command, but leaves package installation and
+publication explicit. To inspect or adopt an already-installed public build:
 ```bash
-sudo /usr/local/libexec/watchdogs-meshtastic adopt-installed vX.Y.Z-wdg.N
+watchdogs-meshtastic-release status
+watchdogs-meshtastic-release adopt vX.Y.Z-wdg.N
 ```
-Use the exact tag whose validated package is installed. Later **Update
-service** operations are transactional because this adoption seeds the private
-rollback cache. If the current config has no stable `General.MACAddress`, the
-adoption check pins the candidate's verified effective MAC before recording the
-baseline; configurations it cannot edit conservatively require a manual pin.
+Do not run the release command itself through `sudo`; it uses the login user's
+authenticated `gh` session and invokes only the fixed privileged operations it
+needs. For a first public install use `install-public`, test the radio, phone,
+identity, and channels, then run `adopt`. For pre-publication hardware testing,
+use `install-draft` with the exact successful tag workflow's run ID and
+attempt, then `publish-adopt-draft ... --yes` after those checks pass. It
+downloads the immutable Actions artifact, never the mutable draft attachment.
+Later **Update service** operations are transactional because adoption seeds
+the private rollback cache. If the current config has no stable
+`General.MACAddress`, adoption proves and applies only a conservative pin;
+configurations it cannot edit safely require a manual pin.
 
 **HTTPS errors when uploading to wdgwars.pl** — check `~/.watchdogs/last_run.log`
 for SSL errors. Most often caused by an expired system CA bundle:

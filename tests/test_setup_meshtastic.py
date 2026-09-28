@@ -259,6 +259,8 @@ def test_setup_installs_support_without_downloading_or_starting_a_daemon():
     assert 'sudo bash "$SCRIPT_DIR/scripts/setup_meshtastic.sh"' in setup
     assert '--install-support "$TARGET_USER" "$TARGET_UID"' in setup
     assert "/usr/local/libexec/watchdogs-meshtastic" in script
+    assert "/usr/local/bin/watchdogs-meshtastic-release" in script
+    assert '"$RELEASE_TOOL_SOURCE" "$RELEASE_TOOL_TARGET"' in script
     assert "/var/cache/watchdogs/meshtasticd-wdg" in script
     assert "/var/backups/meshtasticd-wdg" in script
     assert "install -o root -g root -m 0755" in script

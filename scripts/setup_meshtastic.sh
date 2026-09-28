@@ -6,8 +6,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER_SOURCE="$SCRIPT_DIR/scripts/watchdogs_meshtastic_helper.py"
 VALIDATOR_SOURCE="$SCRIPT_DIR/watchdogs/meshtastic_updates.py"
+RELEASE_TOOL_SOURCE="$SCRIPT_DIR/scripts/meshtastic_release.py"
 HELPER_TARGET="/usr/local/libexec/watchdogs-meshtastic"
 LIB_TARGET="/usr/local/libexec/watchdogs-meshtastic-lib"
+RELEASE_TOOL_TARGET="/usr/local/bin/watchdogs-meshtastic-release"
 SUDOERS_TARGET="/etc/sudoers.d/watchdogs-meshtastic"
 CONFIG_TARGET="/etc/meshtasticd/wdg-portduino.yaml"
 CACHE_ROOT="/var/cache/watchdogs/meshtasticd-wdg"
@@ -204,8 +206,11 @@ wdg_install_meshtastic_support() {
         echo "Missing helper source: $HELPER_SOURCE" >&2; return 1; }
     [ -f "$VALIDATOR_SOURCE" ] && [ ! -L "$VALIDATOR_SOURCE" ] || {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
+    [ -f "$RELEASE_TOOL_SOURCE" ] && [ ! -L "$RELEASE_TOOL_SOURCE" ] || {
+        echo "Missing release tool source: $RELEASE_TOOL_SOURCE" >&2; return 1; }
 
-    for path in "$HELPER_TARGET" "$LIB_TARGET" "$SUDOERS_TARGET" \
+    for path in "$HELPER_TARGET" "$LIB_TARGET" "$RELEASE_TOOL_TARGET" \
+                "$SUDOERS_TARGET" \
                 "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" "$CONFIG_TARGET" \
                 "$RADIO_LOCK_DIR" "$RADIO_LOCK_PATH" \
                 "$TRANSACTION_LOCK_PATH" \
@@ -216,8 +221,11 @@ wdg_install_meshtastic_support() {
     wdg_meshtastic_prepare_radio_access "$user"
 
     install -d -o root -g root -m 0755 /usr/local/libexec
+    install -d -o root -g root -m 0755 /usr/local/bin
     install -d -o root -g root -m 0755 "$LIB_TARGET"
     install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_TARGET"
+    install -o root -g root -m 0755 \
+        "$RELEASE_TOOL_SOURCE" "$RELEASE_TOOL_TARGET"
     install -o root -g root -m 0644 \
         "$VALIDATOR_SOURCE" "$LIB_TARGET/meshtastic_updates.py"
     install -d -o root -g root -m 0700 \
@@ -275,7 +283,7 @@ wdg_install_meshtastic_support() {
     rm -f "$sudoers_temp"
 
     "$HELPER_TARGET" version >/dev/null
-    echo "Meshtastic helper installed for $user (UID $uid)."
+    echo "Meshtastic helper and release tool installed for $user (UID $uid)."
 }
 
 wdg_meshtastic_setup_main() {
