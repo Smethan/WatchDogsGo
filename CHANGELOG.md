@@ -10,6 +10,16 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.49] — 2026-09-28
+
+### Fixed
+
+- Accept GitHub's canonical `%2B` encoding for the plus sign in published
+  `meshtasticd-wdg_*+wdg*_arm64.deb` asset URLs. The strict host/path check had
+  required a literal plus, causing valid public releases to be silently
+  excluded and `adopt` to report that the requested release was not found.
+  Literal-plus and off-repository asset URLs remain rejected.
+
 ## [0.9.48] — 2026-09-28
 
 ### Fixed

@@ -175,7 +175,7 @@ def release_entry(tag=TAG, *, repo="Smethan/meshtastic-firmware"):
         "draft": False,
         "prerelease": False,
         "assets": [
-            {"name": name, "browser_download_url": base + quote(name, safe="._+-")}
+            {"name": name, "browser_download_url": base + quote(name, safe="._-")}
             for name in names
         ],
     }
@@ -213,6 +213,19 @@ def test_release_list_accepts_only_exact_smethan_assets(monkeypatch):
     # Default arguments bind at definition time, so inject the downloader.
     found = updates.meshtastic_releases(downloader=lambda url, limit: payload)
     assert [item["tag_name"] for item in found] == [TAG, "v2.8.0-wdg.9"]
+
+
+def test_release_requires_github_canonical_percent_encoded_plus():
+    release = release_entry()
+    package = next(
+        asset for asset in release["assets"] if asset["name"] == ASSET)
+    assert "%2B" in package["browser_download_url"]
+    updates.validate_release_entry(release)
+
+    package["browser_download_url"] = package["browser_download_url"].replace(
+        "%2B", "+")
+    with pytest.raises(ValueError, match="not hosted"):
+        updates.validate_release_entry(release)
 
 
 def test_valid_package_and_staged_release_are_accepted(tmp_path):
@@ -478,7 +491,7 @@ def test_prepare_downloads_verified_release_assets_into_private_cache(tmp_path):
     payloads = {
         base + "compatibility.json": manifest_blob,
         base + "SHA256SUMS": sums,
-        base + ASSET: package.read_bytes(),
+        base + quote(ASSET, safe="._-"): package.read_bytes(),
         base + "SOURCE.txt": source_blob,
         base + "copyright": copyright_blob,
     }

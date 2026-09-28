@@ -395,7 +395,11 @@ def _asset_map(release: dict[str, Any]) -> dict[str, str]:
             raise ValueError("Release asset is missing its name or URL")
         if name in result:
             raise ValueError("Release contains a duplicate asset: " + name)
-        if url != base + quote(name, safe="._+-"):
+        # GitHub's release API returns '+' in asset filenames as its canonical
+        # percent-encoded form (%2B), even though an unescaped plus often works
+        # in a browser. Require the exact API form so host/path validation
+        # remains closed without filtering every real WDG .deb release.
+        if url != base + quote(name, safe="._-"):
             raise ValueError("Release asset is not hosted by the configured Smethan fork")
         result[name] = url
     return result

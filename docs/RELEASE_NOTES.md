@@ -1,5 +1,18 @@
 # Smethan WatchDogsGo
 
+## 0.9.49 — Accept canonical GitHub package URLs — 2026-09-28
+
+- Fix protected Meshtastic release discovery for real GitHub release metadata.
+  GitHub percent-encodes the plus sign in Debian package asset URLs as `%2B`;
+  the validator had expected a literal `+` and therefore filtered otherwise
+  valid public v6/v7 releases before adoption.
+- Retain the strict repository, tag directory, filename, exact five-asset, and
+  manifest/checksum checks. A regression test accepts only GitHub's canonical
+  encoded package URL and still rejects a literal-plus or off-repository URL.
+
+The failed pre-fix adoption restored the uConsole's previously active daemon;
+no package or service-selection change occurred before this correction.
+
 ## 0.9.48 — Pin the protected firmware publication workflow — 2026-09-28
 
 - Fix `publish-adopt-draft` on the Smethan firmware fork by explicitly
