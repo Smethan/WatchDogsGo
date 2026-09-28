@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 8})
+        return result({"ok": True, "helper_version": 9})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 8
+    assert controller.version() == 9
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -120,7 +120,7 @@ def test_controller_parses_status_and_preserves_helper_errors():
 
 def test_controller_rejects_pre_hardening_helper_version():
     controller = service.MeshtasticServiceController(
-        runner=lambda *a, **k: result({"ok": True, "helper_version": 7}),
+        runner=lambda *a, **k: result({"ok": True, "helper_version": 8}),
         geteuid=lambda: 0)
 
     with pytest.raises(RuntimeError, match="outdated.*setup.sh"):
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 8
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 9
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -2138,6 +2138,9 @@ def test_candidate_config_directory_is_redirected_into_private_copy(
     (source_config / "config.d/radio.yaml").write_text(
         "Lora:\n  Module: sx1262\n", encoding="utf-8")
     (source_config / "config.yaml").write_text(
+        "# Meshtastic configuration\n"
+        "\n"
+        "--- # one ordinary YAML document\n"
         "General:\n"
         "  ConfigDirectory: /etc/meshtasticd/config.d/\n"
         "  AvailableDirectory: /etc/meshtasticd/available.d/\n",
@@ -2154,6 +2157,7 @@ def test_candidate_config_directory_is_redirected_into_private_copy(
         text = config.read_text(encoding="utf-8")
         expected = candidate / "etc-meshtasticd/config.d"
         assert fragment_dir == expected
+        assert "--- # one ordinary YAML document" in text
         assert f"ConfigDirectory: {json.dumps(str(expected))}" in text
         assert "/etc/meshtasticd/config.d/" not in text
         assert (expected / "radio.yaml").is_file()
@@ -2202,6 +2206,27 @@ def test_candidate_config_rejects_indirect_config_directory(
     runtime_root = install_candidate_workspace_fakes(
         helper, monkeypatch, tmp_path)
     with pytest.raises(helper.HelperError, match="General"):
+        helper._copy_candidate_state(backup, 612, 613)
+    assert list(runtime_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("text", [
+    "General:\n  MaxNodes: 100\n---\nLora:\n  Module: sx1262\n",
+    "---\n---\nGeneral:\n  MaxNodes: 100\n",
+    "  ---\nGeneral:\n  MaxNodes: 100\n",
+    "...\nGeneral:\n  MaxNodes: 100\n",
+    "%YAML 1.2\n---\nGeneral:\n  MaxNodes: 100\n",
+])
+def test_candidate_config_rejects_unsafe_yaml_document_features(
+        tmp_path, text, monkeypatch):
+    helper = load_helper()
+    backup = candidate_backup(tmp_path)
+    config = backup / "state/etc-meshtasticd/config.yaml"
+    config.write_text(text, encoding="utf-8")
+
+    runtime_root = install_candidate_workspace_fakes(
+        helper, monkeypatch, tmp_path)
+    with pytest.raises(helper.HelperError, match="document"):
         helper._copy_candidate_state(backup, 612, 613)
     assert list(runtime_root.iterdir()) == []
 
@@ -2455,6 +2480,14 @@ def test_mac_pin_rewrites_only_supported_general_mappings():
     rendered, changed = helper._rewrite_general_mac_text(
         "Lora:\n  Module: sx1262\n", mac)
     assert changed is True
+    assert rendered.endswith(
+        'General:\n  MACAddress: "02:00:A1:B2:C3:D4"\n')
+
+    rendered, changed = helper._rewrite_general_mac_text(
+        "# generated config\n--- # document start\nLora:\n  Module: sx1262\n",
+        mac)
+    assert changed is True
+    assert "--- # document start" in rendered
     assert rendered.endswith(
         'General:\n  MACAddress: "02:00:A1:B2:C3:D4"\n')
 

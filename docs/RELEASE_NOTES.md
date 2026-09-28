@@ -1,5 +1,19 @@
 # Smethan WatchDogsGo
 
+## 0.9.52 — Accept ordinary single-document Meshtastic YAML — 2026-09-28
+
+- Fix release adoption for standard Meshtastic configurations that place one
+  root-level YAML document-start marker (`---`) after leading comments.
+- Preserve that marker while isolating `General.ConfigDirectory` and pinning
+  the candidate daemon's validated MAC address inside its disposable copy.
+- Continue rejecting YAML aliases, anchors, merge keys, directives, document
+  terminators, indented markers, repeated markers, and any marker that would
+  begin a second document.
+- Bump the installed helper contract to version 9.
+
+Automated coverage exercises the uConsole's real leading-marker layout and
+proves that the unsafe multi-document and indirection cases remain blocked.
+
 ## 0.9.51 — Support legacy non-root daemon primary groups — 2026-09-28
 
 - Fix isolated candidate validation on systems where an older package created

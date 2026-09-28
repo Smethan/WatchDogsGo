@@ -10,6 +10,21 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.52] — 2026-09-28
+
+### Fixed
+
+- Permit one root-level YAML document-start marker before the first mapping in
+  the disposable Meshtastic candidate configuration. This is a normal
+  single-document layout and no longer blocks adoption.
+
+### Security
+
+- Keep rejecting multiple, misplaced, or indented document-start markers,
+  document terminators, YAML directives, aliases, anchors, and merge keys.
+  Candidate validation still rewrites only a conservative plain mapping.
+- Bump the privileged helper contract to version 9.
+
 ## [0.9.51] — 2026-09-28
 
 ### Fixed

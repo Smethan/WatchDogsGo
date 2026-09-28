@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 8
+HELPER_VERSION = 9
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -1536,17 +1536,41 @@ def _copy_candidate_state(
 
 
 def _yaml_uses_indirection_or_documents(content: str) -> bool:
-    stripped = content.strip()
-    if not stripped or stripped.startswith("#"):
+    syntax = content.split("#", 1)[0].strip()
+    if not syntax:
         return False
     without_comment = content.split("#", 1)[0]
     return bool(
         re.search(
             r"(?:^|[\s:\-\[,])[*&][A-Za-z0-9_-]+", without_comment)
         or re.search(r"(?:^|\s)<<[ \t]*:", without_comment)
-        or stripped in ("---", "...")
-        or stripped.startswith("%")
+        or syntax == "..."
+        or syntax.startswith("%")
     )
+
+
+def _yaml_has_unsafe_document_start(text: str) -> bool:
+    """Allow one root-level document start before the first YAML content."""
+    document_start_seen = False
+    content_seen = False
+    for line in text.splitlines():
+        without_comment = line.split("#", 1)[0]
+        syntax = without_comment.strip()
+        if not syntax:
+            continue
+        if syntax == "---":
+            if (document_start_seen or content_seen
+                    or without_comment.rstrip() != "---"):
+                return True
+            document_start_seen = True
+            continue
+        content_seen = True
+    return False
+
+
+def _yaml_is_leading_document_start(content: str) -> bool:
+    without_comment = content.split("#", 1)[0]
+    return without_comment.rstrip() == "---"
 
 
 def _isolate_candidate_config_directory(
@@ -1556,6 +1580,11 @@ def _isolate_candidate_config_directory(
         text = config.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise HelperError("Copied Meshtastic config.yaml is unreadable") from exc
+
+    if _yaml_has_unsafe_document_start(text):
+        raise HelperError(
+            "Copied Meshtastic config uses multiple or misplaced YAML "
+            "document markers")
 
     lines = text.splitlines(keepends=True)
     general_rows: list[int] = []
@@ -1568,6 +1597,8 @@ def _isolate_candidate_config_directory(
             raise HelperError(
                 "Copied Meshtastic config uses YAML aliases or document "
                 "features that prevent safe General.ConfigDirectory isolation")
+        if _yaml_is_leading_document_start(content):
+            continue
         if re.match(r"^[\"']General[\"'][ \t]*:", content):
             raise HelperError(
                 "Copied Meshtastic config uses a quoted General key")
@@ -1703,7 +1734,7 @@ def _rewrite_general_mac_text(text: str, mac: str) -> tuple[str, bool]:
         raise HelperError("Validated Meshtastic MAC is malformed")
     lines = text.splitlines(keepends=True)
     general_rows: list[int] = []
-    risky_yaml = False
+    risky_yaml = _yaml_has_unsafe_document_start(text)
     root_mapping = True
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
@@ -1712,6 +1743,8 @@ def _rewrite_general_mac_text(text: str, mac: str) -> tuple[str, bool]:
             continue
         if _yaml_uses_indirection_or_documents(content):
             risky_yaml = True
+        if _yaml_is_leading_document_start(content):
+            continue
         if re.match(r"^[\"']General[\"'][ \t]*:", content):
             raise HelperError(
                 "Automatic MAC pinning does not support quoted General keys")
@@ -1835,6 +1868,10 @@ def _fragment_contains_general(path: Path) -> bool:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise HelperError("Meshtastic config fragment is unreadable: " + str(path)) from exc
+    if _yaml_has_unsafe_document_start(text):
+        raise HelperError(
+            "Automatic MAC pinning does not support multiple or misplaced "
+            "YAML document markers in " + str(path))
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -1843,6 +1880,8 @@ def _fragment_contains_general(path: Path) -> bool:
             raise HelperError(
                 "Automatic MAC pinning does not support YAML aliases or "
                 "document features in " + str(path))
+        if _yaml_is_leading_document_start(line):
+            continue
         if re.match(r"^[\"']General[\"'][ \t]*:", line):
             raise HelperError(
                 "Automatic MAC pinning does not support quoted General keys in "
