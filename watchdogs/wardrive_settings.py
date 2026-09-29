@@ -24,7 +24,7 @@ from .map_display import (
 DOT_FADE_CHOICES = (15, 30, 60, 120)
 TRAIL_MODES = ("off", "solid", "heat")
 LORA_PROTOCOLS = ("meshcore", "meshtastic", "reticulum")
-MESHTASTIC_BACKENDS = ("auto", "fork_socket", "legacy_tcp")
+MESHTASTIC_BACKENDS = ("fork_socket",)
 
 _BLUETOOTH_MAC = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
@@ -47,7 +47,7 @@ DEFAULTS = {
     "lora_protocol": "meshcore",
     "wardrive_adsb": True,
     "wardrive_433": False,
-    "meshtastic_backend": "auto",
+    "meshtastic_backend": "fork_socket",
     "meshtastic_phone_ble_enabled": True,
     "meshtastic_phone_adapter": "auto",
     # Opt-in: upgrades must not unexpectedly expose a new BLE peripheral.
@@ -164,8 +164,10 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
         result["wardrive_433"] = False
     if result["lora_protocol"] not in LORA_PROTOCOLS:
         result["lora_protocol"] = DEFAULTS["lora_protocol"]
-    if result["meshtastic_backend"] not in MESHTASTIC_BACKENDS:
-        result["meshtastic_backend"] = DEFAULTS["meshtastic_backend"]
+    # Stock-versus-WDG selection was removed with unified installation.  Keep
+    # the serialized key for one migration release, but force the only
+    # supported restricted local API.
+    result["meshtastic_backend"] = "fork_socket"
     for key in ("meshtastic_phone_adapter", "meshcore_ble_adapter",
                 "host_ble_adapter"):
         value = result[key].strip() if isinstance(result[key], str) else "auto"

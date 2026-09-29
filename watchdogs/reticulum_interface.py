@@ -1,14 +1,13 @@
-"""Reticulum external interface for the uConsole AIO v2 SX1262.
+"""Reticulum external interface for the broker-owned AIO v2 SX1262.
 
 The AIO radio is not an RNode and has no serial KISS firmware.  This module
-implements the small RNode-compatible LoRa framing layer directly over
-LoRaRF, including split-packet reassembly and the RNode CSMA timing model.
-All SPI access is serialized on one worker thread.
+implements the small RNode-compatible LoRa framing layer over the local radio
+manager, including split-packet reassembly and the RNode CSMA timing model.
+The sidecar never opens SPI or GPIO resources.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
 import math
 import queue
@@ -19,16 +18,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import Any
 
-from .lora_manager import (
-    LORARF_IRQ_POLLING,
-    PIN_BUSY,
-    PIN_RESET,
-    SPI_BUS,
-    SPI_CS,
-    lora_spi_device,
-    missing_spi_message,
-)
-from .radio_ownership import RadioOwnership, RadioOwnershipBusy
+from .broker_lora import BrokerLoRa
 
 try:  # RNS is an optional runtime dependency for non-Reticulum WDG users.
     from RNS.Interfaces.Interface import Interface as _RNSInterface
@@ -302,7 +292,6 @@ class AioSX1262Interface(_RNSInterface):
         self._sleep = config.get("_sleep", time.sleep)
         self._rng = config.get("_rng", random.SystemRandom())
         self._radio_factory = config.get("_radio_factory")
-        self._ownership = config.get("_radio_ownership") or RadioOwnership()
         self._stop_event = threading.Event()
         self._tx_queue: queue.Queue[bytes] = queue.Queue(
             maxsize=self.MAX_QUEUE_PACKETS)
@@ -348,36 +337,15 @@ class AioSX1262Interface(_RNSInterface):
                 log.exception("Reticulum interface event sink failed")
 
     def _open_hardware(self) -> None:
-        try:
-            self._ownership.acquire("WatchDogsGo Reticulum")
-        except RadioOwnershipBusy:
-            raise
-        try:
-            spi_device = lora_spi_device()
-            if not spi_device.exists() and self._radio_factory is None:
-                raise FileNotFoundError(missing_spi_message(spi_device))
-            if self._radio_factory is None:
-                from LoRaRF import SX126x
-                radio = SX126x()
-            else:
-                radio = self._radio_factory()
-            self._radio = radio
-            if not radio.begin(
-                    bus=SPI_BUS, cs=SPI_CS, reset=PIN_RESET, busy=PIN_BUSY,
-                    irq=LORARF_IRQ_POLLING):
-                raise RuntimeError("SX1262 not detected on SPI bus")
-            radio.setDio2RfSwitch(True)
-            radio.setDio3TcxoCtrl(radio.DIO3_OUTPUT_1_8, 10)
-            radio.setRxGain(radio.RX_GAIN_BOOSTED)
-            try:
-                radio.setTxPower(self.tx_power_dbm, radio.TX_POWER_SX1262)
-            except TypeError:
-                radio.setTxPower(self.tx_power_dbm)
-            self._configure_radio()
-            if not radio.request(radio.RX_CONTINUOUS):
-                raise RuntimeError("radio refused continuous receive mode")
-        except Exception:
-            raise
+        radio = (self._radio_factory() if self._radio_factory is not None
+                 else BrokerLoRa("reticulum"))
+        self._radio = radio
+        if not radio.begin():
+            raise RuntimeError("SX1262 manager did not grant the Reticulum lease")
+        radio.setTxPower(self.tx_power_dbm)
+        self._configure_radio()
+        if not radio.request(radio.RX_CONTINUOUS):
+            raise RuntimeError("radio refused continuous receive mode")
 
     def _configure_radio(self) -> None:
         radio = self._radio
@@ -626,34 +594,11 @@ class AioSX1262Interface(_RNSInterface):
             except Exception:
                 pass
             try:
-                module = importlib.import_module(type(radio).__module__)
-                spi = getattr(module, "spi", None)
-                if spi is None:
-                    from LoRaRF import SX126x as sx_module
-                    spi = getattr(sx_module, "spi", None)
-                if spi is None:
-                    raise RuntimeError("LoRaRF SPI handle is unavailable")
-                spi.close()
-            except Exception as exc:
-                # Test radios can expose an explicit close() without the
-                # LoRaRF module-level SPI handle.
-                close = getattr(radio, "close", None)
-                try:
-                    if callable(close):
-                        close()
-                    else:
-                        raise exc
-                except Exception:
-                    ok = False
-                    self._close_uncertain = True
-                    log.warning("Could not confirm Reticulum SPI close: %s", exc)
-        if ok and getattr(self._ownership, "held", True):
-            try:
-                self._ownership.release()
+                radio.close()
             except Exception as exc:
                 ok = False
                 self._close_uncertain = True
-                log.warning("Could not release Reticulum radio lock: %s", exc)
+                log.warning("Could not close Reticulum broker client: %s", exc)
         self._radio = None
         return ok
 

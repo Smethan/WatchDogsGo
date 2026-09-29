@@ -46,6 +46,10 @@ def _core_manifest(tag=TAG):
             "major": updates.MESHTASTIC_WDG_API_MAJOR,
             "minor": updates.MESHTASTIC_WDG_API_MINOR,
         },
+        "sx1262_broker_api": {
+            "major": updates.SX1262_BROKER_API_MAJOR,
+            "minor": updates.SX1262_BROKER_API_MINOR,
+        },
         "package": {
             "name": "meshtasticd-wdg",
             "version": updates.package_version_for_tag(tag),
@@ -99,10 +103,19 @@ def build_package(tmp_path: Path, *, extra_path: str | None = None,
     elf[5] = 1
     elf[18:20] = (183).to_bytes(2, "little")
     _write(root / "usr/lib/meshtasticd-wdg/meshtasticd", bytes(elf), 0o755)
+    _write(
+        root / "usr/lib/watchdogs-sx1262d/watchdogs-sx1262d",
+        bytes(elf),
+        0o755,
+    )
     (root / "usr/lib/meshtasticd-wdg").chmod(binary_directory_mode)
     _write(
         root / "usr/lib/systemd/system/meshtasticd-wdg.service",
         service if service is not None else updates.SAFE_SERVICE,
+    )
+    _write(
+        root / "usr/lib/systemd/system/watchdogs-sx1262d.service",
+        updates.SAFE_MANAGER_SERVICE,
     )
     _write(root / "usr/lib/tmpfiles.d/meshtasticd-wdg.conf",
            tmpfiles if tmpfiles is not None else updates.SAFE_TMPFILES)
@@ -118,6 +131,10 @@ def build_package(tmp_path: Path, *, extra_path: str | None = None,
     )
     _write(root / "usr/share/meshtasticd-wdg/wdg-portduino.example.yaml",
            "wdg_api:\n  enabled: true\n")
+    _write(
+        root / "usr/share/meshtasticd-wdg/sx1262.example.yaml",
+        "sx1262:\n  spidev: /dev/spidev1.0\n",
+    )
     _write(root / "usr/share/doc/meshtasticd-wdg/copyright", "GPL-3.0\n")
     _write(root / "usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE",
            "upstream_tag=v2.8.1\nupstream_commit=" + "a" * 40 + "\n")
@@ -457,6 +474,8 @@ def test_manifest_rejects_wrong_repo_api_arch_and_host(tmp_path):
         (lambda item: item.update(repository="Smethan/firmware"), "Smethan fork"),
         (lambda item: item["wdg_api"].update(major=2), "API major"),
         (lambda item: item["wdg_api"].update(minor=0), "older WDG API"),
+        (lambda item: item["sx1262_broker_api"].update(major=2),
+         "broker API major"),
         (lambda item: item["package"].update(architecture="amd64"), "ARM64"),
         (lambda item: item.update(source_commit="not-a-commit"), "source commit"),
         (lambda item: item.update(source_ref="develop"), "source reference"),

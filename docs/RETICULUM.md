@@ -30,7 +30,7 @@ python -m watchdogs.reticulum_sidecar --profile <private-profile> --socket <priv
 ```
 
 The child hosts exactly one RNS instance, one LXMF router, one delivery
-identity, and one `AioSX1262Interface`. Its RNS configuration sets
+identity, and one broker-backed `AioSX1262Interface`. Its RNS configuration sets
 `share_instance = No` and `enable_transport = No`. The child exits completely
 before another protocol may own the SX1262.
 
@@ -39,19 +39,20 @@ mode-0700 user runtime directory. The parent accepts only the exact spawned PID
 and current UID through `SO_PEERCRED`. There is no TCP listener, root daemon,
 systemd unit, or privileged helper.
 
-MeshCore and Reticulum are the two direct-SPI owners. Meshtastic remains the
-daemon owner. The existing process lock and exact active/enabled service
-snapshot are shared by all three paths. Direct-to-direct handoffs retain the
-same snapshot; direct-to-daemon handoffs restore it before transactional daemon
-selection. A failed radio close or unverifiable lock release activates the
-existing restart-required ownership barrier.
+`watchdogs-sx1262d` is the only SPI/GPIO/power owner. The sidecar receives an
+exclusive Reticulum lease through WDG's controller session and performs no
+direct hardware access. If WDG exits or stops renewing its heartbeat, the
+manager revokes the lease, resets the chip, and returns to Meshtastic. A failed
+quiesce or unverifiable lease release blocks the next frontend from being
+exposed rather than allowing two protocol owners.
 
 ## Radio transport
 
 `watchdogs.reticulum_interface.AioSX1262Interface` is an RNS external interface
-for `/dev/spidev1.0`. It uses the AIO v2 reset GPIO 25, busy GPIO 24, polling
-IRQ arrangement, DIO2 RF switch, and DIO3 1.8 V TCXO. All LoRaRF calls,
-including initialization and teardown, run on one worker thread.
+over the manager socket. Radio wiring, reset GPIO 25, busy GPIO 24, polling IRQ
+arrangement, DIO2 RF switch, and DIO3 1.8 V TCXO remain manager-owned hardware
+facts. The sidecar supplies only the bounded PHY configuration and serialized
+CAD/RX/TX operations used by its RNode-compatible protocol worker.
 
 The implementation follows the on-air framing and CSMA constants in RNode
 Firmware commit
@@ -69,7 +70,7 @@ Firmware commit
 - continuous receive outside transmission and fatal teardown on missed
   `TX_DONE`, SPI failure, or unrecoverable modem state.
 
-The direct-SPI implementation is not an RNode serial emulator. It is an
+The broker-backed implementation is not an RNode serial emulator. It is an
 external RNS interface that deliberately uses the same LoRa wire framing and
 medium-access behavior so it can interoperate over RF with a standard RNode.
 
@@ -212,7 +213,7 @@ release-ready:
 6. Exercise a busy channel and observe DIFS/contention rather than immediate
    transmission.
 7. Complete at least 25 three-way protocol switches and a two-hour receive/send
-   soak with no child, lock, identity, daemon-state, SPI, or queue leak.
+   soak with no child, lease, identity, daemon-state, SPI, or queue leak.
 8. Power-cycle and confirm identity, destination, profile, and history
    persistence.
 

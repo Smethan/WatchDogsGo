@@ -1,16 +1,11 @@
-"""LoRa SX1262 control via SPI — sniffer, scanner, balloon tracker.
+"""LoRa protocol workers backed by the local SX1262 manager.
 
-Uses LoRaRF library for direct SPI communication with SX1262 on AIO v2 board.
-Background threads with queue-based output (same pattern as FlashManager).
-
-Hardware: SX1262 on /dev/spidev1.0
-  IRQ=GPIO26, Busy=GPIO24, Reset=GPIO25
-  DIO2 as RF switch, DIO3 TCXO voltage
+MeshCore/APRS/scanner framing remains in WDG.  Hardware access is exclusively
+performed by ``watchdogs-sx1262d`` through the bounded broker API.
 """
 
 import hashlib
 import hmac
-import importlib
 import logging
 import os
 import re
@@ -19,11 +14,11 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from queue import Queue
 from typing import Optional
 
-from .radio_ownership import RadioOwnership, RadioOwnershipBusy
+from .broker_lora import BrokerLoRa
+from .sx1262_client import BrokerError, SX1262Controller
 
 log = logging.getLogger(__name__)
 
@@ -295,38 +290,12 @@ MC_PAYLOAD_TYPES = {
 }
 MC_ROUTE_TYPES = {0: "TFlood", 1: "Flood", 2: "Direct", 3: "TDirect"}
 
-# Hardware config (from /etc/meshtasticd/config.yaml)
-SPI_BUS = 1
-SPI_CS = 0
-SPI_SPEED = 7_800_000
-PIN_RESET = 25
-PIN_BUSY = 24
-PIN_IRQ = 26  # DIO1
-# WDG reads the SX1262 IRQ status over SPI in every receive/transmit loop.
-# Passing the physical DIO1 pin to LoRaRF also installs RPi.GPIO callbacks,
-# which race those SPI polls and can fail on kernels without sysfs GPIO edge
-# support.  LoRaRF explicitly supports -1 for polling-only operation.
-LORARF_IRQ_POLLING = -1
-
-
-def lora_spi_device() -> Path:
-    """Return the configured AIO SX1262 SPI device path."""
-    override = os.environ.get("WDG_LORA_SPI_DEVICE", "").strip()
-    return Path(override or f"/dev/spidev{SPI_BUS}.{SPI_CS}")
-
-
-def missing_spi_message(device: Path | str) -> str:
-    """Actionable recovery text for an absent AIO SPI1 device."""
-    return (
-        f"LoRa SPI device {device} is missing; run sudo "
-        "WDG_ENABLE_AIO_LORA=1 bash setup.sh, reboot, then enable LoRa")
-
-
 class LoRaManager:
     """Background LoRa operations with queue-based output."""
 
-    def __init__(self, *, radio_ownership=None, service_handoff=None,
-                 thread_factory=None, operation_guard=None) -> None:
+    def __init__(self, *, sx1262_controller=None, radio_ownership=None,
+                 service_handoff=None, thread_factory=None,
+                 operation_guard=None) -> None:
         self.queue: Queue = Queue()
         self._thread: Optional[threading.Thread] = None
         self._thread_factory = thread_factory or threading.Thread
@@ -335,10 +304,13 @@ class LoRaManager:
         self._starting = False
         self._stopping = False
         self._worker_generation = 0
-        self._radio_ownership = (
-            radio_ownership if radio_ownership is not None
-            else RadioOwnership())
-        self._service_handoff = service_handoff
+        # ``radio_ownership`` and ``service_handoff`` remain accepted for one
+        # compatibility release, but production no longer uses either.  The
+        # manager is the sole SPI/GPIO/power owner.
+        self._radio_ownership = radio_ownership
+        self._service_handoff = None
+        self._sx1262 = sx1262_controller or SX1262Controller()
+        self._broker_session_active = False
         self._operation_guard = operation_guard
         # True only while MeshtasticManager retains the exact pre-suspension
         # snapshot.  The direct-radio layer never reconstructs service state
@@ -399,8 +371,8 @@ class LoRaManager:
 
     @property
     def radio_owned(self) -> bool:
-        """Whether this manager currently holds the direct-radio lock."""
-        return bool(self._radio_ownership.held)
+        """Whether this worker currently holds a manager protocol lease."""
+        return self._broker_session_active
 
     @property
     def worker_active(self) -> bool:
@@ -453,11 +425,6 @@ class LoRaManager:
                     or self._companion_cleanup_pending
                     or (thread is not None and thread.is_alive())):
                 return False
-            if self._radio_ownership.held:
-                self._emit(
-                    "SX1262 ownership is still held after an earlier cleanup "
-                    "failure; restart WatchDogsGo before retrying", "error")
-                return False
             self._worker_generation += 1
             generation = self._worker_generation
             self._stop_event.clear()
@@ -498,258 +465,59 @@ class LoRaManager:
                 self._thread = None
 
     def _service_restore_pending(self) -> bool:
-        """Return the service manager's authoritative rollback state."""
-        handoff = self._service_handoff
-        if handoff is None:
-            return False
-        pending = getattr(handoff, "service_restore_pending", False)
-        try:
-            return bool(pending() if callable(pending) else pending)
-        except Exception:
-            return False
+        """Compatibility shim; service stop/restore ownership was removed."""
+        return False
 
     def reuse_retained_service_snapshot_once(self) -> None:
-        """Reuse the existing exact service token for one direct start."""
-        with self._state_lock:
-            self._reuse_retained_snapshot_once = True
+        """Compatibility shim for callers upgraded before their UI module."""
 
     def _restore_service_after_failed_start(self) -> None:
-        """Retry only the exact snapshot retained by MeshtasticManager."""
-        if self._service_handoff is None or not self._service_restore_pending():
-            return
-        try:
-            if self._service_handoff.resume_service(
-                    timeout=15.0, connect=True):
-                self._emit(
-                    "Direct radio failed; Meshtastic service restored", "dim")
-            else:
-                self._emit(
-                    "Direct radio failed and Meshtastic service could not be "
-                    "restored", "error")
-        except Exception as exc:
-            self._emit(
-                "Direct radio failed and Meshtastic service restore failed: "
-                + str(exc)[:120], "error")
+        """The manager performs Meshtastic fallback; there is no service token."""
 
     def _finish_radio_session(self, startup_complete: bool) -> None:
-        """Restore a displaced service only when direct startup itself failed."""
-        service_restore_pending = self._session_service_restore_pending
-        reused_snapshot = self._session_reused_snapshot
-        self._session_service_restore_pending = False
-        self._session_reused_snapshot = False
-        if (startup_complete or self._stop_event.is_set()
-                or self._radio_ownership.held):
-            return
-        if service_restore_pending and not reused_snapshot:
-            self._restore_service_after_failed_start()
+        """Compatibility hook; lease cleanup is completed in `_cleanup_radio`."""
 
     def _open_radio_session(self):
-        """Suspend the daemon, claim process ownership, then initialize SPI."""
-        self._session_service_restore_pending = False
-        self._session_reused_snapshot = False
+        """Request WDG's exclusive broker lease, then attach its PHY client."""
         if self._stop_event.is_set():
             return None
-        service_restore_pending = False
-        handoff = self._service_handoff
-        if handoff is not None:
-            try:
-                # Powering the rail off after a successful direct session
-                # deliberately leaves its exact pre-session service snapshot
-                # retained.  Before opening another direct session, restore
-                # that snapshot without connecting a client, then take a fresh
-                # suspension snapshot.  This work runs in the direct worker,
-                # so bounded systemd waits never block the UI thread.
-                with self._state_lock:
-                    reuse_retained = self._reuse_retained_snapshot_once
-                    self._reuse_retained_snapshot_once = False
-                if self._service_restore_pending() and reuse_retained:
-                    service_restore_pending = True
-                    self._session_reused_snapshot = True
-                elif self._service_restore_pending():
-                    if not handoff.resume_service(
-                            timeout=15.0, connect=False):
-                        self._emit(
-                            "Could not restore the retained Meshtastic service "
-                            "state; direct SX1262 access was not started",
-                            "error")
-                        return None
-                    if self._service_restore_pending():
-                        self._emit(
-                            "Meshtastic service restore remained unresolved; "
-                            "direct SX1262 access was not started", "error")
-                        return None
-                if (not service_restore_pending
-                        and not handoff.suspend_service(timeout=10.0)):
-                    self._emit(
-                        "Could not stop the selected Meshtastic service; "
-                        "direct SX1262 access was not started", "error")
-                    # suspend_service(False) is authoritative.  It may have
-                    # retained a partially restored snapshot, in which case
-                    # the only safe recovery is retrying that exact token.
-                    if not self._session_reused_snapshot:
-                        self._restore_service_after_failed_start()
-                    return None
-                if not self._service_restore_pending():
-                    self._emit(
-                        "Meshtastic service suspension did not retain an "
-                        "exact restore snapshot; direct SX1262 access was "
-                        "not started", "error")
-                    return None
-                service_restore_pending = True
-            except Exception as exc:
-                self._emit(
-                    "Could not hand off the SX1262 from Meshtastic: "
-                    + str(exc)[:120], "error")
-                if not self._session_reused_snapshot:
-                    self._restore_service_after_failed_start()
-                return None
-
-        # stop() may have been requested while the bounded service handoff was
-        # waiting.  A cancelled worker must never claim GPIO/SPI afterward.
-        if self._stop_event.is_set():
-            if service_restore_pending and not self._session_reused_snapshot:
-                self._restore_service_after_failed_start()
-            return None
-
         try:
-            self._radio_ownership.acquire(
-                f"WatchDogsGo {self.mode or 'direct radio'}")
-        except RadioOwnershipBusy as exc:
+            self._sx1262.activate_mode("meshcore")
+            self._broker_session_active = True
+        except BrokerError as exc:
             self._emit(
-                f"{exc}; stop the other radio user before retrying", "error")
-            if service_restore_pending and not self._session_reused_snapshot:
-                self._restore_service_after_failed_start()
-            return None
-        except Exception as exc:
-            self._emit(
-                "Could not acquire the AIO SX1262 ownership lock: "
+                "Could not obtain the SX1262 manager lease: "
                 + str(exc)[:120], "error")
-            if service_restore_pending and not self._session_reused_snapshot:
-                self._restore_service_after_failed_start()
             return None
-
         if self._stop_event.is_set():
             self._cleanup_radio(None)
-            if (not self._radio_ownership.held
-                    and service_restore_pending
-                    and not self._session_reused_snapshot):
-                self._restore_service_after_failed_start()
             return None
-
-        self._resource_close_uncertain = False
         lora = self._init_radio()
-        if lora is not None:
-            self._session_service_restore_pending = service_restore_pending
-            return lora
-
-        # _init_radio() closes a partially initialized SPI object.  Release
-        # process ownership before restarting any service that previously had
-        # the hardware.
-        self._cleanup_radio(None)
-        if (not self._radio_ownership.held
-                and service_restore_pending
-                and not self._session_reused_snapshot):
-            self._restore_service_after_failed_start()
-        return None
+        if lora is None:
+            self._cleanup_radio(None)
+        return lora
 
     def _close_radio_resources(self, lora) -> bool:
-        """Cold-sleep the radio and confirm SPI close without GPIO cleanup.
-
-        LoRaRF's ``end()`` also calls process-wide ``gpio.cleanup()``.  This
-        application intentionally retains the configured BCM pin mode so a
-        later direct session can initialize reliably.  The process ownership
-        lock is still retained whenever SPI close cannot be confirmed.
-        """
-        if lora is None:
-            return not self._resource_close_uncertain
-        try:
-            lora.sleep(lora.SLEEP_COLD_START)
-        except Exception:
-            pass
-        try:
-            module = importlib.import_module(type(lora).__module__)
-            spi = getattr(module, "spi", None)
-            if spi is None:
-                from LoRaRF import SX126x as _sx
-                spi = getattr(_sx, "spi", None)
-            if spi is None:
-                raise RuntimeError("LoRaRF SPI handle is unavailable")
-            spi.close()
-        except Exception as exc:
-            self._resource_close_uncertain = True
-            log.warning("Could not confirm LoRaRF SPI close: %s", exc)
-            return False
-        self._resource_close_uncertain = False
+        """Close the protocol socket; WDG owns no SPI/GPIO resources."""
+        if lora is not None:
+            lora.close()
         return True
 
     def _init_radio(self):
-        """Initialize SX1262 via SPI. Returns LoRa object or None."""
+        """Attach a MeshCore-role client to the manager-selected lease."""
+        lora = BrokerLoRa("meshcore")
         try:
-            from LoRaRF import SX126x
-        except ImportError:
-            self._emit(
-                "LoRaRF not installed! Run: pip install LoRaRF", "error",
-            )
-            return None
-
-        spi_device = lora_spi_device()
-        if not spi_device.exists():
-            self._emit(missing_spi_message(spi_device), "error")
-            return None
-
-        # Release leftover GPIO allocations from crashed/killed previous run
-        try:
-            import lgpio
-            h = lgpio.gpiochip_open(4)  # RP1 on Pi 5 / CM5
-            for pin in (PIN_RESET, PIN_BUSY, PIN_IRQ):
-                try:
-                    lgpio.gpio_free(h, pin)
-                except Exception:
-                    pass
-            lgpio.gpiochip_close(h)
-        except Exception:
-            pass
-
-        lora = None
-        try:
-            lora = SX126x()
-
-            # begin() calls setSpi() + setPins() + reset internally
-            if not lora.begin(
-                bus=SPI_BUS,
-                cs=SPI_CS,
-                reset=PIN_RESET,
-                busy=PIN_BUSY,
-                irq=LORARF_IRQ_POLLING,
-            ):
-                self._emit("SX1262 not detected on SPI bus", "error")
-                self._close_radio_resources(lora)
+            if not lora.begin():
+                self._emit("SX1262 manager did not grant the WDG radio lease", "error")
+                lora.close()
                 return None
-
-            # SX1262-specific: DIO2 as RF switch, DIO3 as TCXO voltage
-            lora.setDio2RfSwitch(True)
-            lora.setDio3TcxoCtrl(lora.DIO3_OUTPUT_1_8, 10)
-
-            lora.setRxGain(lora.RX_GAIN_BOOSTED)
-            try:
-                lora.setTxPower(22, lora.TX_POWER_SX1262)
-            except Exception:
-                try:
-                    lora.setTxPower(22)
-                except Exception:
-                    pass
-            self._emit("SX1262 radio initialized", "dim")
+            lora.setTxPower(22)
+            self._emit("SX1262 manager lease ready", "dim")
             return lora
-        except FileNotFoundError as exc:
-            self._close_radio_resources(lora)
-            missing = exc.filename or spi_device
-            self._emit(missing_spi_message(missing), "error")
-            log.warning("SX1262 device path missing: %s", missing)
-            return None
         except Exception as exc:
-            self._close_radio_resources(lora)
-            self._emit(f"Radio init failed: {exc}", "error")
-            log.warning("SX1262 init failed: %s", exc)
+            lora.close()
+            self._emit(f"SX1262 manager client failed: {exc}", "error")
+            log.warning("SX1262 manager client failed: %s", exc)
             return None
 
     # ------------------------------------------------------------------
@@ -2144,10 +1912,8 @@ class LoRaManager:
                 if not lora.endPacket(5000):
                     raise RuntimeError("radio refused TX while busy")
 
-                # LoRaRF 1.3+ is asynchronous: endPacket() starts TX and
-                # wait() completes its state transition.  With irq=-1,
-                # wait() polls IRQ status over SPI and installs no GPIO edge
-                # callback, matching the rest of WDG's radio loop.
+                # The broker facade is asynchronous: endPacket() requests TX
+                # and wait() consumes the manager's bounded completion event.
                 waited = lora.wait(5.5)
                 irq = lora.getIrqStatus()
                 tx_ok = bool(waited and irq & lora.IRQ_TX_DONE)
@@ -2172,10 +1938,8 @@ class LoRaManager:
                 log.exception("LoRa TX failed for %d-byte packet", len(packet))
                 self._mark_meshcore_discovery_tx(packet, False)
 
-        # A TX changes the packet length and IRQ mask.  Restore the complete
-        # receive configuration, then let LoRaRF enter continuous receive via
-        # its public request() method.  request() resets the library's wait and
-        # IRQ state without WDG mutating LoRaRF private fields.
+        # A TX changes the packet length and event mask. Restore the complete
+        # receive configuration, then ask the broker to resume continuous RX.
         lora.setStandby(lora.STANDBY_RC)
         time.sleep(0.01)
         lora.clearIrqStatus(0x03FF)
@@ -2190,30 +1954,22 @@ class LoRaManager:
             raise RuntimeError("radio refused to resume continuous RX")
 
     def _cleanup_radio(self, lora) -> None:
-        """Release SPI without GPIO.cleanup() (preserves pin mode for reuse).
-
-        LoRaRF's lora.end() calls gpio.cleanup() which clears BCM pin mode.
-        Next begin() fails because setmode() only runs at module import time.
-        We close SPI directly and skip gpio.cleanup().
-        """
-        close_confirmed = self._close_radio_resources(lora)
+        """Quiesce the protocol client and return ownership to Meshtastic."""
         try:
-            # The process lock covers the complete direct-radio lifetime.  An
-            # uncertain SPI close keeps ownership held so a daemon cannot be
-            # started on top of hardware that this process may still own.
-            if not close_confirmed:
-                self._emit(
-                    "Could not confirm SX1262 SPI close; ownership lock "
-                    "retained", "error")
-                return
-            try:
-                self._radio_ownership.release()
-            except Exception as exc:
-                self._emit(
-                    "Failed to release the AIO SX1262 ownership lock: "
-                    + str(exc)[:120], "error")
-                log.exception("Failed to release SX1262 ownership")
+            if self._broker_session_active:
+                self._sx1262.release_mode()
+                if lora is not None and not lora.acknowledge_revoke():
+                    self._emit(
+                        "SX1262 manager did not receive WDG quiescence proof; "
+                        "the transition failed closed", "error")
+            self._close_radio_resources(lora)
+        except Exception as exc:
+            self._emit(
+                "Failed to release the SX1262 manager lease: "
+                + str(exc)[:120], "error")
+            log.exception("Failed to release SX1262 manager lease")
         finally:
+            self._broker_session_active = False
             self.running = False
 
     # ------------------------------------------------------------------
@@ -2221,10 +1977,10 @@ class LoRaManager:
     # ------------------------------------------------------------------
 
     def stop(self, timeout: float = 5.0) -> bool:
-        """Stop the worker and confirm that hardware ownership was released."""
+        """Stop the worker and confirm that its manager lease was released."""
         with self._state_lock:
             if self._stopping:
-                self._emit("Direct radio stop is already in progress", "error")
+                self._emit("LoRa stop is already in progress", "error")
                 return False
             self._stopping = True
             self._stop_event.set()
@@ -2236,7 +1992,7 @@ class LoRaManager:
                 thread.join(timeout=max(0.0, timeout))
             if thread and thread.is_alive():
                 self._emit(
-                    "Direct radio worker did not stop; SX1262 remains unavailable",
+                    "LoRa worker did not stop; manager lease remains active",
                     "error",
                 )
                 return False
@@ -2250,10 +2006,10 @@ class LoRaManager:
                 cleanup_pending = self._companion_cleanup_pending
             if cleanup_pending and not self._stop_meshcore_companion():
                 return False
-            if self._radio_ownership.held:
+            if self._broker_session_active:
                 self._emit(
-                    "Direct radio stopped but the SX1262 ownership lock is still "
-                    "held", "error")
+                    "LoRa worker stopped but its manager lease is still active",
+                    "error")
                 return False
             return True
         finally:

@@ -2,9 +2,10 @@
 
 WatchDogsGo can present the uConsole AIO v2 SX1262 as a standard MeshCore
 companion radio to MeshMapper. The phone talks to BlueZ over the MeshCore
-Nordic-UART GATT service; WDG continues to own the SX1262 directly over SPI.
+Nordic-UART GATT service; WDG holds the MeshCore lease while
+`watchdogs-sx1262d` remains the sole direct SPI/GPIO/power owner.
 Bluetooth is a control/data bridge, not another radio backend and not a second
-radio owner.
+broker lease holder.
 
 This feature is opt-in and disabled on upgrades.
 
@@ -25,7 +26,7 @@ This feature is opt-in and disabled on upgrades.
    `READY` and show its resolved `hci` controller.
 
 The BLE peripheral exists only while WDG's MeshCore backend is running. It is
-removed before the direct radio releases ownership, during protocol handoff,
+removed before the MeshCore lease is released during protocol handoff,
 when LoRa powers off, and at application shutdown.
 
 BlueZ completes peripheral setup by calling back into WDG's exported D-Bus

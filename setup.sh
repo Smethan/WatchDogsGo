@@ -64,6 +64,19 @@ fi
 TARGET_UID="$(id -u "$TARGET_USER")"
 TARGET_GROUP="$(id -gn "$TARGET_USER")"
 
+# Serialize the complete setup/update flow. The descriptor remains open until
+# this shell exits, including package migration and health checks.
+if [ "$(id -u)" -eq 0 ]; then
+    install -d -o root -g root -m 0755 /run/lock/watchdogs
+    exec 9>/run/lock/watchdogs/setup.lock
+else
+    exec 9>"/tmp/watchdogs-setup-${TARGET_UID}.lock"
+fi
+if ! flock -n 9; then
+    fail "Another WatchDogsGo setup or update transaction is active"
+    exit 1
+fi
+
 run_as_target() {
     if [ "$(id -u)" -eq "$TARGET_UID" ]; then
         "$@"
@@ -166,9 +179,9 @@ if command -v apt-get &>/dev/null; then
         info "Parrot OS detected — skipping libsdl2-dev and libsdl2-image-dev"
     fi
 
-    # RPi-only packages — skipped on non-RPi systems (no fail)
+    # RPi-only packages — skipped on non-RPi systems (no fail). The native
+    # SX1262 manager owns radio GPIO; WDG itself no longer needs RPi.GPIO.
     RPI_PKGS=(
-        python3-rpi-lgpio python3-lgpio   # CM5/RPi5 GPIO for LoRa
         raspi-utils                       # provides pinctrl
         gpsd                              # one shared reader for the AIO GPS UART
     )
@@ -264,30 +277,10 @@ if ! pip_run "Installing requirements.txt" install -r requirements.txt ; then
 fi
 
 # --- 6. Link system Python modules into venv ---
-# rpi-lgpio and python3-gi ship native .so files via apt that pip can't
-# easily rebuild. Linking them in lets the venv use them directly.
-# pip install LoRaRF pulls old RPi.GPIO 0.7.1 which doesn't know CM5 — we
-# rm that copy and link the apt one in.
+# python3-gi ships native .so files via apt that pip cannot easily rebuild.
+# Link it into the venv for the serialized BlueZ pairing agent.
 echo "[6/8] Linking system Python modules into venv..."
 if [[ "$(uname)" == "Linux" ]]; then
-    if [ -d "/usr/lib/python3/dist-packages/RPi" ] && \
-       [ -f "/usr/lib/python3/dist-packages/RPi/GPIO/__init__.py" ]; then
-        for sp in .venv/lib/python3.*/site-packages; do
-            if [ -d "$sp" ]; then
-                run_as_target rm -rf "$sp/RPi" "$sp/RPi.GPIO"* 2>/dev/null
-                run_as_target ln -sf /usr/lib/python3/dist-packages/RPi "$sp/RPi"
-                run_as_target ln -sf /usr/lib/python3/dist-packages/lgpio.py "$sp/lgpio.py" 2>/dev/null
-                for so in /usr/lib/python3/dist-packages/_lgpio*.so; do
-                    [ -f "$so" ] && run_as_target ln -sf "$so" "$sp/$(basename "$so")"
-                done
-                ok "rpi-lgpio linked into venv (LoRa GPIO)"
-                break
-            fi
-        done
-    else
-        info "rpi-lgpio not present (non-RPi system) — skipping"
-    fi
-
     if [ -d "/usr/lib/python3/dist-packages/gi" ]; then
         for sp in .venv/lib/python3.*/site-packages; do
             if [ -d "$sp" ] && [ ! -e "$sp/gi" ]; then
@@ -370,7 +363,6 @@ run_as_target .venv/bin/python3 -c "import netifaces" 2>/dev/null || MISSING_OPT
 run_as_target .venv/bin/python3 -c "import bleak" 2>/dev/null || MISSING_OPT="$MISSING_OPT bleak"
 run_as_target .venv/bin/python3 -c "import dbus" 2>/dev/null || MISSING_OPT="$MISSING_OPT dbus-python"
 run_as_target .venv/bin/python3 -c "from gi.repository import GLib" 2>/dev/null || MISSING_OPT="$MISSING_OPT python3-gi"
-run_as_target .venv/bin/python3 -c "import LoRaRF" 2>/dev/null || MISSING_OPT="$MISSING_OPT LoRaRF"
 run_as_target .venv/bin/python3 -c "import nacl" 2>/dev/null || MISSING_OPT="$MISSING_OPT PyNaCl"
 run_as_target .venv/bin/python3 -c "import meshtastic" 2>/dev/null || MISSING_OPT="$MISSING_OPT meshtastic"
 run_as_target .venv/bin/python3 -c "import re,RNS; from importlib.metadata import version; v=tuple(map(int,re.match(r'^(\d+)\.(\d+)\.(\d+)',version('rns')).groups())); assert (1,5,4)<=v<(1,6,0)" 2>/dev/null || MISSING_OPT="$MISSING_OPT rns>=1.5.4,<1.6"
@@ -484,16 +476,103 @@ run_as_target mkdir -p loot maps plugins firmware_cache
 run_as_target chmod 755 loot maps plugins firmware_cache
 ok "Data directories ready (loot, maps, plugins, firmware_cache)"
 
-# Install only the root-owned, argument-allowlisted Meshtastic support helper.
-# Firmware packages remain an explicit in-app install/update action and are
-# revalidated by this helper before dpkg sees them.
+# Install/update the complete radio stack here. There is no separate in-app
+# package download or adoption step.
 if [[ "$(uname)" == "Linux" ]]; then
-    info "Installing protected Meshtastic service/update helper..."
+    if pgrep -f '[p]ython[0-9.]* -m watchdogs([[:space:]]|$)' \
+            >/dev/null 2>&1; then
+        fail "WatchDogsGo is running; close it before updating the radio stack"
+        exit 1
+    fi
+    info "Preparing the unified Meshtastic/SX1262 stack transaction..."
     if sudo bash "$SCRIPT_DIR/scripts/setup_meshtastic.sh" \
             --install-support "$TARGET_USER" "$TARGET_UID"; then
-        ok "Meshtastic helper and private cache installed"
+        STACK_MANIFEST="$SCRIPT_DIR/meshtastic-stack.json"
+        readarray -t STACK_FIELDS < <(python3 - "$STACK_MANIFEST" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+package = value.get("package", {})
+print("1" if value.get("release_ready") is True else "0")
+print(value.get("tag") or "")
+print(package.get("sha256") or "")
+print(value.get("architecture") or "")
+print(value.get("sx1262_broker_api", {}).get("major", ""))
+print(value.get("sx1262_broker_api", {}).get("minor", ""))
+print(value.get("wdg_api", {}).get("major", ""))
+print(value.get("wdg_api", {}).get("minor", ""))
+print(value.get("source_commit") or "")
+print(value.get("source_url") or "")
+PY
+        )
+        STACK_READY="${STACK_FIELDS[0]:-0}"
+        STACK_TAG="${STACK_FIELDS[1]:-}"
+        STACK_SHA256="${STACK_FIELDS[2]:-}"
+        STACK_ARCH="${STACK_FIELDS[3]:-}"
+        STACK_BROKER_MAJOR="${STACK_FIELDS[4]:-}"
+        STACK_BROKER_MINOR="${STACK_FIELDS[5]:-}"
+        STACK_WDG_API_MAJOR="${STACK_FIELDS[6]:-}"
+        STACK_WDG_API_MINOR="${STACK_FIELDS[7]:-}"
+        STACK_SOURCE_COMMIT="${STACK_FIELDS[8]:-}"
+        STACK_SOURCE_URL="${STACK_FIELDS[9]:-}"
+        if [ "$STACK_READY" != "1" ]; then
+            warn "Unified radio package is release-gated pending physical uConsole acceptance"
+            warn "Existing Meshtastic services were left unchanged"
+        elif [ "$STACK_ARCH" != "$(dpkg --print-architecture)" ]; then
+            fail "Pinned radio package requires $STACK_ARCH, not $(dpkg --print-architecture)"
+            ERRORS=$((ERRORS + 1))
+        elif [[ ! "$STACK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            fail "Pinned radio package digest is missing or invalid"
+            ERRORS=$((ERRORS + 1))
+        elif [ "$STACK_BROKER_MAJOR:$STACK_BROKER_MINOR" != "1:0" ] || \
+             [ "$STACK_WDG_API_MAJOR:$STACK_WDG_API_MINOR" != "1:1" ]; then
+            fail "Pinned radio package API metadata is incompatible"
+            ERRORS=$((ERRORS + 1))
+        elif [[ ! "$STACK_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
+             [ "$STACK_SOURCE_URL" != \
+               "https://github.com/Smethan/meshtastic-firmware/tree/$STACK_SOURCE_COMMIT" ]; then
+            fail "Pinned radio package source metadata is invalid"
+            ERRORS=$((ERRORS + 1))
+        else
+            AIO_GPIOCHIP=0
+            AIO_MODEL="$(tr -d '\000' </sys/firmware/devicetree/base/model 2>/dev/null || true)"
+            if [[ "$AIO_MODEL" == *"Compute Module 5"* ]] && [ -e /dev/gpiochip4 ]; then
+                AIO_GPIOCHIP=4
+            fi
+            info "Configuring broker-only SX1262 hardware ownership..."
+            sudo python3 "$SCRIPT_DIR/scripts/configure_sx1262_stack.py" \
+                --meshtastic-config /etc/meshtasticd/config.yaml \
+                --manager-config /etc/watchdogs/sx1262.yaml \
+                --gpiochip "$AIO_GPIOCHIP" >>"$APT_LOG" 2>&1
+            if sudo /usr/local/libexec/watchdogs-meshtastic \
+                    verify-pinned-tag "$STACK_TAG" "$STACK_SHA256" \
+                    >>"$APT_LOG" 2>&1 && \
+               sudo /usr/local/libexec/watchdogs-meshtastic \
+                    converge-tag "$STACK_TAG" >>"$APT_LOG" 2>&1 && \
+               sudo usermod -aG watchdogs "$TARGET_USER" \
+                    >>"$APT_LOG" 2>&1 && \
+               sudo systemctl enable watchdogs-sx1262d.service \
+                    meshtasticd-wdg.service >>"$APT_LOG" 2>&1 && \
+               sudo systemctl mask meshtasticd.service >>"$APT_LOG" 2>&1 && \
+               sudo systemctl restart watchdogs-sx1262d.service \
+                    meshtasticd-wdg.service >>"$APT_LOG" 2>&1 && \
+               sudo systemctl is-active --quiet watchdogs-sx1262d.service && \
+               sudo systemctl is-active --quiet meshtasticd-wdg.service && \
+               sudo test -S /run/watchdogs/sx1262d.sock && \
+               sudo test -S /run/meshtasticd/wdg.sock; then
+                ok "Unified radio stack installed; broker and Meshtastic are healthy"
+            else
+                dump_log_on_fail "Unified radio stack transaction" "$APT_LOG"
+                fail "Prior state was retained or restored; see the transaction log"
+                ERRORS=$((ERRORS + 1))
+            fi
+        fi
+        # Package mutation is setup-only. Remove the former unprivileged
+        # updater capability even on an upgrade from an older WDG release.
+        sudo rm -f /etc/sudoers.d/watchdogs-meshtastic \
+            /usr/local/bin/watchdogs-meshtastic-release
+        ok "Meshtastic package controls are restricted to setup.sh"
     else
-        fail "Meshtastic helper setup failed"
+        fail "Unified Meshtastic setup support failed"
         ERRORS=$((ERRORS + 1))
     fi
 fi

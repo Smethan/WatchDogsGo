@@ -93,7 +93,7 @@ And these Python packages (in `.venv`):
 - `Pillow` — sprite generation
 - `scapy`, `netifaces` — packet manipulation (MITM, Dragon Drain)
 - `bleak`, `dbus-python` — BLE attacks (RACE, BLE HID)
-- `LoRaRF`, `cryptography`, `PyNaCl` — direct-SPI LoRa radio
+- `cryptography`, `PyNaCl` — MeshCore and Reticulum protocol cryptography
 - `rns`, `lxmf` — experimental Reticulum/LXMF endpoint messaging
 
 ### Known platform notes
@@ -530,35 +530,27 @@ periodic announce.
 **SNIFF > Wardrive Settings > All Wardrive collectors** controls whether WDG
 may automatically use the powered LoRa and SDR devices. Protocol, MeshCore
 radio/companion options, and Meshtastic service/phone options are grouped under
-**LoRa settings**. With automatic LoRa off, switching the preferred protocol does not
-stop `meshtasticd` or claim SPI.
-Opening Mesh Messenger remains an explicit request to start the selected
-backend. Switching to MeshCore or powering LoRa off stops `meshtasticd` so the
-direct driver or GPIO power control can safely own the hardware.
+**LoRa settings**. With automatic LoRa off, switching the preferred protocol
+does not request a new broker lease. Opening Mesh Messenger remains an explicit
+request to start the selected backend. The persistent `watchdogs-sx1262d`
+manager is the only process that opens SPI/GPIO or controls the LoRa power rail;
+Meshtastic, MeshCore, and Reticulum exchange bounded radio operations through
+its local socket.
 ADS-B and 433 MHz are mutually exclusive because they share the AIO RTL-SDR.
 Enabling either one disables the other, and both may be left off.
 
-Radio-owner handoffs preserve the exact active and enabled state of both the
-fork and stock services. WDG refuses a handoff from an unknown, transitional,
-unsupported, or double-active service state. If restoration is interrupted,
-that original snapshot remains an ownership barrier until it is restored; a
-new handoff or package update cannot replace it with the partly changed state.
-On exit, WDG waits for every radio/service handoff and protected package
-transaction, and lets Host BLE/watch workers release their daemon leases before
-closing the restricted socket.
+The manager grants one generation-scoped mode lease at a time. MeshCore and
+Reticulum leases require a live WDG heartbeat; if WDG exits or stops renewing,
+the manager resets the radio and returns to Meshtastic. A force-OFF request
+persists and suppresses that fallback until WDG successfully forces the rail on
+again. WDG never bypasses the manager to manipulate the LoRa GPIO directly.
 
-Run `sudo bash setup.sh` to install the root-owned, argument-allowlisted
-Meshtastic service helper. Setup also grants the login account access to the
-shared radio-lock group; log out and back in if setup reports that it added the
-membership. Setup does not download or start a daemon package. After the first
-fork package has been installed, hardware-checked, and explicitly adopted,
-**LoRa settings > Meshtastic service and phone BLE > Update service** can
-install only validated tags from
-[`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware)
-and retains a transactional rollback. The helper deliberately refuses to use a
-new package as its own first semantic baseline; the one-time adoption procedure
-is documented below. No fork package release has been published as part of this
-source change. See
+Run `sudo bash setup.sh` to install or upgrade the complete pinned radio stack.
+Setup validates the exact package tag, size, SHA-256, source commit, ARM64
+payload, broker API, and WDG API recorded in `meshtastic-stack.json`; migrates
+the existing Meshtastic identity/state transactionally; installs the manager
+and broker-backed daemon; masks the stock service; and rolls back on failure.
+There is no separate install, adoption, or in-app package-update ceremony. See
 [Meshtastic service integration](docs/MESHTASTIC_SERVICE.md) and the
 [restricted local API contract](docs/MESHTASTIC_WDG_API.md).
 
@@ -598,9 +590,9 @@ WDG checkout and reboot once.
 
 | Feature | Frequencies | Description |
 |---------|-------------|-------------|
-| MeshCore Messenger | Regional preset | Direct-SPI mesh chat with adverts and speech bubbles |
+| MeshCore Messenger | Regional preset | Broker-backed mesh chat with adverts and speech bubbles |
 | Meshtastic Messenger | Daemon configuration | `meshtasticd` Client API chat, nodes, channels, and zero-hop discovery |
-| Reticulum/LXMF (experimental) | Confirmed RF profile | Direct-SPI endpoint announces, contacts, encrypted text, and optional propagation storage/sync |
+| Reticulum/LXMF (experimental) | Confirmed RF profile | Broker-backed endpoint announces, contacts, encrypted text, and optional propagation storage/sync |
 
 Reticulum is not release-ready until the documented AIO-to-RNode hardware gate
 passes. See [Reticulum/LXMF on the AIO SX1262](docs/RETICULUM.md) for scope,
@@ -622,10 +614,13 @@ the complete physical acceptance checklist.
 
 ## GPS
 
-For a uConsole SIM7600, WDG reads cached NMEA through ModemManager so the modem
-has one control-plane owner. Explicit external GPS devices remain supported.
-Automatic serial discovery excludes every ModemManager-owned port and known
-ESP32/uConsole ACM control device.
+An explicitly selected external GPS remains the highest-priority provider. On
+an AIO configured by WDG, `gpsd` is the permanent sole reader of the CM4/CM5
+GPS UART and is the default provider for both WDG and Meshtastic. WDG does not
+fall back to raw UART or ModemManager while the managed-gpsd marker exists; it
+reports and retries a gpsd transport failure instead of oscillating providers.
+ModemManager GNSS remains available when the AIO GPS is not configured or LTE
+GNSS was explicitly selected.
 
 Before removing the LTE board, open **SNIFF → Wardrive Settings** and turn
 **LTE modem integration** OFF. The choice persists and is read before GPS
@@ -709,7 +704,9 @@ watchdogs/
   mitm.py             ARP spoofing + tcpdump (standalone)
   bt_ducky.py         BLE HID injection (D-Bus, standalone)
   race_attack.py      Airoha BT exploit (bleak GATT)
-  lora_manager.py     LoRa SX1262 (sniffer, MeshCore multi-channel)
+  lora_manager.py     Broker-backed SX1262 MeshCore protocol worker
+  sx1262_client.py    Versioned local manager control/radio client
+  broker_lora.py      LoRaRF-compatible PHY facade over manager leases
   meshcore_ble.py     MeshCore companion protocol + BlueZ GATT peripheral
   bluetooth_pairing.py Shared bounded BlueZ pairing-agent arbitration
   bluetooth_bonds.py  Private controller-keyed shared phone identity registry
@@ -786,12 +783,14 @@ sudo usermod -a -G dialout $USER
 FTDI, or Espressif USB-JTAG. The game logs all USB serial devices it
 sees in the diagnostic block.
 
-**MeshCore radio stays "OFF"** — MeshCore and a Meshtastic daemon cannot own the
-same SX1262 simultaneously. Select MeshCore under **LoRa settings** and open
-Mesh Messenger; WDG will stop the selected daemon before opening SPI. Inspect both
-possible owners before intervening:
+**MeshCore radio stays "OFF"** — MeshCore and Meshtastic cannot use the one
+SX1262 simultaneously. Select MeshCore under **LoRa settings** and open Mesh
+Messenger; WDG requests an exclusive manager lease and starts MeshMapper GATT
+only after the radio is ready. Inspect the manager and protocol services before
+intervening:
 ```bash
-systemctl status meshtasticd-wdg.service meshtasticd.service
+systemctl status watchdogs-sx1262d.service meshtasticd-wdg.service
+sudo journalctl -u watchdogs-sx1262d.service -n 100 --no-pager
 ```
 
 **MeshMapper cannot see or connect to WDG** — select MeshCore, then enable
@@ -833,31 +832,14 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
 ls -l /run/meshtasticd/wdg.sock
 ```
-WDG 0.9.46's delivery and shared-phone workflow requires local API 1.1 from
-firmware `v2.8.0-wdg.7`. Update/adopt that firmware package first, confirm the
-fork socket, and then update WDG. If a MeshCore forget reports pending cleanup,
-start Meshtastic once so API 1.1 can clear only the matching stopped-daemon
-identity before opening a replacement pairing window.
-
-`AUTO` prefers the restricted fork socket. `LEGACY_TCP` is the explicit stock
-daemon fallback. Setup installs the protected helper, policy, and the
-root-owned release workflow command, but leaves package installation and
-publication explicit. To inspect or adopt an already-installed public build:
-```bash
-watchdogs-meshtastic-release status
-watchdogs-meshtastic-release adopt vX.Y.Z-wdg.N
-```
-Do not run the release command itself through `sudo`; it uses the login user's
-authenticated `gh` session and invokes only the fixed privileged operations it
-needs. For a first public install use `install-public`, test the radio, phone,
-identity, and channels, then run `adopt`. For pre-publication hardware testing,
-use `install-draft` with the exact successful tag workflow's run ID and
-attempt, then `publish-adopt-draft ... --yes` after those checks pass. It
-downloads the immutable Actions artifact, never the mutable draft attachment.
-Later **Update service** operations are transactional because adoption seeds
-the private rollback cache. If the current config has no stable
-`General.MACAddress`, adoption proves and applies only a conservative pin;
-configurations it cannot edit safely require a manual pin.
+WDG 0.9.54 requires local API 1.1 and broker API 1.0 from firmware
+`v2.8.0-wdg.8`. Close WDG and rerun `sudo bash setup.sh`; setup downloads the
+exact pinned five-asset release, validates its SHA-256/source metadata, migrates
+the existing identity and channels, and starts the manager before the daemon.
+There is no `watchdogs-meshtastic-release` adoption command or in-app package
+updater. If a MeshCore forget reports pending cleanup, switch to Meshtastic so
+API 1.1 can clear only the matching stopped-daemon identity before opening a
+replacement pairing window.
 
 **HTTPS errors when uploading to wdgwars.pl** — check `~/.watchdogs/last_run.log`
 for SSL errors. Most often caused by an expired system CA bundle:

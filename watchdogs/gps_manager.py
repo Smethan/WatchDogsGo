@@ -4,8 +4,9 @@ import glob
 import logging
 import math
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -90,6 +91,15 @@ class GpsManager:
             self._gpsd_port = 2947
         self._gpsd_managed = bool(gpsd_settings or env_host or env_port)
         self._last_data_at = 0.0
+        self._fix_lock = threading.RLock()
+        self._gpsd_stop = threading.Event()
+        self._gpsd_thread: threading.Thread | None = None
+        self.transport_connected = False
+        self.last_tpv_at = 0.0
+        self.last_valid_fix_at = 0.0
+        self.socket_disconnects = 0
+        self.reconnects = 0
+        self.provider_changes = 0
 
     @property
     def available(self) -> bool:
@@ -99,6 +109,35 @@ class GpsManager:
     def data_flowing(self) -> bool:
         return bool(self._last_data_at
                     and time.monotonic() - self._last_data_at <= 5.0)
+
+    @property
+    def navigation_state(self) -> str:
+        """Return transport/data/fix state without conflating the layers."""
+        now = time.monotonic()
+        with self._fix_lock:
+            fix_valid = self.fix.valid
+            fix_received_at = self.fix.received_at
+        if not self.transport_connected:
+            return "transport_disconnected"
+        if not self.data_flowing:
+            if fix_valid and now - fix_received_at <= 5.0:
+                return "fix_temporarily_stale"
+            return "transport_connected"
+        if fix_valid:
+            return ("valid_fix" if now - fix_received_at <= 5.0
+                    else "fix_temporarily_stale")
+        return "explicit_no_fix"
+
+    def snapshot(self) -> GpsFix:
+        """Atomically copy the latest navigation snapshot for the UI thread."""
+        with self._fix_lock:
+            return replace(self.fix)
+
+    def _set_provider(self, provider: str, device: str) -> None:
+        if provider != self.provider:
+            self.provider_changes += 1
+        self.provider = provider
+        self.device = device
 
     @staticmethod
     def _load_gpsd_config(path: Path) -> dict[str, str]:
@@ -154,14 +193,26 @@ class GpsManager:
                      device)
             return False
 
+        # A setup-managed gpsd endpoint is the authoritative AIO UART owner.
+        # Never acquire ModemManager first and never oscillate providers while
+        # that marker exists.
+        if self._gpsd_managed:
+            if self._gpsd_thread is not None and self._gpsd_thread.is_alive():
+                return self._available
+            if self._try_gpsd():
+                return True
+            self.status_reason = (
+                f"gpsd unavailable at {self._gpsd_host}:{self._gpsd_port}")
+            return False
+
         if self.modem_enabled:
             # The internal SIM7600 is accessed only through ModemManager.
             # Starting this broker does not open its GPS/AT/QMI device nodes.
             if self.modem_broker.acquire("gps", gps=True):
                 if self.modem_broker.wait_ready(5):
-                    self.device = "ModemManager GNSS"
-                    self.provider = "modemmanager"
+                    self._set_provider("modemmanager", "ModemManager GNSS")
                     self._available = True
+                    self.transport_connected = True
                     log.info("GPS provided by ModemManager")
                     return True
                 self.status_reason = self.modem_broker.error
@@ -171,17 +222,6 @@ class GpsManager:
                 self.status_reason = self.modem_broker.error
         else:
             log.info("LTE modem integration disabled; skipping ModemManager GPS")
-
-        # setup.sh makes gpsd the authoritative raw-UART owner and writes the
-        # marker read above. Never fall back to opening that same UART when a
-        # managed gpsd endpoint is temporarily unavailable: doing so would
-        # recreate the two-reader corruption this path exists to prevent.
-        if self._gpsd_managed:
-            if self._try_gpsd():
-                return True
-            self.status_reason = (
-                f"gpsd unavailable at {self._gpsd_host}:{self._gpsd_port}")
-            return False
 
         # No usable internal GNSS — probe only the documented platform UART
         # for this Compute Module.  Avoid broad ttyAMA/ttyS discovery because
@@ -224,9 +264,11 @@ class GpsManager:
             return False
         self._gpsd = client
         self._available = True
-        self.provider = "gpsd"
-        self.device = f"gpsd {self._gpsd_host}:{self._gpsd_port}"
+        self.transport_connected = True
+        self._set_provider(
+            "gpsd", f"gpsd {self._gpsd_host}:{self._gpsd_port}")
         self.status_reason = "gpsd connected; waiting for GPS data"
+        self._start_gpsd_reader()
         log.info("GPS provided by gpsd at %s:%d",
                  self._gpsd_host, self._gpsd_port)
         return True
@@ -282,7 +324,8 @@ class GpsManager:
             )
             self._conn.reset_input_buffer()
             self._available = True
-            self.provider = "serial"
+            self.transport_connected = True
+            self._set_provider("serial", device)
             log.info("GPS opened: %s @ %d baud", device, self._baud)
             return True
         except Exception as exc:
@@ -448,6 +491,8 @@ class GpsManager:
         return None
 
     def close(self) -> None:
+        self._gpsd_stop.set()
+        gpsd_thread, self._gpsd_thread = self._gpsd_thread, None
         if self._conn:
             try:
                 self._conn.close()
@@ -457,6 +502,9 @@ class GpsManager:
         if self._gpsd:
             self._gpsd.close()
             self._gpsd = None
+        if (gpsd_thread is not None
+                and gpsd_thread is not threading.current_thread()):
+            gpsd_thread.join(timeout=1.5)
         if self.provider == "modemmanager":
             self.modem_broker.release("gps")
         # The same broker may have been used for cell tracking while an
@@ -464,8 +512,12 @@ class GpsManager:
         # cleanup after WardriveUI has released its cell owner.
         self.modem_broker.close()
         self._available = False
-        self.provider = ""
+        self.transport_connected = False
+        self._set_provider("", self._configured_device)
         self._last_data_at = 0.0
+        with self._fix_lock:
+            self.fix.valid = False
+            self.fix.received_at = 0.0
 
     @property
     def fd(self) -> int:
@@ -486,7 +538,11 @@ class GpsManager:
                 self._last_data_at = time.monotonic()
             return sentences
         if self.provider == "gpsd":
-            self._read_gpsd()
+            # The dedicated reader is the sole gpsd socket consumer.  Keep a
+            # synchronous seam for deterministic unit tests that inject a
+            # client without starting the managed reader.
+            if self._gpsd_thread is None:
+                self._read_gpsd()
             return []
         if not self._conn:
             return []
@@ -514,17 +570,26 @@ class GpsManager:
             client.close()
             self._gpsd = None
             self._available = False
-            self.provider = ""
+            self.transport_connected = False
+            self.socket_disconnects += 1
             self.status_reason = str(exc)
+            with self._fix_lock:
+                self.fix.valid = False
+                self.fix.received_at = 0.0
             return
 
+        self._consume_gpsd_reports(reports)
+
+    def _consume_gpsd_reports(self, reports: list[dict]) -> None:
+        """Apply one bounded gpsd batch while publishing one atomic snapshot."""
         saw_navigation = False
-        for report in reports:
-            report_class = str(report.get("class", ""))
-            if report_class == "TPV":
-                saw_navigation = self._parse_gpsd_tpv(report) or saw_navigation
-            elif report_class == "SKY":
-                saw_navigation = self._parse_gpsd_sky(report) or saw_navigation
+        with self._fix_lock:
+            for report in reports[-128:]:
+                report_class = str(report.get("class", ""))
+                if report_class == "TPV":
+                    saw_navigation = self._parse_gpsd_tpv(report) or saw_navigation
+                elif report_class == "SKY":
+                    saw_navigation = self._parse_gpsd_sky(report) or saw_navigation
         if saw_navigation:
             self._last_data_at = time.monotonic()
             self.status_reason = (
@@ -532,6 +597,45 @@ class GpsManager:
                 else "GPS data flowing; waiting for satellite fix")
         elif not self.data_flowing:
             self.status_reason = "gpsd connected; waiting for GPS data"
+
+    def _start_gpsd_reader(self) -> None:
+        thread = self._gpsd_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._gpsd_stop.clear()
+        self._gpsd_thread = threading.Thread(
+            target=self._gpsd_reader_loop,
+            name="wdg-gpsd-reader",
+            daemon=True,
+        )
+        self._gpsd_thread.start()
+
+    def _gpsd_reader_loop(self) -> None:
+        """Sole gpsd consumer with bounded exponential reconnect backoff."""
+        backoff = 0.5
+        while not self._gpsd_stop.is_set():
+            if self._gpsd is None:
+                candidate = GpsdClient(self._gpsd_host, self._gpsd_port)
+                try:
+                    candidate.connect()
+                except (OSError, ConnectionError) as exc:
+                    self.transport_connected = False
+                    self._available = False
+                    self.status_reason = (
+                        f"gpsd reconnect pending: {str(exc)[:120]}")
+                    if self._gpsd_stop.wait(backoff):
+                        break
+                    backoff = min(30.0, backoff * 2.0)
+                    continue
+                self._gpsd = candidate
+                self._available = True
+                self.transport_connected = True
+                self.reconnects += 1
+                backoff = 0.5
+                self.status_reason = "gpsd reconnected; waiting for GPS data"
+            self._read_gpsd()
+            if self._gpsd_stop.wait(0.05):
+                break
 
     @staticmethod
     def _finite_number(value) -> Optional[float]:
@@ -542,6 +646,8 @@ class GpsManager:
         return number if math.isfinite(number) else None
 
     def _parse_gpsd_tpv(self, report: dict) -> bool:
+        now = time.monotonic()
+        self.last_tpv_at = now
         try:
             mode = int(report.get("mode", 0))
         except (TypeError, ValueError):
@@ -564,7 +670,9 @@ class GpsManager:
         if report.get("time"):
             self.fix.timestamp = str(report["time"])
         self.fix.fix_quality = 1 if self.fix.valid else 0
-        self.fix.received_at = time.monotonic()
+        self.fix.received_at = now
+        if self.fix.valid:
+            self.last_valid_fix_at = now
         return True
 
     def _parse_gpsd_sky(self, report: dict) -> bool:

@@ -37,6 +37,7 @@ TARGET_SERVICES = {
     "wdg": "meshtasticd-wdg.service",
     "stock": "meshtasticd.service",
 }
+MANAGER_SERVICE = "watchdogs-sx1262d.service"
 SERVICE_ACTIONS = frozenset({"start", "stop", "enable", "disable"})
 PACKAGE_NAME = "meshtasticd-wdg"
 CACHE_ROOT = Path("/var/cache/watchdogs/meshtasticd-wdg")
@@ -50,8 +51,6 @@ PROTECTED_VALIDATOR = Path(
     "/usr/local/libexec/watchdogs-meshtastic-lib/meshtastic_updates.py")
 WDG_SOCKET_PATH = Path("/run/meshtasticd/wdg.sock")
 WDG_BINARY_PATH = Path("/usr/lib/meshtasticd-wdg/meshtasticd")
-RADIO_LOCK_PATH = Path("/run/lock/watchdogs/aio-sx1262.lock")
-FLOCK_PATH = Path("/usr/bin/flock")
 VALIDATION_ROOT = Path("/run/watchdogs-meshtastic-validation")
 MESHTASTIC_CONFIG_DIR = Path("/etc/meshtasticd")
 MESHTASTIC_STATE_DIR = Path("/var/lib/meshtasticd")
@@ -81,7 +80,7 @@ CRITICAL_STATE_FILES = (
     Path("backups/backup.proto"),
     Path("backups/event-backup.proto"),
 )
-SERVICE_SUPPLEMENTARY_GROUPS = ("spi", "gpio", "watchdogs")
+SERVICE_SUPPLEMENTARY_GROUPS = ("watchdogs",)
 RESTORABLE_LOAD_STATES = frozenset({"loaded", "not-found"})
 RESTORABLE_ACTIVE_STATES = frozenset({"active", "inactive"})
 RESTORABLE_UNIT_FILE_STATES = frozenset({"enabled", "disabled", "not-found"})
@@ -2154,7 +2153,6 @@ def _candidate_dry_run(
             "MESHTASTIC_WDG_DISABLE_BLUETOOTH": "1",
         }
         command = [
-            str(FLOCK_PATH), "-n", "-E", "75", str(RADIO_LOCK_PATH),
             str(binary), "--port=0",
             "--fsdir=" + str(fsdir),
             "--config=" + str(config),
@@ -2711,6 +2709,8 @@ def _install_tag(tag: str) -> dict[str, Any]:
                 raise HelperError("meshtasticd system group was not created") from exc
             os.chown(config, 0, meshtastic_gid)
             os.chmod(config, 0o640)
+            _run(["systemctl", "daemon-reload"], timeout=30)
+            _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
             candidate = _candidate_dry_run(
                 backup, pinned_mac=effective_mac if pin_required else None)
             if (candidate["semantic"] != baseline_semantic
@@ -2720,7 +2720,6 @@ def _install_tag(tag: str) -> dict[str, Any]:
                     "differ from the authoritative pre-install baseline")
             if pin_required:
                 _pin_live_mac(effective_mac)
-            _run(["systemctl", "daemon-reload"], timeout=30)
             live_critical = _critical_state_snapshot(
                 _resolve_state_fsdir(MESHTASTIC_STATE_DIR),
                 MESHTASTIC_CONFIG_DIR)
@@ -2731,6 +2730,8 @@ def _install_tag(tag: str) -> dict[str, Any]:
             _cache_installed_release(prepared)
             _record_last_backup(backup)
         except Exception as install_error:
+            _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30,
+                 check=False)
             try:
                 if (package_mutation_started
                         and backup is not None and metadata is not None):
@@ -2758,6 +2759,95 @@ def _install_tag(tag: str) -> dict[str, Any]:
         "backup": str(backup),
         "service": TARGET_SERVICES["wdg"],
         "health": "ready",
+    }
+
+
+def _converge_tag(tag: str) -> dict[str, Any]:
+    """Install or update one exact release as a single setup transaction.
+
+    A first stock-to-WDG migration still needs the installed candidate binary
+    to obtain a semantic identity/channel baseline.  That validation is an
+    internal phase of this operation; users no longer install and then run a
+    separate adoption command.
+    """
+    _require_root()
+    if not TAG_RE.fullmatch(tag):
+        raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
+    expected = _package_version_for_tag(tag)
+    installed = _installed_version()
+    if installed is not None and installed != expected:
+        result = _install_tag(tag)
+        result["action"] = "converge-tag"
+        return result
+    if installed == expected:
+        _run(["systemctl", "daemon-reload"], timeout=30)
+        _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+        result = _adopt_installed(tag)
+        result["action"] = "converge-tag"
+        return result
+
+    services = _service_snapshot()
+    prepared = _prepare_first_tag(tag)
+    package_path = Path(str(prepared["package_path"]))
+    package_installed = False
+    try:
+        for service in TARGET_SERVICES.values():
+            _run(["systemctl", "stop", service], timeout=30, check=False)
+        _run([
+            "apt-get", "-y", "--no-install-recommends", "install",
+            str(package_path),
+        ], timeout=600)
+        package_installed = True
+        if _installed_version() != expected:
+            raise HelperError(
+                "Installed package version does not match the pinned release")
+        _run(["systemctl", "daemon-reload"], timeout=30)
+        _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+        result = _adopt_installed(tag)
+        result["action"] = "converge-tag"
+        return result
+    except Exception as migration_error:
+        rollback_errors: list[str] = []
+        _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30,
+             check=False)
+        if package_installed:
+            try:
+                _run(["dpkg", "--purge", PACKAGE_NAME], timeout=120,
+                     check=False)
+            except Exception as exc:  # noqa: BLE001
+                rollback_errors.append("package purge failed: " + str(exc))
+        try:
+            _restore_services(services)
+        except Exception as exc:  # noqa: BLE001
+            rollback_errors.append("service restore failed: " + str(exc))
+        if rollback_errors:
+            raise HelperError(
+                f"Unified Meshtastic setup failed ({migration_error}); "
+                "rollback was incomplete: " + "; ".join(rollback_errors)
+            ) from migration_error
+        raise HelperError(
+            "Unified Meshtastic setup failed and the previous services were "
+            "restored: " + str(migration_error)) from migration_error
+
+
+def _verify_pinned_tag(tag: str, expected_sha256: str) -> dict[str, Any]:
+    """Resolve one immutable release and bind it to WDG's checked-in digest."""
+    _require_root()
+    if not TAG_RE.fullmatch(tag) or SHA256_RE.fullmatch(expected_sha256) is None:
+        raise HelperError("Pinned Meshtastic release metadata is malformed")
+    validator = _load_validator()
+    _secure_root_directory(CACHE_ROOT)
+    prepared = _prepare_exact_release(tag, validator)
+    package = prepared.manifest.get("package", {})
+    if package.get("sha256") != expected_sha256:
+        raise HelperError(
+            "Downloaded package digest differs from WDG's compatibility manifest")
+    return {
+        "action": "verify-pinned-tag",
+        "tag": tag,
+        "package_version": prepared.package_version,
+        "package_path": str(prepared.package_path),
+        "sha256": expected_sha256,
     }
 
 
@@ -2808,6 +2898,14 @@ def main(argv: list[str] | None = None) -> int:
                 and args[1] in TARGET_SERVICES):
             _json_output(**_select_service(args[1]))
             return 0
+        if len(args) == 2 and args[0] == "converge-tag" and TAG_RE.fullmatch(args[1]):
+            _json_output(**_converge_tag(args[1]))
+            return 0
+        if (len(args) == 3 and args[0] == "verify-pinned-tag"
+                and TAG_RE.fullmatch(args[1])
+                and SHA256_RE.fullmatch(args[2])):
+            _json_output(**_verify_pinned_tag(args[1], args[2]))
+            return 0
         if len(args) == 2 and args[0] == "install-tag" and TAG_RE.fullmatch(args[1]):
             _json_output(**_install_tag(args[1]))
             return 0
@@ -2824,7 +2922,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise HelperError(
             "Usage: watchdogs-meshtastic version | status/start/stop/enable/disable/"
-            "select-service wdg|stock | install-tag/prepare-first-tag/"
+            "select-service wdg|stock | converge-tag/install-tag/prepare-first-tag/"
             "adopt-installed "
             "vX.Y.Z-wdg.N | rollback")
     except InstallTransactionError as exc:

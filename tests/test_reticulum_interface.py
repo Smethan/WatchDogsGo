@@ -252,20 +252,21 @@ class FakeOwner:
 
 
 def test_fake_radio_configuration_serialization_and_teardown_order(monkeypatch):
-    import RNS
-
-    class ReticulumDefaults:
-        def __getattr__(self, name):
-            if name.startswith("_default_"):
-                return lambda: 0
-            raise AttributeError(name)
-
-    defaults = ReticulumDefaults()
-    monkeypatch.setattr(
-        RNS.Reticulum, "get_instance", staticmethod(lambda: defaults))
+    try:
+        import RNS
+    except ImportError:
+        RNS = None
+    if RNS is not None:
+        class ReticulumDefaults:
+            def __getattr__(self, name):
+                if name.startswith("_default_"):
+                    return lambda: 0
+                raise AttributeError(name)
+        monkeypatch.setattr(
+            RNS.Reticulum, "get_instance",
+            staticmethod(lambda: ReticulumDefaults()))
     order = []
     radio = FakeRadio(order)
-    ownership = FakeOwnership(order)
     interface = AioSX1262Interface(FakeOwner(), {
         "name": "test", "frequency": 910_525_000,
         "bandwidth": 62_500, "spreading_factor": 8,
@@ -273,7 +274,6 @@ def test_fake_radio_configuration_serialization_and_teardown_order(monkeypatch):
         "airtime_short_percent": 100,
         "airtime_long_percent": 100,
         "_radio_factory": lambda: radio,
-        "_radio_ownership": ownership,
         "_sleep": lambda seconds: time.sleep(min(seconds, 0.001)),
     })
     interface.process_outgoing(b"x" * 300)
@@ -298,4 +298,5 @@ def test_fake_radio_configuration_serialization_and_teardown_order(monkeypatch):
     # begin/configure/RX/TX/close all stay on the same dedicated worker.
     assert len({thread_id for _name, _args, thread_id in radio.calls}) == 1
     labels = [item[0] for item in order]
-    assert labels.index("sleep") < labels.index("close") < labels.index("unlock")
+    assert labels.index("sleep") < labels.index("close")
+    assert "unlock" not in labels

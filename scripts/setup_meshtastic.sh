@@ -1,27 +1,19 @@
 #!/bin/bash
-# Install the fixed, root-owned WatchDogsGo Meshtastic privilege boundary.
+# Install the root-only setup transaction engine and Meshtastic policy.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER_SOURCE="$SCRIPT_DIR/scripts/watchdogs_meshtastic_helper.py"
 VALIDATOR_SOURCE="$SCRIPT_DIR/watchdogs/meshtastic_updates.py"
-RELEASE_TOOL_SOURCE="$SCRIPT_DIR/scripts/meshtastic_release.py"
 HELPER_TARGET="/usr/local/libexec/watchdogs-meshtastic"
 LIB_TARGET="/usr/local/libexec/watchdogs-meshtastic-lib"
-RELEASE_TOOL_TARGET="/usr/local/bin/watchdogs-meshtastic-release"
-SUDOERS_TARGET="/etc/sudoers.d/watchdogs-meshtastic"
 CONFIG_TARGET="/etc/meshtasticd/wdg-portduino.yaml"
 CACHE_ROOT="/var/cache/watchdogs/meshtasticd-wdg"
 FIRST_INSTALL_INBOX="$CACHE_ROOT/first-install-inbox"
 BACKUP_ROOT="/var/backups/meshtasticd-wdg"
 WATCHDOGS_GROUP="watchdogs"
 MESHTASTIC_GROUP="meshtasticd"
-RADIO_LOCK_DIR="/run/lock/watchdogs"
-RADIO_LOCK_PATH="$RADIO_LOCK_DIR/aio-sx1262.lock"
-TRANSACTION_LOCK_PATH="$RADIO_LOCK_DIR/meshtastic-update.lock"
-RADIO_TMPFILES_DIR="/etc/tmpfiles.d"
-RADIO_TMPFILES_TARGET="$RADIO_TMPFILES_DIR/watchdogs-radio-lock.conf"
 
 wdg_meshtastic_valid_user() {
     local user="$1" uid="$2"
@@ -30,31 +22,6 @@ wdg_meshtastic_valid_user() {
     [ "$uid" -ne 0 ] || return 1
     id "$user" >/dev/null 2>&1 || return 1
     [ "$(id -u "$user")" = "$uid" ]
-}
-
-wdg_meshtastic_sudoers_text() {
-    local user="$1"
-    cat <<EOF
-# WatchDogsGo: closed Meshtastic service/package helper.
-Cmnd_Alias WDG_MESHTASTIC = \\
-    $HELPER_TARGET status wdg, \\
-    $HELPER_TARGET status stock, \\
-    $HELPER_TARGET start wdg, \\
-    $HELPER_TARGET start stock, \\
-    $HELPER_TARGET stop wdg, \\
-    $HELPER_TARGET stop stock, \\
-    $HELPER_TARGET enable wdg, \\
-    $HELPER_TARGET enable stock, \\
-    $HELPER_TARGET disable wdg, \\
-    $HELPER_TARGET disable stock, \\
-    $HELPER_TARGET select-service wdg, \\
-    $HELPER_TARGET select-service stock, \\
-    $HELPER_TARGET install-tag v*-wdg.*, \\
-    $HELPER_TARGET prepare-first-tag v*-wdg.*, \\
-    $HELPER_TARGET adopt-installed v*-wdg.*, \\
-    $HELPER_TARGET rollback
-$user ALL=(root) NOPASSWD: WDG_MESHTASTIC
-EOF
 }
 
 wdg_meshtastic_config_text() {
@@ -72,14 +39,6 @@ wdg_api:
   allowed_uid: $uid
 full_client_policy:
   ble_priority: true
-EOF
-}
-
-wdg_meshtastic_radio_tmpfiles_text() {
-    cat <<EOF
-d $RADIO_LOCK_DIR 2750 root $WATCHDOGS_GROUP -
-f $RADIO_LOCK_PATH 0660 root $WATCHDOGS_GROUP -
-f $TRANSACTION_LOCK_PATH 0600 root root -
 EOF
 }
 
@@ -170,7 +129,7 @@ wdg_meshtastic_warn_policy_restart() {
 }
 
 wdg_meshtastic_prepare_radio_access() {
-    local user="$1" memberships membership_changed=0 tmpfiles_temp
+    local user="$1" memberships membership_changed=0
     if ! getent group "$WATCHDOGS_GROUP" >/dev/null; then
         groupadd --system "$WATCHDOGS_GROUP"
     fi
@@ -179,16 +138,8 @@ wdg_meshtastic_prepare_radio_access() {
         usermod --append --groups "$WATCHDOGS_GROUP" "$user"
         membership_changed=1
     fi
-    install -d -o root -g "$WATCHDOGS_GROUP" -m 2750 "$RADIO_LOCK_DIR"
-    install -d -o root -g root -m 0755 "$RADIO_TMPFILES_DIR"
-    tmpfiles_temp="$(mktemp)"
-    wdg_meshtastic_radio_tmpfiles_text >"$tmpfiles_temp"
-    install -o root -g root -m 0644 \
-        "$tmpfiles_temp" "$RADIO_TMPFILES_TARGET"
-    rm -f "$tmpfiles_temp"
-    systemd-tmpfiles --create "$RADIO_TMPFILES_TARGET"
     if [ "$membership_changed" -eq 1 ]; then
-        echo "Added $user to $WATCHDOGS_GROUP; log out and back in before using the Meshtastic radio." >&2
+        echo "Added $user to $WATCHDOGS_GROUP; log out and back in before using the SX1262 manager." >&2
     fi
 }
 
@@ -206,26 +157,17 @@ wdg_install_meshtastic_support() {
         echo "Missing helper source: $HELPER_SOURCE" >&2; return 1; }
     [ -f "$VALIDATOR_SOURCE" ] && [ ! -L "$VALIDATOR_SOURCE" ] || {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
-    [ -f "$RELEASE_TOOL_SOURCE" ] && [ ! -L "$RELEASE_TOOL_SOURCE" ] || {
-        echo "Missing release tool source: $RELEASE_TOOL_SOURCE" >&2; return 1; }
-
-    for path in "$HELPER_TARGET" "$LIB_TARGET" "$RELEASE_TOOL_TARGET" \
-                "$SUDOERS_TARGET" \
-                "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" "$CONFIG_TARGET" \
-                "$RADIO_LOCK_DIR" "$RADIO_LOCK_PATH" \
-                "$TRANSACTION_LOCK_PATH" \
-                "$RADIO_TMPFILES_DIR" "$RADIO_TMPFILES_TARGET"; do
+    for path in "$HELPER_TARGET" "$LIB_TARGET" \
+                "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" \
+                "$CONFIG_TARGET"; do
         wdg_meshtastic_refuse_symlink "$path"
     done
 
     wdg_meshtastic_prepare_radio_access "$user"
 
     install -d -o root -g root -m 0755 /usr/local/libexec
-    install -d -o root -g root -m 0755 /usr/local/bin
     install -d -o root -g root -m 0755 "$LIB_TARGET"
     install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_TARGET"
-    install -o root -g root -m 0755 \
-        "$RELEASE_TOOL_SOURCE" "$RELEASE_TOOL_TARGET"
     install -o root -g root -m 0644 \
         "$VALIDATOR_SOURCE" "$LIB_TARGET/meshtastic_updates.py"
     install -d -o root -g root -m 0700 \
@@ -274,16 +216,8 @@ wdg_install_meshtastic_support() {
     fi
     wdg_meshtastic_warn_policy_restart "$policy_changed"
 
-    local sudoers_temp
-    sudoers_temp="$(mktemp)"
-    wdg_meshtastic_sudoers_text "$user" >"$sudoers_temp"
-    chmod 0440 "$sudoers_temp"
-    visudo -cf "$sudoers_temp" >/dev/null
-    install -o root -g root -m 0440 "$sudoers_temp" "$SUDOERS_TARGET"
-    rm -f "$sudoers_temp"
-
     "$HELPER_TARGET" version >/dev/null
-    echo "Meshtastic helper and release tool installed for $user (UID $uid)."
+    echo "Meshtastic setup transaction engine installed for $user (UID $uid)."
 }
 
 wdg_meshtastic_setup_main() {

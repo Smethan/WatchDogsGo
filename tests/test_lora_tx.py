@@ -1,12 +1,10 @@
 """LoRa polling-mode transmit and receive recovery tests."""
 
-import sys
 import struct
-from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 from watchdogs.lora_manager import (
-    LoRaManager, LORARF_IRQ_POLLING, MC_DISCOVERY_INTERVAL,
+    LoRaManager, MC_DISCOVERY_INTERVAL,
     MC_DISCOVERY_TYPE_FILTER, MC_DISCOVERY_WINDOW, make_hashtag_channel,
 )
 
@@ -165,19 +163,12 @@ def test_companion_cleanup_uncertainty_blocks_direct_owner_handoff():
     assert not manager.worker_active
 
 
-def test_radio_initialization_disables_gpio_irq_callbacks(
-        monkeypatch, tmp_path):
-    spi = tmp_path / "spidev1.0"
-    spi.touch()
-    monkeypatch.setenv("WDG_LORA_SPI_DEVICE", str(spi))
+def test_radio_initialization_uses_broker_without_gpio_arguments(monkeypatch):
     instances = []
 
     class InitRadio:
-        DIO3_OUTPUT_1_8 = 2
-        RX_GAIN_BOOSTED = 1
-        TX_POWER_SX1262 = 2
-
-        def __init__(self):
+        def __init__(self, role):
+            self.role = role
             self.begin_kwargs = None
             instances.append(self)
 
@@ -185,23 +176,16 @@ def test_radio_initialization_disables_gpio_irq_callbacks(
             self.begin_kwargs = kwargs
             return True
 
-        def setDio2RfSwitch(self, enabled):
-            pass
+        def setTxPower(self, power):
+            self.power = power
 
-        def setDio3TcxoCtrl(self, voltage, delay):
-            pass
-
-        def setRxGain(self, gain):
-            pass
-
-        def setTxPower(self, power, chip=None):
-            pass
-
-    monkeypatch.setitem(sys.modules, "LoRaRF", NS(SX126x=InitRadio))
+    monkeypatch.setattr("watchdogs.lora_manager.BrokerLoRa", InitRadio)
     manager = LoRaManager()
 
     assert manager._init_radio() is instances[0]
-    assert instances[0].begin_kwargs["irq"] == LORARF_IRQ_POLLING == -1
+    assert instances[0].role == "meshcore"
+    assert instances[0].begin_kwargs == {}
+    assert instances[0].power == 22
 
 
 def test_meshcore_discovery_request_is_direct_zero_hop_and_filters_nodes():

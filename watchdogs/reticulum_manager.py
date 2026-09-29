@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .radio_ownership import RadioOwnership, RadioOwnershipBusy
+from .sx1262_client import BrokerError, SX1262Controller
 from .reticulum_config import (
     ReticulumConfigError,
     ReticulumProfile,
@@ -54,16 +54,20 @@ class ReticulumManager:
                  operation_guard: Callable[[], str] | None = None,
                  runtime_dir: str | Path | None = None,
                  process_factory=None, thread_factory=None,
-                 ownership_factory=None,
+                 ownership_factory=None, sx1262_controller=None,
                  monotonic: Callable[[], float] = time.monotonic) -> None:
         self.app_dir = Path(app_dir).resolve()
-        self._service_handoff = service_handoff
+        # Service snapshots and process locks were replaced by the manager's
+        # explicit Reticulum lease.  Keep the legacy keyword for API stability.
+        self._service_handoff = None
         self._operation_guard = operation_guard
         self._runtime_dir_override = (
             Path(runtime_dir).resolve() if runtime_dir is not None else None)
         self._process_factory = process_factory or subprocess.Popen
         self._thread_factory = thread_factory or threading.Thread
-        self._ownership_factory = ownership_factory or RadioOwnership
+        self._ownership_factory = ownership_factory
+        self._sx1262 = sx1262_controller or SX1262Controller()
+        self._manager_lease_active = False
         self._monotonic = monotonic
         self._lock = threading.RLock()
         self._send_lock = threading.Lock()
@@ -165,92 +169,36 @@ class ReticulumManager:
             return self._propagation_node
 
     def _service_restore_pending(self) -> bool:
-        handoff = self._service_handoff
-        if handoff is None:
-            return False
-        pending = getattr(handoff, "service_restore_pending", False)
-        try:
-            return bool(pending() if callable(pending) else pending)
-        except Exception:
-            return False
+        return False
 
     def reuse_retained_service_snapshot_once(self) -> None:
-        """Allow the next direct-to-direct start to reuse the exact token."""
-        with self._lock:
-            self._reuse_snapshot_once = True
+        """Compatibility shim; broker generations replaced restore tokens."""
 
     def _prepare_service_handoff(self) -> bool:
-        handoff = self._service_handoff
-        if handoff is None:
-            return True
-        self._session_created_snapshot = False
-        self._session_reused_snapshot = False
-        reuse = False
-        with self._lock:
-            reuse = self._reuse_snapshot_once
-            self._reuse_snapshot_once = False
+        """Select Reticulum through the authenticated controller connection."""
         try:
-            if self._service_restore_pending():
-                if reuse:
-                    self._session_reused_snapshot = True
-                    return True
-                if not handoff.resume_service(timeout=15.0, connect=False):
-                    self._emit("error", {
-                        "code": "service_restore_failed",
-                        "detail": "Could not restore the retained Meshtastic service state",
-                        "fatal": True,
-                    })
-                    return False
-                if self._service_restore_pending():
-                    self._emit("error", {
-                        "code": "service_restore_unresolved",
-                        "detail": "Meshtastic service restore token remained unresolved",
-                        "fatal": True,
-                    })
-                    return False
-            if not handoff.suspend_service(timeout=10.0):
-                self._emit("error", {
-                    "code": "service_suspend_failed",
-                    "detail": "Meshtastic services did not release the SX1262",
-                    "fatal": True,
-                })
-                return False
-            if not self._service_restore_pending():
-                self._emit("error", {
-                    "code": "service_snapshot_missing",
-                    "detail": "Meshtastic suspension did not retain an exact restore snapshot",
-                    "fatal": True,
-                })
-                return False
-            self._session_created_snapshot = True
+            self._sx1262.activate_mode("reticulum")
+            self._manager_lease_active = True
             return True
-        except Exception as exc:
+        except BrokerError as exc:
             self._emit("error", {
-                "code": "service_handoff_failed", "detail": str(exc)[:240],
+                "code": "manager_lease_failed", "detail": str(exc)[:240],
                 "fatal": True,
             })
             return False
 
     def _restore_service_after_failed_start(self) -> None:
-        if (not self._session_created_snapshot
-                or self._service_handoff is None
-                or not self._service_restore_pending()):
+        if not self._manager_lease_active:
             return
         try:
-            restored = bool(self._service_handoff.resume_service(
-                timeout=15.0, connect=True))
-        except Exception as exc:
-            restored = False
+            self._sx1262.release_mode()
+        except BrokerError as exc:
             self._emit("error", {
-                "code": "service_start_rollback_failed",
-                "detail": str(exc)[:240], "fatal": True,
-            })
-        if not restored:
-            self._emit("error", {
-                "code": "service_start_rollback_failed",
-                "detail": "Reticulum failed and the exact Meshtastic state could not be restored",
+                "code": "manager_release_failed", "detail": str(exc)[:240],
                 "fatal": True,
             })
+        finally:
+            self._manager_lease_active = False
 
     def _emit(self, name: str, payload: dict[str, Any]) -> None:
         payload = dict(payload)
@@ -638,11 +586,13 @@ class ReticulumManager:
                 "fatal": True,
             })
         finally:
-            if not startup_ready and not self._stop_requested.is_set():
-                self._restore_service_after_failed_start()
             self._fail_pending_outbound(
                 "Reticulum sidecar stopped before terminal delivery state")
             self._cleanup_worker_resources()
+            # The sidecar broker socket is closed before releasing the mode;
+            # the manager can therefore confirm cleanup by peer disconnect
+            # and return immediately to Meshtastic.
+            self._restore_service_after_failed_start()
             with self._lock:
                 self._radio_owned = False
                 if self._state != "error" or self._stop_requested.is_set():
@@ -808,15 +758,8 @@ class ReticulumManager:
         return bool(self._send_request("cancel_propagation", {}))
 
     def _probe_lock_free(self) -> bool:
-        probe = self._ownership_factory()
-        try:
-            probe.acquire("WatchDogsGo Reticulum shutdown probe")
-            probe.release()
-            return True
-        except RadioOwnershipBusy:
-            return False
-        except Exception:
-            return False
+        """A released manager lease replaces advisory lock probing."""
+        return not self._manager_lease_active
 
     def stop(self, timeout: float = 8.0) -> bool:
         with self._lock:

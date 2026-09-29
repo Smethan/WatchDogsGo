@@ -1,5 +1,34 @@
 # Smethan WatchDogsGo
 
+## 0.9.54 — Unified SX1262 manager hardware candidate — 2026-09-29
+
+- Add `watchdogs-sx1262d` as the sole AIO SX1262 SPI, GPIO, reset/IRQ/busy,
+  RF-switch, and LoRa power owner. Meshtastic, MeshCore, and Reticulum now use
+  generation-scoped broker clients instead of competing direct drivers.
+- Keep Meshtastic as the powered boot/crash fallback. MeshCore and Reticulum
+  receive heartbeat-bound exclusive leases; stale generations are rejected,
+  failed owners are revoked, and WDG force-OFF remains authoritative until a
+  successful force-ON probe.
+- Make Bluetooth frontend availability follow the confirmed manager mode:
+  Meshtastic exposes only Meshtastic GATT, MeshCore exposes only MeshMapper
+  NUS, and Reticulum/OFF expose neither while preserving the authenticated
+  BlueZ phone bond.
+- Make managed `gpsd` the authoritative AIO UART owner and move WDG consumption
+  to a bounded reader thread with explicit transport/data/fix/stale states.
+  Radio mode changes no longer reopen the UART or switch GPS providers.
+- Move the entire pinned Meshtastic/broker install and transactional migration
+  into `sudo bash setup.sh`. Remove the user-facing adoption and in-app package
+  update ceremony; setup verifies the exact v2.8.0-wdg.8 asset and source before
+  changing services.
+- Add manager, client, transition, power, GPS, installer, and compatibility
+  coverage. The WDG suite passes 1,092 tests; the Meshtastic native build,
+  package policy, and fake-broker conformance tests pass.
+
+This is a uConsole hardware-acceptance candidate. Real SX1262 traffic,
+Meshtastic/MeshMapper pairing exclusivity, Bluetooth restart recovery, GPS
+stability during repeated mode changes, and rail read-back still require the
+physical test matrix before the stack should be treated as production-proven.
+
 ## 0.9.53 — Preserve mature Meshtastic node identities — 2026-09-28
 
 - Fix adoption of established Meshtastic nodes whose persisted node number no

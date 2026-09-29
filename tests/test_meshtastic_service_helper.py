@@ -1977,8 +1977,7 @@ def test_candidate_credentials_match_service_supplementary_groups(monkeypatch):
         else (_ for _ in ()).throw(KeyError(name)))
     monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
 
-    assert helper._meshtasticd_credentials() == (
-        612, 613, [614, 615, 616])
+    assert helper._meshtasticd_credentials() == (612, 613, [616])
 
 
 def test_candidate_credentials_allow_nonroot_legacy_primary_group(monkeypatch):
@@ -1995,8 +1994,7 @@ def test_candidate_credentials_allow_nonroot_legacy_primary_group(monkeypatch):
         else (_ for _ in ()).throw(KeyError(name)))
     monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
 
-    assert helper._meshtasticd_credentials() == (
-        612, 613, [614, 615, 616])
+    assert helper._meshtasticd_credentials() == (612, 613, [616])
 
 
 @pytest.mark.parametrize(("uid", "primary_gid", "service_gid"), [
@@ -2102,11 +2100,7 @@ def test_candidate_dry_run_allows_volatile_node_history_and_sanitizes_env(
     assert snapshot["effective_mac"] == "02:00:A1:B2:C3:D4"
     assert snapshot["mac_pin_required"] is True
     command, kwargs = calls[0]
-    assert command[:6] == [
-        str(helper.FLOCK_PATH), "-n", "-E", "75",
-        str(helper.RADIO_LOCK_PATH), str(helper.WDG_BINARY_PATH),
-    ]
-    assert command[6] == "--port=0"
+    assert command[:2] == [str(helper.WDG_BINARY_PATH), "--port=0"]
     assert any(value.startswith("--fsdir=") for value in command)
     assert any(value.startswith("--config=") for value in command)
     assert kwargs["env"]["MESHTASTIC_WDG_ALLOWED_UID"] == "0"

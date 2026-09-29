@@ -1371,7 +1371,7 @@ class WardriveUI:
             if px.btnp(px.KEY_ESCAPE):
                 self.settings_page = "lora"
                 return
-            row_count = 8
+            row_count = 7
             if px.btnp(px.KEY_UP):
                 self.meshtastic_selection = max(
                     0, self.meshtastic_selection - 1)
@@ -1385,30 +1385,20 @@ class WardriveUI:
                 direction = 1
             activate = px.btnp(px.KEY_RETURN)
             row = self.meshtastic_selection
-            if row == 0 and (direction or activate):
-                self.cycle_meshtastic_backend(direction or 1)
-            elif row == 1 and activate:
+            if row == 0 and activate:
                 self.toggle_meshtastic_phone_ble()
-            elif row == 2 and (direction or activate):
+            elif row == 1 and (direction or activate):
                 self.cycle_bluetooth_adapter(
                     "meshtastic_phone_adapter", direction or 1)
-            elif row == 3 and (direction or activate):
+            elif row == 2 and (direction or activate):
                 self.cycle_bluetooth_adapter(
                     "host_ble_adapter", direction or 1)
-            elif row == 4 and activate:
+            elif row == 3 and activate:
                 self.open_meshtastic_phone_pairing()
-            elif row == 5 and activate:
+            elif row == 4 and activate:
                 self.forget_meshtastic_phone()
-            elif row == 6 and activate:
+            elif row == 5 and activate:
                 self.retry_meshtastic_shared_adapter()
-            elif row == 7 and activate:
-                start_update = getattr(
-                    self.app, "_start_meshtastic_update", None)
-                if start_update is None:
-                    self.app.msg(
-                        "[MT] Service updater is not installed", ORANGE)
-                else:
-                    start_update()
             return
         if self.settings_page == "meshcore":
             if px.btnp(px.KEY_TAB):
@@ -2631,7 +2621,6 @@ class WardriveUI:
                 if transition_busy is not None:
                     action_busy = action_busy or bool(transition_busy())
                 rows = (
-                    ("Backend", self.settings["meshtastic_backend"].upper()),
                     ("Phone BLE", "ON" if self.settings[
                         "meshtastic_phone_ble_enabled"] else "OFF"),
                     ("Phone BLE adapter", self.settings[
@@ -2640,7 +2629,7 @@ class WardriveUI:
                     ("Open pairing", "BUSY" if action_busy else "120 SECONDS"),
                     ("Forget paired phone", "BUSY" if action_busy else "RUN"),
                     ("Retry shared adapter", "BUSY" if action_busy else "RUN"),
-                    ("Update service", "BUSY" if action_busy else "CHECK"),
+                    ("Stack health", "SETUP.SH MANAGED"),
                 )
                 for i, (label, value) in enumerate(rows):
                     selected = i == self.meshtastic_selection
@@ -2663,17 +2652,33 @@ class WardriveUI:
                 if manager is not None and manager.phone_connected:
                     ble = "phone connected"
                 radio = manager.radio_status if manager is not None else "unavailable"
-                px.text(55,216,
-                        f"Service: {service.upper()}  backend: {backend}"[:100],13)
-                px.text(55,230,
-                        (f"{client_label}: {client_state}  Phone BLE: {ble}"
-                         )[:100],13)
-                px.text(55,244,
-                        (f"Radio: {radio}  "
-                         f"Full client: {getattr(manager, 'full_client_owner', 'unknown')}"
-                         )[:100],13)
+                sx_status = getattr(
+                    self.app, "sx1262_status_snapshot", lambda: {})()
+                sx_state = str(sx_status.get("state") or "UNAVAILABLE")
+                sx_power = "ON" if sx_status.get("power") else "OFF"
+                broker_version = str(
+                    sx_status.get("broker_version") or "unavailable")
+                lease_age = int(sx_status.get("lease_age_ms") or 0)
+                metrics = sx_status.get("metrics") or {}
+                active_bt = (
+                    "Meshtastic" if sx_state == "MESHTASTIC" else
+                    "MeshMapper" if sx_state == "MESHCORE" else "none")
+                gps = getattr(self.app, "gps", None)
+                gps_provider = str(getattr(gps, "provider", "") or "none")
+                gps_age = max(0.0, time.monotonic() - float(
+                    getattr(gps, "_last_data_at", 0.0) or 0.0))
+                px.text(55,198,
+                        (f"Manager: {sx_state} power:{sx_power} v{broker_version} "
+                         f"lease:{lease_age}ms")[:100],13)
+                px.text(55,212,
+                        (f"BT frontend: {active_bt}  {client_label}: "
+                         f"{client_state}  BLE:{ble}")[:100],13)
+                px.text(55,226,
+                        (f"RF rx:{metrics.get('rx_packets', 0)} "
+                         f"drop:{metrics.get('rx_drops', 0)} "
+                         f"tx:{metrics.get('tx_packets', 0)}  radio:{radio}")[:100],13)
                 if manager is not None and manager.pairing_pin:
-                    px.text(55,258,
+                    px.text(55,240,
                             "Pairing PIN: " + manager.pairing_pin,11)
                 elif (manager is not None
                       and getattr(manager, "phone_bond_present", False)):
@@ -2681,15 +2686,18 @@ class WardriveUI:
                              or getattr(manager, "phone_bond_address", "")
                              or "authenticated phone")
                     px.text(
-                        55,258,
+                        55,240,
                         ("Shared random-PIN bond: " + str(phone))[:100],11)
                 elif manager is not None and manager.last_error:
-                    px.text(55,258,
+                    px.text(55,240,
                             ("Last error: " + manager.last_error)[:100],8)
+                px.text(55,264,
+                        (f"GPS: {gps_provider} report age:{gps_age:.1f}s  "
+                         f"state:{getattr(gps, 'navigation_state', 'unknown')}")[:100],10)
                 px.text(55,276,
-                        "Adapter choices use stable MACs; hci numbers may change.",10)
-                px.text(55,288,
                         "A connected phone has priority on a shared controller.",10)
+                px.text(55,288,
+                        "Install and update the stack only with sudo bash setup.sh",10)
                 px.text(55,300,"ESC returns   TAB closes settings",10)
                 px.camera()
                 self.app._draw_mc_toast()
@@ -2791,7 +2799,7 @@ class WardriveUI:
                 px.text(55, 138,
                         "Protocol selects the one owner of the AIO SX1262.", 13)
                 px.text(55, 154,
-                        "MeshCore/Reticulum use direct SPI; Meshtastic uses meshtasticd.",
+                        "Manager leases one mode; Meshtastic remains the fallback.",
                         13)
                 px.text(55, 176,
                         "Automatic LoRa capture remains under All Wardrive",

@@ -89,13 +89,6 @@ def _check_deps() -> list[tuple[str, str, bool, bool]]:
     except ImportError:
         checks.append(("python3-gi", "NOT INSTALLED (apt)", False, False))
 
-    # LoRaRF — LoRa SX1262
-    try:
-        import LoRaRF
-        checks.append(("LoRaRF", "OK", True, False))
-    except ImportError:
-        checks.append(("LoRaRF", "NOT INSTALLED", False, False))
-
     # dump1090 — ADS-B aircraft tracking (SDR)
     import shutil
     if find_dump1090():

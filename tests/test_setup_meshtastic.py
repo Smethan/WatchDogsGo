@@ -86,42 +86,22 @@ def test_meshtastic_setup_scripts_have_valid_shell_syntax():
         check=True, capture_output=True, text=True)
 
 
-def test_sudoers_grants_only_the_closed_helper_interface():
-    text = bash_function("wdg_meshtastic_sudoers_text", "sam")
-    helper = "/usr/local/libexec/watchdogs-meshtastic"
-    assert f"{helper} status wdg" in text
-    assert f"{helper} status stock" in text
-    for action in ("start", "stop", "enable", "disable"):
-        assert f"{helper} {action} wdg" in text
-        assert f"{helper} {action} stock" in text
-    assert f"{helper} select-service wdg" in text
-    assert f"{helper} select-service stock" in text
-    assert f"{helper} install-tag v*-wdg.*" in text
-    assert f"{helper} prepare-first-tag v*-wdg.*" in text
-    assert f"{helper} adopt-installed v*-wdg.*" in text
-    assert f"{helper} rollback" in text
-    assert "NOPASSWD: WDG_MESHTASTIC" in text
-    assert "ALL=(ALL)" not in text
-    assert "/bin/sh" not in text and "/bin/bash" not in text
-    assert "systemctl *" not in text and "dpkg *" not in text
+def test_setup_support_installs_no_user_callable_update_boundary():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "sudoers" not in text.lower()
+    assert "watchdogs-meshtastic-release" not in text
+    assert "adopt-installed" not in text
+    assert "NOPASSWD" not in text
 
 
-def test_radio_access_setup_creates_group_appends_user_and_repairs_lock_dir(
-        tmp_path):
-    tmpfiles = tmp_path / "watchdogs-radio-lock.conf"
+def test_radio_access_setup_creates_group_and_appends_user(tmp_path):
     calls, stderr = run_mocked_radio_access(
         tmp_path, group_exists=False, memberships="sam adm dialout")
 
     assert "groupadd:--system watchdogs" in calls
     assert "usermod:--append --groups watchdogs sam" in calls
-    assert any(
-        call.startswith("install:-d -o root -g watchdogs -m 2750 ")
-        for call in calls)
-    assert any(
-        call.startswith("install:-o root -g root -m 0644 ")
-        and call.endswith(" " + str(tmpfiles))
-        for call in calls)
-    assert "systemd-tmpfiles:--create " + str(tmpfiles) in calls
+    assert not any(call.startswith("install:") for call in calls)
+    assert not any(call.startswith("systemd-tmpfiles:") for call in calls)
     assert "log out and back in" in stderr
     assert not any("adm" in call or "dialout" in call for call in calls)
 
@@ -133,9 +113,7 @@ def test_radio_access_setup_is_idempotent_for_existing_membership(tmp_path):
 
     assert not any(call.startswith("groupadd:") for call in calls)
     assert not any(call.startswith("usermod:") for call in calls)
-    assert any(
-        call.startswith("install:-d -o root -g watchdogs -m 2750 ")
-        for call in calls)
+    assert not any(call.startswith("install:") for call in calls)
     assert "log out and back in" not in stderr
 
 
@@ -150,13 +128,11 @@ def test_portduino_policy_uses_resolved_login_uid_and_safe_defaults():
     assert "ble_priority: true" in text
 
 
-def test_radio_lock_tmpfiles_policy_is_persistent_and_inode_safe():
-    text = bash_function("wdg_meshtastic_radio_tmpfiles_text")
-    assert text == (
-        "d /run/lock/watchdogs 2750 root watchdogs -\n"
-        "f /run/lock/watchdogs/aio-sx1262.lock 0660 root watchdogs -\n"
-        "f /run/lock/watchdogs/meshtastic-update.lock 0600 root root -\n"
-    )
+def test_setup_support_has_no_legacy_radio_lock_policy():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "aio-sx1262.lock" not in text
+    assert "watchdogs-radio-lock.conf" not in text
+    assert "wdg_meshtastic_radio_tmpfiles_text" not in text
 
 
 def test_policy_change_warns_when_active_service_needs_restart(tmp_path):
@@ -259,8 +235,8 @@ def test_setup_installs_support_without_downloading_or_starting_a_daemon():
     assert 'sudo bash "$SCRIPT_DIR/scripts/setup_meshtastic.sh"' in setup
     assert '--install-support "$TARGET_USER" "$TARGET_UID"' in setup
     assert "/usr/local/libexec/watchdogs-meshtastic" in script
-    assert "/usr/local/bin/watchdogs-meshtastic-release" in script
-    assert '"$RELEASE_TOOL_SOURCE" "$RELEASE_TOOL_TARGET"' in script
+    assert "/usr/local/bin/watchdogs-meshtastic-release" not in script
+    assert "RELEASE_TOOL_SOURCE" not in script
     assert "/var/cache/watchdogs/meshtasticd-wdg" in script
     assert "/var/backups/meshtasticd-wdg" in script
     assert "install -o root -g root -m 0755" in script
@@ -268,8 +244,8 @@ def test_setup_installs_support_without_downloading_or_starting_a_daemon():
     assert "install -d -o root -g root -m 0700" in script
     assert 'wdg_meshtastic_prepare_radio_access "$user"' in script
     assert 'usermod --append --groups "$WATCHDOGS_GROUP" "$user"' in script
-    assert 'install -d -o root -g "$WATCHDOGS_GROUP" -m 2750' in script
-    assert 'systemd-tmpfiles --create "$RADIO_TMPFILES_TARGET"' in script
+    assert "RADIO_LOCK" not in script
+    assert "RADIO_TMPFILES" not in script
     assert 'policy_group="$MESHTASTIC_GROUP"' in script
     assert 'policy_mode="0640"' in script
     assert 'policy_group="root" policy_mode="0600"' in script

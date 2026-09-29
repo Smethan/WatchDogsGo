@@ -78,6 +78,17 @@ def test_managed_gpsd_failure_never_falls_back_to_raw_uart(tmp_path, monkeypatch
     assert "gpsd unavailable" in gps.status_reason
 
 
+def test_managed_gpsd_precedes_modemmanager(tmp_path, monkeypatch):
+    marker = tmp_path / "gpsd.conf"
+    marker.write_text("HOST=127.0.0.1\nDEVICE=/dev/serial0\n")
+    broker = _broker()
+    gps = GpsManager(modem_broker=broker, modem_enabled=True,
+                     gpsd_config=marker)
+    monkeypatch.setattr(gps, "_try_gpsd", Mock(return_value=True))
+    assert gps.setup()
+    broker.acquire.assert_not_called()
+
+
 def test_gpsd_tpv_and_sky_update_fix_without_nmea(tmp_path, monkeypatch):
     marker = tmp_path / "gpsd.conf"
     marker.write_text("HOST=localhost\nPORT=2947\nDEVICE=/dev/serial0\n")
@@ -131,10 +142,29 @@ def test_gpsd_disconnect_marks_provider_for_reconnect(tmp_path):
     gps._gpsd = fake
     gps._available = True
     gps.provider = "gpsd"
+    gps.transport_connected = True
     gps.read_available()
-    assert not gps.available and gps.provider == ""
+    assert not gps.available and gps.provider == "gpsd"
+    assert not gps.transport_connected
+    assert gps.socket_disconnects == 1
     assert gps.status_reason == "lost gpsd"
     fake.close.assert_called_once()
+
+
+def test_valid_fix_freshness_and_explicit_no_fix_are_distinct(tmp_path, monkeypatch):
+    marker = tmp_path / "gpsd.conf"
+    marker.write_text("HOST=localhost\n")
+    gps = GpsManager(modem_broker=_broker(), modem_enabled=False,
+                     gpsd_config=marker)
+    gps.transport_connected = True
+    gps._last_data_at = time.monotonic()
+    gps._consume_gpsd_reports([
+        {"class": "TPV", "mode": 3, "lat": 40.0, "lon": -90.0},
+    ])
+    assert gps.navigation_state == "valid_fix"
+    gps._consume_gpsd_reports([{"class": "TPV", "mode": 1}])
+    assert not gps.fix.valid
+    assert gps.navigation_state == "explicit_no_fix"
 
 
 def test_app_reads_aio_power_before_opening_gps():

@@ -70,7 +70,7 @@ from .reticulum_config import (
     save_profile as save_reticulum_profile,
 )
 from .reticulum_manager import ReticulumManager
-from .radio_ownership import RadioOwnership, RadioOwnershipBusy
+from .sx1262_client import BrokerError, SX1262Controller
 from .meshtastic_manager import MeshtasticManager
 from .meshtastic_service import (
     MESHTASTIC_HELPER,
@@ -639,6 +639,22 @@ class WatchDogsGame(OtaMixin):
         self._fw_update_available = False
 
         # MeshCore Messenger (runs in background when LoRa enabled)
+        # One authenticated controller connection owns mode selection,
+        # heartbeats and administrative power. Protocol clients use separate
+        # role-restricted connections and never manipulate GPIO themselves.
+        self._sx1262 = SX1262Controller()
+        self._sx1262_status = {
+            "state": "UNAVAILABLE", "power": False, "fault": "",
+            "broker_version": "", "lease_age_ms": 0, "metrics": {},
+        }
+        self._sx1262_status_lock = threading.Lock()
+        self._sx1262_status_stop = threading.Event()
+        self._sx1262_status_thread = threading.Thread(
+            target=self._sx1262_status_loop,
+            name="wdg-sx1262-status",
+            daemon=True,
+        )
+        self._sx1262_status_thread.start()
         self._meshtastic_service = (
             MeshtasticServiceController()
             if MESHTASTIC_HELPER.is_file() else None)
@@ -681,7 +697,7 @@ class WatchDogsGame(OtaMixin):
         self._lora_power_ownership_uncertain = False
         self._lora_power_uncertain_barrier = None
         self._lora = LoRaManager(
-            service_handoff=self._meshtastic,
+            sx1262_controller=self._sx1262,
             operation_guard=lambda: (
                 "SX1262 ownership is uncertain after a failed power-barrier "
                 "release; restart WatchDogsGo before using LoRa"
@@ -784,7 +800,7 @@ class WatchDogsGame(OtaMixin):
                 "[RNS] Profile ignored: " + str(exc)[:120], raw=True)
         self._reticulum = ReticulumManager(
             _app_dir,
-            service_handoff=self._meshtastic,
+            sx1262_controller=self._sx1262,
             operation_guard=lambda: (
                 "SX1262 ownership is uncertain after a failed power-barrier "
                 "release; restart WatchDogsGo before using Reticulum"
@@ -1341,13 +1357,6 @@ class WatchDogsGame(OtaMixin):
         except ImportError:
             checks.append(("  cryptography — not found (MeshCore)", C_WARNING))
 
-        # LoRaRF (LoRa SX1262)
-        try:
-            import LoRaRF
-            checks.append(("  LoRaRF (SX1262)", C_SUCCESS))
-        except ImportError:
-            checks.append(("  LoRaRF — not found (LoRa radio)", C_WARNING))
-
         checks.append(("", 0))
         checks.append(("HARDWARE", C_TEXT))
         checks.append(("", 0))
@@ -1688,6 +1697,27 @@ class WatchDogsGame(OtaMixin):
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
+
+    def _sx1262_status_loop(self):
+        """Refresh confirmed manager state without blocking the UI thread."""
+        while not self._sx1262_status_stop.is_set():
+            try:
+                status = self._sx1262.get_status()
+                if not isinstance(status, dict):
+                    raise RuntimeError("manager returned malformed status")
+            except Exception as exc:
+                status = {
+                    "state": "UNAVAILABLE", "power": False,
+                    "fault": str(exc)[:160], "broker_version": "",
+                    "lease_age_ms": 0, "metrics": {},
+                }
+            with self._sx1262_status_lock:
+                self._sx1262_status = status
+            self._sx1262_status_stop.wait(1.0)
+
+    def sx1262_status_snapshot(self):
+        with self._sx1262_status_lock:
+            return dict(self._sx1262_status)
 
     def update(self):
         # --- Boot screen phase ---
@@ -3058,7 +3088,7 @@ class WatchDogsGame(OtaMixin):
         return list(live)
 
     def _active_direct_owner(self) -> tuple[str, object | None]:
-        """Return the one WDG process that may currently own direct SPI."""
+        """Return the one WDG protocol client that may hold the broker lease."""
         reticulum = getattr(self, "_reticulum", None)
         if (reticulum is not None and
                 (getattr(reticulum, "running", False)
@@ -3245,153 +3275,36 @@ class WatchDogsGame(OtaMixin):
 
     def _run_lora_power_off(self, pending_start_threads=()):
         """Release all radio owners and cut the rail outside Pyxel's thread."""
-        ok = False
-        rail_off = False
-        detail = "LoRa power-off did not complete"
-        direct_active = False
-        prior_direct_mode = ""
-        prior_reticulum_profile = None
-        prior_service_target = None
-        service_suspended = False
-        barrier = None
+        # Unified-manager path.  WDG first shuts down its in-process/sidecar
+        # protocol frontend (which unregisters MeshCore GATT), then asks the
+        # sole hardware owner to force the rail off.  Meshtastic remains a
+        # resident daemon and reacts to the manager's power/revoke events.
         if pending_start_threads is None:
             pending_start_threads = ()
         elif not isinstance(pending_start_threads, (tuple, list, set)):
             pending_start_threads = (pending_start_threads,)
-        # Do not cut power, release the transition barrier, or begin another
-        # service mutation while a displaced handoff can still finish.  The
-        # helper calls used by those workers are bounded; waiting here keeps
-        # an overrun fail-closed without blocking the Pyxel thread.
-        for pending_thread in pending_start_threads:
-            if (pending_thread is not None
-                    and pending_thread is not threading.current_thread()):
-                pending_thread.join()
-        # A displaced handoff can restore a direct owner as its final rollback
-        # action.  Sample ownership only after every such worker has exited;
-        # the values from before the join are no longer authoritative.
-        prior_direct_mode, direct_owner = self._active_direct_owner()
-        if prior_direct_mode == "reticulum":
-            prior_reticulum_profile = (
-                getattr(self._reticulum, "profile", None)
-                or self._reticulum_profile)
-        direct_active = direct_owner is not None
         try:
-            prior_service_target = self._meshtastic.active_service_target()
-        except Exception:
-            pass
-        try:
-            bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
-            if bluetooth_busy:
-                detail = "cannot stop services while " + bluetooth_busy
-            elif direct_active and not self._stop_active_direct_owner():
-                detail = "direct LoRa worker did not release the SX1262"
-            else:
-                # A successful direct-radio session retains the exact service
-                # snapshot captured before it claimed SPI.  That token already
-                # proves both daemons are persistently suspended, and replacing
-                # it with a snapshot of the suspended state would destroy the
-                # only trustworthy rollback path.
-                service_suspended = self._meshtastic_service_restore_pending()
-                if not service_suspended:
-                    service_suspended = self._meshtastic.suspend_service(
-                        timeout=10.0)
-                if not service_suspended:
-                    detail = "Meshtastic service did not release the SX1262"
-                    if prior_direct_mode:
-                        self._restore_lora_power_owner(
-                            prior_direct_mode, None,
-                            reticulum_profile=prior_reticulum_profile)
-                    elif prior_service_target:
-                        try:
-                            if (self._meshtastic.active_service_target()
-                                    != prior_service_target):
-                                self._meshtastic.resume_service(
-                                    timeout=15.0, connect=True,
-                                    target=prior_service_target)
-                        except Exception:
-                            pass
-                else:
-                    factory = getattr(
-                        self, "_lora_power_barrier_factory", RadioOwnership)
-                    barrier = factory()
-                    try:
-                        barrier.acquire("WatchDogsGo LoRa power transition")
-                    except RadioOwnershipBusy as exc:
-                        restored = self._restore_lora_power_owner(
-                            prior_direct_mode, prior_service_target,
-                            reticulum_profile=prior_reticulum_profile)
-                        detail = (
-                            str(exc)[:120] + "; LoRa rail remains on; "
-                            + ("previous owner restored" if restored else
-                               "previous owner could not be restored"))
-                    except Exception as exc:
-                        restored = self._restore_lora_power_owner(
-                            prior_direct_mode, prior_service_target,
-                            reticulum_profile=prior_reticulum_profile)
-                        detail = (
-                            "could not acquire the SX1262 power barrier: "
-                            + str(exc)[:100] + "; LoRa rail remains on; "
-                            + ("previous owner restored" if restored else
-                               "previous owner could not be restored"))
-                    else:
-                        if (self._aio_available
-                                and not AioManager.toggle("lora", False)):
-                            try:
-                                barrier.release()
-                            except Exception as exc:
-                                self._mark_lora_power_ownership_uncertain(
-                                    barrier, exc)
-                                detail = (
-                                    "GPIO power-off failed and the SX1262 "
-                                    "ownership barrier could not be released; "
-                                    "restart WatchDogsGo")
-                            else:
-                                restored = self._restore_lora_power_owner(
-                                    prior_direct_mode, prior_service_target,
-                                    reticulum_profile=
-                                    prior_reticulum_profile)
-                                detail = (
-                                    "GPIO power-off failed; the LoRa rail remains "
-                                    "on; "
-                                    + ("previous owner restored" if restored else
-                                       "previous owner could not be restored"))
-                        else:
-                            rail_off = True
-                            ok = True
-                            detail = "LoRa disabled, mesh clients stopped"
+            for pending_thread in pending_start_threads:
+                if (pending_thread is not None
+                        and pending_thread is not threading.current_thread()):
+                    pending_thread.join(timeout=15.0)
+            if not self._stop_active_direct_owner():
+                raise RuntimeError("active protocol did not quiesce")
+            status = self._sx1262.admin_power_off()
+            powered = bool(status.get("power"))
+            forced_off = bool(status.get("forced_off"))
+            ok = forced_off and not powered
+            detail = ("LoRa disabled by SX1262 manager" if ok else
+                      "SX1262 manager did not confirm the rail is off")
         except Exception as exc:
-            detail = "LoRa power-off failed: " + str(exc)[:140]
-            barrier_released = True
-            if barrier is not None and getattr(barrier, "held", False):
-                try:
-                    barrier.release()
-                except Exception:
-                    barrier_released = False
-                    self._mark_lora_power_ownership_uncertain(barrier)
-            if ((service_suspended or prior_direct_mode or prior_service_target)
-                    and barrier_released):
-                restored = self._restore_lora_power_owner(
-                    prior_direct_mode, prior_service_target,
-                    reticulum_profile=prior_reticulum_profile)
-                detail += ("; previous owner restored" if restored else
-                           "; previous owner could not be restored")
-            elif not barrier_released:
-                detail += "; ownership barrier could not be released"
-        finally:
-            if barrier is not None and getattr(barrier, "held", False):
-                try:
-                    barrier.release()
-                except Exception as exc:
-                    self._mark_lora_power_ownership_uncertain(barrier, exc)
-                    ok = False
-                    detail += (
-                        "; ownership barrier release failed; SX1262 ownership "
-                        "is uncertain; restart WatchDogsGo: " + str(exc)[:80])
+            ok = False
+            detail = "LoRa manager power-off failed: " + str(exc)[:140]
         queue = getattr(self, "_lora_transition_queue", None)
         if queue is not None:
-            queue.put((ok, detail, "power_off", {"rail_off": rail_off}))
+            queue.put((ok, detail, "power_off", {"rail_off": ok}))
         else:
             self._end_meshtastic_transition()
+        return
 
     def _meshtastic_service_restore_pending(self) -> bool:
         """Read the manager's authoritative retained-service snapshot flag."""
@@ -3403,94 +3316,25 @@ class WatchDogsGame(OtaMixin):
         except Exception:
             return False
 
-    def _mark_lora_power_ownership_uncertain(
-            self, barrier, error=None) -> None:
-        """Retain an unreleased barrier and block every later radio owner."""
-        self._lora_power_ownership_uncertain = True
-        self._lora_power_uncertain_barrier = barrier
-        if error is not None:
-            self._term_add(
-                "[LoRa] SX1262 barrier release could not be confirmed: "
-                + str(error)[:120], raw=True)
-
-    def _restore_lora_power_owner(
-            self, direct_mode: str, service_target: str | None, *,
-            reticulum_profile: ReticulumProfile | None = None) -> bool:
-        """Restore the exact owner displaced before a failed rail cut."""
-        def direct_start_accepted(start) -> bool:
-            epoch = self._begin_lora_async_start("restore")
-            marker = ("restore", epoch)
-            self._lora_start_pending = marker
-            accepted = bool(start())
-            if accepted:
-                wardrive = getattr(self, "wardrive", None)
-                if wardrive is not None:
-                    wardrive._wdg_owned_lora = False
-            elif self._lora_start_pending == marker:
-                self._lora_start_pending = ""
-            return accepted
-
-        try:
-            # A direct owner can only be reopened after the retained systemd
-            # snapshot is restored.  Its worker will then suspend that exact
-            # state again before reclaiming SPI, producing a fresh rollback
-            # token for the restored direct session.
-            if (direct_mode
-                    and self._meshtastic_service_restore_pending()
-                    and not self._meshtastic.resume_service(
-                        timeout=15.0, connect=False)):
-                return False
-            if direct_mode == "meshcore":
-                self._lora.set_mc_channels(self._mc_channels_list)
-                return direct_start_accepted(
-                    lambda: self._lora.start_meshcore(self._mc_region))
-            if direct_mode == "reticulum":
-                epoch = self._begin_lora_async_start("restore")
-                marker = ("restore", epoch)
-                self._reticulum_start_pending = marker
-                accepted = bool(self._reticulum.start(
-                    reticulum_profile or self._reticulum_profile,
-                    action="restore"))
-                if accepted:
-                    wardrive = getattr(self, "wardrive", None)
-                    if wardrive is not None:
-                        wardrive._wdg_owned_lora = False
-                elif self._reticulum_start_pending == marker:
-                    self._reticulum_start_pending = None
-                return accepted
-            if direct_mode == "meshtastic":
-                return direct_start_accepted(self._lora.start_meshtastic)
-            if direct_mode == "scanner":
-                return direct_start_accepted(self._lora.start_scanner)
-            if direct_mode == "tracker":
-                return direct_start_accepted(self._lora.start_tracker)
-            if direct_mode == "sniffer":
-                config = getattr(self._lora, "_radio_cfg", None)
-                if config and len(config) >= 6:
-                    freq, sf, cr, bw, sync_word, preamble = config[:6]
-                    return direct_start_accepted(lambda: self._lora.start_sniffer(
-                        freq, sf, cr, bw, "Restored", sync_word, preamble))
-                return False
-            if (service_target
-                    or self._meshtastic_service_restore_pending()):
-                return bool(self._meshtastic.resume_service(
-                    timeout=15.0, connect=True, target=service_target))
-            return True
-        except Exception:
-            pending = getattr(self, "_lora_start_pending", "")
-            if (isinstance(pending, tuple) and pending
-                    and pending[0] == "restore"):
-                self._lora_start_pending = ""
-            return False
-
     def _toggle_lora_locked(self):
         new_state = not self._lora_enabled
-        # Power-up must precede client startup. Power-down is the inverse:
-        # release daemon/SPI owners before cutting the SX1262 rail.
-        if new_state and self._aio_available:
-            ok = AioManager.toggle("lora", new_state)
+        # Power-up is manager-mediated.  A successful reply is hardware
+        # read-back, not an optimistic UI state change.
+        if new_state:
+            preferred = self.wardrive.settings.get(
+                "lora_protocol", "meshtastic")
+            try:
+                status = self._sx1262.admin_power_on(preferred)
+                ok = bool(status.get("power")) and not bool(
+                    status.get("forced_off"))
+            except BrokerError as exc:
+                self.msg("[LoRa] SX1262 manager fault", C_ERROR)
+                self._term_add(
+                    "[LoRa] Restart watchdogs-sx1262d, then retry: "
+                    + str(exc)[:120], raw=True)
+                return False
             if not ok:
-                self.msg("[LoRa] GPIO toggle failed", C_ERROR)
+                self.msg("[LoRa] Manager did not confirm power ON", C_ERROR)
                 return False
         # Start/stop the selected mesh protocol.
         if new_state:
@@ -3524,94 +3368,28 @@ class WatchDogsGame(OtaMixin):
 
     def _run_meshtastic_handoff(self, action: str = "handoff",
                                 epoch: int | None = None) -> None:
-        """Release direct SPI, then restore the selected daemon off-thread."""
-        ok = False
-        detail = ""
-        direct_released = False
-        activation_attempted = False
-        safe_to_restore_direct = True
+        """Release the WDG lease and select the resident Meshtastic client."""
         if epoch is None:
             epoch = int(getattr(self, "_lora_start_epoch", 0))
-        prior_direct_mode, prior_direct_owner = self._active_direct_owner()
         try:
-            bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
-            if bluetooth_busy:
-                detail = "Meshtastic start blocked by " + bluetooth_busy
-            elif not self._stop_active_direct_owner():
-                detail = (
-                    "direct radio worker did not release the SX1262; "
-                    "Meshtastic was not started")
-            elif (prior_direct_owner is not None
-                  and getattr(prior_direct_owner, "radio_owned", False)):
-                detail = (
-                    "direct radio ownership remained held; Meshtastic was "
-                    "not started")
-            else:
-                direct_released = True
-                # LoRaManager intentionally leaves the pre-direct service
-                # snapshot retained for the lifetime of a successful direct
-                # session.  Restore it before beginning a new transactional
-                # backend selection; activate_backend_service() correctly
-                # refuses to overwrite an unresolved snapshot.
-                if (self._meshtastic_service_restore_pending()
-                        and not self._meshtastic.resume_service(
-                            timeout=15.0, connect=False)):
-                    safe_to_restore_direct = False
-                    detail = (
-                        "previous Meshtastic service state could not be "
-                        "restored; backend selection was not attempted")
-                else:
-                    mode = self._meshtastic.backend_mode
-                    activation_attempted = True
-                    if not self._meshtastic.activate_backend_service(
-                            mode, timeout=15.0):
-                        detail = "Meshtastic service did not become ready"
-                    elif not self._meshtastic.start():
-                        detail = "Meshtastic client did not start"
-                    elif not self._meshtastic.wait_connected(timeout=15.0):
-                        detail = (
-                            "Meshtastic endpoint opened but protocol negotiation "
-                            "did not complete")
-                    else:
-                        self._meshtastic.commit_backend_service_activation()
-                        ok = True
-                        detail = "Meshtastic service ready"
+            if not self._stop_active_direct_owner():
+                raise RuntimeError("previous protocol did not quiesce")
+            self._sx1262.activate_mode("meshtastic")
+            # The daemon is persistent; this opens only WDG's restricted local
+            # API client and does not mutate systemd service state.
+            if not self._meshtastic.start():
+                raise RuntimeError("Meshtastic local API client did not start")
+            if not self._meshtastic.wait_connected(timeout=15.0):
+                raise RuntimeError("Meshtastic local API did not become ready")
+            ok = True
+            detail = "Meshtastic manager lease and local API ready"
         except Exception as exc:
+            ok = False
             detail = "Meshtastic handoff failed: " + str(exc)[:140]
-        if not ok and activation_attempted:
-            # Once service selection has begun, disconnecting the candidate
-            # client is a hard barrier.  Never mutate systemd state or reopen
-            # direct SPI while that worker might still issue requests.
-            try:
-                closed = bool(self._meshtastic.close())
-            except Exception as exc:
-                closed = False
-                detail += "; Meshtastic client close failed: " + str(exc)[:100]
-            if not closed:
-                safe_to_restore_direct = False
-                detail += (
-                    "; Meshtastic client worker did not stop; service rollback "
-                    "and direct-radio restore were blocked")
-            else:
-                try:
-                    restored = bool(
-                        self._meshtastic.rollback_backend_service_activation(
-                            timeout=15.0))
-                except Exception as exc:
-                    restored = False
-                    detail += "; service rollback failed: " + str(exc)[:100]
-                if not restored:
-                    safe_to_restore_direct = False
-                    detail += "; previous service state could not be restored"
-        if (not ok and prior_direct_mode and direct_released
-                and safe_to_restore_direct):
-            if self._restore_lora_power_owner(prior_direct_mode, None):
-                detail += "; previous direct radio restored"
-            else:
-                detail += "; previous direct radio could not be restored"
         queue = getattr(self, "_lora_transition_queue", None)
         if queue is not None:
             queue.put((ok, detail, action, epoch))
+        return
 
     def _start_meshtastic_handoff(self, action: str = "handoff") -> bool:
         """Start one nonblocking direct-radio to daemon transition."""
@@ -3660,7 +3438,7 @@ class WatchDogsGame(OtaMixin):
 
     def _run_direct_handoff(self, protocol: str, prior: str,
                             action: str, epoch: int) -> None:
-        """Switch direct-SPI backends without replacing the service token."""
+        """Switch broker-backed protocol clients without losing rollback state."""
         ok = False
         detail = ""
         prior_profile = None
@@ -5505,11 +5283,11 @@ class WatchDogsGame(OtaMixin):
         sentences = self.gps.read_available()
         if sentences:
             self.gps.process_sentences(sentences)
-        fix = self.gps.fix
+        fix = self.gps.snapshot()
         self.wardrive.fixes.update(fix, now)
         self.gps_sats = fix.satellites
         self.gps_sats_vis = fix.satellites_visible
-        if fix.valid and now - fix.received_at <= 3:
+        if fix.valid and now - fix.received_at <= 5:
             # Jitter filter: ignore moves < ~30 m (0.0003°)
             dlat = abs(fix.latitude - self.player_lat)
             dlon = abs(fix.longitude - self.player_lon)
@@ -6230,7 +6008,7 @@ class WatchDogsGame(OtaMixin):
                                     "was not accepted", C_WARNING)
                         else:
                             # With automatic ownership inactive this is only a
-                            # preference change and must not claim SPI.
+                            # preference change and must not request a lease.
                             self.wardrive.settings[
                                 "lora_protocol"] = "reticulum"
                             self.wardrive.persist_settings()
@@ -6655,237 +6433,12 @@ class WatchDogsGame(OtaMixin):
         return stopped
 
     def _start_meshtastic_update(self):
-        """Check and install the newest compatible daemon release off-thread."""
-        if self._meshtastic_update_running:
-            self.msg("[MT] Service update is already running", C_DIM)
-            return False
-        if getattr(self, "_lora_power_ownership_uncertain", False):
-            self.msg(
-                "[MT] SX1262 ownership is uncertain; restart WatchDogsGo "
-                "before updating the service", C_ERROR)
-            return False
-        if not self._begin_meshtastic_transition("update"):
-            self.msg("[MT] Another radio/service operation is running",
-                     C_WARNING)
-            return False
-
-        def reject(message):
-            self.msg(message, C_WARNING)
-            self._end_meshtastic_transition()
-            return False
-
-        if self._meshtastic_service is None:
-            return reject(
-                "[MT] Rerun setup.sh to install the protected updater")
-        if not getattr(self, "_lora_enabled", False):
-            return reject("[MT] Enable the LoRa power rail before updating")
-        if self._lora_transition_active():
-            return reject("[MT] Wait for the current radio handoff to finish")
-        if self._active_direct_owner()[1] is not None:
-            return reject(
-                "[MT] Stop MeshCore/Reticulum direct LoRa before updating")
-        bluetooth_busy = self._meshtastic_bluetooth_busy_reason()
-        if bluetooth_busy:
-            return reject("[MT] Finish " + bluetooth_busy + " before updating")
-        wardrive = getattr(self, "wardrive", None)
-        host_ble = getattr(wardrive, "host_ble", None)
-        action_thread = getattr(wardrive, "_meshtastic_action_thread", None)
-        if host_ble is not None and host_ble.worker_active:
-            return reject("[MT] Stop the active host BLE scan before updating")
-        if getattr(self._watch, "worker_active", False):
-            return reject("[MT] Finish the active watch Bluetooth operation")
-        if action_thread is not None and action_thread.is_alive():
-            return reject("[MT] Wait for the current service control action")
-        if (getattr(self._meshtastic, "ble_scan_lease_active", False)
-                or getattr(self._meshtastic,
-                           "pairing_agent_lease_active", False)):
-            return reject("[MT] Finish the active Bluetooth lease before updating")
-        self._meshtastic_update_running = True
-        self.msg("[MT] Checking Smethan/meshtastic-firmware releases...", C_DIM)
-
-        def worker():
-            reconnect = False
-            prior_backend = ""
-            prior_service_target = None
-            ok = False
-            detail = "Meshtastic update did not complete"
-
-            def restored_service_matches() -> bool:
-                if prior_service_target not in ("wdg", "stock"):
-                    return True
-                current = self._meshtastic.active_service_target()
-                return current == prior_service_target
-
-            def reconnect_previous_backend() -> tuple[bool, str]:
-                """Reconnect only after the helper proved rollback complete."""
-                if not reconnect:
-                    return True, ""
-                try:
-                    if not restored_service_matches():
-                        return False, (
-                            "the restored Meshtastic service does not match "
-                            "the pre-update owner")
-                    if not self._meshtastic.start():
-                        return False, "the previous Meshtastic client did not restart"
-                    if not self._meshtastic.wait_connected(
-                            timeout=15.0, backend=prior_backend):
-                        return False, (
-                            "the previous backend did not recover ("
-                            + prior_backend + ")")
-                    return True, ""
-                except Exception as exc:
-                    return False, str(exc)[:120]
-
-            try:
-                # A stopped direct-radio session may still hold the exact
-                # pre-session systemd snapshot.  Resolve that authoritative
-                # token before release lookup or privileged package/service
-                # mutation; an installer transaction must never coexist with
-                # an older restore state that could later overwrite it.
-                if self._meshtastic_service_restore_pending():
-                    if not self._meshtastic.resume_service(
-                            timeout=15.0, connect=False):
-                        raise RuntimeError(
-                            "Previous Meshtastic service state could not be "
-                            "restored; update was not started")
-                    if self._meshtastic_service_restore_pending():
-                        raise RuntimeError(
-                            "Previous Meshtastic service state remains "
-                            "unresolved; update was not started")
-                from .meshtastic_updates import (
-                    meshtastic_releases, package_version_for_tag,
-                )
-                self._meshtastic_service.require_current()
-                releases = meshtastic_releases()
-                if not releases:
-                    raise RuntimeError(
-                        "No compatible Smethan Meshtastic release was found")
-                tag = releases[0]["tag_name"]
-                expected = package_version_for_tag(tag)
-                status = self._meshtastic_service.status("wdg")
-                if status.package_version == expected:
-                    ok = True
-                    detail = f"Already up to date ({tag})"
-                else:
-                    reconnect = bool(
-                        self._meshtastic.running or self._meshtastic.connected)
-                    prior_backend = str(
-                        getattr(self._meshtastic, "active_backend", "") or "")
-                    if prior_backend not in ("fork_socket", "legacy_tcp"):
-                        prior_backend = (
-                            "legacy_tcp"
-                            if self._meshtastic.backend_mode == "legacy_tcp"
-                            else "fork_socket")
-                    try:
-                        prior_service_target = (
-                            self._meshtastic.active_service_target())
-                    except Exception:
-                        prior_service_target = None
-                    if not self._meshtastic.close():
-                        raise RuntimeError(
-                            "Meshtastic client worker did not stop; package "
-                            "update was aborted before installation")
-                    try:
-                        result = self._meshtastic_service.install_tag(tag)
-                    except MeshtasticInstallError as install_exc:
-                        if not install_exc.rollback_restored:
-                            backup = (
-                                " Backup: " + str(install_exc.backup)
-                                if install_exc.backup is not None else "")
-                            raise RuntimeError(
-                                str(install_exc)[:150]
-                                + "; automatic rollback was not confirmed; "
-                                "the Meshtastic client remains stopped."
-                                + backup) from install_exc
-                        restored, restore_detail = reconnect_previous_backend()
-                        if not restored:
-                            raise RuntimeError(
-                                str(install_exc)[:120]
-                                + "; package rollback completed, but "
-                                + restore_detail) from install_exc
-                        raise RuntimeError(
-                            str(install_exc)[:140]
-                            + "; package update was rolled back and the "
-                            "previous backend was restored") from install_exc
-                    installed = result.get("package_version") or expected
-                    expected_backend = (
-                        "legacy_tcp"
-                        if self._meshtastic.backend_mode == "legacy_tcp"
-                        else "fork_socket")
-                    try:
-                        # The installer validates and enables the fork.
-                        # Preserve an explicit legacy selection across reboot
-                        # by restoring its exact service selection.
-                        if self._meshtastic.backend_mode == "legacy_tcp":
-                            self._meshtastic_service.select("stock")
-                        if reconnect:
-                            if not self._meshtastic.start():
-                                raise RuntimeError(
-                                    "updated Meshtastic client did not restart")
-                            if not self._meshtastic.wait_connected(
-                                    timeout=15.0, backend=expected_backend):
-                                raise RuntimeError(
-                                    "updated " + expected_backend
-                                    + " backend did not complete negotiation")
-                    except Exception as validation_exc:
-                        # The privileged helper saved an immutable transaction
-                        # pointer during install.  Roll back the package and
-                        # exact service snapshot before attempting to restore
-                        # WDG's previous client connection.
-                        if (self._meshtastic.running
-                                or self._meshtastic.connected):
-                            if not self._meshtastic.close():
-                                raise RuntimeError(
-                                    str(validation_exc)[:110]
-                                    + "; rollback is blocked because the "
-                                    "updated client worker did not stop; the "
-                                    "protected transaction was retained") \
-                                    from validation_exc
-                        try:
-                            self._meshtastic_service.rollback()
-                        except Exception as rollback_exc:
-                            raise RuntimeError(
-                                str(validation_exc)[:100]
-                                + "; automatic rollback failed: "
-                                + str(rollback_exc)[:100]) from validation_exc
-                        restored, restore_detail = reconnect_previous_backend()
-                        if not restored:
-                            raise RuntimeError(
-                                str(validation_exc)[:100]
-                                + "; package was rolled back, but "
-                                + restore_detail) from validation_exc
-                        raise RuntimeError(
-                            str(validation_exc)[:120]
-                            + "; package update was rolled back and the "
-                            "previous backend was restored") \
-                            from validation_exc
-                    ok = True
-                    detail = f"Installed {tag} ({installed}); service ready"
-            except Exception as exc:
-                detail = str(exc)[:220]
-            finally:
-                self._meshtastic_update_result.put((ok, detail))
-                self._end_meshtastic_transition()
-
-        try:
-            factory = getattr(
-                self, "_meshtastic_update_thread_factory", threading.Thread)
-            thread = factory(
-                target=worker, name="wdg-meshtastic-update",
-                # Package validation/rollback must outlive the UI.  Cleanup
-                # joins this worker before it closes the control socket.
-                daemon=False)
-            self._meshtastic_update_thread = thread
-            thread.start()
-        except Exception as exc:
-            self._meshtastic_update_thread = None
-            self._meshtastic_update_running = False
-            self._end_meshtastic_transition()
-            self.msg(
-                "[MT] Could not start update worker: " + str(exc)[:90],
-                C_ERROR)
-            return False
-        return True
+        """Compatibility entry point: package mutation belongs to setup.sh."""
+        self.msg("[MT] Run sudo bash setup.sh to update the radio stack", C_DIM)
+        self._term_add(
+            "[MT] In-app Meshtastic installation/adoption was removed; "
+            "setup.sh owns the transactional stack update", raw=True)
+        return False
 
     def _poll_meshtastic_update(self):
         result_queue = getattr(self, "_meshtastic_update_result", None)
@@ -7373,6 +6926,17 @@ class WatchDogsGame(OtaMixin):
                 "[LoRa] Radio handoff still active during shutdown", raw=True)
         if self._sdr.running:
             self._sdr.stop()
+        status_stop = getattr(self, "_sx1262_status_stop", None)
+        if status_stop is not None:
+            status_stop.set()
+        status_thread = getattr(self, "_sx1262_status_thread", None)
+        if (status_thread is not None
+                and status_thread is not threading.current_thread()):
+            status_thread.join(timeout=2.0)
+        try:
+            self._sx1262.close()
+        except Exception:
+            pass
         for p in self._plugins:
             try:
                 p.on_unload()

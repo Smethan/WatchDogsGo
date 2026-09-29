@@ -39,6 +39,8 @@ MESHTASTIC_PACKAGE_NAME = "meshtasticd-wdg"
 MESHTASTIC_ARCHITECTURE = "arm64"
 MESHTASTIC_WDG_API_MAJOR = 1
 MESHTASTIC_WDG_API_MINOR = 1
+SX1262_BROKER_API_MAJOR = 1
+SX1262_BROKER_API_MINOR = 0
 DPKG_DEB = "/usr/bin/dpkg-deb"
 GETCONF = "/usr/bin/getconf"
 
@@ -68,11 +70,14 @@ DPKG_INSPECTION_TIMEOUT_SECONDS = 30.0
 
 PACKAGE_FILES = frozenset({
     "usr/lib/meshtasticd-wdg/meshtasticd",
+    "usr/lib/watchdogs-sx1262d/watchdogs-sx1262d",
     "usr/lib/systemd/system/meshtasticd-wdg.service",
+    "usr/lib/systemd/system/watchdogs-sx1262d.service",
     "usr/lib/tmpfiles.d/meshtasticd-wdg.conf",
     "usr/lib/sysusers.d/meshtasticd-wdg.conf",
     "usr/share/dbus-1/system.d/meshtasticd-wdg.conf",
     "usr/share/meshtasticd-wdg/wdg-portduino.example.yaml",
+    "usr/share/meshtasticd-wdg/sx1262.example.yaml",
     "usr/share/doc/meshtasticd-wdg/copyright",
     "usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE",
     "usr/share/doc/meshtasticd-wdg/compatibility.json",
@@ -143,6 +148,15 @@ configure | reconfigure)
 \t\tchown root:meshtasticd "$policy"
 \t\tchmod 0640 "$policy"
 \tfi
+\tmanager_config=/etc/watchdogs/sx1262.yaml
+\tif [ -e "$manager_config" ] || [ -L "$manager_config" ]; then
+\t\tif [ ! -f "$manager_config" ] || [ -L "$manager_config" ]; then
+\t\t\techo "Unsafe SX1262 manager config: $manager_config" >&2
+\t\t\texit 1
+\t\tfi
+\t\tchown root:watchdogs "$manager_config"
+\t\tchmod 0640 "$manager_config"
+\tfi
 \tif command -v systemctl >/dev/null 2>&1; then
 \t\tsystemctl daemon-reload >/dev/null 2>&1 || true
 \tfi
@@ -161,7 +175,8 @@ exit 0
 SAFE_SERVICE = b'''[Unit]
 Description=Meshtastic daemon for WatchDogsGo
 Wants=bluetooth.service
-After=bluetooth.service meshtasticd.service
+Requires=watchdogs-sx1262d.service
+After=bluetooth.service meshtasticd.service watchdogs-sx1262d.service
 Conflicts=meshtasticd.service
 StartLimitIntervalSec=200
 StartLimitBurst=5
@@ -170,7 +185,7 @@ StartLimitBurst=5
 Type=simple
 User=meshtasticd
 Group=meshtasticd
-SupplementaryGroups=spi gpio watchdogs
+SupplementaryGroups=watchdogs
 RuntimeDirectory=meshtasticd
 RuntimeDirectoryMode=0770
 UMask=0007
@@ -178,10 +193,9 @@ Environment=MESHTASTIC_WDG_POLICY=/etc/meshtasticd/wdg-portduino.yaml
 ExecStartPre=/usr/bin/test -r /etc/meshtasticd/config.yaml
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/bin/flock -n -E 75 /run/lock/watchdogs/aio-sx1262.lock /usr/lib/meshtasticd-wdg/meshtasticd --config=/etc/meshtasticd/config.yaml --fsdir=/var/lib/meshtasticd/.portduino/default
+ExecStart=/usr/lib/meshtasticd-wdg/meshtasticd --config=/etc/meshtasticd/config.yaml --fsdir=/var/lib/meshtasticd/.portduino/default
 Restart=on-failure
 RestartSec=3
-RestartPreventExitStatus=75
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -190,17 +204,68 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 '''
-SAFE_TMPFILES = b'''d /run/lock/watchdogs 2750 root watchdogs -
-f /run/lock/watchdogs/aio-sx1262.lock 0660 root watchdogs -
+SAFE_MANAGER_SERVICE = b'''[Unit]
+Description=WatchDogsGo single-owner SX1262 manager
+Before=meshtasticd-wdg.service
+After=local-fs.target
+StartLimitIntervalSec=200
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=watchdogs-sx1262d
+Group=watchdogs
+SupplementaryGroups=spi gpio
+RuntimeDirectory=watchdogs
+RuntimeDirectoryMode=0770
+StateDirectory=watchdogs
+StateDirectoryMode=0750
+UMask=0007
+ExecStartPre=/usr/bin/test -r /etc/watchdogs/sx1262.yaml
+ExecStart=/usr/lib/watchdogs-sx1262d/watchdogs-sx1262d --sx1262-manager --config=/etc/watchdogs/sx1262.yaml --fsdir=/var/lib/watchdogs/portduino
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/run/watchdogs /var/lib/watchdogs
+DevicePolicy=closed
+DeviceAllow=/dev/spidev1.0 rw
+DeviceAllow=/dev/gpiochip0 rw
+DeviceAllow=/dev/gpiochip1 rw
+DeviceAllow=/dev/gpiochip2 rw
+DeviceAllow=/dev/gpiochip3 rw
+DeviceAllow=/dev/gpiochip4 rw
+
+[Install]
+WantedBy=multi-user.target
+'''
+SAFE_TMPFILES = b'''d /run/watchdogs 0770 watchdogs-sx1262d watchdogs -
+d /var/lib/watchdogs 0750 watchdogs-sx1262d watchdogs -
 d /run/meshtasticd 0770 meshtasticd meshtasticd -
 '''
 SAFE_SYSUSERS = b'''g watchdogs -
 g spi -
 g gpio -
 u meshtasticd - "Meshtastic daemon" /var/lib/meshtasticd /usr/sbin/nologin
+u watchdogs-sx1262d - "WatchDogsGo SX1262 manager" /var/lib/watchdogs /usr/sbin/nologin
 m meshtasticd watchdogs
-m meshtasticd spi
-m meshtasticd gpio
+m watchdogs-sx1262d watchdogs
+m watchdogs-sx1262d spi
+m watchdogs-sx1262d gpio
 '''
 
 
@@ -304,6 +369,19 @@ def validate_compatibility_manifest(
     minor = _require_plain_int(api.get("minor"), "WDG API minor")
     if minor < required_minor:
         raise ValueError("Release provides an older WDG API revision")
+
+    broker_api = manifest.get("sx1262_broker_api")
+    if not isinstance(broker_api, dict):
+        raise ValueError(
+            "Compatibility manifest is missing the SX1262 broker API version")
+    if (_require_plain_int(
+            broker_api.get("major"), "SX1262 broker API major")
+            != SX1262_BROKER_API_MAJOR):
+        raise ValueError("Release requires an incompatible SX1262 broker API major")
+    broker_minor = _require_plain_int(
+        broker_api.get("minor"), "SX1262 broker API minor")
+    if broker_minor < SX1262_BROKER_API_MINOR:
+        raise ValueError("Release provides an older SX1262 broker API revision")
 
     package = manifest.get("package")
     if not isinstance(package, dict):
@@ -647,7 +725,12 @@ def _read_tar_files(
                 raise ValueError("Debian package member is truncated: /" + name)
             mode = member.mode & 0o7777
             expected_mode = (
-                0o755 if name.endswith("/meshtasticd") or name == "postinst"
+                0o755
+                if name in {
+                    "usr/lib/meshtasticd-wdg/meshtasticd",
+                    "usr/lib/watchdogs-sx1262d/watchdogs-sx1262d",
+                    "postinst",
+                }
                 else 0o644)
             if mode != expected_mode:
                 raise ValueError(
@@ -819,6 +902,7 @@ def validate_debian_package(
 
     exact_policy_files = {
         "usr/lib/systemd/system/meshtasticd-wdg.service": SAFE_SERVICE,
+        "usr/lib/systemd/system/watchdogs-sx1262d.service": SAFE_MANAGER_SERVICE,
         "usr/lib/tmpfiles.d/meshtasticd-wdg.conf": SAFE_TMPFILES,
         "usr/lib/sysusers.d/meshtasticd-wdg.conf": SAFE_SYSUSERS,
     }
@@ -833,6 +917,9 @@ def validate_debian_package(
             or binary[5] != 1
             or int.from_bytes(binary[18:20], "little") != 183):
         raise ValueError("meshtasticd-wdg binary is not a 64-bit ARM ELF")
+    if data["usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"] != binary:
+        raise ValueError(
+            "SX1262 manager executable differs from the reviewed daemon build")
 
     try:
         embedded = json.loads(data["usr/share/doc/meshtasticd-wdg/compatibility.json"])
@@ -939,7 +1026,13 @@ def validate_installed_package_payload(
             raise ValueError("Installed package payload is missing or unsafe: /" + name) from exc
         try:
             info = os.fstat(descriptor)
-            expected_mode = 0o755 if name.endswith("/meshtasticd") else 0o644
+            expected_mode = (
+                0o755
+                if name in {
+                    "usr/lib/meshtasticd-wdg/meshtasticd",
+                    "usr/lib/watchdogs-sx1262d/watchdogs-sx1262d",
+                }
+                else 0o644)
             if (not stat.S_ISREG(info.st_mode)
                     or stat.S_IMODE(info.st_mode) != expected_mode
                     or (require_root_ownership

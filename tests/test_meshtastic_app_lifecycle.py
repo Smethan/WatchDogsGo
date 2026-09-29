@@ -88,8 +88,8 @@ def test_cleanup_waits_for_every_registered_radio_transition():
     game._meshtastic.close.assert_called_once_with()
 
 
-def test_cleanup_waits_for_protected_meshtastic_update(monkeypatch):
-    """Exit cannot interrupt package validation or automatic rollback."""
+def test_in_app_meshtastic_update_is_disabled(monkeypatch):
+    """Package mutation belongs exclusively to the setup transaction."""
     game = _cleanup_game()
     install_entered = threading.Event()
     release_install = threading.Event()
@@ -145,7 +145,11 @@ def test_cleanup_waits_for_protected_meshtastic_update(monkeypatch):
     )
     game.msg = Mock()
 
-    assert game._start_meshtastic_update()
+    assert game._start_meshtastic_update() is False
+    game.msg.assert_called_with(
+        "[MT] Run sudo bash setup.sh to update the radio stack", 13)
+    game._meshtastic_service.install_tag.assert_not_called()
+    return
     update_thread = game._meshtastic_update_thread
     assert update_thread is not None
     assert update_thread.daemon is False

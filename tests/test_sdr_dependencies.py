@@ -34,7 +34,6 @@ def test_missing_optional_tools_never_rerun_setup(monkeypatch, capsys):
     monkeypatch.setattr(startup, "_check_deps", lambda: [
         ("pyxel", "OK", True, True),
         ("dump1090", "NOT INSTALLED", False, False),
-        ("LoRaRF", "NOT INSTALLED", False, False),
     ])
     setup = Mock()
     monkeypatch.setattr(startup, "_run_setup", setup)

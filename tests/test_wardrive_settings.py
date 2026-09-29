@@ -154,7 +154,7 @@ def test_meshcore_region_picker_returns_to_meshcore_settings():
 
 def test_meshtastic_backend_and_adapter_settings_are_normalized():
     defaults = normalize_settings({})
-    assert defaults["meshtastic_backend"] == "auto"
+    assert defaults["meshtastic_backend"] == "fork_socket"
     assert defaults["meshtastic_phone_ble_enabled"] is True
     assert defaults["meshtastic_phone_adapter"] == "auto"
     assert defaults["meshcore_ble_enabled"] is False
@@ -190,7 +190,7 @@ def test_meshtastic_backend_and_adapter_settings_are_normalized():
         "meshcore_ble_paired_name": "  " + ("x" * 100),
         "host_ble_adapter": 7,
     })
-    assert invalid["meshtastic_backend"] == "auto"
+    assert invalid["meshtastic_backend"] == "fork_socket"
     assert invalid["meshtastic_phone_adapter"] == "auto"
     assert invalid["meshcore_ble_adapter"] == "auto"
     assert invalid["meshcore_ble_paired_address"] == ""
@@ -806,7 +806,7 @@ def test_backend_switch_rolls_back_and_does_not_persist_before_negotiation():
     manager.rollback_backend_service_activation.assert_called_once_with(
         timeout=15.0)
     manager.commit_backend_service_activation.assert_not_called()
-    assert ui.settings["meshtastic_backend"] == "auto"
+    assert ui.settings["meshtastic_backend"] == "fork_socket"
     ui.persist_settings.assert_not_called()
 
 
