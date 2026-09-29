@@ -72,6 +72,7 @@ def _write(path: Path, data: bytes | str, mode=0o644):
 def build_package(tmp_path: Path, *, extra_path: str | None = None,
                   control_extra: str = "", maintainer_script: str | None = None,
                   service: bytes | None = None,
+                  manager_launcher: bytes | None = None,
                   tmpfiles: bytes | None = None,
                   sysusers: bytes | None = None,
                   depends: str = DEFAULT_DEPENDS,
@@ -105,7 +106,8 @@ def build_package(tmp_path: Path, *, extra_path: str | None = None,
     _write(root / "usr/lib/meshtasticd-wdg/meshtasticd", bytes(elf), 0o755)
     _write(
         root / "usr/lib/watchdogs-sx1262d/watchdogs-sx1262d",
-        bytes(elf),
+        (manager_launcher if manager_launcher is not None
+         else updates.SAFE_MANAGER_LAUNCHER),
         0o755,
     )
     (root / "usr/lib/meshtasticd-wdg").chmod(binary_directory_mode)
@@ -464,6 +466,17 @@ def test_adoption_rejects_writable_installed_payload_directory(tmp_path):
 def test_package_rejects_modified_privileged_policy(tmp_path, package_options):
     stage, _ = stage_release(tmp_path, **package_options)
     with pytest.raises(ValueError, match="unreviewed privileged policy"):
+        updates.validate_prepared_release(
+            stage, expected_tag=TAG, require_secure=False, check_host=False)
+
+
+def test_package_rejects_modified_manager_launcher(tmp_path):
+    stage, _ = stage_release(
+        tmp_path,
+        manager_launcher=(
+            updates.SAFE_MANAGER_LAUNCHER + b"echo unreviewed\n"),
+    )
+    with pytest.raises(ValueError, match="manager launcher"):
         updates.validate_prepared_release(
             stage, expected_tag=TAG, require_secure=False, check_host=False)
 

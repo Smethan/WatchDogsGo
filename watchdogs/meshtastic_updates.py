@@ -253,6 +253,9 @@ DeviceAllow=/dev/gpiochip4 rw
 [Install]
 WantedBy=multi-user.target
 '''
+SAFE_MANAGER_LAUNCHER = b'''#!/bin/sh
+exec /usr/lib/meshtasticd-wdg/meshtasticd "$@"
+'''
 SAFE_TMPFILES = b'''d /run/watchdogs 0770 watchdogs-sx1262d watchdogs -
 d /var/lib/watchdogs 0750 watchdogs-sx1262d watchdogs -
 d /run/meshtasticd 0770 meshtasticd meshtasticd -
@@ -917,9 +920,10 @@ def validate_debian_package(
             or binary[5] != 1
             or int.from_bytes(binary[18:20], "little") != 183):
         raise ValueError("meshtasticd-wdg binary is not a 64-bit ARM ELF")
-    if data["usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"] != binary:
+    if (data["usr/lib/watchdogs-sx1262d/watchdogs-sx1262d"]
+            != SAFE_MANAGER_LAUNCHER):
         raise ValueError(
-            "SX1262 manager executable differs from the reviewed daemon build")
+            "SX1262 manager launcher differs from the reviewed wrapper")
 
     try:
         embedded = json.loads(data["usr/share/doc/meshtasticd-wdg/compatibility.json"])

@@ -1,5 +1,22 @@
 # Smethan WatchDogsGo
 
+## 0.9.55 — Corrected unified-radio package candidate — 2026-09-29
+
+- Pin setup to Meshtastic `v2.8.0-wdg.9`, whose Debian payload contains one
+  ARM64 daemon binary and a separately validated manager launcher. This keeps
+  the expanded archive inside WDG's bounded validation limit without weakening
+  package-layout, digest, source, ownership, or executable checks.
+- Reject a changed manager launcher even when the rest of the package is
+  otherwise well formed. The launcher must contain the exact reviewed `exec`
+  handoff to the broker-capable daemon.
+- Supersede WDG 0.9.54 and firmware `v2.8.0-wdg.8`. Their duplicated daemon
+  payload was caught by the final live setup validator before this candidate
+  was handed off; it was never accepted by the transactional installer.
+
+The functional unified-SX1262 changes and physical acceptance requirements are
+the same as 0.9.54. This remains a uConsole hardware candidate until the real
+radio, Bluetooth, GPS, and power test matrix passes.
+
 ## 0.9.54 — Unified SX1262 manager hardware candidate — 2026-09-29
 
 - Add `watchdogs-sx1262d` as the sole AIO SX1262 SPI, GPIO, reset/IRQ/busy,
