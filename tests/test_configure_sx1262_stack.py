@@ -61,6 +61,8 @@ def test_atomic_write_repairs_content_and_metadata_without_following_symlink(
 def test_manager_config_contains_only_hardware_facts():
     value = manager_config(4)
     assert "spidev: spidev1.0" in value
+    assert "spiSpeed: 2000000" in value
+    assert "7800000" not in value
     assert "gpiochip: 4" in value
     assert "IRQ: 26" in value and "Busy: 24" in value and "Reset: 25" in value
     assert "pin: 16" in value

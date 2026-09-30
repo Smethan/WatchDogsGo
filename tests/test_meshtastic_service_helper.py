@@ -51,6 +51,82 @@ def fake_stack_configurator():
     )
 
 
+class FakeManagerSocket:
+    def __init__(self, responses):
+        self.responses = [json.dumps(item).encode() for item in responses]
+        self.sent = []
+
+    def settimeout(self, _timeout):
+        pass
+
+    def connect(self, _path):
+        pass
+
+    def send(self, payload):
+        self.sent.append(json.loads(payload))
+        return len(payload)
+
+    def recv(self, _size):
+        return self.responses.pop(0)
+
+    def close(self):
+        pass
+
+
+def test_manager_health_check_requires_settled_meshtastic_power(monkeypatch):
+    helper = load_helper()
+    fake = FakeManagerSocket([
+        {"ok": True, "result": {
+            "api": {"major": 1, "minor": 0}, "generation": 7}},
+        {"ok": True, "result": {
+            "state": "MESHTASTIC", "power": True, "forced_off": False,
+            "fault": ""}},
+    ])
+    monkeypatch.setattr(helper.socket, "socket", lambda *_args: fake)
+
+    status = helper._manager_health_check(timeout=1)
+
+    assert status["state"] == "MESHTASTIC"
+    assert fake.sent[0]["role"] == "reticulum"
+    assert fake.sent[1] == {
+        "type": "request", "request_id": 2, "generation": 7,
+        "op": "get_status"}
+
+
+def test_manager_health_check_reports_hardware_fault(monkeypatch):
+    helper = load_helper()
+    fake = FakeManagerSocket([
+        {"ok": True, "result": {
+            "api": {"major": 1, "minor": 0}, "generation": 3}},
+        {"ok": True, "result": {
+            "state": "FAULT", "power": False, "forced_off": False,
+            "fault": "probe failed: -2"}},
+    ])
+    monkeypatch.setattr(helper.socket, "socket", lambda *_args: fake)
+
+    with pytest.raises(
+            helper.HelperError,
+            match=r"hardware probe failed: probe failed: -2"):
+        helper._manager_health_check(timeout=1)
+
+
+def test_manager_health_check_preserves_confirmed_forced_off(monkeypatch):
+    helper = load_helper()
+    fake = FakeManagerSocket([
+        {"ok": True, "result": {
+            "api": {"major": 1, "minor": 0}, "generation": 11}},
+        {"ok": True, "result": {
+            "state": "OFF", "power": False, "forced_off": True,
+            "fault": ""}},
+    ])
+    monkeypatch.setattr(helper.socket, "socket", lambda *_args: fake)
+
+    status = helper._manager_health_check(timeout=1)
+
+    assert status["forced_off"] is True
+    assert status["power"] is False
+
+
 def candidate_live_state(helper, tmp_path, monkeypatch):
     """Create two live state roots plus the helper's protected copy layout."""
     live_config = tmp_path / "live-etc-meshtasticd"
@@ -197,11 +273,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 12})
+        return result({"ok": True, "helper_version": 13})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 12
+    assert controller.version() == 13
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -372,7 +448,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 12
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 13
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -2956,6 +3032,7 @@ def test_candidate_baseline_mismatch_triggers_automatic_rollback(
     monkeypatch.setattr(helper.os, "chown", lambda *a: None)
     monkeypatch.setattr(
         helper, "_load_stack_configurator", fake_stack_configurator)
+    monkeypatch.setattr(helper, "_manager_health_check", Mock())
     mismatch = helper._semantic_status_snapshot(
         semantic_status(long_name="Regenerated"))
     monkeypatch.setattr(helper, "_candidate_dry_run", lambda *_a, **_k: {
@@ -3027,6 +3104,7 @@ def test_live_integrity_failure_uses_existing_automatic_rollback(
     monkeypatch.setattr(helper.os, "chown", lambda *a: None)
     monkeypatch.setattr(
         helper, "_load_stack_configurator", fake_stack_configurator)
+    monkeypatch.setattr(helper, "_manager_health_check", Mock())
     expected = helper._semantic_status_snapshot(semantic_status())
     monkeypatch.setattr(helper, "_candidate_dry_run", lambda _backup, **_kwargs: {
         "semantic": expected,

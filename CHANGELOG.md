@@ -10,6 +10,22 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.60] — 2026-09-30
+
+### Fixed
+
+- Run the uConsole AIO SX1262 at the same validated 2 MHz SPI clock used by
+  the previously working direct Portduino configuration. The earlier 7.8 MHz
+  manager policy could leave RadioLib retrying an unreadable chip for its full
+  probe window before the broker could answer Meshtastic.
+- Make setup query the manager's authenticated local status after systemd
+  starts it. Installation now requires confirmed Meshtastic/powered readiness
+  (or a correctly persisted forced-OFF state), and reports the broker's exact
+  hardware fault instead of continuing into a misleading candidate timeout.
+- Keep the locally built Meshtastic `v2.8.0-wdg.10` package and all identity,
+  channel, NodeDB, Bluetooth-bond, GPS, and transactional rollback safeguards.
+  Bump the protected setup-helper contract to version 13.
+
 ## [0.9.59] — 2026-09-30
 
 ### Fixed

@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 12
+HELPER_VERSION = 13
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -38,6 +38,7 @@ TARGET_SERVICES = {
     "stock": "meshtasticd.service",
 }
 MANAGER_SERVICE = "watchdogs-sx1262d.service"
+MANAGER_SOCKET_PATH = Path("/run/watchdogs/sx1262d.sock")
 SERVICE_ACTIONS = frozenset({"start", "stop", "enable", "disable"})
 PACKAGE_NAME = "meshtasticd-wdg"
 CACHE_ROOT = Path("/var/cache/watchdogs/meshtasticd-wdg")
@@ -286,6 +287,75 @@ def _service_status(target: str) -> dict[str, Any]:
         "unit_file_state": _systemd_property(service, "UnitFileState"),
         "package_version": _installed_version() if target == "wdg" else None,
     }
+
+
+def _manager_health_check(timeout: float = 20.0) -> dict[str, Any]:
+    """Wait for the broker probe and require a safe, settled manager state."""
+    deadline = time.monotonic() + timeout
+    last_error = "manager socket did not become ready"
+    while time.monotonic() < deadline:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            client.settimeout(min(2.0, max(0.1, deadline - time.monotonic())))
+            client.connect(str(MANAGER_SOCKET_PATH))
+            hello = {
+                "type": "hello",
+                "api": {"major": 1, "minor": 0},
+                # Setup only observes readiness, so do not occupy WDG's
+                # singleton controller role during this health check.
+                "role": "reticulum",
+                "request_id": 1,
+            }
+            client.send(json.dumps(hello, separators=(",", ":")).encode())
+            response = json.loads(client.recv(4096))
+            if not response.get("ok"):
+                raise ConnectionError(str(
+                    response.get("error", {}).get("message", "hello rejected")))
+            generation = response.get("result", {}).get("generation")
+            if not isinstance(generation, int) or generation <= 0:
+                raise ConnectionError(
+                    "manager returned an invalid ownership generation")
+            request = {
+                "type": "request",
+                "request_id": 2,
+                "generation": generation,
+                "op": "get_status",
+            }
+            client.send(json.dumps(request, separators=(",", ":")).encode())
+            response = json.loads(client.recv(4096))
+            if not response.get("ok"):
+                raise ConnectionError(str(
+                    response.get("error", {}).get("message", "status rejected")))
+            status = response.get("result")
+            if not isinstance(status, dict):
+                raise ConnectionError("manager returned malformed status")
+            state = status.get("state")
+            if state == "MESHTASTIC":
+                if status.get("power") is True and not status.get("fault"):
+                    return status
+                raise HelperError(
+                    "SX1262 manager reported Meshtastic mode without healthy "
+                    "power/read-back state")
+            if state == "OFF" and status.get("forced_off") is True:
+                if status.get("power") is False:
+                    return status
+                raise HelperError(
+                    "SX1262 manager forced-OFF state still reports rail power")
+            if state == "FAULT":
+                detail = str(status.get("fault") or "unspecified hardware fault")
+                raise HelperError("SX1262 manager hardware probe failed: " + detail)
+            last_error = "manager remained in unexpected state " + repr(state)
+        except HelperError:
+            raise
+        except (FileNotFoundError, ConnectionError, OSError, ValueError,
+                json.JSONDecodeError) as exc:
+            last_error = str(exc) or type(exc).__name__
+        finally:
+            client.close()
+        time.sleep(0.1)
+    raise HelperError(
+        "SX1262 manager did not become healthy within "
+        f"{timeout:.0f} seconds: {last_error}")
 
 
 def _set_service(action: str, target: str) -> dict[str, Any]:
@@ -3134,6 +3204,7 @@ def _install_tag(tag: str, gpiochip: int = 0) -> dict[str, Any]:
                 uid=0, gid=manager_gid, mode=0o640)
             _run(["systemctl", "daemon-reload"], timeout=30)
             _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+            _manager_health_check()
             candidate_options: dict[str, Any] = {"broker_config": True}
             if pin_required:
                 candidate_options["pinned_mac"] = effective_mac
@@ -3304,6 +3375,7 @@ def _converge_tag(tag: str, gpiochip: int = 0) -> dict[str, Any]:
                 tag, direct_hardware=True, include_validation=True)
             validation = result.pop("_validation")
             _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+            _manager_health_check()
 
             # Validate the broker path against a second disposable state copy
             # before changing the live Meshtastic configuration.
@@ -3340,6 +3412,7 @@ def _converge_tag(tag: str, gpiochip: int = 0) -> dict[str, Any]:
                 live_config, MANAGER_CONFIG_PATH, gpiochip,
                 meshtastic_gid, manager_gid)
             _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+            _manager_health_check()
             _run(["systemctl", "start", TARGET_SERVICES["wdg"]], timeout=45)
             initial_status = _health_check()
             initial_semantic = _semantic_status_snapshot(initial_status)

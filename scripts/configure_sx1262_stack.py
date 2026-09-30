@@ -80,7 +80,10 @@ def manager_config(gpiochip: int) -> str:
 Lora:
   Module: sx1262
   spidev: spidev1.0
-  spiSpeed: 7800000
+  # The uConsole AIO wiring is validated at Portduino's conservative 2 MHz
+  # default.  Higher clocks can make the SX1262 probe spend its full retry
+  # window waiting on an unreadable chip before the broker can answer clients.
+  spiSpeed: 2000000
   gpiochip: {int(gpiochip)}
   IRQ: 26
   Busy: 24

@@ -1,5 +1,24 @@
 # Smethan WatchDogsGo
 
+## 0.9.60 — Stable AIO SPI probe policy — 2026-09-30
+
+- Generate `/etc/watchdogs/sx1262.yaml` with a 2 MHz SPI clock, matching the
+  working direct Portduino default on the target uConsole. The 7.8 MHz policy
+  in 0.9.59 could make the manager spend its probe retry window unable to read
+  the SX1262, so its socket never became responsive before candidate timeout.
+- After starting `watchdogs-sx1262d`, setup now performs an authenticated
+  broker handshake and reads confirmed manager state before launching the
+  Meshtastic candidate. It accepts healthy powered Meshtastic mode or a
+  correctly persisted forced-OFF state and fails with the manager's precise
+  hardware fault for every other terminal state.
+- Continue using the locally built and published Meshtastic
+  `v2.8.0-wdg.10` ARM64 package. No GitHub firmware build or new Meshtastic
+  artifact is required for this configuration/orchestration correction.
+
+All migration ordering, exact rollback, identity/channel preservation, and
+single-owner safeguards remain in force. Real radio, Bluetooth, GPS, and power
+behavior remain blocking uConsole acceptance gates.
+
 ## 0.9.59 — Stable manager startup candidate — 2026-09-30
 
 - Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.10`, built
