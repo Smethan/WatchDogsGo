@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 10
+HELPER_VERSION = 11
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -646,6 +646,38 @@ def _package_version_for_tag(tag: str) -> str:
     return f"{major}.{minor}.{patch}+wdg{revision}"
 
 
+def _tag_for_package_version(version: str) -> str:
+    match = PACKAGE_VERSION_RE.fullmatch(version)
+    if match is None:
+        raise HelperError("Installed Meshtastic package version is invalid")
+    major, minor, patch, revision = match.groups()
+    return f"v{major}.{minor}.{patch}-wdg.{revision}"
+
+
+def _is_legacy_rollback_tag(tag: str, validator) -> bool:
+    releases = getattr(validator, "LEGACY_ROLLBACK_RELEASES", {})
+    return isinstance(releases, dict) and tag in releases
+
+
+def _validate_rollback_release(directory: Path, tag: str, validator) -> Any:
+    if _is_legacy_rollback_tag(tag, validator):
+        return validator.validate_legacy_rollback_release(
+            directory, expected_tag=tag, require_secure=True,
+            check_host=False)
+    return validator.validate_prepared_release(
+        directory, expected_tag=tag, require_secure=True, check_host=False,
+        minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+
+
+def _validate_rollback_installed(prepared: Any, validator) -> None:
+    if _is_legacy_rollback_tag(prepared.tag, validator):
+        validator.validate_legacy_installed_package_payload(
+            prepared.package_path, prepared.manifest)
+    else:
+        validator.validate_installed_package_payload(
+            prepared.package_path, prepared.manifest)
+
+
 def _release_identity(prepared: Any) -> dict[str, Any]:
     manifest = getattr(prepared, "manifest", None)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("package"), dict):
@@ -739,10 +771,8 @@ def _validate_transaction_metadata(
         if rollback_identity["package_version"] != previous_version:
             raise HelperError("Meshtastic rollback package metadata is inconsistent")
         rollback_dir = backup / "rollback-release" / rollback_identity["tag"]
-        prepared = validator.validate_prepared_release(
-            rollback_dir, expected_tag=rollback_identity["tag"],
-            require_secure=True, check_host=False,
-            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        prepared = _validate_rollback_release(
+            rollback_dir, rollback_identity["tag"], validator)
         if _release_identity(prepared) != rollback_identity:
             raise HelperError(
                 "Verified rollback release differs from transaction metadata")
@@ -1062,10 +1092,8 @@ def _find_cached_release(version: str, validator) -> Any | None:
         if not candidate.is_dir() or candidate.is_symlink() or not TAG_RE.fullmatch(candidate.name):
             continue
         try:
-            prepared = validator.validate_prepared_release(
-                candidate, expected_tag=candidate.name, require_secure=True,
-                check_host=False,
-                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+            prepared = _validate_rollback_release(
+                candidate, candidate.name, validator)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             continue
         if prepared.package_version == version:
@@ -1104,6 +1132,18 @@ def _prepare_exact_release(
     return prepared
 
 
+def _prepare_rollback_release(tag: str, validator) -> Any:
+    """Resolve a current or exact digest-pinned pre-broker rollback release."""
+    release_dir = CACHE_ROOT / tag
+    if release_dir.exists():
+        return _validate_rollback_release(release_dir, tag, validator)
+    if _is_legacy_rollback_tag(tag, validator):
+        return validator.prepare_legacy_rollback_release(
+            tag, cache_root=CACHE_ROOT, require_root=True, check_host=True)
+    return _prepare_exact_release(
+        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+
+
 def _create_backup(tag: str, prepared: Any, validator,
                    services: dict[str, dict[str, Any]]) -> tuple[Path, dict[str, Any]]:
     _secure_root_directory(BACKUP_ROOT)
@@ -1125,9 +1165,29 @@ def _create_backup(tag: str, prepared: Any, validator,
                 "against itself")
         rollback_release = _find_cached_release(previous_version, validator)
         if rollback_release is None:
-            raise HelperError(
-                "The installed meshtasticd-wdg package has no verified rollback "
-                "package in the root cache; refusing to update")
+            rollback_tag = _tag_for_package_version(previous_version)
+            try:
+                candidate = _prepare_rollback_release(rollback_tag, validator)
+                if candidate.package_version != previous_version:
+                    raise HelperError(
+                        "Downloaded rollback package version does not match the "
+                        "installed Meshtastic package")
+                # Matching a dpkg version is insufficient.  Seed the cache only
+                # after every installed package-owned byte matches the exact,
+                # digest-pinned public rollback artifact.
+                _validate_rollback_installed(candidate, validator)
+                _cache_installed_release(candidate)
+                rollback_release = _find_cached_release(
+                    previous_version, validator)
+            except Exception as exc:  # noqa: BLE001 - preserve root cause
+                raise HelperError(
+                    "The installed meshtasticd-wdg package has no verified "
+                    "rollback package, and automatic rollback seeding failed: "
+                    + str(exc)) from exc
+            if rollback_release is None:
+                raise HelperError(
+                    "Automatic Meshtastic rollback seeding did not create a "
+                    "verified installed-package cache")
         rollback_tag = rollback_release.tag
         rollback_root = backup / "rollback-release"
         rollback_root.mkdir(mode=0o700)
@@ -1221,10 +1281,8 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
         # damage between transaction creation and rollback.
         if prepared is not None:
             rollback_identity = metadata["rollback_release"]
-            prepared = validator.validate_prepared_release(
-                prepared.directory, expected_tag=rollback_identity["tag"],
-                require_secure=True, check_host=False,
-                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+            prepared = _validate_rollback_release(
+                prepared.directory, rollback_identity["tag"], validator)
             if _release_identity(prepared) != rollback_identity:
                 raise HelperError(
                     "Rollback release changed after restore preflight")
@@ -1247,16 +1305,13 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
         if prepared is not None:
             # Prove both the cached release and every installed payload byte
             # still match the exact identity recorded by the transaction.
-            checked = validator.validate_prepared_release(
+            checked = _validate_rollback_release(
                 prepared.directory,
-                expected_tag=metadata["rollback_release"]["tag"],
-                require_secure=True, check_host=False,
-                minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+                metadata["rollback_release"]["tag"], validator)
             if _release_identity(checked) != metadata["rollback_release"]:
                 raise HelperError(
                     "Rollback release identity changed during installation")
-            validator.validate_installed_package_payload(
-                checked.package_path, checked.manifest)
+            _validate_rollback_installed(checked, validator)
 
         _apply_state_restore(entries)
         state_applied = True
@@ -2250,10 +2305,8 @@ def _cache_installed_release(prepared: Any) -> bool:
     target = INSTALLED_CACHE / prepared.tag
     if target.exists():
         validator = _load_validator()
-        cached = validator.validate_prepared_release(
-            target, expected_tag=prepared.tag, require_secure=True,
-            check_host=False,
-            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        cached = _validate_rollback_release(
+            target, prepared.tag, validator)
         if (cached.package_version != prepared.package_version
                 or cached.manifest != prepared.manifest):
             raise HelperError(
@@ -2269,10 +2322,8 @@ def _cache_installed_release(prepared: Any) -> bool:
         for child in staging.iterdir():
             os.chmod(child, 0o600)
         validator = _load_validator()
-        cached = validator.validate_prepared_release(
-            staging, expected_tag=prepared.tag, require_secure=True,
-            check_host=False,
-            minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        cached = _validate_rollback_release(
+            staging, prepared.tag, validator)
         if (cached.package_version != prepared.package_version
                 or cached.manifest != prepared.manifest):
             raise HelperError(

@@ -832,7 +832,7 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
 ls -l /run/meshtasticd/wdg.sock
 ```
-WDG 0.9.56 requires local API 1.1 and broker API 1.0 from firmware
+WDG 0.9.57 requires local API 1.1 and broker API 1.0 from firmware
 `v2.8.0-wdg.9`. Close WDG and rerun `sudo bash setup.sh`; setup downloads the
 exact pinned five-asset release, validates its SHA-256/source metadata, migrates
 the existing identity and channels, and starts the manager before the daemon.

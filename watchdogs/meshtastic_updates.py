@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -88,6 +89,44 @@ PACKAGE_DIRECTORIES = frozenset(
     for parts in (PurePosixPath(filename).parts,)
     for index in range(1, len(parts))
 )
+LEGACY_ROLLBACK_PACKAGE_FILES = frozenset({
+    "usr/lib/meshtasticd-wdg/meshtasticd",
+    "usr/lib/systemd/system/meshtasticd-wdg.service",
+    "usr/lib/tmpfiles.d/meshtasticd-wdg.conf",
+    "usr/lib/sysusers.d/meshtasticd-wdg.conf",
+    "usr/share/dbus-1/system.d/meshtasticd-wdg.conf",
+    "usr/share/meshtasticd-wdg/wdg-portduino.example.yaml",
+    "usr/share/doc/meshtasticd-wdg/copyright",
+    "usr/share/doc/meshtasticd-wdg/UPSTREAM_BASE",
+    "usr/share/doc/meshtasticd-wdg/compatibility.json",
+})
+LEGACY_ROLLBACK_PACKAGE_DIRECTORIES = frozenset(
+    PurePosixPath(*parts[:index]).as_posix()
+    for filename in LEGACY_ROLLBACK_PACKAGE_FILES
+    for parts in (PurePosixPath(filename).parts,)
+    for index in range(1, len(parts))
+)
+# These are immutable, previously hardware-tested pre-broker packages.  They
+# are accepted only as rollback inputs while moving an already installed host
+# to the unified manager.  Exact manifest and package digests prevent a changed
+# GitHub asset or a locally rebuilt same-version package from becoming rollback
+# authority.
+LEGACY_ROLLBACK_RELEASES = {
+    "v2.8.0-wdg.6": {
+        "manifest_sha256": "e6b8c7365de3b412062bbdc74a6f4c0a4698375daf2cc975a5d4a70ca9cf0394",
+        "package_sha256": "fd5a818761e39a192e892f4bd68ce05fcb4cca5a16fe09dfe1351f711532f372",
+        "package_size": 41364788,
+        "source_commit": "e696665fcfefcdae8e0bdb726c5e8140167059ac",
+        "wdg_api_minor": 0,
+    },
+    "v2.8.0-wdg.7": {
+        "manifest_sha256": "8ab6dc06694c53667d5a8a09de9ecbdf6bc1248f90b03247092210f46f6c053f",
+        "package_sha256": "e6fbe32e0e23f6a72d3e0274f431f0dcf89d676af6c3cb1a3abd36c3fc9bc2f6",
+        "package_size": 41457580,
+        "source_commit": "0b3804f560c6f4c2263e0a04a8fe5658123ebd10",
+        "wdg_api_minor": 1,
+    },
+}
 CONTROL_FILES = frozenset({"control", "md5sums", "postinst"})
 MAINTAINER_SCRIPTS = frozenset({
     "preinst", "postinst", "prerm", "postrm", "config", "triggers",
@@ -857,6 +896,94 @@ def _package_data(
     )
 
 
+def _legacy_rollback_package_data(
+    package_path: Path,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> dict[str, bytes]:
+    return _read_tar_files(
+        _dpkg_tar(package_path, "--fsys-tarfile"),
+        allowed_files=LEGACY_ROLLBACK_PACKAGE_FILES,
+        required_files=LEGACY_ROLLBACK_PACKAGE_FILES,
+        required_directories=LEGACY_ROLLBACK_PACKAGE_DIRECTORIES,
+    )
+
+
+def validate_legacy_rollback_debian_package(
+    package_path: Path,
+    manifest: dict[str, Any],
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> None:
+    """Validate an exact pinned pre-broker package for rollback only."""
+    tag = manifest.get("tag")
+    record = LEGACY_ROLLBACK_RELEASES.get(tag)
+    if record is None:
+        raise ValueError("Meshtastic release is not an approved legacy rollback")
+    package = manifest.get("package")
+    if not isinstance(package, dict):
+        raise ValueError("Legacy rollback package metadata is missing")
+    package_path = Path(package_path)
+    try:
+        info = package_path.stat()
+    except OSError as exc:
+        raise ValueError("Legacy rollback package is missing") from exc
+    if package_path.is_symlink() or not package_path.is_file():
+        raise ValueError("Legacy rollback package must be a regular file")
+    digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
+    if (info.st_size != record["package_size"]
+            or package.get("size") != record["package_size"]
+            or digest != record["package_sha256"]
+            or package.get("sha256") != record["package_sha256"]):
+        raise ValueError("Legacy rollback package differs from the pinned artifact")
+
+    control = _read_tar_files(
+        _dpkg_tar(package_path, "--ctrl-tarfile"),
+        allowed_files=CONTROL_FILES,
+        required_files=frozenset({"control", "postinst"}),
+    )
+    fields = _parse_control_stanza(control["control"])
+    expected_fields = {
+        "Package": MESHTASTIC_PACKAGE_NAME,
+        "Version": package_version_for_tag(tag),
+        "Architecture": MESHTASTIC_ARCHITECTURE,
+        **SAFE_CONTROL_STATIC,
+    }
+    for field, expected in expected_fields.items():
+        if fields[field] != expected:
+            raise ValueError(
+                f"Legacy rollback Debian {field} metadata is unexpected")
+    _validate_dependencies(fields["Depends"])
+    if MAINTAINER_SCRIPTS & set(control) != {"postinst"}:
+        raise ValueError("Legacy rollback has unexpected maintainer scripts")
+
+    data = _legacy_rollback_package_data(package_path, runner=runner)
+    binary = data["usr/lib/meshtasticd-wdg/meshtasticd"]
+    if (len(binary) < 20 or binary[:4] != b"\x7fELF" or binary[4] != 2
+            or binary[5] != 1
+            or int.from_bytes(binary[18:20], "little") != 183):
+        raise ValueError("Legacy rollback daemon is not a 64-bit ARM ELF")
+    try:
+        embedded = json.loads(
+            data["usr/share/doc/meshtasticd-wdg/compatibility.json"])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Legacy rollback has invalid embedded metadata") from exc
+    if not isinstance(embedded, dict) or not isinstance(embedded.get("package"), dict):
+        raise ValueError("Legacy rollback has invalid embedded metadata")
+    if {"size", "sha256"} & set(embedded["package"]):
+        raise ValueError("Legacy rollback embedded metadata is self-referential")
+    embedded = json.loads(json.dumps(embedded))
+    if embedded.pop("artifact_digest_source", None) != (
+            "GitHub release compatibility.json"):
+        raise ValueError("Legacy rollback embedded metadata has no digest source")
+    comparable = json.loads(json.dumps(manifest))
+    comparable["package"].pop("size", None)
+    comparable["package"].pop("sha256", None)
+    comparable.pop("built_glibc_requirement", None)
+    if embedded != comparable:
+        raise ValueError("Legacy rollback embedded metadata differs from its release")
+
+
 def validate_debian_package(
     package_path: Path,
     manifest: dict[str, Any],
@@ -1143,6 +1270,234 @@ def validate_prepared_release(
         package_path=package_path,
         manifest=manifest,
     )
+
+
+def validate_legacy_rollback_release(
+    directory: Path,
+    *,
+    expected_tag: str,
+    require_secure: bool = True,
+    check_host: bool = True,
+    machine: str | None = None,
+    glibc_version: str | None = None,
+    runner: Callable[..., Any] = subprocess.run,
+) -> PreparedMeshtasticRelease:
+    """Validate one digest-pinned pre-broker release for rollback only."""
+    record = LEGACY_ROLLBACK_RELEASES.get(expected_tag)
+    if record is None:
+        raise ValueError("Meshtastic release is not an approved legacy rollback")
+    directory = Path(directory)
+    if directory.name != expected_tag or directory.is_symlink() or not directory.is_dir():
+        raise ValueError("Legacy rollback cache has an invalid directory")
+    package_name = package_asset_for_tag(expected_tag)
+    expected_files = {
+        COMPATIBILITY_ASSET, CHECKSUM_ASSET, SOURCE_ASSET, COPYRIGHT_ASSET,
+        package_name,
+    }
+    actual = {path.name for path in directory.iterdir()}
+    if actual != expected_files or any(path.is_symlink() or not path.is_file()
+                                       for path in directory.iterdir()):
+        raise ValueError("Legacy rollback cache contains unexpected files")
+    if require_secure:
+        for path in (directory, *directory.iterdir()):
+            info = path.stat()
+            if info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o077:
+                raise RuntimeError("Legacy rollback cache must be root-owned and private")
+
+    manifest_blob = (directory / COMPATIBILITY_ASSET).read_bytes()
+    if (len(manifest_blob) > MAX_MANIFEST_BYTES
+            or hashlib.sha256(manifest_blob).hexdigest()
+            != record["manifest_sha256"]):
+        raise ValueError("Legacy rollback manifest differs from the pinned artifact")
+    manifest = _load_json(manifest_blob, COMPATIBILITY_ASSET)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("package"), dict):
+        raise ValueError("Legacy rollback manifest is malformed")
+    package = manifest["package"]
+    source_commit = record["source_commit"]
+    if (manifest.get("format") != 1
+            or manifest.get("repository") != MESHTASTIC_RELEASE_REPO
+            or manifest.get("tag") != expected_tag
+            or manifest.get("source_ref") != expected_tag
+            or manifest.get("source_commit") != source_commit
+            or manifest.get("source_url") != (
+                "https://github.com/Smethan/meshtastic-firmware/tree/"
+                + source_commit)
+            or manifest.get("upstream_repository") != MESHTASTIC_UPSTREAM_REPO
+            or manifest.get("license") != "GPL-3.0-only"
+            or "sx1262_broker_api" in manifest
+            or manifest.get("wdg_api") != {
+                "major": MESHTASTIC_WDG_API_MAJOR,
+                "minor": record["wdg_api_minor"],
+            }
+            or package.get("name") != MESHTASTIC_PACKAGE_NAME
+            or package.get("version") != package_version_for_tag(expected_tag)
+            or package.get("architecture") != MESHTASTIC_ARCHITECTURE
+            or package.get("asset") != package_name
+            or package.get("size") != record["package_size"]
+            or package.get("sha256") != record["package_sha256"]):
+        raise ValueError("Legacy rollback manifest differs from the reviewed contract")
+    minimum_glibc = manifest.get("minimum_glibc")
+    if not isinstance(minimum_glibc, str) or not GLIBC_RE.fullmatch(minimum_glibc):
+        raise ValueError("Legacy rollback has invalid glibc metadata")
+    if check_host:
+        host_machine = (machine or platform.machine()).lower()
+        if host_machine not in {"aarch64", "arm64"}:
+            raise RuntimeError("Legacy Meshtastic rollback supports ARM64 only")
+        current = glibc_version or host_glibc_version()
+        if _glibc_tuple(current) < _glibc_tuple(minimum_glibc):
+            raise RuntimeError(
+                f"Legacy rollback requires glibc {minimum_glibc} or newer; "
+                f"this host has {current}")
+
+    sums_blob = (directory / CHECKSUM_ASSET).read_bytes()
+    if len(sums_blob) > MAX_CHECKSUM_BYTES:
+        raise ValueError("Legacy rollback SHA256SUMS is too large")
+    checksums = _parse_checksums(sums_blob)
+    checked_files = {
+        COMPATIBILITY_ASSET: directory / COMPATIBILITY_ASSET,
+        package_name: directory / package_name,
+        SOURCE_ASSET: directory / SOURCE_ASSET,
+        COPYRIGHT_ASSET: directory / COPYRIGHT_ASSET,
+    }
+    if set(checksums) != set(checked_files):
+        raise ValueError("Legacy rollback checksums cover the wrong files")
+    for name, path in checked_files.items():
+        if (path.stat().st_size <= 0
+                or hashlib.sha256(path.read_bytes()).hexdigest() != checksums[name]):
+            raise ValueError("Legacy rollback checksum mismatch: " + name)
+    package_path = directory / package_name
+    validate_legacy_rollback_debian_package(
+        package_path, manifest, runner=runner)
+    return PreparedMeshtasticRelease(
+        tag=expected_tag,
+        package_version=package["version"],
+        directory=directory,
+        package_path=package_path,
+        manifest=manifest,
+    )
+
+
+def validate_legacy_installed_package_payload(
+    package_path: Path,
+    manifest: dict[str, Any],
+    *,
+    root: Path = Path("/"),
+    runner: Callable[..., Any] = subprocess.run,
+    require_root_ownership: bool = True,
+) -> None:
+    """Prove an installed legacy package matches its exact pinned release."""
+    validate_legacy_rollback_debian_package(
+        package_path, manifest, runner=runner)
+    data = _legacy_rollback_package_data(Path(package_path), runner=runner)
+    root = Path(root)
+    root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("Installed package root must be a real directory")
+    for name in sorted(
+            LEGACY_ROLLBACK_PACKAGE_DIRECTORIES,
+            key=lambda value: (len(PurePosixPath(value).parts), value)):
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor = os.open(root / name, flags)
+        except OSError as exc:
+            raise ValueError(
+                "Installed legacy package directory is missing or unsafe: /" + name
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISDIR(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o755
+                    or (require_root_ownership
+                        and (info.st_uid != 0 or info.st_gid != 0))):
+                raise ValueError(
+                    "Installed legacy package directory has unsafe metadata: /"
+                    + name)
+        finally:
+            os.close(descriptor)
+    for name, expected in data.items():
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(root / name, flags)
+        except OSError as exc:
+            raise ValueError(
+                "Installed legacy package payload is missing or unsafe: /" + name
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            expected_mode = 0o755 if name.endswith("/meshtasticd") else 0o644
+            if (not stat.S_ISREG(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != expected_mode
+                    or (require_root_ownership
+                        and (info.st_uid != 0 or info.st_gid != 0))):
+                raise ValueError(
+                    "Installed legacy package payload has unsafe metadata: /" + name)
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                actual = stream.read(len(expected) + 1)
+            if actual != expected:
+                raise ValueError(
+                    "Installed legacy package differs from the pinned release: /"
+                    + name)
+        finally:
+            os.close(descriptor)
+
+
+def prepare_legacy_rollback_release(
+    tag: str,
+    *,
+    cache_root: Path = MESHTASTIC_CACHE_ROOT,
+    downloader: Callable[[str, int], bytes] = download,
+    require_root: bool = True,
+    check_host: bool = True,
+    runner: Callable[..., Any] = subprocess.run,
+) -> PreparedMeshtasticRelease:
+    """Download and seal one exact approved legacy rollback release."""
+    if tag not in LEGACY_ROLLBACK_RELEASES:
+        raise ValueError("Meshtastic release is not an approved legacy rollback")
+    releases = meshtastic_releases(downloader=downloader)
+    release = next((item for item in releases if item.get("tag_name") == tag), None)
+    if release is None:
+        raise ValueError("Approved legacy rollback release was not found")
+    release = validate_release_entry(release)
+    assets = _asset_map(release)
+    cache_root = Path(cache_root)
+    _secure_cache_directory(cache_root, require_root=require_root)
+    target = cache_root / tag
+    if target.exists():
+        return validate_legacy_rollback_release(
+            target, expected_tag=tag, require_secure=require_root,
+            check_host=check_host, runner=runner)
+    package_name = package_asset_for_tag(tag)
+    payloads = {
+        COMPATIBILITY_ASSET: downloader(assets[COMPATIBILITY_ASSET], MAX_MANIFEST_BYTES),
+        package_name: downloader(assets[package_name], MAX_PACKAGE_BYTES),
+        SOURCE_ASSET: downloader(assets[SOURCE_ASSET], MAX_NOTICE_BYTES),
+        COPYRIGHT_ASSET: downloader(assets[COPYRIGHT_ASSET], MAX_NOTICE_BYTES),
+        CHECKSUM_ASSET: downloader(assets[CHECKSUM_ASSET], MAX_CHECKSUM_BYTES),
+    }
+    staging_root = Path(tempfile.mkdtemp(
+        prefix=".legacy-rollback-", dir=cache_root))
+    os.chmod(staging_root, 0o700)
+    staging = staging_root / tag
+    staging.mkdir(mode=0o700)
+    try:
+        for name, payload in payloads.items():
+            path = staging / name
+            path.write_bytes(payload)
+            os.chmod(path, 0o600)
+        checked = validate_legacy_rollback_release(
+            staging, expected_tag=tag, require_secure=require_root,
+            check_host=check_host, runner=runner)
+        os.replace(staging, target)
+        return PreparedMeshtasticRelease(
+            tag=checked.tag,
+            package_version=checked.package_version,
+            directory=target,
+            package_path=target / checked.package_path.name,
+            manifest=checked.manifest,
+        )
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def prepare_meshtastic_release(

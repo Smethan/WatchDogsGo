@@ -1,5 +1,18 @@
 # Smethan WatchDogsGo
 
+## 0.9.57 — Seed verified pre-broker rollback packages — 2026-09-30
+
+- Let the one-command setup migrate an installed, byte-identical
+  `v2.8.0-wdg.6` or `v2.8.0-wdg.7` package whose old adoption cache is absent.
+  Setup downloads only the exact prior public release, checks hard-coded
+  manifest and package digests, validates the closed ARM64 Debian layout, and
+  compares every installed package-owned byte before sealing it as rollback.
+- Continue refusing locally rebuilt, modified, unknown, or unsafe same-version
+  packages. A matching dpkg version alone never establishes rollback authority.
+- Use the legacy validator only for rollback; the new `v2.8.0-wdg.9` candidate
+  still requires the complete broker API, manager service, launcher, and current
+  package-policy contract. Bump the installed helper contract to version 11.
+
 ## 0.9.56 — Repair the protected setup lock directory — 2026-09-30
 
 - Fix `sudo bash setup.sh` creating `/run/lock/watchdogs` as `root:root 0755`

@@ -100,11 +100,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 10})
+        return result({"ok": True, "helper_version": 11})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 10
+    assert controller.version() == 11
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -275,7 +275,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 10
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 11
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -636,6 +636,54 @@ def test_helper_refuses_update_without_verified_rollback_package(
     validator = NS(validate_prepared_release=lambda *a, **k: None)
     with pytest.raises(helper.HelperError, match="no verified rollback package"):
         helper._create_backup("v2.8.1-wdg.1", prepared, validator, {})
+
+
+def test_update_seeds_exact_legacy_rollback_before_backup(tmp_path, monkeypatch):
+    helper = load_helper()
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir(mode=0o700)
+    rollback_dir = tmp_path / "v2.8.0-wdg.7"
+    rollback_dir.mkdir()
+    (rollback_dir / "release-marker").write_text("exact", encoding="utf-8")
+    rollback = fake_prepared_release(rollback_dir.name, rollback_dir)
+    prepared_dir = tmp_path / "v2.8.0-wdg.9"
+    prepared_dir.mkdir()
+    prepared = fake_prepared_release(prepared_dir.name, prepared_dir)
+    find_results = iter((None, rollback))
+    validator = NS(LEGACY_ROLLBACK_RELEASES={rollback.tag: {}})
+    validate_installed = Mock()
+    cache_installed = Mock()
+
+    monkeypatch.setattr(helper, "BACKUP_ROOT", backup_root)
+    monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
+    monkeypatch.setattr(helper, "_installed_version", lambda: rollback.package_version)
+    monkeypatch.setattr(
+        helper, "_find_cached_release", lambda *_args: next(find_results))
+    monkeypatch.setattr(
+        helper, "_prepare_rollback_release", lambda *_args: rollback)
+    monkeypatch.setattr(
+        helper, "_validate_rollback_installed", validate_installed)
+    monkeypatch.setattr(helper, "_cache_installed_release", cache_installed)
+    monkeypatch.setattr(helper, "_tree_fingerprint", lambda _path: [])
+    monkeypatch.setattr(helper, "_copy_state_to_backup", lambda _backup: {})
+    monkeypatch.setattr(
+        helper, "_candidate_dry_run",
+        lambda _backup: {
+            "semantic": helper._semantic_status_snapshot(semantic_status()),
+            "effective_mac": "02:00:A1:B2:C3:D4",
+            "mac_pin_required": False,
+        })
+    monkeypatch.setattr(helper.os, "fchown", lambda *_args: None)
+
+    backup, metadata = helper._create_backup(
+        prepared.tag, prepared, validator, {})
+
+    validate_installed.assert_called_once_with(rollback, validator)
+    cache_installed.assert_called_once_with(rollback)
+    assert metadata["previous_version"] == rollback.package_version
+    assert metadata["rollback_release"]["tag"] == rollback.tag
+    assert (backup / "rollback-release" / rollback.tag / "release-marker").read_text(
+        encoding="utf-8") == "exact"
 
 
 def test_first_install_requires_manual_migration_baseline(
