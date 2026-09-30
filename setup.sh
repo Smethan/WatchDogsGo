@@ -548,17 +548,12 @@ PY
             if [[ "$AIO_MODEL" == *"Compute Module 5"* ]] && [ -e /dev/gpiochip4 ]; then
                 AIO_GPIOCHIP=4
             fi
-            info "Configuring broker-only SX1262 hardware ownership..."
-            sudo python3 "$SCRIPT_DIR/scripts/configure_sx1262_stack.py" \
-                --meshtastic-config /etc/meshtasticd/config.yaml \
-                --manager-config /etc/watchdogs/sx1262.yaml \
-                --gpiochip "$AIO_GPIOCHIP" >>"$APT_LOG" 2>&1
+            info "Migrating SX1262 ownership inside the protected transaction..."
             if sudo /usr/local/libexec/watchdogs-meshtastic \
                     verify-pinned-tag "$STACK_TAG" "$STACK_SHA256" \
                     >>"$APT_LOG" 2>&1 && \
                sudo /usr/local/libexec/watchdogs-meshtastic \
-                    converge-tag "$STACK_TAG" >>"$APT_LOG" 2>&1 && \
-               sudo usermod -aG watchdogs "$TARGET_USER" \
+                    converge-tag "$STACK_TAG" "$AIO_GPIOCHIP" \
                     >>"$APT_LOG" 2>&1 && \
                sudo systemctl enable watchdogs-sx1262d.service \
                     meshtasticd-wdg.service >>"$APT_LOG" 2>&1 && \

@@ -19,7 +19,7 @@ from typing import Any
 from .meshtastic_updates import TAG_RE, parse_meshtastic_tag
 
 MESHTASTIC_HELPER = Path("/usr/local/libexec/watchdogs-meshtastic")
-REQUIRED_HELPER_VERSION = 11
+REQUIRED_HELPER_VERSION = 12
 TRANSACTION_TIMEOUT = 900
 SERVICE_TARGETS = ("wdg", "stock")
 SERVICE_ACTIONS = ("start", "stop", "enable", "disable")

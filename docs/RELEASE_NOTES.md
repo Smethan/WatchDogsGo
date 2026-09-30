@@ -1,5 +1,30 @@
 # Smethan WatchDogsGo
 
+## 0.9.58 — Complete transactional SX1262 migration — 2026-09-30
+
+- Stop changing `/etc/meshtasticd/config.yaml` before the package transaction.
+  Setup now validates the installed direct-radio daemon first, installs the
+  pinned package, brings up the manager, validates the broker-backed candidate,
+  and only then atomically commits the live broker mapping.
+- Repair devices affected by the 0.9.55–0.9.57 ordering bug by importing only
+  the direct `Lora` hardware block from the most recent fully validated private
+  transaction. The current identity, channels, NodeDB, GPS configuration, and
+  phone state remain authoritative.
+- Give a legacy direct-radio validation process the required `spi` and `gpio`
+  groups; broker candidates retain only the `watchdogs` socket group. Report
+  bounded, secret-filtered startup diagnostics when either candidate fails.
+- Store manager-policy presence and fingerprints in transaction metadata,
+  restore the policy on rollback, preserve masked stock-service state, and fix
+  live file ownership to `root:meshtasticd 0640` and `root:watchdogs 0640`.
+- Complete the no-adoption first-install path for both existing stock state and
+  a new node. A fresh identity is initialized once through the broker and then
+  validated before setup is committed.
+- Recognize an already healthy pinned stack so rerunning `sudo bash setup.sh`
+  is idempotent. Bump the installed helper contract to version 12.
+
+The firmware pairing remains `v2.8.0-wdg.9`; this release changes WDG's
+transaction orchestration and does not require another Meshtastic build.
+
 ## 0.9.57 — Seed verified pre-broker rollback packages — 2026-09-30
 
 - Let the one-command setup migrate an installed, byte-identical

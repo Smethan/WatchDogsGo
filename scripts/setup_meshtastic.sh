@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER_SOURCE="$SCRIPT_DIR/scripts/watchdogs_meshtastic_helper.py"
 VALIDATOR_SOURCE="$SCRIPT_DIR/watchdogs/meshtastic_updates.py"
+CONFIGURATOR_SOURCE="$SCRIPT_DIR/scripts/configure_sx1262_stack.py"
 HELPER_TARGET="/usr/local/libexec/watchdogs-meshtastic"
 LIB_TARGET="/usr/local/libexec/watchdogs-meshtastic-lib"
 CONFIG_TARGET="/etc/meshtasticd/wdg-portduino.yaml"
@@ -157,6 +158,8 @@ wdg_install_meshtastic_support() {
         echo "Missing helper source: $HELPER_SOURCE" >&2; return 1; }
     [ -f "$VALIDATOR_SOURCE" ] && [ ! -L "$VALIDATOR_SOURCE" ] || {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
+    [ -f "$CONFIGURATOR_SOURCE" ] && [ ! -L "$CONFIGURATOR_SOURCE" ] || {
+        echo "Missing configurator source: $CONFIGURATOR_SOURCE" >&2; return 1; }
     for path in "$HELPER_TARGET" "$LIB_TARGET" \
                 "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" \
                 "$CONFIG_TARGET" /run/lock/watchdogs; do
@@ -175,6 +178,8 @@ wdg_install_meshtastic_support() {
     install -o root -g root -m 0755 "$HELPER_SOURCE" "$HELPER_TARGET"
     install -o root -g root -m 0644 \
         "$VALIDATOR_SOURCE" "$LIB_TARGET/meshtastic_updates.py"
+    install -o root -g root -m 0644 \
+        "$CONFIGURATOR_SOURCE" "$LIB_TARGET/configure_sx1262_stack.py"
     install -d -o root -g root -m 0700 \
         "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT"
 

@@ -10,6 +10,28 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.58] — 2026-09-30
+
+### Fixed
+
+- Move the Meshtastic broker configuration change inside the protected package
+  transaction. The installed direct-radio daemon now establishes the rollback
+  identity/channel baseline before setup changes any live hardware mapping.
+- Recover the exact direct SX1262 mapping from the last validated private
+  transaction when a failed 0.9.55–0.9.57 setup left the old daemon pointed at
+  the broker. No identity, channel, NodeDB, GPS, or Bluetooth secret is copied
+  from the old backup.
+- Launch legacy direct-radio candidates with only the required `spi`, `gpio`,
+  and `watchdogs` groups, while broker candidates retain only `watchdogs`.
+- Repair live configuration ownership to `root:meshtasticd 0640` and manager
+  policy ownership to `root:watchdogs 0640`.
+- Preserve and restore the manager policy and masked stock-service state as
+  part of rollback, and recognize a completed healthy stack on repeat setup.
+- Support both an existing stock Meshtastic state and a genuinely fresh node
+  in the one-command setup path without a separate adoption command.
+- Include bounded, secret-filtered candidate startup diagnostics in setup
+  failures. Bump the protected helper contract to version 12.
+
 ## [0.9.53] — 2026-09-28
 
 ### Fixed

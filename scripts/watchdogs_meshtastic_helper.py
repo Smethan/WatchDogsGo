@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-HELPER_VERSION = 11
+HELPER_VERSION = 12
 ROLLBACK_MINIMUM_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
@@ -49,12 +49,16 @@ LOCK_DIRECTORY = Path("/run/lock/watchdogs")
 LOCK_PATH = LOCK_DIRECTORY / "meshtastic-update.lock"
 PROTECTED_VALIDATOR = Path(
     "/usr/local/libexec/watchdogs-meshtastic-lib/meshtastic_updates.py")
+PROTECTED_STACK_CONFIGURATOR = Path(
+    "/usr/local/libexec/watchdogs-meshtastic-lib/configure_sx1262_stack.py")
 WDG_SOCKET_PATH = Path("/run/meshtasticd/wdg.sock")
 WDG_BINARY_PATH = Path("/usr/lib/meshtasticd-wdg/meshtasticd")
 VALIDATION_ROOT = Path("/run/watchdogs-meshtastic-validation")
 MESHTASTIC_CONFIG_DIR = Path("/etc/meshtasticd")
 MESHTASTIC_STATE_DIR = Path("/var/lib/meshtasticd")
 WDG_POLICY_PATH = MESHTASTIC_CONFIG_DIR / "wdg-portduino.yaml"
+MANAGER_CONFIG_PATH = Path("/etc/watchdogs/sx1262.yaml")
+GPIOCHIP_RE = re.compile(r"^(0|[1-9][0-9]{0,2})$")
 STARTUP_OUTPUT_LIMIT = 64 * 1024
 MAC_LINE_RE = re.compile(
     rb"(?m)^MAC ADDRESS: ([0-9A-F]{2}(?::[0-9A-F]{2}){5})\r?$")
@@ -80,10 +84,12 @@ CRITICAL_STATE_FILES = (
     Path("backups/backup.proto"),
     Path("backups/event-backup.proto"),
 )
-SERVICE_SUPPLEMENTARY_GROUPS = ("watchdogs",)
-RESTORABLE_LOAD_STATES = frozenset({"loaded", "not-found"})
+BROKER_SERVICE_SUPPLEMENTARY_GROUPS = ("watchdogs",)
+DIRECT_SERVICE_SUPPLEMENTARY_GROUPS = ("spi", "gpio", "watchdogs")
+RESTORABLE_LOAD_STATES = frozenset({"loaded", "masked", "not-found"})
 RESTORABLE_ACTIVE_STATES = frozenset({"active", "inactive"})
-RESTORABLE_UNIT_FILE_STATES = frozenset({"enabled", "disabled", "not-found"})
+RESTORABLE_UNIT_FILE_STATES = frozenset({
+    "enabled", "disabled", "masked", "not-found"})
 PACKAGE_VERSION_RE = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)\+wdg(0|[1-9][0-9]*)$")
@@ -195,6 +201,30 @@ def _load_validator():
     module = importlib.util.module_from_spec(spec)
     # dataclasses resolves annotations through sys.modules while the module is
     # executing, so register this private fixed-name import first.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+def _load_stack_configurator():
+    """Import only the root-owned stack configurator installed by setup."""
+    path = PROTECTED_STACK_CONFIGURATOR
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise HelperError("Protected SX1262 configurator is not installed") from exc
+    if (path.is_symlink() or not path.is_file() or info.st_uid != 0
+            or info.st_gid != 0 or info.st_mode & 0o022):
+        raise HelperError("Protected SX1262 configurator has unsafe ownership or mode")
+    spec = importlib.util.spec_from_file_location(
+        "_watchdogs_protected_sx1262_configurator", path)
+    if spec is None or spec.loader is None:
+        raise HelperError("Could not load the protected SX1262 configurator")
+    module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
@@ -621,6 +651,83 @@ def _copy_state_to_backup(backup: Path) -> dict[str, bool]:
     return presence
 
 
+def _copy_manager_config_to_backup(
+        backup: Path) -> tuple[bool, dict[str, Any] | None]:
+    """Copy the manager hardware policy into the private transaction record."""
+    fingerprint = _file_fingerprint(MANAGER_CONFIG_PATH)
+    if fingerprint is None:
+        return False, None
+    if fingerprint.get("type") != "file":
+        raise HelperError("SX1262 manager configuration must be a regular file")
+    destination_dir = backup / "state-files"
+    destination_dir.mkdir(mode=0o700)
+    destination = destination_dir / "sx1262.yaml"
+    _run(["cp", "-a", "--", str(MANAGER_CONFIG_PATH), str(destination)])
+    if _file_fingerprint(destination) != fingerprint:
+        raise HelperError("SX1262 manager configuration backup changed while copying")
+    return True, fingerprint
+
+
+def _validate_manager_config_backup(metadata: dict[str, Any], backup: Path) -> None:
+    present = metadata.get("manager_config_present")
+    fingerprint = metadata.get("manager_config_fingerprint")
+    if type(present) is not bool:
+        raise HelperError("SX1262 manager backup metadata is malformed")
+    source_dir = backup / "state-files"
+    source = source_dir / "sx1262.yaml"
+    if present:
+        if (not isinstance(fingerprint, dict)
+                or fingerprint.get("type") != "file"
+                or source_dir.is_symlink() or not source_dir.is_dir()
+                or source.is_symlink() or not source.is_file()
+                or _file_fingerprint(source) != fingerprint):
+            raise HelperError("SX1262 manager configuration backup is invalid")
+    elif fingerprint is not None or source_dir.exists() or source_dir.is_symlink():
+        raise HelperError("SX1262 absent-manager backup metadata is malformed")
+
+
+def _restore_manager_config(backup: Path, metadata: dict[str, Any]) -> None:
+    """Atomically restore or remove the exact pre-transaction manager config."""
+    _validate_manager_config_backup(metadata, backup)
+    present = metadata["manager_config_present"]
+    target = MANAGER_CONFIG_PATH
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise HelperError("Refusing unsafe SX1262 manager configuration path")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise HelperError("SX1262 manager configuration parent is unsafe")
+    if not present:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_directory(target.parent)
+        return
+
+    source = backup / "state-files" / "sx1262.yaml"
+    fingerprint = metadata["manager_config_fingerprint"]
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".sx1262.yaml.wdg-restore-", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        with source.open("rb") as source_stream, os.fdopen(
+                descriptor, "wb", closefd=True) as destination:
+            shutil.copyfileobj(source_stream, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chown(temporary, fingerprint["uid"], fingerprint["gid"])
+        os.chmod(temporary, fingerprint["mode"])
+        if _file_fingerprint(temporary) != fingerprint:
+            raise HelperError("Prepared SX1262 manager restore copy is invalid")
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(
         path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -733,14 +840,21 @@ def _validate_transaction_metadata(
             and (backup_info.st_uid != 0 or backup_info.st_gid != 0
                  or stat.S_IMODE(backup_info.st_mode) != 0o700)):
         raise HelperError("Meshtastic rollback backup is not root-private")
-    expected_keys = {
+    common_keys = {
         "format", "new_release", "previous_version", "rollback_release",
         "services", "state_presence", "state_fingerprints",
         "semantic_baseline", "effective_mac", "mac_pin_required",
     }
-    if (not isinstance(metadata, dict) or set(metadata) != expected_keys
-            or type(metadata.get("format")) is not int
-            or metadata["format"] != 2):
+    if not isinstance(metadata, dict) or type(metadata.get("format")) is not int:
+        raise HelperError("Meshtastic transaction metadata is unsupported")
+    if metadata["format"] == 2:
+        expected_keys = common_keys
+    elif metadata["format"] == 3:
+        expected_keys = common_keys | {
+            "manager_config_present", "manager_config_fingerprint"}
+    else:
+        raise HelperError("Meshtastic transaction metadata is unsupported")
+    if set(metadata) != expected_keys:
         raise HelperError("Meshtastic transaction metadata is unsupported")
 
     _validate_release_identity(metadata.get("new_release"))
@@ -797,6 +911,8 @@ def _validate_transaction_metadata(
                     "Meshtastic backup state fingerprint does not match: " + key)
         elif expected is not None:
             raise HelperError("Meshtastic absent-state fingerprint is malformed")
+    if metadata["format"] == 3:
+        _validate_manager_config_backup(metadata, backup)
     return prepared, presence, fingerprints
 
 
@@ -1038,7 +1154,7 @@ def _read_private_json(path: Path) -> dict[str, Any]:
         raise HelperError("Meshtastic transaction metadata is invalid") from exc
     if (not isinstance(value, dict)
             or type(value.get("format")) is not int
-            or value.get("format") != 2):
+            or value.get("format") not in (2, 3)):
         raise HelperError("Meshtastic transaction metadata is unsupported")
     return value
 
@@ -1068,7 +1184,10 @@ def _validate_service_snapshot(
         if load_state == "not-found":
             if active_state != "inactive" or unit_file_state != "not-found":
                 raise HelperError("Meshtastic service snapshot is inconsistent")
-        elif unit_file_state == "not-found":
+        elif load_state == "masked":
+            if active_state != "inactive" or unit_file_state != "masked":
+                raise HelperError("Meshtastic service snapshot is inconsistent")
+        elif unit_file_state in ("masked", "not-found"):
             raise HelperError("Meshtastic service snapshot is inconsistent")
         if active_state == "active":
             active_targets.append(target)
@@ -1144,6 +1263,62 @@ def _prepare_rollback_release(tag: str, validator) -> Any:
         tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
 
 
+def _legacy_baseline_lora(
+        installed_version: str, validator) -> str | None:
+    """Recover only a pre-broker Lora mapping after an interrupted old setup.
+
+    v0.9.55-v0.9.57 could write the generated broker mapping before opening
+    the package transaction.  An older installed daemon then cannot establish
+    its semantic baseline.  Reuse only the hardware mapping from the most
+    recent fully validated private transaction; current identity, channels,
+    NodeDB, GPS, and every other live setting still come from the current
+    state copy.
+    """
+    config = MESHTASTIC_CONFIG_DIR / "config.yaml"
+    try:
+        current = config.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise HelperError("Meshtastic config.yaml is unreadable") from exc
+    if (re.search(r"(?m)^Lora:[ \t]*(?:#.*)?$", current) is None
+            or re.search(
+                r"(?m)^[ \t]+Module:[ \t]*broker[ \t]*(?:#.*)?$",
+                current) is None):
+        return None
+    configurator = _load_stack_configurator()
+    if not configurator.is_broker_meshtastic_config(current):
+        return None
+
+    try:
+        previous_backup = _last_backup_directory()
+        previous_metadata = _read_private_json(
+            previous_backup / "transaction.json")
+        _validate_transaction_metadata(
+            previous_metadata, previous_backup, validator)
+        release = previous_metadata.get("new_release")
+        if (not isinstance(release, dict)
+                or release.get("package_version") != installed_version):
+            raise HelperError(
+                "the last completed transaction does not describe the "
+                "installed package")
+        previous_config = (
+            previous_backup / "state"
+            / _state_backup_key(MESHTASTIC_CONFIG_DIR) / "config.yaml")
+        previous_text = previous_config.read_text(encoding="utf-8")
+        mapping = configurator.lora_mapping(previous_text)
+        if mapping is None or configurator.is_broker_meshtastic_config(
+                previous_text):
+            raise HelperError(
+                "the last completed transaction has no direct-radio mapping")
+        return mapping
+    except Exception as exc:
+        raise HelperError(
+            "The live Meshtastic config contains an interrupted broker "
+            "migration, but no verified direct-radio baseline can repair it: "
+            + str(exc)) from exc
+
+
 def _create_backup(tag: str, prepared: Any, validator,
                    services: dict[str, dict[str, Any]]) -> tuple[Path, dict[str, Any]]:
     _secure_root_directory(BACKUP_ROOT)
@@ -1179,7 +1354,7 @@ def _create_backup(tag: str, prepared: Any, validator,
                 _cache_installed_release(candidate)
                 rollback_release = _find_cached_release(
                     previous_version, validator)
-            except Exception as exc:  # noqa: BLE001 - preserve root cause
+            except Exception as exc:
                 raise HelperError(
                     "The installed meshtasticd-wdg package has no verified "
                     "rollback package, and automatic rollback seeding failed: "
@@ -1201,10 +1376,18 @@ def _create_backup(tag: str, prepared: Any, validator,
         fingerprints = {
             str(path): _tree_fingerprint(path) for path in STATE_PATHS}
         presence = _copy_state_to_backup(backup)
-        baseline = _candidate_dry_run_preserving_live_state(
-            backup, fingerprints, presence)
+        manager_present, manager_fingerprint = (
+            _copy_manager_config_to_backup(backup))
+        legacy_lora = _legacy_baseline_lora(previous_version, validator)
+        if legacy_lora is None:
+            baseline = _candidate_dry_run_preserving_live_state(
+                backup, fingerprints, presence, direct_hardware=True)
+        else:
+            baseline = _candidate_dry_run_preserving_live_state(
+                backup, fingerprints, presence,
+                lora_override=legacy_lora, direct_hardware=True)
         metadata = {
-            "format": 2,
+            "format": 3,
             "new_release": _release_identity(prepared),
             "previous_version": previous_version,
             "rollback_release": _release_identity(rollback_release),
@@ -1214,6 +1397,8 @@ def _create_backup(tag: str, prepared: Any, validator,
             "semantic_baseline": baseline["semantic"],
             "effective_mac": baseline["effective_mac"],
             "mac_pin_required": baseline["mac_pin_required"],
+            "manager_config_present": manager_present,
+            "manager_config_fingerprint": manager_fingerprint,
         }
         _validation_baseline(metadata)
         _write_private_json(backup / "transaction.json", metadata)
@@ -1237,16 +1422,34 @@ def _state_unchanged(metadata: dict[str, Any]) -> bool:
 def _set_enabled(service: str, enabled: bool) -> None:
     if not enabled and _systemd_property(service, "LoadState") == "not-found":
         return
+    if enabled:
+        _run(["systemctl", "unmask", service], timeout=30, check=False)
     _run(["systemctl", "enable" if enabled else "disable", service], timeout=30)
+
+
+def _set_unit_file_state(service: str, state: str) -> None:
+    if state == "enabled":
+        _run(["systemctl", "unmask", service], timeout=30, check=False)
+        _run(["systemctl", "enable", service], timeout=30)
+    elif state == "disabled":
+        _run(["systemctl", "unmask", service], timeout=30, check=False)
+        _run(["systemctl", "disable", service], timeout=30)
+    elif state == "masked":
+        _run(["systemctl", "disable", service], timeout=30, check=False)
+        _run(["systemctl", "mask", service], timeout=30)
+    elif state != "not-found":
+        raise HelperError("Unsupported service unit-file state")
 
 
 def _restore_services(snapshot: dict[str, Any]) -> None:
     snapshot = _validate_service_snapshot(snapshot)
     _run(["systemctl", "daemon-reload"], timeout=30)
+    for service in TARGET_SERVICES.values():
+        _run(["systemctl", "stop", service], timeout=30, check=False)
     for target, service in TARGET_SERVICES.items():
         state = snapshot[target]
         if state["load_state"] != "not-found":
-            _set_enabled(service, state["unit_file_state"] == "enabled")
+            _set_unit_file_state(service, state["unit_file_state"])
     # Conflicting daemons cannot be active simultaneously.  The validated
     # snapshot identifies the sole prior radio owner, if there was one.
     active_target = None
@@ -1254,8 +1457,6 @@ def _restore_services(snapshot: dict[str, Any]) -> None:
         state = snapshot.get(target, {}) if isinstance(snapshot, dict) else {}
         if state.get("active_state") == "active":
             active_target = target
-    for service in TARGET_SERVICES.values():
-        _run(["systemctl", "stop", service], timeout=30, check=False)
     if active_target is not None:
         _run(["systemctl", "start", TARGET_SERVICES[active_target]], timeout=45)
     restored = _service_snapshot()
@@ -1289,6 +1490,7 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
 
         for service in TARGET_SERVICES.values():
             _run(["systemctl", "stop", service], timeout=30, check=False)
+        _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30, check=False)
         previous_version = metadata["previous_version"]
         if previous_version is None:
             _run(["dpkg", "--purge", PACKAGE_NAME], timeout=120, check=False)
@@ -1318,6 +1520,8 @@ def _restore_transaction(backup: Path, metadata: dict[str, Any], validator) -> N
         if not _state_unchanged(metadata):
             raise HelperError(
                 "Meshtastic state rollback did not restore the verified backup")
+        if metadata.get("format") == 3:
+            _restore_manager_config(backup, metadata)
         _restore_services(metadata["services"])
         _finalize_state_restore(entries)
     except Exception:
@@ -1498,7 +1702,8 @@ def _secure_validation_root() -> Path:
     return path
 
 
-def _meshtasticd_credentials() -> tuple[int, int, list[int]]:
+def _meshtasticd_credentials(
+        *, direct_hardware: bool = False) -> tuple[int, int, list[int]]:
     try:
         account = pwd.getpwnam("meshtasticd")
         group = grp.getgrnam("meshtasticd")
@@ -1514,7 +1719,10 @@ def _meshtasticd_credentials() -> tuple[int, int, list[int]]:
     if uid <= 0 or gid <= 0 or account.pw_gid <= 0:
         raise HelperError("meshtasticd system account has unsafe credentials")
     supplementary: list[int] = []
-    for name in SERVICE_SUPPLEMENTARY_GROUPS:
+    group_names = (
+        DIRECT_SERVICE_SUPPLEMENTARY_GROUPS if direct_hardware
+        else BROKER_SERVICE_SUPPLEMENTARY_GROUPS)
+    for name in group_names:
         try:
             supplement = grp.getgrnam(name).gr_gid
         except KeyError as exc:
@@ -2117,6 +2325,30 @@ def _finish_output_capture(capture) -> tuple[bytes, bool]:
     return bytes(captured), bool(state["truncated"])
 
 
+def _candidate_failure_with_output(
+        error: Exception, output: bytes, *, truncated: bool) -> HelperError:
+    """Attach a small secret-filtered diagnostic excerpt to startup errors."""
+    decoded = output.decode("utf-8", "replace")
+    diagnostics: list[str] = []
+    sensitive = re.compile(r"(?i)(private.?key|\bpsk\b|pass(word|key)|secret)")
+    interesting = re.compile(
+        r"(?i)(error|failed|fatal|critical|unknown|refused|invalid|cannot|"
+        r"could not|no such|not found)")
+    for raw in decoded.splitlines():
+        line = "".join(
+            character for character in raw
+            if character == "\t" or 0x20 <= ord(character) <= 0x7e).strip()
+        if line and interesting.search(line) and not sensitive.search(line):
+            diagnostics.append(line[:400])
+    diagnostics = diagnostics[-8:]
+    if not diagnostics:
+        return HelperError(str(error))
+    suffix = " [output truncated]" if truncated else ""
+    return HelperError(
+        str(error) + "; candidate diagnostics: "
+        + " | ".join(diagnostics) + suffix)
+
+
 def _process_group_exists(process_group: int) -> bool:
     try:
         os.killpg(process_group, 0)
@@ -2180,15 +2412,40 @@ def _terminate_candidate(process: subprocess.Popen) -> None:
 
 
 def _candidate_dry_run(
-        backup: Path, *, pinned_mac: str | None = None) -> dict[str, Any]:
+        backup: Path, *, pinned_mac: str | None = None,
+        broker_config: bool = False,
+        lora_override: str | None = None,
+        direct_hardware: bool = False) -> dict[str, Any]:
     """Boot the installed candidate against a disposable state copy."""
     binary = _validate_installed_binary()
-    uid, gid, supplementary_groups = _meshtasticd_credentials()
+    if broker_config and direct_hardware:
+        raise HelperError("Broker candidate may not receive direct-radio groups")
+    if direct_hardware:
+        uid, gid, supplementary_groups = _meshtasticd_credentials(
+            direct_hardware=True)
+    else:
+        uid, gid, supplementary_groups = _meshtasticd_credentials()
     candidate = None
     try:
         (candidate, fsdir, config, socket_path,
          fragment_dir) = _copy_candidate_state(backup, uid, gid)
         config_dir = config.parent
+        if broker_config and lora_override is not None:
+            raise HelperError("Candidate radio configuration request is ambiguous")
+        if broker_config or lora_override is not None:
+            configurator = _load_stack_configurator()
+            try:
+                config_text = config.read_text(encoding="utf-8")
+                if broker_config:
+                    config_text = configurator.broker_meshtastic_config(
+                        config_text)
+                else:
+                    config_text = configurator.replace_lora_mapping(
+                        config_text, lora_override)
+                config.write_text(config_text, encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise HelperError(
+                    "Could not render the isolated candidate radio config") from exc
         if pinned_mac is not None:
             rendered, changed = _render_pinned_config(
                 config, pinned_mac, fragment_dir)
@@ -2256,7 +2513,8 @@ def _candidate_dry_run(
                 "meshtasticd-wdg candidate modified critical identity or channel "
                 "state during its isolated dry-run") from health_error
         if health_error is not None:
-            raise health_error
+            raise _candidate_failure_with_output(
+                health_error, output, truncated=truncated) from health_error
         if status is None:
             raise HelperError("meshtasticd-wdg candidate returned no health status")
         semantic = _semantic_status_snapshot(status)
@@ -2344,6 +2602,9 @@ def _current_state_fingerprints() -> dict[str, Any]:
 def _candidate_dry_run_preserving_live_state(
         backup: Path, expected_fingerprints: dict[str, Any],
         presence: dict[str, bool], *, pinned_mac: str | None = None,
+        broker_config: bool = False,
+        lora_override: str | None = None,
+        direct_hardware: bool = False,
         ) -> dict[str, Any]:
     """Run a candidate and reject or restore any writes to live state.
 
@@ -2355,11 +2616,16 @@ def _candidate_dry_run_preserving_live_state(
     candidate_error: Exception | None = None
     candidate_result: dict[str, Any] | None = None
     try:
-        if pinned_mac is None:
-            candidate_result = _candidate_dry_run(backup)
-        else:
-            candidate_result = _candidate_dry_run(
-                backup, pinned_mac=pinned_mac)
+        candidate_options: dict[str, Any] = {}
+        if pinned_mac is not None:
+            candidate_options["pinned_mac"] = pinned_mac
+        if broker_config:
+            candidate_options["broker_config"] = True
+        if lora_override is not None:
+            candidate_options["lora_override"] = lora_override
+        if direct_hardware:
+            candidate_options["direct_hardware"] = True
+        candidate_result = _candidate_dry_run(backup, **candidate_options)
     except Exception as exc:  # noqa: BLE001 - inspect live state before propagating
         candidate_error = exc
 
@@ -2467,6 +2733,57 @@ def _snapshot_live_state_for_adoption() -> tuple[Path, dict[str, Any]]:
         raise
 
 
+def _snapshot_preinstall_state() -> tuple[Path, dict[str, Any]]:
+    """Capture even an absent pre-install state for exact first-run rollback."""
+    parent = _secure_validation_root()
+    snapshot = Path(tempfile.mkdtemp(prefix="preinstall-state-", dir=parent))
+    try:
+        os.chown(snapshot, 0, 0)
+        os.chmod(snapshot, 0o700)
+        fingerprints = _current_state_fingerprints()
+        presence = _copy_state_to_backup(snapshot)
+        manager_present, manager_fingerprint = (
+            _copy_manager_config_to_backup(snapshot))
+        if _current_state_fingerprints() != fingerprints:
+            raise HelperError(
+                "Meshtastic config or state changed while preparing the "
+                "first-install rollback snapshot")
+        metadata = {
+            "state_presence": presence,
+            "state_fingerprints": fingerprints,
+            "manager_config_present": manager_present,
+            "manager_config_fingerprint": manager_fingerprint,
+        }
+        _validate_manager_config_backup(metadata, snapshot)
+        return snapshot, metadata
+    except Exception:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def _restore_preinstall_state(snapshot: Path, metadata: dict[str, Any]) -> None:
+    """Restore the filesystem portion of a failed first package install."""
+    _restore_state_from_backup(
+        snapshot, metadata["state_presence"],
+        metadata["state_fingerprints"])
+    _restore_manager_config(snapshot, metadata)
+
+
+def _ensure_bootstrap_state(uid: int, gid: int) -> None:
+    """Create the fixed Portduino state path for a genuinely fresh node."""
+    paths = (
+        (MESHTASTIC_STATE_DIR, 0o750),
+        (MESHTASTIC_STATE_DIR / ".portduino", 0o750),
+        (MESHTASTIC_STATE_DIR / ".portduino" / "default", 0o750),
+    )
+    for path, mode in paths:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise HelperError("Fresh Meshtastic state path is unsafe: " + str(path))
+        path.mkdir(mode=mode, exist_ok=True)
+        os.chown(path, uid, gid)
+        os.chmod(path, mode)
+
+
 def _require_quiescent_services() -> None:
     services = _service_snapshot()
     running = [
@@ -2481,7 +2798,9 @@ def _require_quiescent_services() -> None:
             "package; still running: " + ", ".join(running))
 
 
-def _adopt_installed(tag: str) -> dict[str, Any]:
+def _adopt_installed(
+        tag: str, *, direct_hardware: bool = False,
+        include_validation: bool = False) -> dict[str, Any]:
     """Validate an already-installed fork and seed its rollback package."""
     _require_root()
     if not TAG_RE.fullmatch(tag):
@@ -2513,7 +2832,8 @@ def _adopt_installed(tag: str) -> dict[str, Any]:
             snapshot_presence = {
                 _state_backup_key(path): True for path in STATE_PATHS}
             baseline = _candidate_dry_run_preserving_live_state(
-                snapshot, live_fingerprints, snapshot_presence)
+                snapshot, live_fingerprints, snapshot_presence,
+                direct_hardware=direct_hardware)
             semantic, effective_mac, pin_required = _validation_baseline({
                 "semantic_baseline": baseline.get("semantic"),
                 "effective_mac": baseline.get("effective_mac"),
@@ -2527,7 +2847,8 @@ def _adopt_installed(tag: str) -> dict[str, Any]:
                 rollback_config = _adoption_config_rollback_copy(snapshot)
                 pinned = _candidate_dry_run_preserving_live_state(
                     snapshot, live_fingerprints, snapshot_presence,
-                    pinned_mac=effective_mac)
+                    pinned_mac=effective_mac,
+                    direct_hardware=direct_hardware)
                 if (pinned.get("semantic") != semantic
                         or pinned.get("effective_mac") != effective_mac
                         or pinned.get("mac_pin_required") is not False):
@@ -2610,12 +2931,18 @@ def _adopt_installed(tag: str) -> dict[str, Any]:
                     "incomplete: " + "; ".join(rollback_errors)
                 ) from adoption_error
             raise
-    return {
+    result = {
         "action": "adopt-installed",
         "tag": tag,
         "package_version": prepared.package_version,
         "health": "ready",
     }
+    if include_validation:
+        result["_validation"] = {
+            "semantic": semantic,
+            "effective_mac": effective_mac,
+        }
+    return result
 
 
 def _record_last_backup(backup: Path) -> None:
@@ -2697,10 +3024,49 @@ def _prepare_first_tag(tag: str) -> dict[str, Any]:
     }
 
 
-def _install_tag(tag: str) -> dict[str, Any]:
+def _installed_stack_is_healthy(gpiochip: int) -> bool:
+    """Recognize a completed broker migration without disrupting live radio."""
+    try:
+        configurator = _load_stack_configurator()
+        meshtastic_gid = grp.getgrnam("meshtasticd").gr_gid
+        manager_gid = grp.getgrnam("watchdogs").gr_gid
+        meshtastic_config = MESHTASTIC_CONFIG_DIR / "config.yaml"
+        manager_config_path = MANAGER_CONFIG_PATH
+        meshtastic_info = meshtastic_config.lstat()
+        manager_info = manager_config_path.lstat()
+        if (not stat.S_ISREG(meshtastic_info.st_mode)
+                or meshtastic_info.st_uid != 0
+                or meshtastic_info.st_gid != meshtastic_gid
+                or stat.S_IMODE(meshtastic_info.st_mode) != 0o640
+                or not stat.S_ISREG(manager_info.st_mode)
+                or manager_info.st_uid != 0
+                or manager_info.st_gid != manager_gid
+                or stat.S_IMODE(manager_info.st_mode) != 0o640):
+            return False
+        meshtastic_text = meshtastic_config.read_text(encoding="utf-8")
+        if not configurator.is_broker_meshtastic_config(meshtastic_text):
+            return False
+        if manager_config_path.read_text(encoding="utf-8") != (
+                configurator.manager_config(gpiochip)):
+            return False
+        if (_systemd_property(MANAGER_SERVICE, "ActiveState") != "active"
+                or _systemd_property(
+                    TARGET_SERVICES["wdg"], "ActiveState") != "active"
+                or _systemd_property(
+                    TARGET_SERVICES["stock"], "ActiveState") != "inactive"):
+            return False
+        _health_check()
+        return True
+    except (HelperError, OSError, UnicodeError, ValueError):
+        return False
+
+
+def _install_tag(tag: str, gpiochip: int = 0) -> dict[str, Any]:
     _require_root()
     if not TAG_RE.fullmatch(tag):
         raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
+    if type(gpiochip) is not int or not 0 <= gpiochip <= 255:
+        raise HelperError("Expected an SX1262 GPIO chip number from 0 to 255")
     _secure_root_directory(CACHE_ROOT)
     validator = _load_validator()
     # The unprivileged UI passes only an immutable, strictly validated release
@@ -2756,19 +3122,30 @@ def _install_tag(tag: str) -> dict[str, Any]:
                 raise HelperError("Meshtastic WDG policy is missing or unsafe; rerun setup.sh")
             try:
                 meshtastic_gid = grp.getgrnam("meshtasticd").gr_gid
+                manager_gid = grp.getgrnam("watchdogs").gr_gid
             except KeyError as exc:
-                raise HelperError("meshtasticd system group was not created") from exc
+                raise HelperError(
+                    "Meshtastic/SX1262 service groups were not created") from exc
             os.chown(config, 0, meshtastic_gid)
             os.chmod(config, 0o640)
+            configurator = _load_stack_configurator()
+            configurator.atomic_write(
+                MANAGER_CONFIG_PATH, configurator.manager_config(gpiochip),
+                uid=0, gid=manager_gid, mode=0o640)
             _run(["systemctl", "daemon-reload"], timeout=30)
             _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
-            candidate = _candidate_dry_run(
-                backup, pinned_mac=effective_mac if pin_required else None)
+            candidate_options: dict[str, Any] = {"broker_config": True}
+            if pin_required:
+                candidate_options["pinned_mac"] = effective_mac
+            candidate = _candidate_dry_run(backup, **candidate_options)
             if (candidate["semantic"] != baseline_semantic
                     or candidate["effective_mac"] != effective_mac):
                 raise HelperError(
                     "New meshtasticd-wdg candidate identity or channel semantics "
                     "differ from the authoritative pre-install baseline")
+            configurator.configure_stack(
+                MESHTASTIC_CONFIG_DIR / "config.yaml", MANAGER_CONFIG_PATH,
+                gpiochip, meshtastic_gid, manager_gid)
             if pin_required:
                 _pin_live_mac(effective_mac)
             live_critical = _critical_state_snapshot(
@@ -2778,6 +3155,7 @@ def _install_tag(tag: str) -> dict[str, Any]:
             _verify_live_state(baseline_semantic, live_critical)
             _set_enabled(TARGET_SERVICES["wdg"], True)
             _set_enabled(TARGET_SERVICES["stock"], False)
+            _set_enabled(MANAGER_SERVICE, True)
             _cache_installed_release(prepared)
             _record_last_backup(backup)
         except Exception as install_error:
@@ -2813,7 +3191,7 @@ def _install_tag(tag: str) -> dict[str, Any]:
     }
 
 
-def _converge_tag(tag: str) -> dict[str, Any]:
+def _converge_tag(tag: str, gpiochip: int = 0) -> dict[str, Any]:
     """Install or update one exact release as a single setup transaction.
 
     A first stock-to-WDG migration still needs the installed candidate binary
@@ -2824,26 +3202,58 @@ def _converge_tag(tag: str) -> dict[str, Any]:
     _require_root()
     if not TAG_RE.fullmatch(tag):
         raise HelperError("Expected Meshtastic tag vX.Y.Z-wdg.N")
+    if type(gpiochip) is not int or not 0 <= gpiochip <= 255:
+        raise HelperError("Expected an SX1262 GPIO chip number from 0 to 255")
     expected = _package_version_for_tag(tag)
     installed = _installed_version()
     if installed is not None and installed != expected:
-        result = _install_tag(tag)
+        result = _install_tag(tag, gpiochip)
         result["action"] = "converge-tag"
         return result
     if installed == expected:
-        _run(["systemctl", "daemon-reload"], timeout=30)
-        _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
-        result = _adopt_installed(tag)
-        result["action"] = "converge-tag"
-        return result
+        validator = _load_validator()
+        prepared_release = _prepare_exact_release(tag, validator)
+        validator.validate_installed_package_payload(
+            prepared_release.package_path, prepared_release.manifest)
+        if not _installed_stack_is_healthy(gpiochip):
+            raise HelperError(
+                "The pinned Meshtastic package is installed, but its broker "
+                "stack is not healthy. Run setup from the release that first "
+                "installed it, or use the protected rollback before retrying")
+        return {
+            "action": "converge-tag",
+            "tag": tag,
+            "package_version": expected,
+            "service": TARGET_SERVICES["wdg"],
+            "health": "ready",
+            "unchanged": True,
+        }
 
     services = _service_snapshot()
     prepared = _prepare_first_tag(tag)
     package_path = Path(str(prepared["package_path"]))
     package_installed = False
+    preinstall_snapshot: Path | None = None
+    preinstall_metadata: dict[str, Any] | None = None
+    broker_snapshot: Path | None = None
     try:
         for service in TARGET_SERVICES.values():
             _run(["systemctl", "stop", service], timeout=30, check=False)
+        _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30,
+             check=False)
+        preinstall_snapshot, preinstall_metadata = (
+            _snapshot_preinstall_state())
+        for path, description in (
+                (MESHTASTIC_CONFIG_DIR, "Meshtastic configuration"),
+                (MESHTASTIC_STATE_DIR, "Meshtastic state")):
+            if path.exists() or path.is_symlink():
+                _validate_regular_tree(path, description)
+        live_config = MESHTASTIC_CONFIG_DIR / "config.yaml"
+        nested_state = MESHTASTIC_STATE_DIR / ".portduino" / "default"
+        flat_state = MESHTASTIC_STATE_DIR / "prefs"
+        direct_baseline = (
+            live_config.is_file()
+            and (nested_state.is_dir() or flat_state.is_dir()))
         _run([
             "apt-get", "-y", "--no-install-recommends", "install",
             str(package_path),
@@ -2852,13 +3262,114 @@ def _converge_tag(tag: str) -> dict[str, Any]:
         if _installed_version() != expected:
             raise HelperError(
                 "Installed package version does not match the pinned release")
+        # A package post-install script may have asked systemd to start a unit.
+        # First-install validation needs the direct SX1262 completely quiescent.
+        for service in TARGET_SERVICES.values():
+            _run(["systemctl", "stop", service], timeout=30, check=False)
+        _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30,
+             check=False)
+        _run([
+            "systemd-sysusers",
+            "/usr/lib/sysusers.d/meshtasticd-wdg.conf",
+        ], timeout=30)
+        _run([
+            "systemd-tmpfiles", "--create",
+            "/usr/lib/tmpfiles.d/meshtasticd-wdg.conf",
+        ], timeout=30)
         _run(["systemctl", "daemon-reload"], timeout=30)
-        _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
-        result = _adopt_installed(tag)
+
+        try:
+            meshtastic_uid = pwd.getpwnam("meshtasticd").pw_uid
+            meshtastic_gid = grp.getgrnam("meshtasticd").gr_gid
+            manager_gid = grp.getgrnam("watchdogs").gr_gid
+        except KeyError as exc:
+            raise HelperError(
+                "Meshtastic/SX1262 service groups were not created") from exc
+        policy = WDG_POLICY_PATH
+        if policy.is_symlink() or not policy.is_file():
+            raise HelperError(
+                "Meshtastic WDG policy is missing or unsafe; rerun setup.sh")
+        os.chown(policy, 0, meshtastic_gid)
+        os.chmod(policy, 0o640)
+
+        configurator = _load_stack_configurator()
+        configurator.atomic_write(
+            MANAGER_CONFIG_PATH, configurator.manager_config(gpiochip),
+            uid=0, gid=manager_gid, mode=0o640)
+
+        if direct_baseline:
+            # Prove identity and channels once using the still-direct
+            # configuration. This replaces the old manual adoption step.
+            result = _adopt_installed(
+                tag, direct_hardware=True, include_validation=True)
+            validation = result.pop("_validation")
+            _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+
+            # Validate the broker path against a second disposable state copy
+            # before changing the live Meshtastic configuration.
+            broker_snapshot, broker_fingerprints = (
+                _snapshot_live_state_for_adoption())
+            broker_presence = {
+                _state_backup_key(path): True for path in STATE_PATHS}
+            broker_candidate = _candidate_dry_run_preserving_live_state(
+                broker_snapshot, broker_fingerprints, broker_presence,
+                broker_config=True)
+            if (broker_candidate["semantic"] != validation["semantic"]
+                    or broker_candidate["effective_mac"]
+                    != validation["effective_mac"]):
+                raise HelperError(
+                    "Broker candidate identity or channel semantics differ "
+                    "from the verified direct-radio baseline")
+            shutil.rmtree(broker_snapshot)
+            broker_snapshot = None
+
+            configurator.configure_stack(
+                live_config, MANAGER_CONFIG_PATH, gpiochip,
+                meshtastic_gid, manager_gid)
+            live_critical = _critical_state_snapshot(
+                _resolve_state_fsdir(MESHTASTIC_STATE_DIR),
+                MESHTASTIC_CONFIG_DIR)
+            _run(["systemctl", "start", TARGET_SERVICES["wdg"]], timeout=45)
+            _verify_live_state(validation["semantic"], live_critical)
+        else:
+            # With no initialized state there is no identity to adopt. Create
+            # the node once through the broker, then validate/cache that exact
+            # initialized state before declaring setup complete.
+            _ensure_bootstrap_state(meshtastic_uid, meshtastic_gid)
+            configurator.configure_stack(
+                live_config, MANAGER_CONFIG_PATH, gpiochip,
+                meshtastic_gid, manager_gid)
+            _run(["systemctl", "start", MANAGER_SERVICE], timeout=45)
+            _run(["systemctl", "start", TARGET_SERVICES["wdg"]], timeout=45)
+            initial_status = _health_check()
+            initial_semantic = _semantic_status_snapshot(initial_status)
+            _run(["systemctl", "stop", TARGET_SERVICES["wdg"]], timeout=30)
+            result = _adopt_installed(
+                tag, include_validation=True)
+            validation = result.pop("_validation")
+            if validation["semantic"] != initial_semantic:
+                raise HelperError(
+                    "Fresh broker validation changed the initialized "
+                    "Meshtastic identity or channel semantics")
+            live_critical = _critical_state_snapshot(
+                _resolve_state_fsdir(MESHTASTIC_STATE_DIR),
+                MESHTASTIC_CONFIG_DIR)
+            _run(["systemctl", "start", TARGET_SERVICES["wdg"]], timeout=45)
+            _verify_live_state(initial_semantic, live_critical)
+        _set_enabled(TARGET_SERVICES["wdg"], True)
+        _set_enabled(TARGET_SERVICES["stock"], False)
+        _set_enabled(MANAGER_SERVICE, True)
+
+        if preinstall_snapshot is not None:
+            shutil.rmtree(preinstall_snapshot)
+            preinstall_snapshot = None
         result["action"] = "converge-tag"
+        result["service"] = TARGET_SERVICES["wdg"]
         return result
     except Exception as migration_error:
         rollback_errors: list[str] = []
+        for service in TARGET_SERVICES.values():
+            _run(["systemctl", "stop", service], timeout=30, check=False)
         _run(["systemctl", "stop", MANAGER_SERVICE], timeout=30,
              check=False)
         if package_installed:
@@ -2867,14 +3378,37 @@ def _converge_tag(tag: str) -> dict[str, Any]:
                      check=False)
             except Exception as exc:  # noqa: BLE001
                 rollback_errors.append("package purge failed: " + str(exc))
+        if preinstall_snapshot is not None and preinstall_metadata is not None:
+            try:
+                _restore_preinstall_state(
+                    preinstall_snapshot, preinstall_metadata)
+            except Exception as exc:  # noqa: BLE001
+                rollback_errors.append("state restore failed: " + str(exc))
         try:
             _restore_services(services)
         except Exception as exc:  # noqa: BLE001
             rollback_errors.append("service restore failed: " + str(exc))
+        if not rollback_errors and preinstall_snapshot is not None:
+            try:
+                shutil.rmtree(preinstall_snapshot)
+                preinstall_snapshot = None
+            except OSError as exc:
+                rollback_errors.append("snapshot cleanup failed: " + str(exc))
+        if (broker_snapshot is not None
+                and not isinstance(migration_error,
+                                   CandidateStateRestoreError)):
+            try:
+                shutil.rmtree(broker_snapshot)
+                broker_snapshot = None
+            except OSError as exc:
+                rollback_errors.append(
+                    "broker snapshot cleanup failed: " + str(exc))
         if rollback_errors:
             raise HelperError(
                 f"Unified Meshtastic setup failed ({migration_error}); "
                 "rollback was incomplete: " + "; ".join(rollback_errors)
+                + (f"; evidence retained at {preinstall_snapshot}"
+                   if preinstall_snapshot is not None else "")
             ) from migration_error
         raise HelperError(
             "Unified Meshtastic setup failed and the previous services were "
@@ -2949,8 +3483,11 @@ def main(argv: list[str] | None = None) -> int:
                 and args[1] in TARGET_SERVICES):
             _json_output(**_select_service(args[1]))
             return 0
-        if len(args) == 2 and args[0] == "converge-tag" and TAG_RE.fullmatch(args[1]):
-            _json_output(**_converge_tag(args[1]))
+        if (len(args) in (2, 3) and args[0] == "converge-tag"
+                and TAG_RE.fullmatch(args[1])
+                and (len(args) == 2 or GPIOCHIP_RE.fullmatch(args[2]))):
+            _json_output(**_converge_tag(
+                args[1], int(args[2]) if len(args) == 3 else 0))
             return 0
         if (len(args) == 3 and args[0] == "verify-pinned-tag"
                 and TAG_RE.fullmatch(args[1])
@@ -2973,7 +3510,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise HelperError(
             "Usage: watchdogs-meshtastic version | status/start/stop/enable/disable/"
-            "select-service wdg|stock | converge-tag/install-tag/prepare-first-tag/"
+            "select-service wdg|stock | converge-tag TAG [GPIOCHIP] | "
+            "install-tag/prepare-first-tag/"
             "adopt-installed "
             "vX.Y.Z-wdg.N | rollback")
     except InstallTransactionError as exc:

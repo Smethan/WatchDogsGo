@@ -39,6 +39,18 @@ def result(payload=None, *, returncode=0, stderr=""):
     )
 
 
+def fake_stack_configurator():
+    return NS(
+        manager_config=lambda gpiochip: f"gpiochip: {gpiochip}\n",
+        atomic_write=Mock(return_value=True),
+        configure_stack=Mock(return_value=(True, False)),
+        broker_meshtastic_config=lambda text: text,
+        replace_lora_mapping=lambda text, _mapping: text,
+        is_broker_meshtastic_config=lambda _text: False,
+        lora_mapping=lambda _text: None,
+    )
+
+
 def candidate_live_state(helper, tmp_path, monkeypatch):
     """Create two live state roots plus the helper's protected copy layout."""
     live_config = tmp_path / "live-etc-meshtasticd"
@@ -56,6 +68,91 @@ def candidate_live_state(helper, tmp_path, monkeypatch):
     presence = helper._copy_state_to_backup(snapshot)
     before = helper._current_state_fingerprints()
     return live_config, live_state, snapshot, presence, before
+
+
+def test_preinstall_snapshot_restores_an_initially_absent_stack(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    config = tmp_path / "etc" / "meshtasticd"
+    state = tmp_path / "var" / "lib" / "meshtasticd"
+    manager = tmp_path / "etc" / "watchdogs" / "sx1262.yaml"
+    validation = tmp_path / "validation"
+    validation.mkdir()
+    monkeypatch.setattr(helper, "MESHTASTIC_CONFIG_DIR", config)
+    monkeypatch.setattr(helper, "MESHTASTIC_STATE_DIR", state)
+    monkeypatch.setattr(helper, "STATE_PATHS", (config, state))
+    monkeypatch.setattr(helper, "MANAGER_CONFIG_PATH", manager)
+    monkeypatch.setattr(helper, "_secure_validation_root", lambda: validation)
+    monkeypatch.setattr(helper.os, "chown", lambda *_args: None)
+
+    snapshot, metadata = helper._snapshot_preinstall_state()
+    config.mkdir(parents=True)
+    state.mkdir(parents=True)
+    manager.parent.mkdir(parents=True)
+    (config / "config.yaml").write_text("candidate\n", encoding="utf-8")
+    (state / "identity.bin").write_bytes(b"candidate")
+    manager.write_text("candidate\n", encoding="utf-8")
+
+    helper._restore_preinstall_state(snapshot, metadata)
+
+    assert not config.exists()
+    assert not state.exists()
+    assert not manager.exists()
+
+
+def test_manager_config_restore_preserves_bytes_owner_and_mode(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    target = tmp_path / "etc" / "watchdogs" / "sx1262.yaml"
+    backup = tmp_path / "backup"
+    source = backup / "state-files" / "sx1262.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"verified manager config\n")
+    source.chmod(0o640)
+    fingerprint = helper._file_fingerprint(source)
+    metadata = {
+        "manager_config_present": True,
+        "manager_config_fingerprint": fingerprint,
+    }
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"candidate\n")
+    monkeypatch.setattr(helper, "MANAGER_CONFIG_PATH", target)
+
+    helper._restore_manager_config(backup, metadata)
+
+    assert target.read_bytes() == source.read_bytes()
+    assert helper._file_fingerprint(target) == fingerprint
+
+
+def test_fresh_bootstrap_creates_only_fixed_owned_state_tree(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    state = tmp_path / "var" / "lib" / "meshtasticd"
+    state.parent.mkdir(parents=True)
+    monkeypatch.setattr(helper, "MESHTASTIC_STATE_DIR", state)
+    uid = os.getuid()
+    gid = os.getgid()
+
+    helper._ensure_bootstrap_state(uid, gid)
+
+    for path in (state, state / ".portduino", state / ".portduino" / "default"):
+        info = path.stat()
+        assert path.is_dir()
+        assert info.st_uid == uid
+        assert info.st_gid == gid
+        assert stat.S_IMODE(info.st_mode) == 0o750
+
+
+def test_fresh_bootstrap_rejects_symlinked_state_component(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".portduino").symlink_to(tmp_path)
+    monkeypatch.setattr(helper, "MESHTASTIC_STATE_DIR", state)
+
+    with pytest.raises(helper.HelperError, match="unsafe"):
+        helper._ensure_bootstrap_state(os.getuid(), os.getgid())
 
 
 def test_controller_builds_only_fixed_helper_commands():
@@ -100,11 +197,11 @@ def test_controller_parses_status_and_preserves_helper_errors():
                 "unit_file_state": "enabled",
                 "package_version": "2.8.1+wdg1",
             })
-        return result({"ok": True, "helper_version": 11})
+        return result({"ok": True, "helper_version": 12})
 
     controller = service.MeshtasticServiceController(
         runner=runner, geteuid=lambda: 0)
-    assert controller.version() == 11
+    assert controller.version() == 12
     controller.require_current()
     status = controller.status("wdg")
     assert status.installed and status.active and status.enabled
@@ -275,7 +372,7 @@ def test_source_helper_accepts_only_closed_cli(monkeypatch, capsys):
         "package_version": None,
     })
     assert helper.main(["version"]) == 0
-    assert json.loads(capsys.readouterr().out)["helper_version"] == 11
+    assert json.loads(capsys.readouterr().out)["helper_version"] == 12
     assert helper.main(["status", "stock"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "meshtasticd.service"
 
@@ -423,10 +520,8 @@ def test_transaction_lock_rejects_unlinked_replacement_inode(
 
 @pytest.mark.parametrize("field,value", [
     ("unit_file_state", "enabled-runtime"),
-    ("unit_file_state", "masked"),
     ("unit_file_state", "linked"),
     ("active_state", "failed"),
-    ("load_state", "masked"),
 ])
 def test_service_snapshot_rejects_states_it_cannot_restore_exactly(
         monkeypatch, field, value):
@@ -448,6 +543,25 @@ def test_service_snapshot_rejects_states_it_cannot_restore_exactly(
 
     with pytest.raises(helper.HelperError, match="Cannot preserve"):
         helper._service_snapshot()
+
+
+def test_service_snapshot_accepts_restorable_masked_stock_unit(monkeypatch):
+    helper = load_helper()
+    states = {
+        "wdg": {
+            "target": "wdg", "service": helper.TARGET_SERVICES["wdg"],
+            "load_state": "loaded", "active_state": "active",
+            "unit_file_state": "enabled", "package_version": "2.8.0+wdg9",
+        },
+        "stock": {
+            "target": "stock", "service": helper.TARGET_SERVICES["stock"],
+            "load_state": "masked", "active_state": "inactive",
+            "unit_file_state": "masked", "package_version": None,
+        },
+    }
+    monkeypatch.setattr(helper, "_service_status", lambda target: states[target])
+
+    assert helper._service_snapshot() == states
 
 
 def test_restore_rejects_unrestorable_snapshot_before_systemctl(monkeypatch):
@@ -668,7 +782,7 @@ def test_update_seeds_exact_legacy_rollback_before_backup(tmp_path, monkeypatch)
     monkeypatch.setattr(helper, "_copy_state_to_backup", lambda _backup: {})
     monkeypatch.setattr(
         helper, "_candidate_dry_run",
-        lambda _backup: {
+        lambda _backup, **_kwargs: {
             "semantic": helper._semantic_status_snapshot(semantic_status()),
             "effective_mac": "02:00:A1:B2:C3:D4",
             "mac_pin_required": False,
@@ -733,7 +847,7 @@ def test_update_baseline_restores_live_state_changed_by_failing_candidate(
         lambda *_args: NS(
             tag="v2.8.0-wdg.1", directory=rollback_release))
 
-    def corrupt_then_fail(_backup):
+    def corrupt_then_fail(_backup, **_kwargs):
         (live_config / "config.yaml").write_text(
             "General:\n  MACAddress: FF:FF:FF:FF:FF:FF\n",
             encoding="utf-8")
@@ -772,7 +886,7 @@ def test_update_baseline_rejects_and_restores_successful_candidate_live_write(
             tag="v2.8.0-wdg.1", directory=rollback_release))
     semantic = helper._semantic_status_snapshot(semantic_status())
 
-    def corrupt_then_report_ready(_backup):
+    def corrupt_then_report_ready(_backup, **_kwargs):
         (live_config / "config.yaml").write_text(
             "General:\n  MACAddress: FF:FF:FF:FF:FF:FF\n",
             encoding="utf-8")
@@ -822,7 +936,7 @@ def test_update_baseline_retains_backup_when_candidate_restore_fails(
         lambda *_args: NS(
             tag="v2.8.0-wdg.1", directory=rollback_release))
 
-    def corrupt_then_fail(_backup):
+    def corrupt_then_fail(_backup, **_kwargs):
         (live_state / "identity.bin").write_bytes(b"candidate corruption")
         raise helper.HelperError("candidate health failed")
 
@@ -1452,7 +1566,9 @@ def test_backup_persists_private_sanitized_preinstall_baseline(
     assert persisted["semantic_baseline"] == semantic
     assert persisted["effective_mac"] == "02:00:A1:B2:C3:D4"
     assert persisted["mac_pin_required"] is True
-    assert persisted["format"] == 2
+    assert persisted["format"] == 3
+    assert persisted["manager_config_present"] is False
+    assert persisted["manager_config_fingerprint"] is None
     assert persisted["new_release"]["package_sha256"] == "a" * 64
     assert persisted["rollback_release"]["tag"] == "v2.8.0-wdg.1"
     assert "PRIVATE-KEY-BYTES" not in serialized
@@ -2005,7 +2121,7 @@ def install_candidate_workspace_fakes(helper, monkeypatch, tmp_path):
     runtime_root.mkdir(mode=0o711)
     monkeypatch.setattr(
         helper, "_meshtasticd_credentials",
-        lambda: (612, 613, [614, 615, 616]))
+        lambda **_kwargs: (612, 613, [614, 615, 616]))
     monkeypatch.setattr(helper, "_secure_validation_root", lambda: runtime_root)
     monkeypatch.setattr(helper.os, "chown", lambda *a, **k: None)
     return runtime_root
@@ -2026,6 +2142,8 @@ def test_candidate_credentials_match_service_supplementary_groups(monkeypatch):
     monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
 
     assert helper._meshtasticd_credentials() == (612, 613, [616])
+    assert helper._meshtasticd_credentials(direct_hardware=True) == (
+        612, 613, [614, 615, 616])
 
 
 def test_candidate_credentials_allow_nonroot_legacy_primary_group(monkeypatch):
@@ -2043,6 +2161,58 @@ def test_candidate_credentials_allow_nonroot_legacy_primary_group(monkeypatch):
     monkeypatch.setattr(helper.grp, "getgrnam", lambda name: groups[name])
 
     assert helper._meshtasticd_credentials() == (612, 613, [616])
+    assert helper._meshtasticd_credentials(direct_hardware=True) == (
+        612, 613, [614, 615, 616])
+
+
+def test_interrupted_broker_config_uses_only_verified_prior_lora_mapping(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    import configure_sx1262_stack as configurator
+
+    live_config = tmp_path / "etc-meshtasticd"
+    live_config.mkdir()
+    current = (
+        "Lora:\n"
+        "  # WDG unified manager is the sole SPI/GPIO/power owner.\n"
+        "  Module: broker\n"
+        "  BrokerSocket: /run/watchdogs/sx1262d.sock\n"
+        "GPS:\n  GpsdHost: 127.0.0.1\n")
+    (live_config / "config.yaml").write_text(current, encoding="utf-8")
+    monkeypatch.setattr(helper, "MESHTASTIC_CONFIG_DIR", live_config)
+    monkeypatch.setattr(helper, "_load_stack_configurator", lambda: configurator)
+
+    previous = tmp_path / "previous"
+    previous_config = (
+        previous / "state" / helper._state_backup_key(live_config)
+        / "config.yaml")
+    previous_config.parent.mkdir(parents=True)
+    previous_config.write_text(
+        "Lora:\n  Module: sx1262\n  IRQ: 26\n  Busy: 24\n"
+        "GPS:\n  SerialPath: /dev/ttyS0\n",
+        encoding="utf-8")
+    metadata = {"new_release": {"package_version": "2.8.0+wdg7"}}
+    monkeypatch.setattr(helper, "_last_backup_directory", lambda: previous)
+    monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
+    validate = Mock()
+    monkeypatch.setattr(helper, "_validate_transaction_metadata", validate)
+
+    mapping = helper._legacy_baseline_lora("2.8.0+wdg7", NS())
+
+    assert mapping == "Lora:\n  Module: sx1262\n  IRQ: 26\n  Busy: 24\n"
+    assert "GPS" not in mapping
+    validate.assert_called_once()
+
+
+def test_candidate_failure_includes_diagnostics_but_redacts_secret_lines():
+    helper = load_helper()
+    error = helper._candidate_failure_with_output(
+        helper.HelperError("candidate exited (status 1)"),
+        b"Unknown Lora.Module: broker\nprivate_key: do-not-print\n",
+        truncated=False)
+
+    assert "Unknown Lora.Module: broker" in str(error)
+    assert "do-not-print" not in str(error)
 
 
 @pytest.mark.parametrize(("uid", "primary_gid", "service_gid"), [
@@ -2784,6 +2954,8 @@ def test_candidate_baseline_mismatch_triggers_automatic_rollback(
     monkeypatch.setattr(helper, "_state_unchanged", lambda _metadata: True)
     monkeypatch.setattr(helper.grp, "getgrnam", lambda _name: NS(gr_gid=995))
     monkeypatch.setattr(helper.os, "chown", lambda *a: None)
+    monkeypatch.setattr(
+        helper, "_load_stack_configurator", fake_stack_configurator)
     mismatch = helper._semantic_status_snapshot(
         semantic_status(long_name="Regenerated"))
     monkeypatch.setattr(helper, "_candidate_dry_run", lambda *_a, **_k: {
@@ -2853,6 +3025,8 @@ def test_live_integrity_failure_uses_existing_automatic_rollback(
     monkeypatch.setattr(helper, "_state_unchanged", lambda _metadata: True)
     monkeypatch.setattr(helper.grp, "getgrnam", lambda _name: NS(gr_gid=995))
     monkeypatch.setattr(helper.os, "chown", lambda *a: None)
+    monkeypatch.setattr(
+        helper, "_load_stack_configurator", fake_stack_configurator)
     expected = helper._semantic_status_snapshot(semantic_status())
     monkeypatch.setattr(helper, "_candidate_dry_run", lambda _backup, **_kwargs: {
         "semantic": expected,

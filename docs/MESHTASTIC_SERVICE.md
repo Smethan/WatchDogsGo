@@ -1,6 +1,6 @@
 # Meshtastic and Unified SX1262 Service
 
-WatchDogsGo 0.9.57 uses one persistent hardware manager for the AIO v2
+WatchDogsGo 0.9.58 uses one persistent hardware manager for the AIO v2
 SX1262. The manager, `watchdogs-sx1262d`, is the only process allowed to open
 the SPI device, claim the radio GPIO lines, reset the chip, configure the RF
 switch, or change the LoRa power rail.
@@ -20,7 +20,7 @@ power, bounded PHY settings, CAD, RX, TX, metrics, and exclusive leases.
 
 ## Release pairing
 
-WDG 0.9.57 is pinned to `v2.8.0-wdg.9` from
+WDG 0.9.58 is pinned to `v2.8.0-wdg.9` from
 [`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware).
 The checked-in `meshtastic-stack.json` records the exact package filename,
 SHA-256, source commit, ARM64 architecture, broker API 1.0, and WDG local API
@@ -52,19 +52,25 @@ Setup performs one root-owned transaction:
 4. Downloads the exact public five-asset release from the Smethan fork.
 5. Validates `SHA256SUMS`, `compatibility.json`, the Debian package, source
    metadata, runtime dependencies, maintainer scripts, and embedded policy.
-6. Preserves the authoritative existing Meshtastic private identity, node
-   number, owner data, channels, NodeDB, retained phone identity, and BlueZ
-   link keys.
-7. Writes the hardware-only manager configuration and changes Meshtastic to
-   broker radio plus `gpsd` input.
+6. Boots the installed direct-radio daemon only against a disposable state
+   copy to establish the authoritative private identity/channel baseline. If
+   an affected 0.9.55–0.9.57 run left the old daemon pointed at the broker,
+   only the direct `Lora` block is recovered from the last validated backup.
+7. Installs the package, writes the hardware-only manager policy, and validates
+   the broker-backed daemon against another disposable copy before atomically
+   changing the live Meshtastic configuration to broker radio. A node with no
+   initialized state is created once through the broker and then validated.
 8. Stops, disables, and masks stock `meshtasticd.service`, while retaining its
    package and state for rollback.
 9. Starts `watchdogs-sx1262d.service` and then `meshtasticd-wdg.service`.
 10. Commits only after the broker socket, Meshtastic socket, services, package,
     and preserved semantic identity all pass their checks.
 
-On failure, setup restores the previous package/configuration and exact service
-states. The timestamped backup and transaction log remain for diagnosis.
+On failure, setup restores the previous package, Meshtastic state, manager
+policy, and exact enabled/disabled/masked service states. The timestamped
+backup and transaction log remain for diagnosis. Repeating setup after a
+successful migration validates the already-pinned stack and leaves its state
+unchanged.
 
 The installed layout is:
 
