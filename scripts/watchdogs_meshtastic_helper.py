@@ -2402,7 +2402,7 @@ def _candidate_failure_with_output(
     diagnostics: list[str] = []
     sensitive = re.compile(r"(?i)(private.?key|\bpsk\b|pass(word|key)|secret)")
     interesting = re.compile(
-        r"(?i)(error|failed|fatal|critical|unknown|refused|invalid|cannot|"
+        r"(?i)(error|failed|fatal|critical|unknown|refused|rejected|invalid|cannot|"
         r"could not|no such|not found)")
     for raw in decoded.splitlines():
         line = "".join(

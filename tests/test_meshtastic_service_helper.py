@@ -2284,9 +2284,11 @@ def test_candidate_failure_includes_diagnostics_but_redacts_secret_lines():
     helper = load_helper()
     error = helper._candidate_failure_with_output(
         helper.HelperError("candidate exited (status 1)"),
+        b"SX1262 broker rejected configure_phy: PHY values are outside limits\n"
         b"Unknown Lora.Module: broker\nprivate_key: do-not-print\n",
         truncated=False)
 
+    assert "rejected configure_phy" in str(error)
     assert "Unknown Lora.Module: broker" in str(error)
     assert "do-not-print" not in str(error)
 

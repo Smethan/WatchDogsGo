@@ -1,5 +1,31 @@
 # Smethan WatchDogsGo
 
+## 0.9.62 — Board-safe broker PHY configuration — 2026-09-30
+
+- Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.12`, built
+  locally for ARM64 from source commit `06fb89d50` and published with exact
+  package SHA-256
+  `40a858717d9c6bb0800fe2ed08bf569a69c072c5ec2499349b4ec42c2f4a876d`.
+- Fix the next startup failure reproduced from the protected transaction on
+  the target uConsole. Meshtastic's US-region default requested 30 dBm; the
+  manager correctly rejected it because the AIO SX1262 board limit is 22 dBm.
+  The broker adapter now applies the same board-power clamp as the direct
+  SX126x interface before configuring the manager.
+- Exercise the real daemon end to end against the fake manager with a fresh
+  US-region state. The regression requires `Final Tx power: 22 dBm`, a healthy
+  broker initialization, and no rejected PHY configuration. The actual ARM64
+  release binary also passes broker conformance, simulated configuration,
+  62/62 config-validation assertions, checksums, dependency closure, and
+  Debian package-policy checks.
+- Preserve the setup transaction's exact rollback behavior and improve its
+  secret-filtered diagnostics to retain explicit broker rejection lines.
+
+The misleading `/dev/spidev0.0` line seen in the earlier failure came from a
+non-fatal Portduino display probe; the selected LoRa module was confirmed as
+`broker`. Identity, channels, NodeDB, BlueZ bonds, GPS state, service state,
+and single-owner hardware policy remain protected. Real over-air, Bluetooth,
+GPS, and power behavior remain target-hardware acceptance gates.
+
 ## 0.9.61 — Authenticated Meshtastic broker connection — 2026-09-30
 
 - Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.11`, built

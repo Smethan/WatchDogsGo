@@ -10,6 +10,24 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.62] — 2026-09-30
+
+### Fixed
+
+- Pin setup to the locally built Meshtastic `v2.8.0-wdg.12` ARM64 package.
+  The broker-backed radio now applies the configured SX1262 board power limit
+  before sending PHY configuration to the manager, matching the direct
+  SX126x path. This safely clamps the US-region 30 dBm request to the AIO's
+  22 dBm limit instead of making the manager reject daemon startup.
+- Add a full-process broker regression that starts the actual daemon with a
+  fresh US-region state, requires the 22 dBm clamp and successful broker
+  initialization, and rejects any `configure_phy` failure. The exact ARM64
+  release binary passes this regression, broker conformance, simulated-config,
+  62/62 config validation, and package-policy checks.
+- Include broker `rejected` lines in bounded, secret-filtered candidate
+  diagnostics so setup reports the actionable PHY rejection rather than only
+  earlier non-fatal Portduino probe messages.
+
 ## [0.9.61] — 2026-09-30
 
 ### Fixed
