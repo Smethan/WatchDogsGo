@@ -10,6 +10,21 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.59] — 2026-09-30
+
+### Fixed
+
+- Pin setup to the locally built Meshtastic `v2.8.0-wdg.10` ARM64 package.
+  The broker-backed daemon now waits for the SX1262 manager's startup and
+  handshake instead of immediately falling through to an invalid direct-radio
+  default when systemd starts both services together.
+- Use a teardown-safe manager exit after its socket, clients, and radio backend
+  have been released, preventing the early rollback path from aborting with
+  `free(): invalid pointer`.
+- Run the fake-manager conformance test in firmware CI and require a clean
+  manager SIGTERM exit. Preserve every transactional migration, identity,
+  channel, GPS, Bluetooth, rollback, and ownership safeguard from 0.9.58.
+
 ## [0.9.58] — 2026-09-30
 
 ### Fixed

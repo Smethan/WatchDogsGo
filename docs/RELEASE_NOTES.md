@@ -1,5 +1,29 @@
 # Smethan WatchDogsGo
 
+## 0.9.59 — Stable manager startup candidate — 2026-09-30
+
+- Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.10`, built
+  locally as ARM64 from source commit `5f98f391c` and published with exact
+  package SHA-256
+  `80f7522c048c5da974b060bce593ecb30197c0547c066d681bd93bc3ac45e6bf`.
+- Give the broker-backed Meshtastic radio interface a bounded startup window
+  for the manager socket and API handshake. This removes the systemd race that
+  made the candidate report the manager unavailable and then try the invalid
+  `/dev/spidev0.0` direct-radio default.
+- Exit the manager through a teardown-safe path after its local resources have
+  been released. The rollback stop path no longer aborts with
+  `free(): invalid pointer`.
+- Make broker conformance part of firmware CI and require the manager to exit
+  cleanly on SIGTERM. The ARM64 release binary passed broker conformance,
+  simulated config loading, 62/62 config-validation assertions, package policy,
+  dependency closure, and a clean Debian install locally. The exhaustive
+  firmware suite was interrupted by request after its completed suites passed;
+  real radio, Bluetooth, GPS, and power behavior remain uConsole acceptance
+  gates.
+
+All migration ordering, state preservation, rollback, file-ownership, and
+idempotency fixes from WDG 0.9.58 remain unchanged.
+
 ## 0.9.58 — Complete transactional SX1262 migration — 2026-09-30
 
 - Stop changing `/etc/meshtasticd/config.yaml` before the package transaction.
