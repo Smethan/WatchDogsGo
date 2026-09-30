@@ -1,11 +1,11 @@
 {
   "format": 1,
   "release_ready": true,
-  "tag": "v2.8.0-wdg.12",
+  "tag": "v2.8.0-wdg.13",
   "package": {
     "name": "meshtasticd-wdg",
-    "asset": "meshtasticd-wdg_2.8.0+wdg12_arm64.deb",
-    "sha256": "40a858717d9c6bb0800fe2ed08bf569a69c072c5ec2499349b4ec42c2f4a876d"
+    "asset": "meshtasticd-wdg_2.8.0+wdg13_arm64.deb",
+    "sha256": "9e4ea007b130b54c293da0fd89f9071fa19a38f05d5dec5b0055fae15e9e8066"
   },
   "sx1262_broker_api": {
     "major": 1,
@@ -18,6 +18,6 @@
   "supported_wdg": ">=0.9.43,<0.10.0",
   "architecture": "arm64",
   "minimum_glibc": "2.41",
-  "source_commit": "06fb89d509c799684dc40b25e81fd581cb77501f",
-  "source_url": "https://github.com/Smethan/meshtastic-firmware/tree/06fb89d509c799684dc40b25e81fd581cb77501f"
+  "source_commit": "19e9177387ec7af211328dde7e8f8128f404cc4f",
+  "source_url": "https://github.com/Smethan/meshtastic-firmware/tree/19e9177387ec7af211328dde7e8f8128f404cc4f"
 }

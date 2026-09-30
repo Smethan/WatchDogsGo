@@ -1,5 +1,28 @@
 # Smethan WatchDogsGo
 
+## 0.9.63 — Strict broker-only Portduino startup — 2026-09-30
+
+- Pin setup to Meshtastic `v2.8.0-wdg.13`, built locally for ARM64 from source
+  commit `19e917738` and published with exact package SHA-256
+  `9e4ea007b130b54c293da0fd89f9071fa19a38f05d5dec5b0055fae15e9e8066`.
+- Preserve v12's verified 30-to-22 dBm board-power clamp, then remove the last
+  generic Portduino `SPI.begin()` call for broker and simulated radios. The
+  daemon no longer probes nonexistent `/dev/spidev0.0`; only the manager opens
+  the real AIO SX1262 SPI device.
+- Keep Portduino randomness entirely on the host CSPRNG. Linux `getrandom()`
+  already supplies secure entropy, so broker mode no longer looks for a
+  nonexistent physical `RadioLibInterface` or emits a false error.
+- Require the real daemon startup regression to contain neither a direct SPI
+  open failure nor a missing-radio entropy warning. The final ARM64 binary
+  passes that stricter broker test, simulated configuration, 62/62 config
+  assertions, package policy, checksums, and dependency closure.
+
+Before this cleanup, v12 completed both an upgrade and an idempotent setup
+rerun on the target uConsole, preserved node `!43f0fbd9` and LongFast, kept
+gpsd as the sole UART reader, and left the manager as the sole real SPI owner.
+v13 removes the two non-fatal log paths found in that live audit without
+changing identity, migration, Bluetooth, GPS, or manager protocols.
+
 ## 0.9.62 — Board-safe broker PHY configuration — 2026-09-30
 
 - Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.12`, built

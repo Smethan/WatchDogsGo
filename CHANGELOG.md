@@ -10,6 +10,23 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.63] — 2026-09-30
+
+### Fixed
+
+- Pin setup to the locally built Meshtastic `v2.8.0-wdg.13` ARM64 package.
+  Broker and simulated Portduino radios no longer call the generic
+  `SPI.begin()` path, eliminating the non-fatal `/dev/spidev0.0` probe while
+  leaving the manager as the only process that opens the AIO SX1262 SPI node.
+- Use the host CSPRNG exclusively on Portduino instead of attempting to mix
+  entropy through a physical `RadioLibInterface` singleton that does not exist
+  for a broker-backed radio. This removes a false startup error without
+  weakening randomness.
+- Extend full-process broker startup coverage to reject direct SPI-open and
+  missing-physical-radio entropy messages. The exact ARM64 release binary
+  passes the stricter test along with all v12 broker, configuration, and
+  package checks.
+
 ## [0.9.62] — 2026-09-30
 
 ### Fixed
