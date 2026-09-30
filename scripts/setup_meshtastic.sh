@@ -159,11 +159,16 @@ wdg_install_meshtastic_support() {
         echo "Missing validator source: $VALIDATOR_SOURCE" >&2; return 1; }
     for path in "$HELPER_TARGET" "$LIB_TARGET" \
                 "$CACHE_ROOT" "$FIRST_INSTALL_INBOX" "$BACKUP_ROOT" \
-                "$CONFIG_TARGET"; do
+                "$CONFIG_TARGET" /run/lock/watchdogs; do
         wdg_meshtastic_refuse_symlink "$path"
     done
 
     wdg_meshtastic_prepare_radio_access "$user"
+
+    # Repair older setup runs that created this shared lock parent as
+    # root:root 0755.  The transaction helper deliberately accepts only this
+    # root-owned, setgid, non-writable group directory.
+    install -d -o root -g "$WATCHDOGS_GROUP" -m 2750 /run/lock/watchdogs
 
     install -d -o root -g root -m 0755 /usr/local/libexec
     install -d -o root -g root -m 0755 "$LIB_TARGET"

@@ -135,6 +135,21 @@ def test_setup_support_has_no_legacy_radio_lock_policy():
     assert "wdg_meshtastic_radio_tmpfiles_text" not in text
 
 
+def test_setup_lock_directory_matches_transaction_helper_contract():
+    setup_text = SETUP.read_text(encoding="utf-8")
+    support_text = SCRIPT.read_text(encoding="utf-8")
+
+    assert "install -d -o root -g root -m 0755 /run/lock/watchdogs" not in setup_text
+    assert "getent group watchdogs" in setup_text
+    assert "groupadd --system watchdogs" in setup_text
+    assert "install -d -o root -g watchdogs -m 2750 /run/lock/watchdogs" in setup_text
+    assert "[ -L /run/lock/watchdogs ]" in setup_text
+    assert (
+        'install -d -o root -g "$WATCHDOGS_GROUP" -m 2750 '
+        '/run/lock/watchdogs'
+    ) in support_text
+
+
 def test_policy_change_warns_when_active_service_needs_restart(tmp_path):
     mock_bin = tmp_path / "bin"
     mock_bin.mkdir()

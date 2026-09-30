@@ -67,7 +67,17 @@ TARGET_GROUP="$(id -gn "$TARGET_USER")"
 # Serialize the complete setup/update flow. The descriptor remains open until
 # this shell exits, including package migration and health checks.
 if [ "$(id -u)" -eq 0 ]; then
-    install -d -o root -g root -m 0755 /run/lock/watchdogs
+    if [ -L /run/lock/watchdogs ] || \
+       { [ -e /run/lock/watchdogs ] && [ ! -d /run/lock/watchdogs ]; }; then
+        fail "/run/lock/watchdogs must be a real directory"
+        exit 1
+    fi
+    if ! getent group watchdogs >/dev/null; then
+        groupadd --system watchdogs
+    fi
+    # This directory is also the root-only Meshtastic transaction-lock parent.
+    # Keep its owner/mode identical to the helper's fail-closed contract.
+    install -d -o root -g watchdogs -m 2750 /run/lock/watchdogs
     exec 9>/run/lock/watchdogs/setup.lock
 else
     exec 9>"/tmp/watchdogs-setup-${TARGET_UID}.lock"

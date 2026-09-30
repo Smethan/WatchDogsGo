@@ -1,5 +1,18 @@
 # Smethan WatchDogsGo
 
+## 0.9.56 — Repair the protected setup lock directory — 2026-09-30
+
+- Fix `sudo bash setup.sh` creating `/run/lock/watchdogs` as `root:root 0755`
+  immediately before the Meshtastic transaction helper correctly required the
+  protected `root:watchdogs 2750` contract.
+- Create the `watchdogs` system group before taking the outer setup lock, refuse
+  a symlink or non-directory at the protected path, and idempotently repair an
+  older real directory's owner and mode in both the outer setup and support
+  installation paths.
+- Keep the exact Meshtastic `v2.8.0-wdg.9` package, digest, APIs, identity
+  migration, and rollback policy unchanged. No state or package deletion is
+  needed after this pre-transaction failure; update WDG and rerun setup.
+
 ## 0.9.55 — Corrected unified-radio package candidate — 2026-09-29
 
 - Pin setup to Meshtastic `v2.8.0-wdg.9`, whose Debian payload contains one
