@@ -10,6 +10,22 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.64] — 2026-09-30
+
+### Fixed
+
+- Distinguish a completed, healthy broker-managed installation from the
+  interrupted pre-transaction broker migrations produced by 0.9.55–0.9.57.
+  A broker-to-broker package upgrade now validates the installed daemon and
+  copied identity state through the still-running manager, with only the
+  `watchdogs` socket group, instead of demanding an obsolete direct-SPI
+  mapping from the previous transaction backup.
+- Continue using the recovered direct-radio mapping only for genuinely
+  interrupted legacy migrations. Add regressions for both classifications and
+  for the broker-only candidate options selected by the backup transaction.
+- Keep the exact locally built Meshtastic `v2.8.0-wdg.13` package and all
+  checksum, rollback, identity, GPS, Bluetooth, and single-owner safeguards.
+
 ## [0.9.63] — 2026-09-30
 
 ### Fixed

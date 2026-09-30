@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.9.64 — Safe broker-to-broker upgrades — 2026-09-30
+
+- Fix the protected updater's classification of an already-managed broker
+  stack. The first v12-to-v13 attempt on the target uConsole stopped before
+  package mutation because the last successful transaction correctly held a
+  broker mapping rather than the obsolete direct-SPI mapping the helper asked
+  for. Services were restored and v12 remained healthy.
+- When the last completed transaction names the installed package and both its
+  saved and current configurations are broker-managed, establish the semantic
+  identity/channel baseline by running the installed daemon through the
+  still-active SX1262 manager. The candidate receives only broker socket
+  access; it never receives SPI/GPIO groups.
+- Preserve the direct-radio recovery branch for the genuinely interrupted
+  0.9.55–0.9.57 migration case. Automated tests cover both classifications and
+  assert the managed upgrade selects only `broker_config=True`.
+
+This WDG-only release remains pinned to the locally built and validated
+Meshtastic `v2.8.0-wdg.13` artifact at SHA-256
+`9e4ea007b130b54c293da0fd89f9071fa19a38f05d5dec5b0055fae15e9e8066`.
+No firmware rebuild or GitHub-built binary is involved.
+
 ## 0.9.63 — Strict broker-only Portduino startup — 2026-09-30
 
 - Pin setup to Meshtastic `v2.8.0-wdg.13`, built locally for ARM64 from source

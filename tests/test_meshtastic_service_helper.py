@@ -876,6 +876,43 @@ def test_update_seeds_exact_legacy_rollback_before_backup(tmp_path, monkeypatch)
         encoding="utf-8") == "exact"
 
 
+def test_update_uses_broker_candidate_for_completed_managed_stack(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir(mode=0o700)
+    rollback_dir = tmp_path / "v2.8.0-wdg.12"
+    rollback_dir.mkdir()
+    (rollback_dir / "release-marker").write_text("exact", encoding="utf-8")
+    rollback = fake_prepared_release(rollback_dir.name, rollback_dir)
+    prepared_dir = tmp_path / "v2.8.0-wdg.13"
+    prepared_dir.mkdir()
+    prepared = fake_prepared_release(prepared_dir.name, prepared_dir)
+    semantic = helper._semantic_status_snapshot(semantic_status())
+    dry_run = Mock(return_value={
+        "semantic": semantic,
+        "effective_mac": "02:00:A1:B2:C3:D4",
+        "mac_pin_required": False,
+    })
+
+    monkeypatch.setattr(helper, "BACKUP_ROOT", backup_root)
+    monkeypatch.setattr(helper, "_secure_root_directory", lambda _path: None)
+    monkeypatch.setattr(helper, "_installed_version", lambda: rollback.package_version)
+    monkeypatch.setattr(helper, "_find_cached_release", lambda *_args: rollback)
+    monkeypatch.setattr(helper, "_tree_fingerprint", lambda _path: [])
+    monkeypatch.setattr(helper, "_copy_state_to_backup", lambda _backup: {})
+    monkeypatch.setattr(
+        helper, "_baseline_radio_config", lambda *_args: (True, None))
+    monkeypatch.setattr(
+        helper, "_candidate_dry_run_preserving_live_state", dry_run)
+    monkeypatch.setattr(helper.os, "fchown", lambda *_args: None)
+
+    helper._create_backup(prepared.tag, prepared, NS(), {})
+
+    assert dry_run.call_count == 1
+    assert dry_run.call_args.kwargs == {"broker_config": True}
+
+
 def test_first_install_requires_manual_migration_baseline(
         tmp_path, monkeypatch):
     helper = load_helper()
@@ -2273,10 +2310,48 @@ def test_interrupted_broker_config_uses_only_verified_prior_lora_mapping(
     validate = Mock()
     monkeypatch.setattr(helper, "_validate_transaction_metadata", validate)
 
-    mapping = helper._legacy_baseline_lora("2.8.0+wdg7", NS())
+    broker, mapping = helper._baseline_radio_config("2.8.0+wdg7", NS())
 
+    assert broker is False
     assert mapping == "Lora:\n  Module: sx1262\n  IRQ: 26\n  Busy: 24\n"
     assert "GPS" not in mapping
+    validate.assert_called_once()
+
+
+def test_completed_broker_config_uses_managed_baseline(tmp_path, monkeypatch):
+    helper = load_helper()
+    import configure_sx1262_stack as configurator
+
+    live_config = tmp_path / "etc-meshtasticd"
+    live_config.mkdir()
+    broker_config = (
+        "Lora:\n"
+        "  # WDG unified manager is the sole SPI/GPIO/power owner.\n"
+        "  Module: broker\n"
+        "  BrokerSocket: /run/watchdogs/sx1262d.sock\n"
+        "GPS:\n  GpsdHost: 127.0.0.1\n")
+    (live_config / "config.yaml").write_text(
+        broker_config, encoding="utf-8")
+    monkeypatch.setattr(helper, "MESHTASTIC_CONFIG_DIR", live_config)
+    monkeypatch.setattr(helper, "_load_stack_configurator", lambda: configurator)
+
+    previous = tmp_path / "previous"
+    previous_config = (
+        previous / "state" / helper._state_backup_key(live_config)
+        / "config.yaml")
+    previous_config.parent.mkdir(parents=True)
+    previous_config.write_text(broker_config, encoding="utf-8")
+    metadata = {"new_release": {"package_version": "2.8.0+wdg12"}}
+    monkeypatch.setattr(helper, "_last_backup_directory", lambda: previous)
+    monkeypatch.setattr(helper, "_read_private_json", lambda _path: metadata)
+    validate = Mock()
+    monkeypatch.setattr(helper, "_validate_transaction_metadata", validate)
+
+    broker, mapping = helper._baseline_radio_config(
+        "2.8.0+wdg12", NS())
+
+    assert broker is True
+    assert mapping is None
     validate.assert_called_once()
 
 

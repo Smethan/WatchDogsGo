@@ -1333,32 +1333,38 @@ def _prepare_rollback_release(tag: str, validator) -> Any:
         tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
 
 
-def _legacy_baseline_lora(
-        installed_version: str, validator) -> str | None:
-    """Recover only a pre-broker Lora mapping after an interrupted old setup.
+def _baseline_radio_config(
+        installed_version: str, validator) -> tuple[bool, str | None]:
+    """Classify the installed stack's trusted radio baseline.
 
     v0.9.55-v0.9.57 could write the generated broker mapping before opening
     the package transaction.  An older installed daemon then cannot establish
     its semantic baseline.  Reuse only the hardware mapping from the most
     recent fully validated private transaction; current identity, channels,
     NodeDB, GPS, and every other live setting still come from the current
-    state copy.
+    state copy.  A completed broker-managed transaction is different: its
+    installed daemon must be validated through the still-running manager, not
+    forced back through a direct-SPI mapping that no longer exists.
+
+    Return ``(use_broker, lora_override)``.  A normal direct configuration is
+    ``(False, None)``; an interrupted old migration returns its validated
+    direct mapping; a completed managed stack is ``(True, None)``.
     """
     config = MESHTASTIC_CONFIG_DIR / "config.yaml"
     try:
         current = config.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        return False, None
     except (OSError, UnicodeError) as exc:
         raise HelperError("Meshtastic config.yaml is unreadable") from exc
     if (re.search(r"(?m)^Lora:[ \t]*(?:#.*)?$", current) is None
             or re.search(
                 r"(?m)^[ \t]+Module:[ \t]*broker[ \t]*(?:#.*)?$",
                 current) is None):
-        return None
+        return False, None
     configurator = _load_stack_configurator()
     if not configurator.is_broker_meshtastic_config(current):
-        return None
+        return False, None
 
     try:
         previous_backup = _last_backup_directory()
@@ -1377,11 +1383,12 @@ def _legacy_baseline_lora(
             / _state_backup_key(MESHTASTIC_CONFIG_DIR) / "config.yaml")
         previous_text = previous_config.read_text(encoding="utf-8")
         mapping = configurator.lora_mapping(previous_text)
-        if mapping is None or configurator.is_broker_meshtastic_config(
-                previous_text):
+        if configurator.is_broker_meshtastic_config(previous_text):
+            return True, None
+        if mapping is None:
             raise HelperError(
                 "the last completed transaction has no direct-radio mapping")
-        return mapping
+        return False, mapping
     except Exception as exc:
         raise HelperError(
             "The live Meshtastic config contains an interrupted broker "
@@ -1448,8 +1455,12 @@ def _create_backup(tag: str, prepared: Any, validator,
         presence = _copy_state_to_backup(backup)
         manager_present, manager_fingerprint = (
             _copy_manager_config_to_backup(backup))
-        legacy_lora = _legacy_baseline_lora(previous_version, validator)
-        if legacy_lora is None:
+        broker_baseline, legacy_lora = _baseline_radio_config(
+            previous_version, validator)
+        if broker_baseline:
+            baseline = _candidate_dry_run_preserving_live_state(
+                backup, fingerprints, presence, broker_config=True)
+        elif legacy_lora is None:
             baseline = _candidate_dry_run_preserving_live_state(
                 backup, fingerprints, presence, direct_hardware=True)
         else:

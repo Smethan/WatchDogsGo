@@ -1,6 +1,6 @@
 # Meshtastic and Unified SX1262 Service
 
-WatchDogsGo 0.9.63 uses one persistent hardware manager for the AIO v2
+WatchDogsGo 0.9.64 uses one persistent hardware manager for the AIO v2
 SX1262. The manager, `watchdogs-sx1262d`, is the only process allowed to open
 the SPI device, claim the radio GPIO lines, reset the chip, configure the RF
 switch, or change the LoRa power rail.
@@ -20,7 +20,7 @@ power, bounded PHY settings, CAD, RX, TX, metrics, and exclusive leases.
 
 ## Release pairing
 
-WDG 0.9.63 is pinned to `v2.8.0-wdg.13` from
+WDG 0.9.64 is pinned to `v2.8.0-wdg.13` from
 [`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware).
 The checked-in `meshtastic-stack.json` records the exact package filename,
 SHA-256, source commit, ARM64 architecture, broker API 1.0, and WDG local API
