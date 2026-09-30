@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.9.61 — Authenticated Meshtastic broker connection — 2026-09-30
+
+- Pin the one-command setup transaction to Meshtastic `v2.8.0-wdg.11`, built
+  locally for ARM64 from source commit `8aa6eab19` and published with exact
+  package SHA-256
+  `e043a35ccac48075713456de177395415af6d1ffb43ba1f22228513617413aec`.
+- Fix broker peer authentication after the healthy manager startup introduced
+  in 0.9.60. The prior code retained two pointers returned by `getpwnam()`;
+  the second NSS lookup could reuse the first lookup's static storage, making
+  the legitimate `meshtasticd` UID appear to be the manager UID and producing
+  `unauthorized_role` followed by the misleading candidate timeout.
+- Copy each account UID immediately and add a regression using distinct
+  Meshtastic and manager accounts. Both the native build and the actual ARM64
+  release binary pass authenticated broker conformance.
+
+The target uConsole confirmed that the 2 MHz manager reaches a healthy state;
+this release addresses the next blocked stage observed in that same protected
+transaction. Identity, channels, NodeDB, BlueZ bonds, GPS state, and service
+state continue to be protected by transactional rollback. Real over-air,
+Bluetooth, GPS, and power behavior remain hardware acceptance gates.
+
 ## 0.9.60 — Stable AIO SPI probe policy — 2026-09-30
 
 - Generate `/etc/watchdogs/sx1262.yaml` with a 2 MHz SPI clock, matching the

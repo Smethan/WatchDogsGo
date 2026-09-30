@@ -10,6 +10,22 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.61] — 2026-09-30
+
+### Fixed
+
+- Pin setup to the locally built Meshtastic `v2.8.0-wdg.11` ARM64 package.
+  The SX1262 broker now copies each NSS account UID before performing the next
+  account lookup, so `getpwnam()` static-buffer reuse cannot replace the
+  `meshtasticd` UID with the manager UID and reject a legitimate Meshtastic
+  broker connection as `unauthorized_role`.
+- Add an authenticated regression that uses two distinct system accounts and
+  verifies that Meshtastic is accepted while a controller role from the same
+  UID is rejected. The native and ARM64 broker conformance suites pass.
+- Retain the validated 2 MHz uConsole SPI policy and the pre-candidate manager
+  health gate from 0.9.60. The manager can now become healthy and authorize the
+  candidate daemon in the same protected transaction.
+
 ## [0.9.60] — 2026-09-30
 
 ### Fixed
