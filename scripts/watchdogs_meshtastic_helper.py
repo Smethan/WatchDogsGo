@@ -30,6 +30,7 @@ from typing import Any
 
 HELPER_VERSION = 13
 ROLLBACK_MINIMUM_API_MINOR = 0
+ROLLBACK_MINIMUM_BROKER_API_MINOR = 0
 TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
     r"(0|[1-9][0-9]*)-wdg\.(0|[1-9][0-9]*)$")
@@ -843,7 +844,8 @@ def _validate_rollback_release(directory: Path, tag: str, validator) -> Any:
             check_host=False)
     return validator.validate_prepared_release(
         directory, expected_tag=tag, require_secure=True, check_host=False,
-        minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR,
+        minimum_broker_api_minor=ROLLBACK_MINIMUM_BROKER_API_MINOR)
 
 
 def _validate_rollback_installed(prepared: Any, validator) -> None:
@@ -1292,11 +1294,14 @@ def _find_cached_release(version: str, validator) -> Any | None:
 
 def _prepare_exact_release(
     tag: str, validator, *, minimum_api_minor: int | None = None,
+    minimum_broker_api_minor: int | None = None,
 ) -> Any:
     """Load or download one exact, protected-validator-approved release."""
-    compatibility = (
-        {} if minimum_api_minor is None
-        else {"minimum_api_minor": minimum_api_minor})
+    compatibility = {}
+    if minimum_api_minor is not None:
+        compatibility["minimum_api_minor"] = minimum_api_minor
+    if minimum_broker_api_minor is not None:
+        compatibility["minimum_broker_api_minor"] = minimum_broker_api_minor
     release_dir = CACHE_ROOT / tag
     if release_dir.exists():
         prepared = validator.validate_prepared_release(
@@ -1330,7 +1335,8 @@ def _prepare_rollback_release(tag: str, validator) -> Any:
         return validator.prepare_legacy_rollback_release(
             tag, cache_root=CACHE_ROOT, require_root=True, check_host=True)
     return _prepare_exact_release(
-        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR,
+        minimum_broker_api_minor=ROLLBACK_MINIMUM_BROKER_API_MINOR)
 
 
 def _baseline_radio_config(
@@ -2889,7 +2895,8 @@ def _adopt_installed(
     _secure_root_directory(CACHE_ROOT)
     validator = _load_validator()
     prepared = _prepare_exact_release(
-        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR)
+        tag, validator, minimum_api_minor=ROLLBACK_MINIMUM_API_MINOR,
+        minimum_broker_api_minor=ROLLBACK_MINIMUM_BROKER_API_MINOR)
     with _lock_transaction():
         installed_version = _installed_version()
         if installed_version != prepared.package_version:

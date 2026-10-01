@@ -357,6 +357,7 @@ def validate_compatibility_manifest(
     *,
     expected_tag: str | None = None,
     minimum_api_minor: int = MESHTASTIC_WDG_API_MINOR,
+    minimum_broker_api_minor: int = SX1262_BROKER_API_MINOR,
 ) -> dict[str, Any]:
     """Validate the signed-by-checksum compatibility contract.
 
@@ -420,9 +421,13 @@ def validate_compatibility_manifest(
             broker_api.get("major"), "SX1262 broker API major")
             != SX1262_BROKER_API_MAJOR):
         raise ValueError("Release requires an incompatible SX1262 broker API major")
+    required_broker_minor = _require_plain_int(
+        minimum_broker_api_minor, "minimum SX1262 broker API minor")
+    if required_broker_minor < 0:
+        raise ValueError("Minimum SX1262 broker API minor cannot be negative")
     broker_minor = _require_plain_int(
         broker_api.get("minor"), "SX1262 broker API minor")
-    if broker_minor < SX1262_BROKER_API_MINOR:
+    if broker_minor < required_broker_minor:
         raise ValueError("Release provides an older SX1262 broker API revision")
 
     package = manifest.get("package")
@@ -482,9 +487,11 @@ def check_host_compatibility(
     machine: str | None = None,
     glibc_version: str | None = None,
     minimum_api_minor: int = MESHTASTIC_WDG_API_MINOR,
+    minimum_broker_api_minor: int = SX1262_BROKER_API_MINOR,
 ) -> None:
     validate_compatibility_manifest(
-        manifest, minimum_api_minor=minimum_api_minor)
+        manifest, minimum_api_minor=minimum_api_minor,
+        minimum_broker_api_minor=minimum_broker_api_minor)
     machine = (machine or platform.machine()).lower()
     if machine not in {"aarch64", "arm64"}:
         raise RuntimeError("meshtasticd-wdg releases support ARM64 hosts only")
@@ -1207,6 +1214,7 @@ def validate_prepared_release(
     machine: str | None = None,
     glibc_version: str | None = None,
     minimum_api_minor: int = MESHTASTIC_WDG_API_MINOR,
+    minimum_broker_api_minor: int = SX1262_BROKER_API_MINOR,
     runner: Callable[..., Any] = subprocess.run,
 ) -> PreparedMeshtasticRelease:
     directory = Path(directory)
@@ -1235,11 +1243,13 @@ def validate_prepared_release(
         raise ValueError("compatibility.json is too large")
     manifest = validate_compatibility_manifest(
         _load_json(manifest_blob, COMPATIBILITY_ASSET), expected_tag=expected_tag,
-        minimum_api_minor=minimum_api_minor)
+        minimum_api_minor=minimum_api_minor,
+        minimum_broker_api_minor=minimum_broker_api_minor)
     if check_host:
         check_host_compatibility(
             manifest, machine=machine, glibc_version=glibc_version,
-            minimum_api_minor=minimum_api_minor)
+            minimum_api_minor=minimum_api_minor,
+            minimum_broker_api_minor=minimum_broker_api_minor)
     checksums_blob = (directory / CHECKSUM_ASSET).read_bytes()
     if len(checksums_blob) > MAX_CHECKSUM_BYTES:
         raise ValueError("SHA256SUMS is too large")
@@ -1510,6 +1520,7 @@ def prepare_meshtastic_release(
     machine: str | None = None,
     glibc_version: str | None = None,
     minimum_api_minor: int = MESHTASTIC_WDG_API_MINOR,
+    minimum_broker_api_minor: int = SX1262_BROKER_API_MINOR,
     runner: Callable[..., Any] = subprocess.run,
 ) -> PreparedMeshtasticRelease:
     """Download every required immutable asset and atomically stage a release."""
@@ -1527,11 +1538,13 @@ def prepare_meshtastic_release(
     manifest_blob = downloader(assets[COMPATIBILITY_ASSET], MAX_MANIFEST_BYTES)
     manifest = validate_compatibility_manifest(
         _load_json(manifest_blob, COMPATIBILITY_ASSET), expected_tag=tag,
-        minimum_api_minor=minimum_api_minor)
+        minimum_api_minor=minimum_api_minor,
+        minimum_broker_api_minor=minimum_broker_api_minor)
     if check_host:
         check_host_compatibility(
             manifest, machine=machine, glibc_version=glibc_version,
-            minimum_api_minor=minimum_api_minor)
+            minimum_api_minor=minimum_api_minor,
+            minimum_broker_api_minor=minimum_broker_api_minor)
     package_name = manifest["package"]["asset"]
     if package_name not in assets:
         raise ValueError("Release is missing the package named by compatibility.json")
@@ -1572,7 +1585,9 @@ def prepare_meshtastic_release(
                 candidate, expected_tag=tag, require_secure=require_root,
                 check_host=check_host, machine=machine,
                 glibc_version=glibc_version,
-                minimum_api_minor=minimum_api_minor, runner=runner)
+                minimum_api_minor=minimum_api_minor,
+                minimum_broker_api_minor=minimum_broker_api_minor,
+                runner=runner)
             if (cached.manifest != manifest
                     or hashlib.sha256(cached.package_path.read_bytes()).hexdigest()
                     != sums[package_name]):
@@ -1585,7 +1600,9 @@ def prepare_meshtastic_release(
             candidate, expected_tag=tag, require_secure=require_root,
             check_host=check_host, machine=machine,
             glibc_version=glibc_version,
-            minimum_api_minor=minimum_api_minor, runner=runner)
+            minimum_api_minor=minimum_api_minor,
+            minimum_broker_api_minor=minimum_broker_api_minor,
+            runner=runner)
     finally:
         if temp_dir.exists() and temp_dir.name.startswith(".prepare-"):
             for child in temp_dir.iterdir():

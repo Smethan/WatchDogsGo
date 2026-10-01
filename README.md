@@ -493,7 +493,7 @@ saved to `meshtastic_nodes.csv`, while received text is appended to
 `meshtastic_messages.log`. Node names and channel configuration come from the
 daemon; change them with a Meshtastic client.
 
-WDG 0.9.65 expects `meshtasticd-wdg` `v2.8.0-wdg.14`, broker API 1.1,
+WDG 0.9.66 expects `meshtasticd-wdg` `v2.8.0-wdg.14`, broker API 1.1,
 and WDG local API 1.1. Upgrade both components with `sudo bash setup.sh`.
 Channel/broadcast messages are
 sent with `want_ack=false` and finish at `SENT` once accepted; direct messages
@@ -842,7 +842,7 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
 ls -l /run/meshtasticd/wdg.sock
 ```
-WDG 0.9.65 requires local API 1.1 and broker API 1.1 from firmware
+WDG 0.9.66 requires local API 1.1 and broker API 1.1 from firmware
 `v2.8.0-wdg.14`. Close WDG and rerun `sudo bash setup.sh`; setup downloads the
 exact pinned five-asset release, validates its SHA-256/source metadata, migrates
 the existing identity and channels, and starts the manager before the daemon.

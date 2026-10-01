@@ -10,6 +10,17 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.66] — 2026-10-01
+
+### Fixed
+
+- Allow an exact, checksum-verified installed Meshtastic package with an older
+  broker minor revision to seed the rollback cache during an upgrade. The new
+  candidate still must satisfy broker API 1.1; only the rollback-only artifact
+  may retain its own older compatible minor revision. This lets the protected
+  transaction upgrade `v2.8.0-wdg.13` (broker API 1.0) to
+  `v2.8.0-wdg.14` without weakening candidate validation.
+
 ## [0.9.65] — 2026-10-01
 
 ### Fixed

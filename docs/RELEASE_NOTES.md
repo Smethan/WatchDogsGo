@@ -1,5 +1,21 @@
 # Smethan WatchDogsGo
 
+## 0.9.66 — Safe rollback seeding across broker API revisions — 2026-10-01
+
+- Fix the fail-closed updater gate found during the live 0.9.64-to-0.9.65
+  uConsole test. The new Meshtastic `v2.8.0-wdg.14` candidate was correctly
+  verified against broker API 1.1, but the helper also applied that new minimum
+  to the currently installed `v2.8.0-wdg.13` rollback package. It therefore
+  rejected the legitimate broker API 1.0 rollback artifact before mutation.
+- Separate candidate and rollback compatibility floors. New installations
+  still require the current WDG and broker API revisions. A rollback seed may
+  use an older minor revision only after its public assets, checksum, embedded
+  manifest, package layout, version, and every installed package-owned byte
+  match exactly. API majors remain strict.
+- The failed live attempts changed no package or service state. Setup can now
+  seed the verified v13 rollback cache, install v14, and retain the same exact
+  recovery boundary.
+
 ## 0.9.65 — Reliable SX1262 handoff and GPS acquisition telemetry — 2026-10-01
 
 - Pin the one-command setup transaction to the locally built Meshtastic

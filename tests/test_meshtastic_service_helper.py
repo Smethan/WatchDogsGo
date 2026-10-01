@@ -876,6 +876,23 @@ def test_update_seeds_exact_legacy_rollback_before_backup(tmp_path, monkeypatch)
         encoding="utf-8") == "exact"
 
 
+def test_current_rollback_release_relaxes_both_minor_floors(
+        tmp_path, monkeypatch):
+    helper = load_helper()
+    tag = "v2.8.0-wdg.13"
+    prepared = NS(tag=tag, package_version="2.8.0+wdg13")
+    validator = NS(LEGACY_ROLLBACK_RELEASES={})
+    prepare = Mock(return_value=prepared)
+    monkeypatch.setattr(helper, "CACHE_ROOT", tmp_path)
+    monkeypatch.setattr(helper, "_prepare_exact_release", prepare)
+
+    assert helper._prepare_rollback_release(tag, validator) is prepared
+    prepare.assert_called_once_with(
+        tag, validator, minimum_api_minor=helper.ROLLBACK_MINIMUM_API_MINOR,
+        minimum_broker_api_minor=(
+            helper.ROLLBACK_MINIMUM_BROKER_API_MINOR))
+
+
 def test_update_uses_broker_candidate_for_completed_managed_stack(
         tmp_path, monkeypatch):
     helper = load_helper()
@@ -1342,7 +1359,9 @@ def test_adopt_installed_validates_copy_then_seeds_only_rollback_cache(
         "health": "ready",
     }
     prepare.assert_called_once_with(
-        tag, validator, minimum_api_minor=helper.ROLLBACK_MINIMUM_API_MINOR)
+        tag, validator, minimum_api_minor=helper.ROLLBACK_MINIMUM_API_MINOR,
+        minimum_broker_api_minor=(
+            helper.ROLLBACK_MINIMUM_BROKER_API_MINOR))
     validator.validate_installed_package_payload.assert_called_once_with(
         prepared.package_path, prepared.manifest)
     candidate.assert_called_once_with(snapshot)
