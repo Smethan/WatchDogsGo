@@ -454,6 +454,15 @@ class WatchDogsGame(OtaMixin):
             pass
         pyxel.mouse(False)
 
+        # Terminal state must exist before serial, GPS, plugin, or background
+        # startup can report a diagnostic.  Plugins may start workers from
+        # on_load(), so initializing this near the end of __init__ races their
+        # first callback.
+        self.terminal_lines: list[str] = []
+        self._terminal_colors: list[int] = []
+        self.term_scroll = 0
+        self._term_lock = threading.Lock()
+
         # Load hacker character sprite into image bank 1
         self._hacker_sprite_ok = False
         self._hacker_w = 0
@@ -1142,12 +1151,6 @@ class WatchDogsGame(OtaMixin):
 
         # Quit confirm dialog
         self.confirm_quit = False
-
-        # Terminal
-        self.terminal_lines: list[str] = []
-        self._terminal_colors: list[int] = []
-        self.term_scroll = 0
-        self._term_lock = threading.Lock()
 
         # Loot GPS points (loaded from all loot sessions)
         self.loot_points: list[dict] = []
@@ -4439,12 +4442,7 @@ class WatchDogsGame(OtaMixin):
             else:
                 # Show satellite info periodically
                 if pyxel.frame_count % 60 == 0:
-                    if self.gps_sats:
-                        sat = f"Sat:{self.gps_sats}"
-                    elif self.gps_sats_vis:
-                        sat = f"Vis:{self.gps_sats_vis}"
-                    else:
-                        sat = "no satellites"
+                    sat = f"Sat:{self.gps_sats}/{self.gps_sats_vis}"
                     self.msg(f"[GPS] Waiting for fix... {sat}", C_WARNING)
             return
 
@@ -8084,11 +8082,8 @@ class WatchDogsGame(OtaMixin):
                        f"{abs(self.player_lon):.5f}{lon_c}")
             pyxel.text(W - 108, y, gps_txt, C_SUCCESS)
         elif self.gps.available:
-            if self.gps_sats_vis > 0:
-                pyxel.text(W - 120, y,
-                           f"Waiting fix Vis:{self.gps_sats_vis}", C_WARNING)
-            else:
-                pyxel.text(W - 100, y, "Waiting for GPS fix", C_ERROR)
+            pyxel.text(W - 120, y,
+                       f"Waiting fix Vis:{self.gps_sats_vis}", C_WARNING)
         else:
             pyxel.text(W - 60, y, "GPS offline", C_DIM)
 
@@ -9302,7 +9297,7 @@ class WatchDogsGame(OtaMixin):
         elif self.gps_sats_vis:
             sat = f"Visible: {self.gps_sats_vis}"
         else:
-            sat = "No satellites detected"
+            sat = "Visible: 0 (receiver sees none)"
         pyxel.text(dx + 4, dy + 18, sat, C_DIM)
         pyxel.text(dx + 4, dy + 30, "Wait for GPS fix?", C_TEXT)
         # Buttons

@@ -36,6 +36,14 @@ def configure_gpsd_defaults(text: str, device: str) -> str:
         options = []
     if "-n" not in options:
         options.append("-n")
+    # gpsd's automatic u-blox probing changes receiver message rates.  The
+    # AIO module has been observed coming back with GSV/GGA disabled after a
+    # restart, which leaves every client without satellite-view telemetry.
+    # Passive mode keeps gpsd as the sole UART owner while preserving the
+    # receiver's standard NMEA output.  Manual configuration through gpsd is
+    # still possible for the one-time recovery helper used by setup.sh.
+    if "-p" not in options:
+        options.append("-p")
     replacements = {
         "START_DAEMON": '"true"',
         "USBAUTO": '"false"',

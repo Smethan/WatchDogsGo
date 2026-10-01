@@ -344,6 +344,10 @@ class SX1262Controller(SX1262Client):
     def activate_mode(self, mode: str) -> dict[str, Any]:
         if mode not in VALID_MODES:
             raise ValueError(f"invalid SX1262 mode: {mode}")
+        # Refresh controller liveness before requesting a non-default mode.
+        # This also protects upgrades that temporarily retain a pre-v16
+        # manager, whose activation request did not itself refresh the lease.
+        self.heartbeat()
         result = self.request("activate_mode", mode=mode)
         self._active_mode = mode
         if mode in {"meshcore", "reticulum"}:

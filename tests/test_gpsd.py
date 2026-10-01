@@ -211,3 +211,10 @@ def test_app_reads_aio_power_before_opening_gps():
     setup_call = source.index("self.gps.setup()", status_read)
     assert status_read < setup_call
     assert 'GPS transport: {self.gps.device}' in source
+
+
+def test_terminal_is_initialized_before_plugins_can_start_workers():
+    source = (Path(__file__).resolve().parents[1] / "watchdogs" / "app.py").read_text()
+    terminal_lock = source.index("self._term_lock = threading.Lock()")
+    plugins = source.index("self._plugins = discover_plugins()")
+    assert terminal_lock < plugins

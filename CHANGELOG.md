@@ -10,6 +10,31 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.69] — 2026-10-01
+
+### Fixed
+
+- Treat every authenticated broker controller command as proof that WDG is
+  alive, preventing an older heartbeat timestamp from revoking a newly
+  activated MeshCore or Reticulum lease during PHY setup.
+- Send an explicit heartbeat immediately before WDG requests a mode change,
+  providing the same protection while upgrading from the previous broker.
+- Run managed gpsd in passive mode and restore the standard u-blox NMEA set
+  through gpsd during setup. This prevents gpsd autoconfiguration from
+  suppressing the AIO receiver's GGA/GSV satellite telemetry while preserving
+  gpsd as the sole UART owner.
+- Initialize terminal synchronization before plugin startup so an immediate
+  background plugin diagnostic cannot race `_term_lock`.
+
+### Changed
+
+- Pin setup to the locally built `v2.8.0-wdg.16` ARM64 package. Its broker
+  conformance test now ages the controller past the five-second timeout before
+  activation and verifies that the activation refreshes the lease.
+- Display `Vis:0` explicitly for a connected no-fix receiver, install the
+  bounded gpsd diagnostic helpers needed by setup, and reject a running WDG
+  process before setup mutates gpsd or system services.
+
 ## [0.9.68] — 2026-10-01
 
 ### Fixed

@@ -1,6 +1,6 @@
 # Meshtastic and Unified SX1262 Service
 
-WatchDogsGo 0.9.68 uses one persistent hardware manager for the AIO v2
+WatchDogsGo 0.9.69 uses one persistent hardware manager for the AIO v2
 SX1262. The manager, `watchdogs-sx1262d`, is the only process allowed to open
 the SPI device, claim the radio GPIO lines, reset the chip, configure the RF
 switch, or change the LoRa power rail.
@@ -20,7 +20,7 @@ power, bounded PHY settings, CAD, RX, TX, metrics, and exclusive leases.
 
 ## Release pairing
 
-WDG 0.9.68 is pinned to `v2.8.0-wdg.15` from
+WDG 0.9.69 is pinned to `v2.8.0-wdg.16` from
 [`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware).
 The checked-in `meshtastic-stack.json` records the exact package filename,
 SHA-256, source commit, ARM64 architecture, broker API 1.1, and WDG local API
@@ -28,8 +28,8 @@ SHA-256, source commit, ARM64 architecture, broker API 1.1, and WDG local API
 size, checksum, architecture, API, or package layout differs from that record.
 The ARM64 Debian package is built locally and published as a release artifact;
 setup does not compile it on the uConsole or invoke a GitHub firmware build.
-The candidate is source commit `c16a74c6a` with package SHA-256
-`de0cdda4d6568c1f9c26acc360dfad5d305941a19be701d2a533d35e4fd50eb3`.
+The candidate is source commit `ead1df274` with package SHA-256
+`d5a5bd00cabe8c37d323353daa80e490df40b46d180fbc457ddae33dcb2b0443`.
 
 This release is a physical uConsole acceptance candidate. Automated tests and
 the fake-radio conformance suite pass, but real SX1262, Bluetooth, GPS, and
@@ -180,6 +180,14 @@ data-flow, valid-fix, stale-fix, explicit no-fix, and disconnected states are
 tracked separately. A valid TPV is fresh for at most five seconds, but a newer
 explicit `mode < 2` report invalidates it immediately. No stale fix survives a
 transport reconnect.
+
+Setup adds gpsd passive mode (`-p`) so gpsd cannot autoconfigure the AIO
+receiver into a reduced message set that omits GGA/GSV satellite telemetry.
+For an already affected u-blox stream, setup uses `ubxtool` through gpsd to
+restore the standard NMEA messages; it never opens the UART directly. The HUD
+shows the visible count even when it is zero. `Vis:0` with fresh TPV/SKY data
+means the receiver is connected but currently sees no satellites; it is not
+reported as a transport failure or fabricated into a fix.
 
 Radio mode changes do not restart gpsd, change WDG's provider, reconnect
 Meshtastic's gpsd client, or clear WDG's current fix.

@@ -175,6 +175,22 @@ def test_controller_validates_modes_without_contacting_broker():
         controller.activate_mode("invalid")
 
 
+def test_controller_refreshes_heartbeat_before_mode_activation():
+    sock = FakeSocket([
+        hello_response(),
+        response(2),
+        response(3, {"target_mode": "meshtastic"}),
+    ])
+    controller = SX1262Controller(socket_factory=lambda *_: sock)
+    controller.connect()
+
+    result = controller.activate_mode("meshtastic")
+
+    assert result == {"target_mode": "meshtastic"}
+    assert [message["op"] for message in sock.sent[1:]] == [
+        "heartbeat", "activate_mode"]
+
+
 def test_controller_waits_for_confirmed_power_off(monkeypatch):
     sock = FakeSocket([
         hello_response(),

@@ -1,5 +1,32 @@
 # Smethan WatchDogsGo
 
+## 0.9.69 — Controller liveness at activation — 2026-10-01
+
+- Fix the second rapid-handoff failure found by the target uConsole stress
+  test. Repeated short MeshCore sessions stopped WDG's one-second heartbeat
+  worker before its first tick. After five seconds, `activate_mode` could
+  prove WDG was alive without refreshing the broker's older heartbeat
+  timestamp, causing an immediate fallback while MeshCore configured its PHY.
+- The broker now refreshes controller liveness for every authenticated
+  controller operation, including activation, release, power, and heartbeat
+  commands. WDG also sends an explicit heartbeat before activation so the
+  upgrade is safe while the previously installed manager is still running.
+- Add a broker regression that intentionally lets the original heartbeat age
+  past five seconds, then activates and configures MeshCore. Pin setup to the
+  locally built Meshtastic `v2.8.0-wdg.16` ARM64 release from source commit
+  `ead1df274` at SHA-256
+  `d5a5bd00cabe8c37d323353daa80e490df40b46d180fbc457ddae33dcb2b0443`.
+- Stop gpsd from rewriting the AIO receiver's message rates. Setup now uses
+  passive mode and, when gpsd identifies an already affected u-blox stream,
+  restores standard NMEA output through gpsd without adding a second UART
+  reader. This restores GGA/GSV satellite telemetry across service restarts.
+- Show the satellite-view count while a fix is pending even when it is zero,
+  so a live receiver with no RF view is distinct from a disconnected gpsd
+  transport. Also initialize terminal synchronization before plugin workers;
+  the wardrive-upload startup callback can no longer race `_term_lock`.
+- Refuse setup while WDG is running before apt, gpsd, or service changes, rather
+  than restarting gpsd first and rejecting the radio transaction later.
+
 ## 0.9.68 — Connection-bound SX1262 leases — 2026-10-01
 
 - Fix the intermittent rapid MeshCore re-acquisition failure found by the

@@ -21,7 +21,7 @@ def test_gpsd_defaults_are_owned_without_losing_unrelated_options():
     assert 'START_DAEMON="true"' in result
     assert 'USBAUTO="false"' in result
     assert 'DEVICES="/dev/serial0"' in result
-    assert 'GPSD_OPTIONS="-G -n"' in result
+    assert 'GPSD_OPTIONS="-G -n -p"' in result
     assert 'OTHER="keep"' in result
     assert configure_gpsd_defaults(result, "/dev/serial0") == result
 
@@ -70,6 +70,16 @@ def test_helper_writes_backups_marker_and_is_idempotent(tmp_path):
 def test_setup_installs_and_configures_gpsd():
     setup = (ROOT / "setup.sh").read_text()
     assert "gpsd                              # one shared reader" in setup
+    assert "gpsd-tools" in setup
+    assert "python3-gps" in setup
     assert "scripts/configure_shared_gps.py" in setup
+    assert "scripts/restore_aio_gps_output.py" in setup
     assert "WDG_ENABLE_SHARED_GPSD" in setup
     assert "systemctl restart gpsd.service" in setup
+
+
+def test_setup_refuses_running_wdg_before_gpsd_mutation():
+    setup = (ROOT / "setup.sh").read_text()
+    running_guard = setup.index("close it before setup changes services")
+    gpsd_mutation = setup.index("scripts/configure_shared_gps.py")
+    assert running_guard < gpsd_mutation

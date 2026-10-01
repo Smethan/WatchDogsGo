@@ -139,6 +139,15 @@ if ! repair_checkout_ownership; then
     exit 1
 fi
 
+# Refuse before apt, gpsd, or any service mutation.  An older placement near
+# the radio transaction allowed setup to restart gpsd underneath a running WDG
+# process and only then report that WDG had to be closed.
+if [[ "$(uname)" == "Linux" ]] && \
+   pgrep -f '[p]ython[0-9.]* -m watchdogs([[:space:]]|$)' >/dev/null 2>&1; then
+    fail "WatchDogsGo is running; close it before setup changes services"
+    exit 1
+fi
+
 # --- 0. Internet connectivity ---
 echo "[0/8] Checking internet connectivity..."
 if ping -c 1 -W 3 github.com &>/dev/null || ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
@@ -208,6 +217,8 @@ if command -v apt-get &>/dev/null; then
     RPI_PKGS=(
         raspi-utils                       # provides pinctrl
         gpsd                              # one shared reader for the AIO GPS UART
+        gpsd-tools                        # bounded receiver recovery through gpsd
+        python3-gps                       # ubxtool runtime used by that recovery
     )
 
     SYS_PKGS=("${CORE_PKGS[@]}")
@@ -344,6 +355,12 @@ if [[ "$(uname)" == "Linux" ]]; then
             if sudo systemctl enable gpsd.socket >>"$APT_LOG" 2>&1 && \
                sudo systemctl restart gpsd.socket >>"$APT_LOG" 2>&1 && \
                sudo systemctl restart gpsd.service >>"$APT_LOG" 2>&1; then
+                if sudo python3 "$SCRIPT_DIR/scripts/restore_aio_gps_output.py" \
+                        --device /dev/serial0 >>"$APT_LOG" 2>&1; then
+                    ok "AIO GPS standard satellite output verified through gpsd"
+                else
+                    warn "AIO GPS output recovery was not confirmed (see $APT_LOG)"
+                fi
                 ok "gpsd owns /dev/serial0; WDG and Meshtastic share its fixes"
                 for unit in meshtasticd.service meshtasticd-wdg.service; do
                     if systemctl is-active --quiet "$unit" 2>/dev/null; then
@@ -503,11 +520,6 @@ ok "Data directories ready (loot, maps, plugins, firmware_cache)"
 # Install/update the complete radio stack here. There is no separate in-app
 # package download or adoption step.
 if [[ "$(uname)" == "Linux" ]]; then
-    if pgrep -f '[p]ython[0-9.]* -m watchdogs([[:space:]]|$)' \
-            >/dev/null 2>&1; then
-        fail "WatchDogsGo is running; close it before updating the radio stack"
-        exit 1
-    fi
     info "Preparing the unified Meshtastic/SX1262 stack transaction..."
     if sudo bash "$SCRIPT_DIR/scripts/setup_meshtastic.sh" \
             --install-support "$TARGET_USER" "$TARGET_UID"; then
