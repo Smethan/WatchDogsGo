@@ -10,6 +10,32 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.65] — 2026-10-01
+
+### Fixed
+
+- Pin the unified radio stack to the locally built Meshtastic
+  `v2.8.0-wdg.14` ARM64 package and broker API 1.1. The manager now performs
+  complete SX1262/LoRa and board reinitialization after every hardware reset
+  and before granting the next lease, preventing MeshCore startup from failing
+  with RadioLib `RADIOLIB_ERR_WRONG_MODEM` (`-20`).
+- Keep WDG in a pending transition state until the MeshCore broker lease is
+  granted, its PHY is configured, and receive mode is running. An accepted
+  mode request alone is no longer reported as radio ownership.
+- Give Force OFF up to two seconds for protocol and Bluetooth quiescence before
+  forcing the rail low. WDG waits for confirmed manager read-back instead of
+  treating the administrative request as completed immediately.
+- Add GPS acquisition diagnostics for gpsd transport, TPV/SKY ages, visible
+  and used satellites, first-fix timing, reconnects, provider changes, and
+  observed rail state. Managed `gpsd` ownership, provider precedence, and
+  five-second fix freshness behavior are unchanged.
+
+### Changed
+
+- Keep `sudo bash setup.sh` as the only supported install/update path. It
+  validates and installs the exact locally built `v2.8.0-wdg.14` release;
+  neither the uConsole nor GitHub Actions builds Meshtastic during setup.
+
 ## [0.9.64] — 2026-09-30
 
 ### Fixed

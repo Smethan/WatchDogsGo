@@ -507,6 +507,7 @@ class WatchDogsGame(OtaMixin):
             _aio_st = AioManager.get_status() or {}
             self._usb_enabled = _aio_st.get("usb", False)
             self._gps_enabled = _aio_st.get("gps", False)
+            self.gps.note_power_state(self._gps_enabled)
             self._lora_enabled = _aio_st.get("lora", False)
             self._sdr_enabled = _aio_st.get("sdr", False)
             if not self._usb_enabled:
@@ -3168,6 +3169,7 @@ class WatchDogsGame(OtaMixin):
             if not ok:
                 self.msg("[GPS] GPIO toggle failed", C_ERROR)
                 return
+            self.gps.note_power_state(new_state)
         if new_state:
             # Enable GPS — re-open serial
             if not self.gps.available:

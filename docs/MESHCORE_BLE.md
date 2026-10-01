@@ -22,8 +22,10 @@ This feature is opt-in and disabled on upgrades.
    only connected device when it subscribes to notifications.
 7. Set **MeshMapper companion BLE** to `ON`.
 8. Open **ADDONS > Mesh Messenger**, or enable **Automatic LoRa collector** and
-   start All Wardrive. The settings page should progress from `STARTING` to
-   `READY` and show its resolved `hci` controller.
+   start All Wardrive. The settings page should progress through the manager
+   transition, generation lease, PHY configuration, and RX startup before it
+   reports `READY` and shows its resolved `hci` controller. An accepted mode
+   request alone is not treated as radio ownership.
 
 The BLE peripheral exists only while WDG's MeshCore backend is running. It is
 removed before the MeshCore lease is released during protocol handoff,
@@ -102,12 +104,13 @@ rule:
 - A paused host scan is automatically eligible for retry after the companion
   peripheral stops. Wi-Fi and the other All Wardrive collectors continue.
 
-Meshtastic phone BLE does not run at the same time: selecting direct MeshCore
-stops the Meshtastic daemon according to the existing exact service-state
-handoff rules. The two backends nevertheless share one random-PIN bond when
-they use the same controller. On the next Meshtastic connection, WDG verifies
-that exact controller/device pair and asks the daemon to adopt it without
-opening another pairing window.
+Meshtastic phone BLE does not run at the same time. Selecting MeshCore asks the
+persistent manager to quiesce Meshtastic's radio/Bluetooth frontend and grant a
+new generation lease; `meshtasticd-wdg` remains running with its identity and
+NodeDB intact. The two frontends share one random-PIN bond when they use the
+same controller. On the next Meshtastic activation, WDG verifies that exact
+controller/device pair and the daemon re-exposes only its own GATT frontend
+without opening another pairing window.
 
 WDG also serializes temporary BlueZ pairing-agent ownership. A MeshMapper
 window, PipBoy-watch pairing, and the Meshtastic daemon's pairing agent cannot

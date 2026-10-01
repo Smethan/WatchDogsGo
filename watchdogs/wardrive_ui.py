@@ -2665,8 +2665,17 @@ class WardriveUI:
                     "MeshMapper" if sx_state == "MESHCORE" else "none")
                 gps = getattr(self.app, "gps", None)
                 gps_provider = str(getattr(gps, "provider", "") or "none")
-                gps_age = max(0.0, time.monotonic() - float(
-                    getattr(gps, "_last_data_at", 0.0) or 0.0))
+                gps_diag = (
+                    gps.diagnostics_snapshot() if gps is not None and
+                    hasattr(gps, "diagnostics_snapshot") else {})
+
+                def _gps_age(value):
+                    return "n/a" if value is None else f"{float(value):.1f}s"
+
+                gps_power = gps_diag.get("power_enabled")
+                gps_power_state = (
+                    "unknown" if gps_power is None
+                    else "on" if gps_power else "off")
                 px.text(55,198,
                         (f"Manager: {sx_state} power:{sx_power} v{broker_version} "
                          f"lease:{lease_age}ms")[:100],13)
@@ -2692,10 +2701,15 @@ class WardriveUI:
                     px.text(55,240,
                             ("Last error: " + manager.last_error)[:100],8)
                 px.text(55,264,
-                        (f"GPS: {gps_provider} report age:{gps_age:.1f}s  "
+                        (f"GPS: {gps_provider} report:{_gps_age(gps_diag.get('report_age'))} "
                          f"state:{getattr(gps, 'navigation_state', 'unknown')}")[:100],10)
                 px.text(55,276,
-                        "A connected phone has priority on a shared controller.",10)
+                        (f"TPV:{_gps_age(gps_diag.get('tpv_age'))} "
+                         f"SKY:{_gps_age(gps_diag.get('sky_age'))} "
+                         f"sats:{gps_diag.get('satellites_used', 0)}/"
+                         f"{gps_diag.get('satellites_visible', 0)} "
+                         f"pwr:{gps_power_state}@"
+                         f"{_gps_age(gps_diag.get('power_observed_age'))}")[:100],10)
                 px.text(55,288,
                         "Install and update the stack only with sudo bash setup.sh",10)
                 px.text(55,300,"ESC returns   TAB closes settings",10)

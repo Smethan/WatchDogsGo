@@ -60,6 +60,7 @@ class BrokerLoRa:
         self._tx_payload = bytearray()
         self._tx_pending = False
         self._lease_ready = False
+        self._rx_started = False
         self._revoking = False
         self._last_metrics: dict[str, Any] = {}
 
@@ -85,6 +86,7 @@ class BrokerLoRa:
     def close(self) -> None:
         self.client.close()
         self._lease_ready = False
+        self._rx_started = False
         self._configured = False
 
     def end(self) -> None:
@@ -170,7 +172,13 @@ class BrokerLoRa:
         self._apply_configuration()
         self.client.start_rx()
         self._rx_continuous = mode == self.RX_CONTINUOUS
+        self._rx_started = True
         return True
+
+    @property
+    def ready(self) -> bool:
+        """Whether the granted lease has a configured, receiving PHY."""
+        return self._lease_ready and self._configured and self._rx_started
 
     def getIrqStatus(self) -> int:
         try:
@@ -303,8 +311,10 @@ class BrokerLoRa:
                 self._revoking = False
             elif name == "prepare_revoke":
                 self._revoking = True
+                self._rx_started = False
             elif name == "lease_revoked":
                 self._lease_ready = False
+                self._rx_started = False
             elif name == "rx_packet":
                 if len(self._packets) == self._packets.maxlen:
                     self._packets.popleft()
@@ -320,6 +330,7 @@ class BrokerLoRa:
                 self._irq |= self.IRQ_TIMEOUT
             elif name in {"radio_fault", "power_changed"}:
                 self._lease_ready = False
+                self._rx_started = False
 
 
 __all__ = ["BrokerLoRa"]

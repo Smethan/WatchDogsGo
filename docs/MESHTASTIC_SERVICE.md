@@ -1,6 +1,6 @@
 # Meshtastic and Unified SX1262 Service
 
-WatchDogsGo 0.9.64 uses one persistent hardware manager for the AIO v2
+WatchDogsGo 0.9.65 uses one persistent hardware manager for the AIO v2
 SX1262. The manager, `watchdogs-sx1262d`, is the only process allowed to open
 the SPI device, claim the radio GPIO lines, reset the chip, configure the RF
 switch, or change the LoRa power rail.
@@ -20,12 +20,16 @@ power, bounded PHY settings, CAD, RX, TX, metrics, and exclusive leases.
 
 ## Release pairing
 
-WDG 0.9.64 is pinned to `v2.8.0-wdg.13` from
+WDG 0.9.65 is pinned to `v2.8.0-wdg.14` from
 [`Smethan/meshtastic-firmware`](https://github.com/Smethan/meshtastic-firmware).
 The checked-in `meshtastic-stack.json` records the exact package filename,
-SHA-256, source commit, ARM64 architecture, broker API 1.0, and WDG local API
+SHA-256, source commit, ARM64 architecture, broker API 1.1, and WDG local API
 1.1. Setup refuses a package whose release metadata, embedded manifest, source,
 size, checksum, architecture, API, or package layout differs from that record.
+The ARM64 Debian package is built locally and published as a release artifact;
+setup does not compile it on the uConsole or invoke a GitHub firmware build.
+The candidate is source commit `c6aa18a6a` with package SHA-256
+`1c1789332da9b4835d593b2d4232ab8f8d310eb604bacf755e33b96fea91f7ee`.
 
 This release is a physical uConsole acceptance candidate. Automated tests and
 the fake-radio conformance suite pass, but real SX1262, Bluetooth, GPS, and
@@ -102,13 +106,19 @@ returns to Meshtastic.
 Every request includes the current ownership generation. A delayed request
 from a revoked mode is rejected before it can touch reconfigured hardware.
 Mode changes quiesce the old protocol and its Bluetooth frontend, finish or
-bound any in-flight TX, reset the chip, apply the new PHY, grant the new lease,
-and only then expose the new frontend.
+bound any in-flight TX, and reset the chip. Because a reset clears the SX1262
+packet type, broker API 1.1 then performs complete LoRa, TCXO, regulator,
+current-limit, and RF-switch initialization before granting the new generation.
+The active client applies its bounded PHY configuration and starts RX before
+WDG reports the protocol ready or exposes its Bluetooth frontend. An
+initialization failure enters `FAULT` and grants no lease.
 
 SYSTEM LoRa power controls are administrative manager commands:
 
-- **Force OFF** rejects new TX, performs bounded cleanup, resets/sleeps the
-  chip, drives the rail low, persists OFF, and suppresses all fallback/GATT.
+- **Force OFF** rejects new TX immediately and gives the active protocol up to
+  two seconds to quiesce its worker and Bluetooth frontend. It then
+  resets/sleeps the chip, drives the rail low, persists OFF, and suppresses all
+  fallback/GATT. WDG waits for confirmed `OFF` and rail-low read-back.
 - **Force ON** raises the rail, waits for stabilization, probes the chip, and
   activates WDG's selected protocol when WDG has a live controller session;
   otherwise it activates Meshtastic.
@@ -173,6 +183,15 @@ transport reconnect.
 
 Radio mode changes do not restart gpsd, change WDG's provider, reconnect
 Meshtastic's gpsd client, or clear WDG's current fix.
+
+WDG's diagnostic snapshot tracks independent report, TPV, and SKY ages;
+visible and used satellite counts; first SKY/satellite/fix timing; reconnect
+and provider-change counters; and the last observed GPS rail state. The LoRa
+health screen shows the current report/TPV/SKY ages, satellite counts,
+navigation state, and power-observation age. Missing reports display as `n/a`,
+allowing a cold satellite acquisition to be distinguished from a disconnected
+gpsd transport. These are telemetry changes only: WDG does not automatically
+cycle GPS power or alter provider/fix-freshness behavior.
 
 ## Verification and troubleshooting
 

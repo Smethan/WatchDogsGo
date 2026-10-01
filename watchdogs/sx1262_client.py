@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 
 API_MAJOR = 1
-API_MINOR = 0
+API_MINOR = 1
 DEFAULT_SOCKET = "/run/watchdogs/sx1262d.sock"
 MAX_PACKET = 4096
 MAX_LORA_PAYLOAD = 255
@@ -336,7 +336,23 @@ class SX1262Controller(SX1262Client):
     def admin_power_off(self) -> dict[str, Any]:
         self._stop_heartbeat()
         self._active_mode = None
-        return self.request("admin_power_off")
+        result = self.request("admin_power_off")
+        if not bool(result.get("pending")):
+            return result
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            status = self.get_status()
+            if (str(status.get("state")) == "OFF"
+                    and bool(status.get("forced_off"))
+                    and not bool(status.get("power"))):
+                return status
+            if str(status.get("state")) == "FAULT":
+                raise BrokerError(
+                    "radio_fault: " + str(status.get("fault") or
+                                           "power-off failed"))
+            time.sleep(0.05)
+        raise BrokerError(
+            "power_transition: SX1262 manager did not confirm OFF state")
 
     def admin_power_on(self, preferred_mode: str | None = None) -> dict[str, Any]:
         arguments: dict[str, Any] = {}

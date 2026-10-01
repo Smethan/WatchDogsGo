@@ -310,7 +310,8 @@ class LoRaManager:
         self._radio_ownership = radio_ownership
         self._service_handoff = None
         self._sx1262 = sx1262_controller or SX1262Controller()
-        self._broker_session_active = False
+        self._broker_mode_requested = False
+        self._broker_radio = None
         self._operation_guard = operation_guard
         # True only while MeshtasticManager retains the exact pre-suspension
         # snapshot.  The direct-radio layer never reconstructs service state
@@ -371,8 +372,9 @@ class LoRaManager:
 
     @property
     def radio_owned(self) -> bool:
-        """Whether this worker currently holds a manager protocol lease."""
-        return self._broker_session_active
+        """Whether the broker lease has a configured, receiving PHY."""
+        radio = self._broker_radio
+        return bool(radio is not None and getattr(radio, "ready", False))
 
     @property
     def worker_active(self) -> bool:
@@ -483,7 +485,7 @@ class LoRaManager:
             return None
         try:
             self._sx1262.activate_mode("meshcore")
-            self._broker_session_active = True
+            self._broker_mode_requested = True
         except BrokerError as exc:
             self._emit(
                 "Could not obtain the SX1262 manager lease: "
@@ -495,6 +497,8 @@ class LoRaManager:
         lora = self._init_radio()
         if lora is None:
             self._cleanup_radio(None)
+        else:
+            self._broker_radio = lora
         return lora
 
     def _close_radio_resources(self, lora) -> bool:
@@ -1956,7 +1960,7 @@ class LoRaManager:
     def _cleanup_radio(self, lora) -> None:
         """Quiesce the protocol client and return ownership to Meshtastic."""
         try:
-            if self._broker_session_active:
+            if self._broker_mode_requested:
                 self._sx1262.release_mode()
                 if lora is not None and not lora.acknowledge_revoke():
                     self._emit(
@@ -1969,7 +1973,8 @@ class LoRaManager:
                 + str(exc)[:120], "error")
             log.exception("Failed to release SX1262 manager lease")
         finally:
-            self._broker_session_active = False
+            self._broker_mode_requested = False
+            self._broker_radio = None
             self.running = False
 
     # ------------------------------------------------------------------
@@ -2006,7 +2011,7 @@ class LoRaManager:
                 cleanup_pending = self._companion_cleanup_pending
             if cleanup_pending and not self._stop_meshcore_companion():
                 return False
-            if self._broker_session_active:
+            if self._broker_mode_requested:
                 self._emit(
                     "LoRa worker stopped but its manager lease is still active",
                     "error")

@@ -1,5 +1,41 @@
 # Smethan WatchDogsGo
 
+## 0.9.65 — Reliable SX1262 handoff and GPS acquisition telemetry — 2026-10-01
+
+- Pin the one-command setup transaction to the locally built Meshtastic
+  `v2.8.0-wdg.14` ARM64 package and broker API 1.1. The published package is
+  installed as an artifact; setup does not build Meshtastic on the uConsole or
+  invoke the long GitHub firmware build. It was built from source commit
+  `c6aa18a6a` and is pinned at SHA-256
+  `1c1789332da9b4835d593b2d4232ab8f8d310eb604bacf755e33b96fea91f7ee`.
+- Fix the MeshCore handoff reproduced on the target uConsole. A physical
+  SX1262 reset clears its packet type, but the old transition granted the next
+  lease before restoring LoRa mode and the board configuration. MeshCore's
+  first PHY request therefore failed with RadioLib
+  `RADIOLIB_ERR_WRONG_MODEM` (`-20`). The manager now completes SX1262, TCXO,
+  regulator, current-limit, and RF-switch initialization before lease grant;
+  an initialization failure enters `FAULT` without exposing a protocol lease.
+- Keep WDG's mode status non-optimistic. A controller request may be pending,
+  but MeshCore is owned/ready only after its generation lease, PHY
+  configuration, and RX startup succeed. Partial startup is cleaned up before
+  Meshtastic fallback.
+- Make Force OFF a bounded transition: new TX is rejected immediately, the
+  active protocol gets up to two seconds to remove its Bluetooth frontend and
+  quiesce, and WDG waits for confirmed `OFF`/rail-low read-back. A late reply
+  from the revoked generation is harmless.
+- Add acquisition-focused GPS diagnostics: independent report, TPV, and SKY
+  ages; visible/used satellite counts; first SKY/satellite/fix timing;
+  reconnect/provider counters; and observed power-rail age. This addresses the
+  misleading appearance of a broken GPS during a several-minute cold start,
+  especially when power was toggled during acquisition. `gpsd` remains the
+  sole UART reader and no provider, fallback, or fix-freshness policy changed.
+
+The fake radio now models reset-induced modem loss so a transition that omits
+reinitialization fails in automated coverage. Physical release acceptance
+still requires repeated three-mode transitions, real MeshCore traffic,
+exclusive GATT behavior, Force OFF/ON, and a clear-sky GPS acquisition run on
+the uConsole.
+
 ## 0.9.64 — Safe broker-to-broker upgrades — 2026-09-30
 
 - Fix the protected updater's classification of an already-managed broker

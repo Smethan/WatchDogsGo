@@ -95,11 +95,21 @@ class GpsManager:
         self._gpsd_stop = threading.Event()
         self._gpsd_thread: threading.Thread | None = None
         self.transport_connected = False
+        self.transport_connected_at = 0.0
+        self.last_report_at = 0.0
         self.last_tpv_at = 0.0
+        self.last_sky_at = 0.0
+        self.first_sky_at = 0.0
+        self.first_satellites_at = 0.0
+        self.first_valid_fix_at = 0.0
         self.last_valid_fix_at = 0.0
+        self.last_tpv_mode = 0
         self.socket_disconnects = 0
         self.reconnects = 0
         self.provider_changes = 0
+        self.power_enabled: bool | None = None
+        self.power_observed_at = 0.0
+        self._last_logged_navigation_state = ""
 
     @property
     def available(self) -> bool:
@@ -126,7 +136,49 @@ class GpsManager:
         if fix_valid:
             return ("valid_fix" if now - fix_received_at <= 5.0
                     else "fix_temporarily_stale")
-        return "explicit_no_fix"
+        if self.last_tpv_at:
+            return "explicit_no_fix"
+        if self.last_sky_at:
+            return "acquiring"
+        return "data_flowing"
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Return a stable acquisition/transport snapshot for UI and logs."""
+        now = time.monotonic()
+
+        def age(timestamp: float) -> float | None:
+            return max(0.0, now - timestamp) if timestamp else None
+
+        fix = self.snapshot()
+        return {
+            "provider": self.provider,
+            "navigation_state": self.navigation_state,
+            "transport_connected": self.transport_connected,
+            "transport_age": age(self.transport_connected_at),
+            "report_age": age(self.last_report_at),
+            "tpv_age": age(self.last_tpv_at),
+            "sky_age": age(self.last_sky_at),
+            "first_sky_after": (
+                self.first_sky_at - self.transport_connected_at
+                if self.first_sky_at and self.transport_connected_at else None),
+            "first_satellites_after": (
+                self.first_satellites_at - self.transport_connected_at
+                if self.first_satellites_at and self.transport_connected_at
+                else None),
+            "first_fix_after": (
+                self.first_valid_fix_at - self.transport_connected_at
+                if self.first_valid_fix_at and self.transport_connected_at
+                else None),
+            "last_valid_fix_age": age(self.last_valid_fix_at),
+            "satellites_visible": fix.satellites_visible,
+            "satellites_used": fix.satellites,
+            "last_tpv_mode": self.last_tpv_mode,
+            "socket_disconnects": self.socket_disconnects,
+            "reconnects": self.reconnects,
+            "provider_changes": self.provider_changes,
+            "power_enabled": self.power_enabled,
+            "power_observed_age": age(self.power_observed_at),
+        }
 
     def snapshot(self) -> GpsFix:
         """Atomically copy the latest navigation snapshot for the UI thread."""
@@ -136,8 +188,50 @@ class GpsManager:
     def _set_provider(self, provider: str, device: str) -> None:
         if provider != self.provider:
             self.provider_changes += 1
+            log.info("GPS provider changed: %s -> %s",
+                     self.provider or "none", provider or "none")
         self.provider = provider
         self.device = device
+
+    def note_power_state(self, enabled: bool) -> None:
+        """Record an observed AIO rail state without manipulating hardware."""
+        enabled = bool(enabled)
+        if self.power_enabled is enabled:
+            return
+        self.power_enabled = enabled
+        self.power_observed_at = time.monotonic()
+        log.info("GPS power rail observed %s", "ON" if enabled else "OFF")
+
+    def _mark_transport_connected(self) -> None:
+        now = time.monotonic()
+        self.transport_connected = True
+        self.transport_connected_at = now
+        self.last_report_at = 0.0
+        self.last_tpv_at = 0.0
+        self.last_sky_at = 0.0
+        self.first_sky_at = 0.0
+        self.first_satellites_at = 0.0
+        self.first_valid_fix_at = 0.0
+        self.last_valid_fix_at = 0.0
+        self.last_tpv_mode = 0
+        self._last_data_at = 0.0
+        self._last_logged_navigation_state = ""
+        with self._fix_lock:
+            self.fix.valid = False
+            self.fix.received_at = 0.0
+            self.fix.satellites = 0
+            self.fix.satellites_visible = 0
+
+    def _log_navigation_transition(self) -> None:
+        state = self.navigation_state
+        if state == self._last_logged_navigation_state:
+            return
+        self._last_logged_navigation_state = state
+        fix = self.snapshot()
+        log.info(
+            "GPS state=%s provider=%s visible=%d used=%d tpv_mode=%d",
+            state, self.provider or "none", fix.satellites_visible,
+            fix.satellites, self.last_tpv_mode)
 
     @staticmethod
     def _load_gpsd_config(path: Path) -> dict[str, str]:
@@ -264,7 +358,7 @@ class GpsManager:
             return False
         self._gpsd = client
         self._available = True
-        self.transport_connected = True
+        self._mark_transport_connected()
         self._set_provider(
             "gpsd", f"gpsd {self._gpsd_host}:{self._gpsd_port}")
         self.status_reason = "gpsd connected; waiting for GPS data"
@@ -515,9 +609,20 @@ class GpsManager:
         self.transport_connected = False
         self._set_provider("", self._configured_device)
         self._last_data_at = 0.0
+        self.transport_connected_at = 0.0
+        self.last_report_at = 0.0
+        self.last_tpv_at = 0.0
+        self.last_sky_at = 0.0
+        self.first_sky_at = 0.0
+        self.first_satellites_at = 0.0
+        self.first_valid_fix_at = 0.0
+        self.last_valid_fix_at = 0.0
+        self.last_tpv_mode = 0
         with self._fix_lock:
             self.fix.valid = False
             self.fix.received_at = 0.0
+            self.fix.satellites = 0
+            self.fix.satellites_visible = 0
 
     @property
     def fd(self) -> int:
@@ -576,6 +681,9 @@ class GpsManager:
             with self._fix_lock:
                 self.fix.valid = False
                 self.fix.received_at = 0.0
+                self.fix.satellites = 0
+                self.fix.satellites_visible = 0
+            self._log_navigation_transition()
             return
 
         self._consume_gpsd_reports(reports)
@@ -591,12 +699,15 @@ class GpsManager:
                 elif report_class == "SKY":
                     saw_navigation = self._parse_gpsd_sky(report) or saw_navigation
         if saw_navigation:
-            self._last_data_at = time.monotonic()
+            now = time.monotonic()
+            self._last_data_at = now
+            self.last_report_at = now
             self.status_reason = (
                 "GPS fix acquired" if self.fix.valid
                 else "GPS data flowing; waiting for satellite fix")
         elif not self.data_flowing:
             self.status_reason = "gpsd connected; waiting for GPS data"
+        self._log_navigation_transition()
 
     def _start_gpsd_reader(self) -> None:
         thread = self._gpsd_thread
@@ -629,7 +740,7 @@ class GpsManager:
                     continue
                 self._gpsd = candidate
                 self._available = True
-                self.transport_connected = True
+                self._mark_transport_connected()
                 self.reconnects += 1
                 backoff = 0.5
                 self.status_reason = "gpsd reconnected; waiting for GPS data"
@@ -652,6 +763,7 @@ class GpsManager:
             mode = int(report.get("mode", 0))
         except (TypeError, ValueError):
             mode = 0
+        self.last_tpv_mode = mode
         lat = self._finite_number(report.get("lat"))
         lon = self._finite_number(report.get("lon"))
         self.fix.valid = bool(mode >= 2 and lat is not None and lon is not None)
@@ -672,16 +784,24 @@ class GpsManager:
         self.fix.fix_quality = 1 if self.fix.valid else 0
         self.fix.received_at = now
         if self.fix.valid:
+            if not self.first_valid_fix_at:
+                self.first_valid_fix_at = now
             self.last_valid_fix_at = now
         return True
 
     def _parse_gpsd_sky(self, report: dict) -> bool:
+        now = time.monotonic()
+        self.last_sky_at = now
+        if not self.first_sky_at:
+            self.first_sky_at = now
         satellites = report.get("satellites")
         if isinstance(satellites, list):
             self.fix.satellites_visible = len(satellites)
             self.fix.satellites = sum(
                 1 for satellite in satellites
                 if isinstance(satellite, dict) and satellite.get("used") is True)
+            if self.fix.satellites_visible and not self.first_satellites_at:
+                self.first_satellites_at = now
         hdop = self._finite_number(report.get("hdop"))
         if hdop is not None:
             self.fix.hdop = hdop

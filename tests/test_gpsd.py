@@ -115,6 +115,12 @@ def test_gpsd_tpv_and_sky_update_fix_without_nmea(tmp_path, monkeypatch):
     assert gps.fix.hdop == 0.8 and gps.fix.received_at >= before
     assert gps.data_flowing
     assert gps.status_reason == "GPS fix acquired"
+    diagnostics = gps.diagnostics_snapshot()
+    assert diagnostics["tpv_age"] is not None
+    assert diagnostics["sky_age"] is not None
+    assert diagnostics["satellites_used"] == 2
+    assert diagnostics["satellites_visible"] == 3
+    assert diagnostics["first_fix_after"] is None
 
 
 def test_gpsd_no_fix_is_live_data_not_a_transport_failure(tmp_path):
@@ -130,6 +136,38 @@ def test_gpsd_no_fix_is_live_data_not_a_transport_failure(tmp_path):
     gps.read_available()
     assert gps.available and not gps.fix.valid and gps.data_flowing
     assert "waiting for satellite fix" in gps.status_reason
+
+
+def test_gpsd_sky_progress_precedes_first_tpv_fix(tmp_path):
+    marker = tmp_path / "gpsd.conf"
+    marker.write_text("HOST=localhost\n")
+    gps = GpsManager(modem_broker=_broker(), modem_enabled=False,
+                     gpsd_config=marker)
+    gps.transport_connected = True
+    gps.transport_connected_at = time.monotonic()
+    gps._consume_gpsd_reports([{
+        "class": "SKY",
+        "satellites": [{"used": False}, {"used": False}],
+    }])
+    diagnostics = gps.diagnostics_snapshot()
+    assert gps.navigation_state == "acquiring"
+    assert diagnostics["tpv_age"] is None
+    assert diagnostics["sky_age"] is not None
+    assert diagnostics["satellites_visible"] == 2
+    assert diagnostics["first_satellites_after"] is not None
+
+
+def test_gps_power_observation_is_telemetry_only(tmp_path):
+    marker = tmp_path / "gpsd.conf"
+    marker.write_text("HOST=localhost\n")
+    gps = GpsManager(modem_broker=_broker(), modem_enabled=False,
+                     gpsd_config=marker)
+    before = time.monotonic()
+    gps.note_power_state(True)
+    diagnostics = gps.diagnostics_snapshot()
+    assert diagnostics["power_enabled"] is True
+    assert diagnostics["power_observed_age"] is not None
+    assert gps.power_observed_at >= before
 
 
 def test_gpsd_disconnect_marks_provider_for_reconnect(tmp_path):

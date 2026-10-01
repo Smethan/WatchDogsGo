@@ -472,15 +472,15 @@ Targets Airoha, Sony, and TRSPX Bluetooth SoCs (CVE-2025-20700/20701/20702). Ext
 
 The messenger supports three mutually exclusive owners for the AIO v2 SX1262.
 Choose **MeshCore**, **Meshtastic**, or experimental **Reticulum** under **SNIFF
-> Wardrive Settings > LoRa settings**. MeshCore and Reticulum use separate WDG
-direct LoRaRF/SPI implementations.
-Meshtastic leaves the radio entirely under a daemon; WDG never opens SPI while
-that protocol is selected. The preferred `meshtasticd-wdg` fork exposes a
+> Wardrive Settings > LoRa settings**. The persistent
+`watchdogs-sx1262d` manager is the only process that opens SPI/GPIO or controls
+the LoRa power rail. Meshtastic, MeshCore, and Reticulum use mutually exclusive
+generation-scoped leases and bounded operations through its local socket.
+The preferred `meshtasticd-wdg` fork exposes a
 restricted `/run/meshtasticd/wdg.sock` API, so WDG can receive nodes and
 messages while the official phone app uses the standard Meshtastic GATT
-service over BlueZ. An independently installed stock `meshtasticd` remains
-available through the legacy local Client API on `127.0.0.1:4403`. Closing WDG
-disconnects its client without stopping the selected daemon.
+service over BlueZ. Closing WDG revokes any temporary MeshCore or Reticulum
+lease and returns the powered radio to Meshtastic.
 
 Opening **ADDONS > Mesh Messenger** uses the selected protocol. MeshCore and
 Meshtastic provide channels, heard nodes, direct messages, background reception,
@@ -493,8 +493,9 @@ saved to `meshtastic_nodes.csv`, while received text is appended to
 `meshtastic_messages.log`. Node names and channel configuration come from the
 daemon; change them with a Meshtastic client.
 
-WDG 0.9.46 expects `meshtasticd-wdg` `v2.8.0-wdg.7` and its local API 1.1.
-Upgrade the firmware package first, then WDG. Channel/broadcast messages are
+WDG 0.9.65 expects `meshtasticd-wdg` `v2.8.0-wdg.14`, broker API 1.1,
+and WDG local API 1.1. Upgrade both components with `sudo bash setup.sh`.
+Channel/broadcast messages are
 sent with `want_ack=false` and finish at `SENT` once accepted; direct messages
 use `want_ack=true` and progress through the same correlated row to
 `DELIVERED` or `FAILED`. This avoids broadcast retries being mistaken for a
@@ -507,10 +508,10 @@ MeshCore radio and companion BLE**, choose the Bluetooth controller, then open
 Mesh Messenger or start the automatic LoRa collector. MeshMapper will see an
 advertisement named `MeshCore-<WDG node name>` and can create/use its
 `#wardriving` channel, transmit pings and discovery requests, receive raw LoRa
-packets, read radio/identity metadata, and export its signed contact. WDG
-remains the only SX1262/SPI owner; the BLE service only queues
-work onto its existing radio thread. The peripheral is opt-in and requires an
-explicit 120-second authenticated pairing window. BlueZ generates a six-digit
+packets, read radio/identity metadata, and export its signed contact. The
+manager remains the only SX1262/SPI owner; the BLE service only queues work
+through WDG's broker-backed radio worker. The peripheral is opt-in and requires
+an explicit 120-second authenticated pairing window. BlueZ generates a six-digit
 passkey that WDG displays; enter it on the phone to retain that one MeshMapper
 device as paired, bonded, and trusted. That random-PIN bond belongs to the
 selected controller and is shared with Meshtastic: switching protocols adopts
@@ -541,9 +542,14 @@ Enabling either one disables the other, and both may be left off.
 
 The manager grants one generation-scoped mode lease at a time. MeshCore and
 Reticulum leases require a live WDG heartbeat; if WDG exits or stops renewing,
-the manager resets the radio and returns to Meshtastic. A force-OFF request
-persists and suppresses that fallback until WDG successfully forces the rail on
-again. WDG never bypasses the manager to manipulate the LoRa GPIO directly.
+the manager reinitializes the radio and returns to Meshtastic. A reset clears
+the SX1262 packet type, so broker API 1.1 restores LoRa and board configuration
+before granting the next lease. WDG reports MeshCore as ready only after the
+lease, PHY configuration, and RX startup all succeed. A force-OFF request
+rejects new TX immediately, allows up to two seconds for protocol/Bluetooth
+quiescence, and persists OFF after confirmed rail-low read-back. It suppresses
+fallback until WDG successfully forces the rail on again. WDG never bypasses
+the manager to manipulate the LoRa GPIO directly.
 
 Run `sudo bash setup.sh` to install or upgrade the complete pinned radio stack.
 Setup validates the exact package tag, size, SHA-256, source commit, ARM64
@@ -620,7 +626,11 @@ GPS UART and is the default provider for both WDG and Meshtastic. WDG does not
 fall back to raw UART or ModemManager while the managed-gpsd marker exists; it
 reports and retries a gpsd transport failure instead of oscillating providers.
 ModemManager GNSS remains available when the AIO GPS is not configured or LTE
-GNSS was explicitly selected.
+GNSS was explicitly selected. The LoRa health screen reports independent
+gpsd/report/TPV/SKY ages, visible and used satellites, navigation state, and
+the observed GPS power age so a cold acquisition can be distinguished from a
+transport failure. Toggling GPS power restarts acquisition; these diagnostics
+do not add automatic power cycling or change fix-freshness behavior.
 
 Before removing the LTE board, open **SNIFF → Wardrive Settings** and turn
 **LTE modem integration** OFF. The choice persists and is read before GPS
@@ -832,8 +842,8 @@ systemctl status meshtasticd-wdg.service meshtasticd.service
 sudo journalctl -u meshtasticd-wdg.service -n 100 --no-pager
 ls -l /run/meshtasticd/wdg.sock
 ```
-WDG 0.9.64 requires local API 1.1 and broker API 1.0 from firmware
-`v2.8.0-wdg.13`. Close WDG and rerun `sudo bash setup.sh`; setup downloads the
+WDG 0.9.65 requires local API 1.1 and broker API 1.1 from firmware
+`v2.8.0-wdg.14`. Close WDG and rerun `sudo bash setup.sh`; setup downloads the
 exact pinned five-asset release, validates its SHA-256/source metadata, migrates
 the existing identity and channels, and starts the manager before the daemon.
 There is no `watchdogs-meshtastic-release` adoption command or in-app package

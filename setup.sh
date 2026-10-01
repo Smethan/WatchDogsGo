@@ -533,7 +533,7 @@ PY
         elif [[ ! "$STACK_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
             fail "Pinned radio package digest is missing or invalid"
             ERRORS=$((ERRORS + 1))
-        elif [ "$STACK_BROKER_MAJOR:$STACK_BROKER_MINOR" != "1:0" ] || \
+        elif [ "$STACK_BROKER_MAJOR:$STACK_BROKER_MINOR" != "1:1" ] || \
              [ "$STACK_WDG_API_MAJOR:$STACK_WDG_API_MINOR" != "1:1" ]; then
             fail "Pinned radio package API metadata is incompatible"
             ERRORS=$((ERRORS + 1))

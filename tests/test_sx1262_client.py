@@ -6,10 +6,11 @@ import pytest
 
 from watchdogs.sx1262_client import (
     API_MAJOR,
+    API_MINOR,
+    MAX_PACKET,
     BrokerError,
     BrokerProtocolError,
     BrokerUnavailable,
-    MAX_PACKET,
     SX1262Client,
     SX1262Controller,
 )
@@ -55,7 +56,7 @@ def response(request_id, result=None, generation=4):
 
 def hello_response(request_id=1):
     result = {
-        "api": {"major": API_MAJOR, "minor": 0},
+        "api": {"major": API_MAJOR, "minor": API_MINOR},
         "connection_id": 9,
         "generation": 4,
     }
@@ -72,7 +73,7 @@ def test_connect_negotiates_role_and_records_generation():
     assert session.generation == 4
     assert sock.path == "/run/watchdogs/sx1262d.sock"
     assert sock.sent == [{
-        "api": {"major": 1, "minor": 0},
+        "api": {"major": 1, "minor": 1},
         "pid": sock.sent[0]["pid"],
         "request_id": 1,
         "role": "meshcore",
@@ -172,3 +173,31 @@ def test_controller_validates_modes_without_contacting_broker():
     controller = SX1262Controller(socket_factory=lambda *_: Mock())
     with pytest.raises(ValueError):
         controller.activate_mode("invalid")
+
+
+def test_controller_waits_for_confirmed_power_off(monkeypatch):
+    sock = FakeSocket([
+        hello_response(),
+        response(2, {
+            "state": "TRANSITION", "power": True,
+            "forced_off": False, "pending": True,
+        }),
+        response(3, {
+            "state": "TRANSITION", "power": True,
+            "forced_off": False,
+        }),
+        response(4, {
+            "state": "OFF", "power": False, "forced_off": True,
+        }, generation=5),
+    ])
+    controller = SX1262Controller(socket_factory=lambda *_: sock)
+    monkeypatch.setattr("watchdogs.sx1262_client.time.sleep", lambda _delay: None)
+    controller.connect()
+
+    result = controller.admin_power_off()
+
+    assert result["state"] == "OFF"
+    assert result["forced_off"] is True
+    assert result["power"] is False
+    assert [message["op"] for message in sock.sent[1:]] == [
+        "admin_power_off", "get_status", "get_status"]

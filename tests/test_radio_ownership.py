@@ -25,6 +25,7 @@ class Controller:
 class Radio:
     def __init__(self, events):
         self.events = events
+        self.ready = False
 
     def acknowledge_revoke(self):
         self.events.append(("quiesced",))
@@ -51,6 +52,8 @@ def test_session_uses_manager_lease_and_never_legacy_owners(monkeypatch):
     )
 
     assert manager._open_radio_session() is radio
+    assert not manager.radio_owned
+    radio.ready = True
     assert manager.radio_owned
     manager._cleanup_radio(radio)
 
