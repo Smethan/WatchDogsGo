@@ -317,6 +317,30 @@ class SX1262Controller(SX1262Client):
     def get_status(self) -> dict[str, Any]:
         return self.request("get_status")
 
+    def wait_for_mode_ready(
+        self, mode: str, *, timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Wait for confirmed mode ownership, PHY configuration, and RX."""
+        if mode not in VALID_MODES:
+            raise ValueError(f"invalid SX1262 mode: {mode}")
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        last_status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            last_status = self.get_status()
+            state = str(last_status.get("state") or "").upper()
+            if (state == mode.upper()
+                    and str(last_status.get("active_mode") or mode) == mode
+                    and bool(last_status.get("protocol_ready"))):
+                return last_status
+            if state in {"FAULT", "OFF"}:
+                raise BrokerError(
+                    "radio_fault: " + str(last_status.get("fault") or state))
+            time.sleep(0.05)
+        raise BrokerError(
+            "mode_not_ready: SX1262 manager did not confirm "
+            f"{mode} PHY/RX readiness; last state="
+            f"{last_status.get('state', 'unknown')}")
+
     def activate_mode(self, mode: str) -> dict[str, Any]:
         if mode not in VALID_MODES:
             raise ValueError(f"invalid SX1262 mode: {mode}")

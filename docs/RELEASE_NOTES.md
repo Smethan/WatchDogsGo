@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.9.68 — Connection-bound SX1262 leases — 2026-10-01
+
+- Fix the intermittent rapid MeshCore re-acquisition failure found by the
+  physical transition stress test. Broker ownership is now bound to one
+  authenticated socket connection, not just a role string, so a delayed
+  request from a superseded `meshcore` connection cannot operate on a lease
+  granted to its replacement.
+- Prefer the newest viable protocol connection when granting a mode lease,
+  atomically supersede a same-process reconnect, and reject a second live
+  process or a replacement attempted during an in-flight transmission. A
+  closed active MeshCore or Reticulum client now triggers immediate,
+  reset-backed Meshtastic fallback.
+- Expose `protocol_ready` and the active lease connection ID in manager status
+  and the WDG health display. The acceptance loop can now distinguish a mode
+  transition from completion of PHY configuration and RX startup instead of
+  switching away while Meshtastic is still restoring its frontend.
+- Pin setup to the locally built Meshtastic `v2.8.0-wdg.15` ARM64 release from
+  source commit `c16a74c6a` at SHA-256
+  `de0cdda4d6568c1f9c26acc360dfad5d305941a19be701d2a533d35e4fd50eb3`.
+  Neither the Pi nor GitHub Actions builds the Meshtastic artifact.
+
 ## 0.9.67 — Reliable final setup readiness check — 2026-10-01
 
 - Fix the last live setup false failure after the v14 package had already

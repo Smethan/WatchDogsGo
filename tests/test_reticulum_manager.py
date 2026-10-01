@@ -12,6 +12,27 @@ from watchdogs.reticulum_manager import (
 )
 
 
+def test_release_waits_for_meshtastic_protocol_readiness(tmp_path):
+    events = []
+
+    class Controller:
+        def release_mode(self):
+            events.append(("release",))
+
+        def wait_for_mode_ready(self, mode, *, timeout):
+            events.append(("ready", mode, timeout))
+
+    manager = ReticulumManager(
+        tmp_path, sx1262_controller=Controller())
+    manager._manager_lease_active = True
+
+    manager._restore_service_after_failed_start()
+
+    assert events == [
+        ("release",), ("ready", "meshtastic", 10.0)]
+    assert manager._manager_lease_active is False
+
+
 def test_decode_rejects_malformed_and_oversized_envelopes():
     good = json.dumps({
         "v": 1, "type": "event", "name": "ready", "payload": {},

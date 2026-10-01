@@ -21,6 +21,10 @@ class Controller:
         self.events.append(("release",))
         return {}
 
+    def wait_for_mode_ready(self, mode, *, timeout):
+        self.events.append(("ready", mode, timeout))
+        return {"state": mode.upper(), "protocol_ready": True}
+
 
 class Radio:
     def __init__(self, events):
@@ -62,6 +66,7 @@ def test_session_uses_manager_lease_and_never_legacy_owners(monkeypatch):
         ("protocol_connect",),
         ("release",),
         ("quiesced",),
+        ("ready", "meshtastic", 10.0),
         ("close",),
     ]
     ownership.assert_not_called()

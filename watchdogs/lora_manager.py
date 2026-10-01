@@ -1962,17 +1962,21 @@ class LoRaManager:
         try:
             if self._broker_mode_requested:
                 self._sx1262.release_mode()
-                if lora is not None and not lora.acknowledge_revoke():
-                    self._emit(
-                        "SX1262 manager did not receive WDG quiescence proof; "
-                        "the transition failed closed", "error")
-            self._close_radio_resources(lora)
+                if lora is not None:
+                    if not lora.acknowledge_revoke():
+                        self._emit(
+                            "SX1262 manager did not receive WDG quiescence "
+                            "proof; the transition failed closed", "error")
+                    else:
+                        self._sx1262.wait_for_mode_ready(
+                            "meshtastic", timeout=10.0)
         except Exception as exc:
             self._emit(
                 "Failed to release the SX1262 manager lease: "
                 + str(exc)[:120], "error")
             log.exception("Failed to release SX1262 manager lease")
         finally:
+            self._close_radio_resources(lora)
             self._broker_mode_requested = False
             self._broker_radio = None
             self.running = False

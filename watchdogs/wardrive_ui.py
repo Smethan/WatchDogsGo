@@ -2659,6 +2659,9 @@ class WardriveUI:
                 broker_version = str(
                     sx_status.get("broker_version") or "unavailable")
                 lease_age = int(sx_status.get("lease_age_ms") or 0)
+                protocol_ready = bool(sx_status.get("protocol_ready"))
+                lease_connection = int(
+                    sx_status.get("lease_connection_id") or 0)
                 metrics = sx_status.get("metrics") or {}
                 active_bt = (
                     "Meshtastic" if sx_state == "MESHTASTIC" else
@@ -2678,7 +2681,8 @@ class WardriveUI:
                     else "on" if gps_power else "off")
                 px.text(55,198,
                         (f"Manager: {sx_state} power:{sx_power} v{broker_version} "
-                         f"lease:{lease_age}ms")[:100],13)
+                         f"ready:{'yes' if protocol_ready else 'no'} "
+                         f"lease:{lease_age}ms owner:{lease_connection}")[:100],13)
                 px.text(55,212,
                         (f"BT frontend: {active_bt}  {client_label}: "
                          f"{client_state}  BLE:{ble}")[:100],13)

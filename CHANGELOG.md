@@ -10,6 +10,23 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.68] — 2026-10-01
+
+### Fixed
+
+- Bind each SX1262 generation lease to one broker connection instead of
+  authorizing every connection with the active role. Same-process protocol
+  reconnects supersede their old socket, stale requests receive `not_owner`,
+  and MeshCore or Reticulum client loss resets the radio back to Meshtastic.
+- Select the newest viable protocol connection during handoff, avoiding the
+  old-socket race reproduced by rapid physical MeshCore transitions.
+
+### Changed
+
+- Surface manager `protocol_ready` and active connection read-back in the LoRa
+  health display, and pin one-command setup to the locally built
+  `v2.8.0-wdg.15` ARM64 package.
+
 ## [0.9.67] — 2026-10-01
 
 ### Fixed

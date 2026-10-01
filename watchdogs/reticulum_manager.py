@@ -192,6 +192,7 @@ class ReticulumManager:
             return
         try:
             self._sx1262.release_mode()
+            self._sx1262.wait_for_mode_ready("meshtastic", timeout=10.0)
         except BrokerError as exc:
             self._emit("error", {
                 "code": "manager_release_failed", "detail": str(exc)[:240],

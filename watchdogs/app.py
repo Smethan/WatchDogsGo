@@ -646,7 +646,9 @@ class WatchDogsGame(OtaMixin):
         self._sx1262 = SX1262Controller()
         self._sx1262_status = {
             "state": "UNAVAILABLE", "power": False, "fault": "",
-            "broker_version": "", "lease_age_ms": 0, "metrics": {},
+            "broker_version": "", "lease_age_ms": 0,
+            "lease_connection_id": 0, "protocol_ready": False,
+            "metrics": {},
         }
         self._sx1262_status_lock = threading.Lock()
         self._sx1262_status_stop = threading.Event()
@@ -1710,7 +1712,8 @@ class WatchDogsGame(OtaMixin):
                 status = {
                     "state": "UNAVAILABLE", "power": False,
                     "fault": str(exc)[:160], "broker_version": "",
-                    "lease_age_ms": 0, "metrics": {},
+                    "lease_age_ms": 0, "lease_connection_id": 0,
+                    "protocol_ready": False, "metrics": {},
                 }
             with self._sx1262_status_lock:
                 self._sx1262_status = status

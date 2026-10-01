@@ -201,3 +201,30 @@ def test_controller_waits_for_confirmed_power_off(monkeypatch):
     assert result["power"] is False
     assert [message["op"] for message in sock.sent[1:]] == [
         "admin_power_off", "get_status", "get_status"]
+
+
+def test_controller_waits_for_confirmed_protocol_readiness(monkeypatch):
+    sock = FakeSocket([
+        hello_response(),
+        response(2, {
+            "state": "TRANSITION", "active_mode": "",
+            "protocol_ready": False,
+        }),
+        response(3, {
+            "state": "MESHTASTIC", "active_mode": "meshtastic",
+            "protocol_ready": False,
+        }, generation=5),
+        response(4, {
+            "state": "MESHTASTIC", "active_mode": "meshtastic",
+            "protocol_ready": True,
+        }, generation=5),
+    ])
+    controller = SX1262Controller(socket_factory=lambda *_: sock)
+    monkeypatch.setattr("watchdogs.sx1262_client.time.sleep", lambda _delay: None)
+    controller.connect()
+
+    status = controller.wait_for_mode_ready("meshtastic")
+
+    assert status["protocol_ready"] is True
+    assert [message["op"] for message in sock.sent[1:]] == [
+        "get_status", "get_status", "get_status"]
