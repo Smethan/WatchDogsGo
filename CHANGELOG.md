@@ -10,6 +10,16 @@ minor versions.
 
 ## Unreleased
 
+## [0.9.67] — 2026-10-01
+
+### Fixed
+
+- Wait up to ten seconds for the manager and Meshtastic sockets after setup's
+  final service restart. Systemd can report both `Type=simple` units active
+  before their Unix sockets are bound; the former immediate socket checks
+  could therefore report setup failure even though the converged package and
+  both services were healthy moments later.
+
 ## [0.9.66] — 2026-10-01
 
 ### Fixed

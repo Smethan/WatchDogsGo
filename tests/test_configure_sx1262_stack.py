@@ -79,3 +79,6 @@ def test_setup_is_only_stack_mutation_entrypoint():
     assert "configure_sx1262_stack.py" in support
     assert "rm -f /etc/sudoers.d/watchdogs-meshtastic" in setup
     assert "mask meshtasticd.service" in setup
+    assert "wait_for_unified_radio_stack" in setup
+    assert "for attempt in {1..100}" in setup
+    assert "sleep 0.1" in setup

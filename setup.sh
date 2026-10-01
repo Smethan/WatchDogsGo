@@ -41,6 +41,20 @@ dump_log_on_fail() {
     echo "  Full log preserved at: $log"
 }
 
+wait_for_unified_radio_stack() {
+    local attempt
+    for attempt in {1..100}; do
+        if sudo systemctl is-active --quiet watchdogs-sx1262d.service && \
+           sudo systemctl is-active --quiet meshtasticd-wdg.service && \
+           sudo test -S /run/watchdogs/sx1262d.sock && \
+           sudo test -S /run/meshtasticd/wdg.sock; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 echo ""
 echo -e "${CYAN}========================================${NC}"
 echo -e "${CYAN}  ESP32 Watch Dogs — Setup${NC}"
@@ -560,10 +574,7 @@ PY
                sudo systemctl mask meshtasticd.service >>"$APT_LOG" 2>&1 && \
                sudo systemctl restart watchdogs-sx1262d.service \
                     meshtasticd-wdg.service >>"$APT_LOG" 2>&1 && \
-               sudo systemctl is-active --quiet watchdogs-sx1262d.service && \
-               sudo systemctl is-active --quiet meshtasticd-wdg.service && \
-               sudo test -S /run/watchdogs/sx1262d.sock && \
-               sudo test -S /run/meshtasticd/wdg.sock; then
+               wait_for_unified_radio_stack; then
                 ok "Unified radio stack installed; broker and Meshtastic are healthy"
             else
                 dump_log_on_fail "Unified radio stack transaction" "$APT_LOG"

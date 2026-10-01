@@ -1,5 +1,17 @@
 # Smethan WatchDogsGo
 
+## 0.9.67 — Reliable final setup readiness check — 2026-10-01
+
+- Fix the last live setup false failure after the v14 package had already
+  converged successfully. The transaction returned `health: ready`, v14 was
+  installed, both services restarted successfully, and both sockets appeared,
+  but setup tested the sockets immediately after systemd marked the
+  `Type=simple` units active. That small startup window was reported as a
+  failed transaction despite the resulting stack being healthy.
+- Keep the final manager/daemon restart, then poll for both active units and
+  both Unix sockets for up to ten seconds. Real service failures still fail
+  setup; normal socket startup latency no longer does.
+
 ## 0.9.66 — Safe rollback seeding across broker API revisions — 2026-10-01
 
 - Fix the fail-closed updater gate found during the live 0.9.64-to-0.9.65
