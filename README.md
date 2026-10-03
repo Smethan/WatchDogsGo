@@ -296,8 +296,8 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Capture | `start_handshake` | Active capture to ESP32 SD; BSSID picker includes latest sniffer metrics (firmware 1.7.13+) |
 | HS Capture no SD | `start_handshake_serial` | Active capture streamed to uConsole; same picker and sniffer metrics (firmware 1.7.13+) |
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
-| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE with host GPS, WiGLE loot, optional serving-cell tracking, and the selected LoRa/ADS-B/433 collectors |
-| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi plus uConsole BLE with the same host GPS and selected host collectors |
+| All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE, optional live Flock/Axon OUI popups (firmware 1.7.14+), host GPS, WiGLE loot, serving-cell tracking and selected LoRa/ADS-B/433 collectors |
+| All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi with optional live OUI popups plus incremental uConsole BLE, the same host GPS and selected host collectors |
 
 ### ATTACK
 

@@ -5,7 +5,7 @@ MAC = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 KINDS = {"started", "stopped", "error", "stats", "wifi", "wifi_mgmt", "ble", "hs_packet"}
 V2_KINDS = {"started", "stopped", "error", "heartbeat", "status", "batch_start",
-            "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble"}
+            "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble", "live_oui"}
 
 def integer(d, key, low, high):
     v = d.get(key)
@@ -27,6 +27,11 @@ def parse_record(line):
                 raise ValueError("capabilities")
             if type(d.get("wardrive_serial_v1")) is not bool:
                 raise ValueError("capabilities")
+            if "wardrive_live_oui_v1" in d:
+                if type(d["wardrive_live_oui_v1"]) is not bool:
+                    raise ValueError("live_oui capability")
+                if d["wardrive_live_oui_v1"]:
+                    integer(d, "live_oui_max", 1, 8)
             return d
         allowed = V2_KINDS if d["v"] == 2 else KINDS
         if kind not in allowed or not isinstance(d.get("session"), str) or not TOKEN.fullmatch(d["session"]):
@@ -35,15 +40,25 @@ def parse_record(line):
         if d["v"] == 2:
             integer(d, "batch", 0, 2**32-1)
             state = d.get("state")
-            if kind in V2_KINDS-{"wifi", "wifi_mgmt", "ble"} and state not in ("running", "reporting", "stopped", "error"):
+            if kind in V2_KINDS-{"wifi", "wifi_mgmt", "ble", "live_oui"} and state not in ("running", "reporting", "stopped", "error"):
                 raise ValueError("state")
-            if kind in ("batch_start", "batch_results", "batch_done") and d["batch"] < 1:
+            if kind in ("batch_start", "batch_results", "batch_done", "live_oui") and d["batch"] < 1:
                 raise ValueError("batch")
             if kind == "batch_start":
                 integer(d, "window_ms", 1000, 60000)
             if kind in ("batch_results", "batch_done"):
                 integer(d, "batch_wifi", 0, 2**32-1)
                 integer(d, "batch_ble", 0, 2**32-1)
+        if kind == "live_oui":
+            integer(d, "capture_ms", 0, 2**63-1)
+            integer(d, "age_ms", 0, 2000)
+            integer(d, "rssi", -127, 20)
+            if d.get("radio") not in ("wifi", "ble") or not isinstance(d.get("mac"), str) or not MAC.fullmatch(d["mac"]):
+                raise ValueError("live_oui address")
+            d["mac"] = d["mac"].upper()
+            if d["radio"] == "ble":
+                integer(d, "addr_type", 0, 3)
+            return d
         if kind == "hs_packet":
             for key, low, high in (("packet",1,2**32-1), ("offset",0,2303),
                                    ("total",24,2304), ("capture_ms",0,2**63-1),

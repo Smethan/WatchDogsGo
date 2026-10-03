@@ -33,6 +33,34 @@ class NotableDetector:
     def clear(self):
         self.cache.clear()
 
+    def oui_prefixes(self):
+        """Firmware filter data only; labels and alert policy remain on the host."""
+        return sorted({r["value"].replace(":", "").upper() for r in self.rules
+                       if r["method"] == "oui" and r["strength"] > 0})
+
+    def oui_hits(self, event, suppressed_rules=()):
+        kind, mac = event["kind"], event["mac"]
+        public = (kind != "ble" or event.get("addr_type") == 0) and not (int(mac[:2], 16) & 3)
+        return [dict(r) for r in self.rules if r["method"] == "oui"
+                and r["id"] not in suppressed_rules and public
+                and mac.startswith(r["value"] + ":")]
+
+    @staticmethod
+    def results(hits):
+        results = []
+        for category in ("flock", "axon"):
+            evidence = [h for h in hits if h["category"] == category]
+            if not evidence:
+                continue
+            strength = max(h["strength"] for h in evidence)
+            label = ("Axon body-camera signature" if strength >= 3 else "Possible Axon device") if category == "axon" else ("Flock signature match" if strength >= 2 else "Possible Flock" if strength == 1 else "Flock-associated OEM clue")
+            results.append(dict(category=category,strength=strength,label=label,evidence=evidence))
+        return results
+
+    def classify_oui(self, event, blocked=lambda mac: False, suppressed_rules=()):
+        """No payload parsing/cache updates for provisional notification hints."""
+        return [] if blocked(event["mac"]) else self.results(self.oui_hits(event, suppressed_rules))
+
     def classify(self, event, now, blocked=lambda mac: False, suppressed_rules=()):
         kind, mac = event["kind"], event["mac"]
         if blocked(mac):
@@ -53,17 +81,15 @@ class NotableDetector:
             names.append(bytes.fromhex(event.get("ssid_hex", "")).decode("utf-8", "replace"))
         if event.get("name"):
             names.append(event["name"])
-        # A BLE random/static/private address cannot identify a manufacturer by OUI.
-        public = kind != "ble" or event.get("addr_type") == 0
-        public = public and not (int(mac[:2],16) & 3)
-        hits = []
+        # Share public-address eligibility and rule matching with live hints.
+        hits = self.oui_hits(event, suppressed_rules)
         for rule in self.rules:
             if rule["id"] in suppressed_rules:
                 continue
             method, value = rule["method"], rule["value"]
             match = False
             if method == "oui":
-                match = public and mac.startswith(value + ":")
+                continue
             elif method == "name":
                 match = any(re.fullmatch(value, name) for name in names)
             elif method == "company":
@@ -83,12 +109,4 @@ class NotableDetector:
         if kind == "wifi_mgmt" and event.get("subtype") == 4 and event.get("ssid_present") and event.get("ssid_hex") == "":
             if "flock-wildcard-probe" not in suppressed_rules and any(h["id"] == "flock-oui" for h in hits):
                 hits.append(dict(id="flock-wildcard-probe",category="flock",method="wildcard_probe",strength=2,source=self.rules[0]["source"]))
-        results = []
-        for category in ("flock", "axon"):
-            evidence = [h for h in hits if h["category"] == category]
-            if not evidence:
-                continue
-            strength = max(h["strength"] for h in evidence)
-            label = ("Axon body-camera signature" if strength >= 3 else "Possible Axon device") if category == "axon" else ("Flock signature match" if strength >= 2 else "Possible Flock" if strength == 1 else "Flock-associated OEM clue")
-            results.append(dict(category=category,strength=strength,label=label,evidence=evidence))
-        return results
+        return self.results(hits)

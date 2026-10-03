@@ -48,6 +48,74 @@ def batch_record(kind="wifi", **changes):
     d.update(changes)
     return d
 
+def live_record(**changes):
+    d = dict(v=2, kind="live_oui", session="test", seq=3, batch=1,
+             capture_ms=1000, age_ms=0, radio="wifi", mac="B4:1E:52:00:00:01", rssi=-62)
+    d.update(changes)
+    return d
+
+def start_live_scan(w):
+    w.handle_line(wire(dict(v=1, kind="capabilities", wardrive_serial_v1=True,
+                           wardrive_wifi_serial_v1=True, wardrive_batch_serial_v2=True,
+                           wardrive_wifi_batch_serial_v2=True, wardrive_live_oui_v1=True,
+                           live_oui_max=8)))
+    assert w.scan.start(live_ouis=w.detector.oui_prefixes())
+    token = w.scan.session
+    w.handle_line(wire(batch_control("started", session=token, seq=1, batch=0)))
+    w.handle_line(wire(batch_control("batch_start", session=token, seq=2)))
+    return token
+
+@pytest.mark.parametrize("changes", [dict(v=1), dict(batch=0), dict(age_ms=2001),
+    dict(age_ms=-1), dict(capture_ms=True), dict(rssi=-128), dict(radio="other"),
+    dict(mac="bad"), dict(radio="ble"), dict(radio="ble", addr_type=4)])
+def test_live_oui_protocol_rejects_malformed(changes):
+    assert parse_record(wire(live_record(**changes))) is None
+
+def test_live_oui_protocol_and_capability_bounds():
+    assert parse_record(wire(live_record(mac="b4:1e:52:00:00:01")))["mac"] == "B4:1E:52:00:00:01"
+    assert parse_record(wire(live_record(radio="ble", addr_type=0)))
+    caps = dict(v=1, kind="capabilities", wardrive_serial_v1=True, wardrive_live_oui_v1=True, live_oui_max=8)
+    assert parse_record(wire(caps))
+    for changes in (dict(live_oui_max=9), dict(live_oui_max=0), dict(live_oui_max=True), dict(wardrive_live_oui_v1=1)):
+        assert parse_record(wire(dict(caps, **changes))) is None
+
+@pytest.mark.parametrize("wifi_only", [False, True])
+def test_live_oui_negotiation_old_firmware_fallback_and_liveness(wifi_only):
+    sent=[]; now=[0]; c=ScanController(sent.append, lambda:now[0])
+    caps = dict(kind="capabilities", wardrive_serial_v1=True, wardrive_wifi_serial_v1=True,
+                wardrive_batch_serial_v2=True, wardrive_wifi_batch_serial_v2=True)
+    c.handle(caps); assert c.start(wifi_only=wifi_only, live_ouis=NotableDetector().oui_prefixes())
+    assert "live_oui=" not in sent[-1]
+    c.reset(); c.handle(dict(caps, wardrive_live_oui_v1=True, live_oui_max=8))
+    assert c.start(wifi_only=wifi_only, live_ouis=["b41e52", "0025DF", "B41E52"])
+    assert sent[-1].endswith(" live_oui=0025DF,B41E52")
+    c.handle(batch_control("started", session=c.session, batch=0))
+    c.handle(batch_control("batch_start", session=c.session, seq=2))
+    now[0]=1; hint=live_record(session=c.session)
+    assert c.handle(hint) and c.last_data==1 and c.last_control==0
+    assert not c.last_seen and c.batch_counts==dict(wifi=0, ble=0)
+    assert not c.handle(hint)  # duplicate sequence
+    assert not c.handle(live_record(session="stale", seq=4))
+    c.handle(batch_control("batch_start", session=c.session, batch=2, seq=4))
+    assert not c.handle(live_record(session=c.session, seq=5, batch=1))
+    c.stop(); assert not c.handle(live_record(session=c.session, seq=5, batch=2))
+    c.reset(); assert not c.live_oui_enabled and not c.live_oui_supported
+
+def test_live_oui_classifier_uses_shared_rules_not_payload_or_random_addresses():
+    detector=NotableDetector()
+    assert detector.oui_prefixes()==["0025DF", "B41E52"]
+    for radio, mac, category in (("wifi", "B4:1E:52:00:00:01", "flock"),
+                                  ("ble", "00:25:DF:00:00:01", "axon")):
+        event=dict(kind=radio, mac=mac, addr_type=0)
+        assert detector.classify_oui(event)==detector.classify(event, 0)
+        assert detector.classify_oui(event)[0]["category"]==category
+    assert not detector.classify_oui(dict(kind="ble", mac="00:25:DF:00:00:01", addr_type=1))
+    assert not detector.classify_oui(dict(kind="wifi", mac="B6:1E:52:00:00:01"))
+    assert not detector.classify_oui(dict(kind="wifi", mac="00:58:28:00:00:01"))
+    assert not detector.classify_oui(dict(kind="wifi", mac="B4:1E:52:00:00:01"), suppressed_rules=["flock-oui"])
+    detector.clear(); detector.classify_oui(dict(kind="ble", mac="00:25:DF:00:00:01", addr_type=0))
+    assert not detector.cache
+
 @pytest.mark.parametrize("chunk", [1,2,7,1024])
 def test_framing(chunk):
     text = (wire(record())+"\r\n"+wire(record("ble"))+"\n").encode()
@@ -282,6 +350,125 @@ def game(tmp_path,loot,monkeypatch):
     monkeypatch.setattr(ui.time,"monotonic",lambda:10)
     app.wardrive.tick()
     return app
+
+@pytest.mark.parametrize("radio,mac,category", [("wifi", "B4:1E:52:00:00:01", "flock"),
+                                                ("ble", "00:25:DF:00:00:01", "axon")])
+def test_live_popup_before_batch_no_early_loot_xp_inventory_or_map(game, monkeypatch, radio, mac, category):
+    w=game.wardrive; token=start_live_scan(w)
+    before={p.name:p.read_bytes() for p in game.loot._session.iterdir() if p.is_file() and p.name!="serial.log"}
+    w.handle_line(wire(live_record(session=token, radio=radio, mac=mac, addr_type=0)))
+    assert len(w.alerts)==1 and w.alerts[0]["pending_batch"] and w.alerts[0]["category"]==category
+    assert not w.notables and not list(w.visible_notables()) and not w.live_notable_identities()[0]
+    assert not game.wifi_networks and not game.ble_devices and not game.loot_points
+    game.gain_xp.assert_not_called()
+    after={p.name:p.read_bytes() for p in game.loot._session.iterdir() if p.is_file() and p.name!="serial.log"}
+    # Only raw serial transport logging may have changed, never evidence/loot.
+    assert after==before
+    w.handle_line(wire(live_record(session=token, radio=radio, mac=mac, addr_type=0, seq=4)))
+    assert len(w.alerts)==1
+    w.handle_line(wire(batch_control("batch_results", session=token, seq=5)))
+    # Simulate the toast having expired during the ten-second collection.
+    w.alerts.clear()
+    import watchdogs.wardrive_ui as ui
+    monkeypatch.setattr(ui.time, "monotonic", lambda:20)
+    payload=ad(0x16, b"\x81\xfcBWCDEVICE").hex() if radio=="ble" else ""
+    w.handle_line(wire(batch_record(radio, session=token, seq=6, mac=mac, data_hex=payload)))
+    assert not w.alerts  # even stronger batch evidence cannot repeat the popup
+    assert len(w.notables)==1 and len(list(w.visible_notables()))==1
+    item=next(iter(w.notables.values()))
+    assert item["strength"]==(3 if radio=="ble" else 2) and w.position(item)==(40,-90)
+    assert len(game.wifi_networks)+len(game.ble_devices)==1
+    assert game.gain_xp.call_count==1 and w.store_path.exists()
+
+def test_live_popup_upgrades_queued_details_without_duplicate(game):
+    w=game.wardrive; token=start_live_scan(w)
+    w.handle_line(wire(live_record(session=token)))
+    w.handle_line(wire(batch_record(session=token, seq=4, age_ms=0)))
+    assert len(w.alerts)==1 and not w.alerts[0].get("pending_batch")
+    assert w.alerts[0]["label"]=="Flock signature match" and w.alerts[0]["observation_fix"]
+
+@pytest.mark.parametrize("state,command", [("all_wardrive", "start_wardrive_batch_serial"),
+                                          ("all_wardrive_host", "start_wardrive_wifi_batch_serial")])
+def test_live_negotiation_through_actual_scan_menu_transition(game, state, command):
+    w=game.wardrive
+    w.handle_line(wire(dict(v=1, kind="capabilities", wardrive_serial_v1=True,
+                           wardrive_wifi_serial_v1=True, wardrive_batch_serial_v2=True,
+                           wardrive_wifi_batch_serial_v2=True, wardrive_live_oui_v1=True,
+                           live_oui_max=8)))
+    game._start_scan_cmd("start_wardrive_serial", state, "All Wardrive")
+    w.handle_line("All operations stopped.")
+    assert game.serial.send_command.call_args.args[0]==command+" "+w.scan.session+" live_oui=0025DF,B41E52"
+
+def test_live_popup_draws_pending_status_without_gps_claim(game, monkeypatch):
+    import watchdogs.wardrive_ui as ui
+    w=game.wardrive; token=start_live_scan(w)
+    w.handle_line(wire(live_record(session=token)))
+    import sys
+    px=Mock(); monkeypatch.setitem(sys.modules, "pyxel", px)
+    monkeypatch.setattr(ui.time, "monotonic", lambda:10)
+    w.draw_overlay()
+    lines=[call.args[2] for call in px.text.call_args_list]
+    assert any("OUI match" in line for line in lines)
+    assert any("Details pending batch" in line for line in lines)
+    assert not any("heard here" in line for line in lines)
+
+@pytest.mark.parametrize("mute", ["category", "rule", "device", "whitelist", "random_ble"])
+def test_live_popup_obeys_existing_controls(game, mute):
+    w=game.wardrive; token=start_live_scan(w); hint=live_record(session=token)
+    if mute=="category": w.settings["flock"]=False
+    if mute=="rule": w.settings["suppressed_rules"]=["flock-oui"]
+    if mute=="device": w.settings["suppressed_devices"]=["wifi:"+hint["mac"]]
+    if mute=="whitelist": game._whitelist.is_blocked=lambda mac:True
+    if mute=="random_ble": hint.update(radio="ble", addr_type=1)
+    w.handle_line(wire(hint))
+    assert not w.alerts and not w.live_notifications and not w.notables
+
+@pytest.mark.parametrize("radio,mac,data_hex", [
+    ("wifi", "10:20:30:00:00:01", ""),
+    ("ble", "C2:00:00:00:00:01", ad(0x16, b"\x81\xfcBWCDEVICE").hex()),
+    ("ble", "C2:00:00:00:00:01", ad(255, b"\x4d\x03").hex()),
+    ("ble", "C2:00:00:00:00:01", ad(3, b"\x81\xfc").hex())])
+def test_non_oui_signatures_keep_delayed_popup(game, radio, mac, data_hex):
+    w=game.wardrive; token=start_live_scan(w)
+    assert not w.alerts
+    w.handle_line(wire(batch_record(radio, session=token, seq=3, mac=mac,
+                                    data_hex=data_hex, addr_type=1)))
+    assert len(w.alerts)==1 and not w.alerts[0].get("pending_batch")
+
+def test_lost_hint_batch_fallback_and_cross_category_independence(game):
+    w=game.wardrive; token=start_live_scan(w)
+    w.handle_line(wire(live_record(session=token, radio="ble", addr_type=0)))
+    # An Axon payload in the same physical address is independent of the Flock OUI popup.
+    w.handle_line(wire(batch_record("ble", session=token, seq=4,
+                                    data_hex=ad(255, b"\x4d\x03").hex())))
+    assert {a["category"] for a in w.alerts}=={"flock", "axon"}
+    # No hint for this second address: retain the normal batch popup fallback.
+    w.handle_line(wire(batch_record(session=token, seq=5, mac="B4:1E:52:00:00:02")))
+    assert len(w.alerts)==3
+
+def test_live_cache_continuous_presence_absence_and_stop_cleanup(game, monkeypatch):
+    import watchdogs.wardrive_ui as ui
+    w=game.wardrive; token=start_live_scan(w); now=[10]
+    monkeypatch.setattr(ui.time, "monotonic", lambda:now[0])
+    for batch in range(1, 9):
+        now[0]=batch*10
+        w.live_oui(live_record(session=token, batch=batch))
+        if batch==1: assert len(w.alerts)==1
+        else: assert not w.alerts  # continuous presence, including beyond 60 seconds
+        w.alerts.clear()
+    now[0]=141; w.live_oui(live_record(session=token, batch=9))
+    assert len(w.alerts)==1
+    w.on_stop(); assert not w.live_notifications and not w.alerts
+
+def test_live_cache_bound_disconnect_and_session_restart(game):
+    w=game.wardrive; token=start_live_scan(w)
+    for i in range(300):
+        w.live_oui(live_record(session=token, mac=f"B4:1E:52:00:{i//256:02X}:{i%256:02X}"))
+    assert len(w.live_notifications)==256 and len(w.alerts)==16 and not w.notables
+    game.serial=None; w.tick()
+    assert not w.live_notifications and not w.alerts
+    w.live_oui(live_record(session="new-session"))
+    assert len(w.alerts)==1
 
 def test_integration_both_radios_precise_toggle_and_raw_gps(game):
     w=game.wardrive;w.scan.supported=True;w.scan.start();token=w.scan.session

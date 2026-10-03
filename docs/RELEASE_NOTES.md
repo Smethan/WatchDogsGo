@@ -1,5 +1,25 @@
 # Smethan WatchDogsGo
 
+## 0.9.70 — Early OUI alerts with batched evidence — 2026-10-03
+
+- Negotiate firmware 1.7.14's optional `wardrive_live_oui_v1` side channel and
+  supply a bounded OUI filter from the existing signature rules. Older firmware
+  keeps the original batch/stream commands without extra arguments.
+- Show immediate provisional Flock/Axon OUI popups using the same conservative
+  labels, colors, address eligibility, toggles, whitelist and mutes as full
+  detection. No inventory, XP, saved evidence, WiGLE row or map marker is made
+  from a hint; raw serial logging is preserved.
+- Keep full classification, evidence upgrades, loot and geographic markers in
+  the normal batch path. Suppress a second same-batch popup only for an already
+  notified identity/category. Non-OUI matches and lost-hint fallback keep their
+  normal full-record alerts; standalone scans and host BLE are unchanged.
+- Bound and reset provisional notification state, ignore duplicate/stale
+  hints, and count valid hints as ESP data liveness without hiding missing
+  control heartbeats or inflating full Wi-Fi/BLE counts.
+- Add synthetic protocol, negotiation, early-vs-batch ordering, persistence,
+  map, mute, upgrade, absence/re-alert and lifecycle regressions. Physical
+  RF/USB popup latency still requires testing on the uConsole.
+
 ## 0.9.69 — Controller liveness at activation — 2026-10-01
 
 - Fix the second rapid-handoff failure found by the target uConsole stress

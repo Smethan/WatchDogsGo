@@ -33,6 +33,41 @@ Random/private BLE addresses and locally administered/multicast Wi-Fi addresses 
 
 A bare 10-digit name, broad OEM prefix lists, receiver-only address matches, unrelated Axon Networks prefixes (00:58:28 and 84:70:03), and Biscuit's unpublished SOUI database are not implemented. This is documented public-signature coverage, not exact parity with Biscuit's private firmware.
 
+## Early OUI popups with batched ESP scans
+
+WDG 0.9.70 negotiates firmware 1.7.14's `wardrive_live_oui_v1` capability and
+sends a bounded prefix filter derived from the existing positive-strength OUI
+rules. During All Wardrive, the ESP can return a lightweight `live_oui` hint
+before the ten-second batch completes. Both Flock and Axon OUI candidates use
+their existing conservative labels and colors, with **details pending batch**
+shown in the popup. Wi-Fi-only ESP capture also supports these hints when BLE
+is collected on the host.
+
+These hints are notification-only. They do not create inventory entries, XP,
+WiGLE rows, saved notable evidence or map markers, and do not claim a GPS fix.
+The raw serial log still includes the received protocol message. Full batch
+records run normal classification and storage and create the map marker when
+their observation GPS is available. Stronger evidence updates an existing
+queued popup in place; it does not enqueue a second popup for the same
+session/batch/identity/category already notified early.
+
+Category switches, whitelist entries, rule mutes and observed-identity mutes
+also apply to early popups. Matching uses the same OUI rules and public-address
+checks as full classification. The provisional notification cache is separate
+from the 256-entry notable evidence list, bounded to 256 keys, and cleared at
+stop, disconnect and session transition. Duplicate hints within a batch are
+ignored; continued presence does not repeatedly alert, and a new observation
+after the configured absence interval can alert again. Flock and Axon remain
+independent categories.
+
+Only OUI candidates take the early path. Name, wildcard-probe, company, service
+and body-camera signatures without an OUI hint retain their existing batch-time
+popup; an OEM clue alone still produces none. Standalone scans and already
+incremental host BLE observations are unchanged. Older firmware keeps normal
+batch/stream behavior. Lost hints, the 32-hint firmware bound or transport
+congestion fall back to full-record detection; sub-second notification is a
+normal-transport target, not a guaranteed latency or proof of a physical device.
+
 ## Sources and provenance
 
 The JSON ruleset contains source URLs and checked dates. Numeric identifiers and observed packet conventions are factual data; matcher code and synthetic fixtures were written independently. No third-party firmware implementation or signature database was copied.

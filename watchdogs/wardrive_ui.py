@@ -127,6 +127,7 @@ class WardriveUI:
         self._notable_revision = 0
         self.alerts = deque(maxlen=16)
         self.alert_until = 0
+        self.live_notifications = OrderedDict()
         self.connection = None
         self.store_path = None
         self.invalid_records = 0
@@ -159,6 +160,7 @@ class WardriveUI:
         self.app._gps_wait_dialog = False
         self.trail.break_segment()
         self.detector.clear()
+        self.clear_live_notifications()
         self.mc_discovery_session = None
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
@@ -199,6 +201,7 @@ class WardriveUI:
             self.targets.disconnect()
             app._clear_scan_state()
             self.detector.clear()
+            self.clear_live_notifications()
             self.trail.break_segment()
             if connection:
                 self.scan.probe()
@@ -210,6 +213,8 @@ class WardriveUI:
         now = time.monotonic()
         self.fixes.update(app.gps.fix, now)
         self.scan.tick()
+        if not self.scan.active and self.live_notifications:
+            self.clear_live_notifications()
         if self.targets.tick():
             if app._pending_cmd and app._pending_cmd.startswith("hs_scan "):
                 app._pending_cmd = None
@@ -248,6 +253,7 @@ class WardriveUI:
             self.store_path = path
             self.notables.clear()
             self.alerts.clear()
+            self.clear_live_notifications()
             if path and path.exists():
                 with path.open(encoding="utf-8") as f:
                     for line in f:
@@ -328,6 +334,8 @@ class WardriveUI:
                         self.app.msg("[HS SNIFF] Storage error: " + str(exc)[:60], 8)
                         self.app._send("stop")
                         self.close_passive()
+                elif d["kind"] == "live_oui":
+                    self.live_oui(d)
                 else:
                     self.observation(d)
             if d["kind"] == "batch_start":
@@ -357,6 +365,7 @@ class WardriveUI:
                 self.start_cell()
                 self.start_auxiliary_collectors()
             if d["kind"] == "stopped" and not self.scan.active:
+                self.clear_live_notifications()
                 self.host_ble.stop()
                 self.cell.stop()
                 self.close_passive()
@@ -388,6 +397,7 @@ class WardriveUI:
                 app._pending_state = ""
                 if state in ("all_wardrive", "all_wardrive_host", "hs_sniff"):
                     self.detector.clear()
+                    self.clear_live_notifications()
                     if state == "hs_sniff":
                         if not self.app.loot or not self.app.loot.active:
                             app.msg("[HS SNIFF] No writable loot session; capture cancelled.", 8)
@@ -399,7 +409,8 @@ class WardriveUI:
                             return True
                     if not self.scan.start(
                             "hs_sniff" if state == "hs_sniff" else "wardrive",
-                            wifi_only=state == "all_wardrive_host"):
+                            wifi_only=state == "all_wardrive_host",
+                            live_ouis=self.detector.oui_prefixes()):
                         self.close_passive()
                         app.msg("[WDG] Scan unavailable; check firmware/connection", 8)
                         return True
@@ -1039,6 +1050,54 @@ class WardriveUI:
              "addr_type": None, "fix": self.fixes.at(time.monotonic()), "observed_at": time.time()}
         self.detect(d)
 
+    def clear_live_notifications(self):
+        self.live_notifications.clear()
+        self.alerts = deque((a for a in self.alerts if not a.get("pending_batch")), maxlen=16)
+        if not self.alerts:
+            self.alert_until = 0
+
+    def live_oui(self, d):
+        """Provisional popup only: no inventory, evidence persistence or map fix."""
+        now = time.monotonic()
+        identity = d["radio"] + ":" + d["mac"]
+        if identity in self.settings["suppressed_devices"]:
+            return
+        event = dict(d, kind=d["radio"])
+        hits = self.detector.classify_oui(event, self.app._whitelist.is_blocked,
+                                          self.settings["suppressed_rules"])
+        absence = max(10, self.settings["realert_seconds"])
+        for hit in hits:
+            if not self.settings[hit["category"]] or hit["strength"] <= 0:
+                continue
+            key = identity + ":" + hit["category"]
+            previous = self.live_notifications.get(key)
+            if previous and previous["session"] != d["session"]:
+                previous = None
+            if previous and previous["batch"] == d["batch"]:
+                continue
+            old = self.notables.get(key)
+            recent_live = previous and now-previous["seen"] < absence
+            recent_full = old and old["strength"] > 0 and now-old["seen"] < absence
+            show = not (recent_live or recent_full)
+            self.live_notifications.pop(key, None)
+            self.live_notifications[key] = dict(
+                session=d["session"], batch=d["batch"], seen=now,
+                notified=bool(show or (recent_live and previous["notified"]) or recent_full))
+            while len(self.live_notifications) > 256:
+                self.live_notifications.popitem(last=False)
+            if not show:
+                continue
+            item = dict(hit, key=key, identity=identity, mac=d["mac"], kind=d["radio"],
+                        name="", rssi=d["rssi"], observation_fix=None, pending_batch=True)
+            for i, queued in enumerate(self.alerts):
+                if queued["key"] == key:
+                    self.alerts[i] = item
+                    break
+            else:
+                self.alerts.append(item)
+            self.app._term_add("[DETECT] " + hit["label"] + " " + d["mac"]
+                               + " OUI match; details pending batch", raw=True)
+
     def detect(self, d):
         now = time.monotonic()
         kind = "wifi" if d["kind"] == "wifi_mgmt" else d["kind"]
@@ -1078,7 +1137,17 @@ class WardriveUI:
             elif old:
                 item["saved"] = old.get("saved",0)
             absence = max(10, self.settings["realert_seconds"])
-            if hit["strength"] > 0 and (not old or now-old["seen"] >= absence or hit["strength"] > old["strength"]):
+            live = self.live_notifications.get(key)
+            live_notified = (live and live["session"] == d.get("session")
+                             and live["batch"] == d.get("batch") and live["notified"])
+            # Upgrade an existing provisional toast in place, without enqueueing
+            # a second popup. Persistence and map state above always run.
+            if live_notified:
+                for i, queued in enumerate(self.alerts):
+                    if queued["key"] == key:
+                        self.alerts[i] = item
+                        break
+            if not live_notified and hit["strength"] > 0 and (not old or now-old["seen"] >= absence or hit["strength"] > old["strength"]):
                 # One queued alert per identity/category; evidence updates replace it.
                 for i, queued in enumerate(self.alerts):
                     if queued["key"] == key:
@@ -2970,5 +3039,9 @@ class WardriveUI:
             px.rectb(55,56,530,39,color)
             px.rect(56,57,528,14,color)
             px.text(62,61,item["label"].upper()+"  "+item["mac"],7 if color==PURPLE else 0)
-            px.text(62,74,(item["name"][:22]+"  "+str(item["rssi"])+"dBm  "+("heard here" if item["observation_fix"] else "GPS unavailable")),7)
-            px.text(62,84,(", ".join(h["method"] for h in item["evidence"]))[:95],13)
+            if item.get("pending_batch"):
+                px.text(62,74,str(item["rssi"])+"dBm  OUI match",7)
+                px.text(62,84,"Details pending batch; map marker waits for full record",13)
+            else:
+                px.text(62,74,(item["name"][:22]+"  "+str(item["rssi"])+"dBm  "+("heard here" if item["observation_fix"] else "GPS unavailable")),7)
+                px.text(62,84,(", ".join(h["method"] for h in item["evidence"]))[:95],13)

@@ -1,5 +1,6 @@
 """Acknowledged scan lifecycle with separate control and observation clocks."""
 import secrets
+import re
 from collections import Counter
 
 
@@ -18,6 +19,8 @@ class ScanController:
         self.target_intel_supported = None
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
+        self.live_oui_supported = self.live_oui_enabled = False
+        self.live_oui_max = 0
         self.wifi_only = self.batch = self.legacy = False
         self.record_counts = Counter()
         self.seq_gaps = 0
@@ -59,6 +62,8 @@ class ScanController:
         self.target_intel_supported = None
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
+        self.live_oui_supported = False
+        self.live_oui_max = 0
         self.probing = True
         self.probe_error = ""
         self.probe_attempts = 1
@@ -67,7 +72,7 @@ class ScanController:
         self.send("get_capabilities")
         return True
 
-    def start(self, mode="wardrive", wifi_only=False):
+    def start(self, mode="wardrive", wifi_only=False, live_ouis=()):
         supported = self.hs_supported if mode == "hs_sniff" else (
             self.wifi_supported if wifi_only else self.supported)
         if not supported or self.active:
@@ -102,7 +107,11 @@ class ScanController:
             command = "start_wardrive_wifi_batch_serial" if self.wifi_only else "start_wardrive_batch_serial"
         else:
             command = "start_wardrive_wifi_serial" if self.wifi_only else "start_wardrive_serial"
-        self.send(command + " " + self.session)
+        prefixes = sorted({p.upper() for p in live_ouis if isinstance(p, str)
+                           and re.fullmatch(r"[0-9a-fA-F]{6}", p)})
+        self.live_oui_enabled = bool(self.batch and self.live_oui_supported and prefixes)
+        extra = (" live_oui=" + ",".join(prefixes[:self.live_oui_max])) if self.live_oui_enabled else ""
+        self.send(command + " " + self.session + extra)
         return True
 
     def stop(self):
@@ -134,10 +143,15 @@ class ScanController:
             self.wifi_supported = d.get("wardrive_wifi_serial_v1", False) is True
             self.batch_supported = d.get("wardrive_batch_serial_v2", False) is True
             self.wifi_batch_supported = d.get("wardrive_wifi_batch_serial_v2", False) is True
+            self.live_oui_supported = d.get("wardrive_live_oui_v1", False) is True
+            self.live_oui_max = d.get("live_oui_max", 0) if self.live_oui_supported else 0
             self.probing = False
             self.probe_error = ""
             return False
         if not self.active or d["session"] != self.session or d["seq"] <= self.seq:
+            return False
+        if d["kind"] == "live_oui" and (not self.live_oui_enabled or not self.batch
+                or self.state != "running" or d["batch"] < max(1, self.batch_number)):
             return False
         now = self.clock()
         self.seq_gaps += max(0, d["seq"] - self.seq - 1)
@@ -148,7 +162,7 @@ class ScanController:
             self.last_control = now
             self._control_warned = False
             self.last_heartbeat = now
-        if kind in ("wifi", "wifi_mgmt", "ble", "hs_packet"):
+        if kind in ("wifi", "wifi_mgmt", "ble", "hs_packet", "live_oui"):
             self.last_data = now
             self.last_heartbeat = now
         if kind == "started" and self.state == "starting":
@@ -186,7 +200,7 @@ class ScanController:
             self.last_seen[kind] = now
         if self.mode == "hs_sniff":
             return self.state in ("running", "stopping") and kind == "hs_packet"
-        return self.state == "running" and kind in ("wifi", "wifi_mgmt", "ble")
+        return self.state == "running" and kind in ("wifi", "wifi_mgmt", "ble", "live_oui")
 
     def _status(self):
         if self.batch and self.session:

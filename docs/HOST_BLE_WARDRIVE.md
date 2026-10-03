@@ -5,6 +5,14 @@ Wi-Fi and BLE. **All Wardrive (host BLE)** keeps Wi-Fi on the ESP32 and uses a
 uConsole BlueZ adapter for BLE. Firmware 1.7.10 adds the preferred ten-second
 batch transport; older supported firmware uses the streaming fallback.
 
+WDG 0.9.70 with firmware 1.7.14 also negotiates optional live OUI notification
+hints during ESP collection. Flock/Axon OUI candidates can show a provisional
+popup immediately, while full evidence, loot and map markers still wait for the
+batch. This works for ESP Wi-Fi in both modes and for ESP BLE in the combined
+mode. Host BLE already supplies incremental observations and is unchanged.
+Other signatures without OUI hints retain batch-time alerts. See
+[early OUI popups](NOTABLE_DETECTIONS.md#early-oui-popups-with-batched-esp-scans).
+
 Both modes can record the registered serving cell from ModemManager's cached
 location state and use the same host GPS fix. The safe default does not launch
 qmicli or open a modem device node. Optional QMI neighbor measurements are
@@ -26,6 +34,9 @@ without control it asks `wardrive_status` for the current phase. It stops after
 duplicate sequences, malformed records, host BLE observations and ModemManager
 cell snapshots cannot keep an unresponsive ESP32 session alive. The firmware's
 15-second host lease and WDG's five-second keepalive remain in effect.
+
+Live OUI hints update the ESP data clock, not its control clock or full
+Wi-Fi/BLE result counts. A provisional hint cannot forge a lifecycle heartbeat.
 
 Reference: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32c5/api-guides/coexist.html
 
