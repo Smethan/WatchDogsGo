@@ -1,0 +1,6 @@
+$GPRMC,120000.00,V,,,,,,,021026,,,N*79
+{"class":"TPV","mode":1}
+$GPGSA,A,1,,,,,,,,,,,,,,,,*32
+{"class":"TPV","mode":1}
+$GPGSV,1,1,03,01,20,,35,02,10,,00,03,,,25*78
+{"class":"SKY","nSat":3,"uSat":0,"satellites":[{"PRN":1,"gnssid":0,"svid":1,"az":0.0,"el":20.0,"ss":35.0,"used":false},{"PRN":2,"gnssid":0,"svid":2,"az":0.0,"el":10.0,"ss":0.0,"used":false},{"PRN":3,"gnssid":0,"svid":3,"az":0.0,"el":0.0,"ss":25.0,"used":false}]}

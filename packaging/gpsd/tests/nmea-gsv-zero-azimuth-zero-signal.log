@@ -1,0 +1,12 @@
+# Name: Synthetic SiRF-style zero-azimuth, zero-signal hairball
+# Chipset: synthetic
+# Firmware: synthetic
+# Submitter: WatchDogsGo project
+# Date: 2026-10-02
+# Sample-Notes: All satellites lack azimuth and positive signal strength.
+#
+# This file is Copyright (c) 2026 by the GPSD project
+# SPDX-License-Identifier: BSD-2-clause
+$GPRMC,120001.00,V,,,,,,,021026,,,N*78
+$GPGSA,A,1,,,,,,,,,,,,,,,,*32
+$GPGSV,1,1,03,04,30,,00,05,15,,00,06,05,,00*7F

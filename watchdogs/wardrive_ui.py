@@ -1733,6 +1733,7 @@ class WardriveUI:
                 self.app.gps_fix = False
                 self.app.gps_sats = 0
                 self.app.gps_sats_vis = 0
+                self.app.gps_sats_vis_known = False
             state = "enabled" if self.settings[key] else "disabled"
             provider = self.app.gps.provider or "no GPS provider"
             self.app._term_add(

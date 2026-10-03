@@ -1,0 +1,12 @@
+# Name: Synthetic zero-azimuth partial sky view with signal
+# Chipset: synthetic
+# Firmware: synthetic
+# Submitter: WatchDogsGo project
+# Date: 2026-10-02
+# Sample-Notes: Satellites have signal strength before azimuth is available.
+#
+# This file is Copyright (c) 2026 by the GPSD project
+# SPDX-License-Identifier: BSD-2-clause
+$GPRMC,120000.00,V,,,,,,,021026,,,N*79
+$GPGSA,A,1,,,,,,,,,,,,,,,,*32
+$GPGSV,1,1,03,01,20,,35,02,10,,00,03,,,25*78

@@ -28,6 +28,7 @@ class GpsFix:
     speed_knots: float = 0.0
     satellites: int = 0
     satellites_visible: int = 0
+    satellites_visible_known: bool = False
     fix_quality: int = 0       # 0=no fix, 1=GPS, 2=DGPS
     hdop: float = 99.9
     timestamp: str = ""        # UTC time from NMEA (hhmmss.ss)
@@ -99,6 +100,7 @@ class GpsManager:
         self.last_report_at = 0.0
         self.last_tpv_at = 0.0
         self.last_sky_at = 0.0
+        self.satellite_view_at = 0.0
         self.first_sky_at = 0.0
         self.first_satellites_at = 0.0
         self.first_valid_fix_at = 0.0
@@ -158,6 +160,7 @@ class GpsManager:
             "report_age": age(self.last_report_at),
             "tpv_age": age(self.last_tpv_at),
             "sky_age": age(self.last_sky_at),
+            "satellite_view_age": age(self.satellite_view_at),
             "first_sky_after": (
                 self.first_sky_at - self.transport_connected_at
                 if self.first_sky_at and self.transport_connected_at else None),
@@ -171,6 +174,7 @@ class GpsManager:
                 else None),
             "last_valid_fix_age": age(self.last_valid_fix_at),
             "satellites_visible": fix.satellites_visible,
+            "satellites_visible_known": fix.satellites_visible_known,
             "satellites_used": fix.satellites,
             "last_tpv_mode": self.last_tpv_mode,
             "socket_disconnects": self.socket_disconnects,
@@ -209,6 +213,7 @@ class GpsManager:
         self.last_report_at = 0.0
         self.last_tpv_at = 0.0
         self.last_sky_at = 0.0
+        self.satellite_view_at = 0.0
         self.first_sky_at = 0.0
         self.first_satellites_at = 0.0
         self.first_valid_fix_at = 0.0
@@ -221,6 +226,8 @@ class GpsManager:
             self.fix.received_at = 0.0
             self.fix.satellites = 0
             self.fix.satellites_visible = 0
+            self.fix.satellites_visible_known = False
+            self._gsv_visible.clear()
 
     def _log_navigation_transition(self) -> None:
         state = self.navigation_state
@@ -613,6 +620,7 @@ class GpsManager:
         self.last_report_at = 0.0
         self.last_tpv_at = 0.0
         self.last_sky_at = 0.0
+        self.satellite_view_at = 0.0
         self.first_sky_at = 0.0
         self.first_satellites_at = 0.0
         self.first_valid_fix_at = 0.0
@@ -623,6 +631,8 @@ class GpsManager:
             self.fix.received_at = 0.0
             self.fix.satellites = 0
             self.fix.satellites_visible = 0
+            self.fix.satellites_visible_known = False
+            self._gsv_visible.clear()
 
     @property
     def fd(self) -> int:
@@ -683,6 +693,9 @@ class GpsManager:
                 self.fix.received_at = 0.0
                 self.fix.satellites = 0
                 self.fix.satellites_visible = 0
+                self.fix.satellites_visible_known = False
+                self.satellite_view_at = 0.0
+                self._gsv_visible.clear()
             self._log_navigation_transition()
             return
 
@@ -797,15 +810,36 @@ class GpsManager:
         satellites = report.get("satellites")
         if isinstance(satellites, list):
             self.fix.satellites_visible = len(satellites)
+            self.fix.satellites_visible_known = True
+            self.satellite_view_at = now
             self.fix.satellites = sum(
                 1 for satellite in satellites
                 if isinstance(satellite, dict) and satellite.get("used") is True)
             if self.fix.satellites_visible and not self.first_satellites_at:
                 self.first_satellites_at = now
+        else:
+            visible = self._nonnegative_int(report.get("nSat"))
+            if visible is not None:
+                used = self._nonnegative_int(report.get("uSat"))
+                if used is None or used > visible:
+                    used = 0
+                self.fix.satellites_visible = visible
+                self.fix.satellites = used
+                self.fix.satellites_visible_known = True
+                self.satellite_view_at = now
+                if visible and not self.first_satellites_at:
+                    self.first_satellites_at = now
         hdop = self._finite_number(report.get("hdop"))
         if hdop is not None:
             self.fix.hdop = hdop
         return True
+
+    @staticmethod
+    def _nonnegative_int(value) -> Optional[int]:
+        """Accept gpsd JSON counters without coercing malformed values to zero."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
 
     def process_sentences(self, sentences: List[str]) -> None:
         """Parse NMEA sentences and update self.fix."""
@@ -875,6 +909,8 @@ class GpsManager:
         total_visible = int(p[3]) if p[3] else 0
         self._gsv_visible[prefix] = total_visible
         self.fix.satellites_visible = sum(self._gsv_visible.values())
+        self.fix.satellites_visible_known = True
+        self.satellite_view_at = time.monotonic()
 
     @staticmethod
     def _to_decimal(value: str, direction: str) -> float:

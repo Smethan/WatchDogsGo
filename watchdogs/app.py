@@ -146,6 +146,11 @@ def _bottom_menu_hint(left: int, right: int) -> tuple[int, str]:
             return _fit_hud_text(text, left, right, align_right=True)
     return left, ""
 
+
+def _gps_visible_text(count: int, known: bool) -> str:
+    """Render an unknown satellite view distinctly from an explicit zero."""
+    return str(count) if known else "--"
+
 ZOOM_LEVELS = [
     (360.0, "WORLD"),
     (180.0, "HEMISPHERE"),
@@ -968,6 +973,7 @@ class WatchDogsGame(OtaMixin):
         self.gps_fix = False
         self.gps_sats = 0
         self.gps_sats_vis = 0
+        self.gps_sats_vis_known = False
         self._manual_move = False
         self._breath = 0
         self._battery_pct = self._read_battery()  # -1 if unavailable
@@ -3196,6 +3202,7 @@ class WatchDogsGame(OtaMixin):
             self.gps_fix = False
             self.gps_sats = 0
             self.gps_sats_vis = 0
+            self.gps_sats_vis_known = False
             self.msg("[GPS] OFF", C_WARNING)
             self._term_add("[SYS] GPS disabled", raw=True)
         self.glitch_timer = 2
@@ -4442,7 +4449,9 @@ class WatchDogsGame(OtaMixin):
             else:
                 # Show satellite info periodically
                 if pyxel.frame_count % 60 == 0:
-                    sat = f"Sat:{self.gps_sats}/{self.gps_sats_vis}"
+                    visible = _gps_visible_text(
+                        self.gps_sats_vis, self.gps_sats_vis_known)
+                    sat = f"Sat:{self.gps_sats}/{visible}"
                     self.msg(f"[GPS] Waiting for fix... {sat}", C_WARNING)
             return
 
@@ -5290,6 +5299,8 @@ class WatchDogsGame(OtaMixin):
         self.wardrive.fixes.update(fix, now)
         self.gps_sats = fix.satellites
         self.gps_sats_vis = fix.satellites_visible
+        self.gps_sats_vis_known = getattr(
+            fix, "satellites_visible_known", fix.satellites_visible > 0)
         if fix.valid and now - fix.received_at <= 5:
             # Jitter filter: ignore moves < ~30 m (0.0003°)
             dlat = abs(fix.latitude - self.player_lat)
@@ -8037,7 +8048,7 @@ class WatchDogsGame(OtaMixin):
         if self.gps_fix:
             gps_left = W - 108
         elif self.gps.available:
-            gps_left = W - (120 if self.gps_sats_vis > 0 else 100)
+            gps_left = W - 120
         else:
             gps_left = W - 60
         right_status_edge = gps_left - 6
@@ -8082,8 +8093,10 @@ class WatchDogsGame(OtaMixin):
                        f"{abs(self.player_lon):.5f}{lon_c}")
             pyxel.text(W - 108, y, gps_txt, C_SUCCESS)
         elif self.gps.available:
+            visible = _gps_visible_text(
+                self.gps_sats_vis, self.gps_sats_vis_known)
             pyxel.text(W - 120, y,
-                       f"Waiting fix Vis:{self.gps_sats_vis}", C_WARNING)
+                       f"Waiting fix Vis:{visible}", C_WARNING)
         else:
             pyxel.text(W - 60, y, "GPS offline", C_DIM)
 
@@ -9294,10 +9307,12 @@ class WatchDogsGame(OtaMixin):
         # Info
         if self.gps_sats:
             sat = f"Satellites: {self.gps_sats}"
+        elif not self.gps_sats_vis_known:
+            sat = "Visible: -- (waiting for satellite data)"
         elif self.gps_sats_vis:
             sat = f"Visible: {self.gps_sats_vis}"
         else:
-            sat = "Visible: 0 (receiver sees none)"
+            sat = "Visible: 0 (receiver reports none)"
         pyxel.text(dx + 4, dy + 18, sat, C_DIM)
         pyxel.text(dx + 4, dy + 30, "Wait for GPS fix?", C_TEXT)
         # Buttons
@@ -11260,7 +11275,9 @@ class WatchDogsGame(OtaMixin):
         if self.gps_fix:
             pyxel.text(col3 + 60, y, "FIX", C_SUCCESS)
         elif self.gps.available:
-            pyxel.text(col3 + 60, y, f"Vis:{self.gps_sats_vis}", C_WARNING)
+            visible = _gps_visible_text(
+                self.gps_sats_vis, self.gps_sats_vis_known)
+            pyxel.text(col3 + 60, y, f"Vis:{visible}", C_WARNING)
         else:
             pyxel.text(col3 + 60, y, "N/A", C_ERROR)
         y += ROW_H
