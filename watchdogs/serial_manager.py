@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import logging
+from collections import deque
 from typing import List, Optional, Callable, Tuple
 
 import serial
@@ -173,6 +174,7 @@ class SerialManager:
         self.usb_port_info = None
         self.baud_rate = BAUD_RATE
         self.line_buffer = SerialLineBuffer()
+        self._pending_lines = deque()
 
     # ------------------------------------------------------------------
     # Connection
@@ -200,8 +202,9 @@ class SerialManager:
         except Exception:
             pass
         self.line_buffer = SerialLineBuffer()
+        self._pending_lines.clear()
         self.serial_conn = serial.Serial(
-            port=self.device,
+            port=None,
             baudrate=self.baud_rate,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
@@ -209,8 +212,12 @@ class SerialManager:
             timeout=READ_TIMEOUT,
             write_timeout=2,
         )
-        self.serial_conn.reset_input_buffer()
-        self.serial_conn.reset_output_buffer()
+        # Opening a candidate must not pulse EN/BOOT. Set control lines before
+        # open, and keep any boot/lifecycle records for the endpoint's reader.
+        self.serial_conn.dtr = False
+        self.serial_conn.rts = False
+        self.serial_conn.port = self.device
+        self.serial_conn.open()
         log.info("Serial port %s opened at %d baud", self.device, self.baud_rate)
 
     def probe(self) -> bool:
@@ -260,29 +267,55 @@ class SerialManager:
     # ------------------------------------------------------------------
 
     def send_command(self, command: str) -> None:
+        self._send_command(command, strict=False)
+
+    def send_command_strict(self, command: str) -> None:
+        """Write a command without hiding failures or blocking on ``flush``.
+
+        The portal HTML transfer is a multi-command transaction: continuing
+        after a short or failed write could start a job with incomplete HTML.
+        Its worker also must not block the UI polling loop waiting for a USB
+        driver flush.
+        """
+        self._send_command(command, strict=True)
+
+    def _send_command(self, command: str, *, strict: bool) -> None:
         if not self.serial_conn:
+            if strict or command.startswith("job_"):
+                raise ConnectionError("Job endpoint is disconnected")
             log.error("Serial not connected — cannot send %r", command)
             return
         try:
-            self.serial_conn.write((command + "\r\n").encode("utf-8"))
-            self.serial_conn.flush()
-            if not (command.startswith("wardrive_keepalive ") or
-                    command.startswith("wardrive_status ")):
+            payload = (command + "\r\n").encode("utf-8")
+            if self.serial_conn.write(payload) != len(payload):
+                raise OSError("Incomplete serial command write")
+            if not strict and not command.startswith(("job_", "get_device_info", "get_capabilities")):
+                self.serial_conn.flush()
+            if not strict and not (command.startswith("wardrive_keepalive ") or
+                    command.startswith("wardrive_status ") or
+                    command.startswith(("job_", "get_device_info", "get_capabilities"))):
                 time.sleep(0.1)
                 log.debug("TX: %s", command)
         except Exception as exc:
             log.error("Send error: %s", exc)
+            if strict or command.startswith("job_"):
+                raise
 
-    def read_available(self) -> List[str]:
+    def read_available(self, max_bytes: int = 16384, max_lines: int = 64) -> List[str]:
         """Non-blocking read: grab whatever bytes are waiting and return
         complete lines via the internal line buffer."""
         if not self.serial_conn:
             return []
-        waiting = self.serial_conn.in_waiting
-        if waiting <= 0:
-            return []
-        raw = self.serial_conn.read(waiting)
-        return self.line_buffer.feed(raw)
+        if max_bytes < 1 or max_lines < 1:
+            raise ValueError("Serial read budgets must be positive")
+        # Pending lines count against this tick before accepting more bytes.
+        # This bounds both dispatch time and the retained queue under floods.
+        if not self._pending_lines:
+            waiting = min(self.serial_conn.in_waiting, max_bytes)
+            if waiting > 0:
+                self._pending_lines.extend(self.line_buffer.feed(self.serial_conn.read(waiting)))
+        return [self._pending_lines.popleft()
+                for _ in range(min(max_lines, len(self._pending_lines)))]
 
     def read_response(self, timeout: float = SCAN_TIMEOUT, idle_timeout: float = 1.5) -> List[str]:
         """Blocking read with timeout — kept for legacy / direct-call use."""

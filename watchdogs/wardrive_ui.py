@@ -46,6 +46,7 @@ MAIN_SETTINGS = (
     ("_map_layers", "Map dot layers"),
     ("trail_mode", "Wardrive trail"),
     ("_collectors", "All Wardrive collectors"),
+    ("_c5_devices", "USB C5 devices and roles"),
     ("_lora_settings", "LoRa settings"),
     ("lte_modem", "LTE modem integration"),
     ("cell_tracking", "Cell mast tracking"),
@@ -69,6 +70,7 @@ class WardriveUI:
     def __init__(self, app, initial_settings=None):
         self.app = app
         self.scan = ScanController(app._send, time.monotonic)
+        self.legacy_scan = self.scan
         meshtastic = getattr(app, "_meshtastic", None)
         lease_acquire = (
             (lambda seconds, owner: meshtastic.acquire_ble_scan_lease(
@@ -111,6 +113,8 @@ class WardriveUI:
         self.selection = 0
         self.layer_selection = 0
         self.collector_selection = 0
+        self.c5_selection = 0
+        self.c5_alias_draft = None
         self.lora_selection = 0
         self.meshcore_selection = 0
         self.meshtastic_selection = 0
@@ -188,7 +192,9 @@ class WardriveUI:
         if action_thread is not None and not action_thread.is_alive():
             self._meshtastic_action_thread = None
         connection = app.serial if app.serial and app.serial.is_open else None
-        if connection is not self.connection:
+        pool = getattr(app, 'c5_pool', None)
+        managed = pool is not None and pool.available
+        if connection is not self.connection and not managed:
             self.host_ble.stop()
             self.host_ble_batch_lines.clear()
             self.cell.stop()
@@ -205,6 +211,8 @@ class WardriveUI:
             self.trail.break_segment()
             if connection:
                 self.scan.probe()
+        elif managed:
+            self.connection = connection
         # Legacy stop acknowledgement may precede the no-SD base64 dump.
         # Resume transitions only after its cleanup line was fully processed.
         if self.capture_stop_ack and self.capture.current and not self.capture.current.active:
@@ -466,7 +474,7 @@ class WardriveUI:
         }
         networks = [
             Network(
-                index=str(row["seq"]), ssid=row["name"],
+                index=str(row.get("seq", index)), ssid=row["name"],
                 bssid=row["bssid"], channel=str(row["channel"]),
                 auth=auth_names.get(row["auth"], "Auth " + str(row["auth"])),
                 rssi=str(row["rssi"]),
@@ -474,7 +482,7 @@ class WardriveUI:
                 client_count=row["clients"], packet_count=row["packets"],
                 probe_count=row["probes"],
             )
-            for row in self.targets.rows.values()
+            for index, row in enumerate(self.targets.rows.values())
         ]
         self.app._et_scan_pending = False
         self.app._wifi_scan_done_time = time.time()
@@ -1406,6 +1414,9 @@ class WardriveUI:
         if px.btnp(px.KEY_S):
             self.app._send("stop")
             return
+        if self.settings_page == 'c5':
+            self._update_c5_settings(px)
+            return
         if self.settings_page == "layers":
             if px.btnp(px.KEY_TAB):
                 self.settings_open = False
@@ -1588,6 +1599,9 @@ class WardriveUI:
             elif key == "_collectors":
                 self.settings_page = "collectors"
                 self.collector_selection = 0
+            elif key == '_c5_devices':
+                self.settings_page = 'c5'
+                self.c5_selection = 0
             elif key == "_lora_settings":
                 self.settings_page = "lora"
                 self.lora_selection = 0
@@ -2651,12 +2665,96 @@ class WardriveUI:
         except OSError as exc:
             self.app.msg("[WDG] Settings save failed: " + str(exc)[:50],8)
 
+    def _update_c5_settings(self, px):
+        pool = getattr(self.app,'c5_pool',None)
+        devices = pool.registry.list(connected_only=True) if pool else []
+        if px.btnp(px.KEY_TAB):
+            self.settings_open = False
+            self.c5_alias_draft = None
+            return
+        if self.c5_alias_draft is not None and devices:
+            device = devices[min(self.c5_selection,len(devices)-1)]
+            if px.btnp(px.KEY_ESCAPE):
+                self.c5_alias_draft = None
+            elif px.btnp(px.KEY_RETURN):
+                try:
+                    if self.c5_alias_draft:
+                        pool.registry.assign_alias(device.device_id,self.c5_alias_draft)
+                    self.settings['c5_devices'].setdefault(device.device_id,{})['alias'] = self.c5_alias_draft
+                    self.persist_settings()
+                    self.c5_alias_draft = None
+                except ValueError as exc:
+                    self.app.msg(str(exc),9)
+            elif px.btnp(px.KEY_BACKSPACE):
+                self.c5_alias_draft = self.c5_alias_draft[:-1]
+            else:
+                char = self.app._get_char_input()
+                if char and len(self.c5_alias_draft) < 32:
+                    self.c5_alias_draft += char
+            return
+        if px.btnp(px.KEY_ESCAPE):
+            self.settings_page = 'main'
+            return
+        if px.btnp(px.KEY_UP):
+            self.c5_selection = max(0,self.c5_selection-1)
+        elif px.btnp(px.KEY_DOWN):
+            self.c5_selection = min(max(0,len(devices)-1),self.c5_selection+1)
+        elif px.btnp(px.KEY_P):
+            self.settings['c5_preset'] = ('wifi-dedicated-ble' if self.settings['c5_preset'] == 'split-wifi-ble'
+                                          else 'split-wifi-ble')
+            self.persist_settings()
+            self.app.msg('[C5] Preset applies on the next wardrive start',3)
+        elif devices:
+            device = devices[min(self.c5_selection,len(devices)-1)]
+            preference = self.settings['c5_devices'].setdefault(device.device_id, {'alias':'','role':'auto'})
+            if px.btnp(px.KEY_RETURN) and device.session:
+                self.app.serial = device.session.serial
+                self.app._boot_serial_port = device.endpoint
+                self.app.msg('[C5] Selected for direct commands and updates: '+device.board,3)
+            elif px.btnp(px.KEY_R):
+                roles = ('auto','wifi24-ble','wifi5','ble','wifi')
+                role = preference.get('role','auto')
+                preference['role'] = roles[(roles.index(role)+1)%len(roles)]
+                self.persist_settings()
+            elif px.btnp(px.KEY_A):
+                self.c5_alias_draft = preference.get('alias','')
+
+    def _draw_c5_settings(self, px):
+        pool = getattr(self.app,'c5_pool',None)
+        devices = pool.registry.list(connected_only=True) if pool else []
+        px.text(55,47,'USB C5 DEVICES / explicit physical update selection',7)
+        px.text(55,66,'Preset: '+self.settings['c5_preset']+'  [P] change',11)
+        for index, device in enumerate(devices[:4]):
+            preference = self.settings['c5_devices'].get(device.device_id,{})
+            prefix = '> ' if index == self.c5_selection else '  '
+            selected = device.session and device.session.serial is self.app.serial
+            label = preference.get('alias') or device.board
+            px.text(55,88+index*26,(prefix+label+' '+device.device_id+' '+preference.get('role','auto')
+                                   +(' SELECTED' if selected else ''))[:106],11 if selected else 7)
+            px.text(65,100+index*26,device.endpoint+' / '+device.boot_id,13)
+        if not devices:
+            px.text(55,90,'No job-capable USB C5 has completed negotiation.',9)
+        if self.c5_alias_draft is not None:
+            px.text(55,203,'Alias: '+self.c5_alias_draft+'_  ENTER saves / ESC cancels',11)
+        else:
+            px.text(55,203,'[ENTER] select update device  [R] role  [A] alias',3)
+        px.text(55,224,'2.4 GHz + BLE shares radio airtime; sniffer coexistence can be unstable.',9)
+        px.text(55,240,'Wi-Fi + dedicated BLE assigns one Wi-Fi board and one BLE board.',13)
+        px.text(55,256,'Role/preset changes apply on the next start. Updates reserve the selected board.',13)
+        if pool and pool.available:
+            px.text(55,274,pool.coverage_gap()[:105],9)
+        px.text(55,296,'ESC returns / TAB closes / S stops managed radio jobs',10)
+
     def draw_overlay(self):
         import pyxel as px
         if self.settings_open:
             px.camera(0,-24)
             px.rect(40,35,560,285,0)
             px.rectb(40,35,560,285,PURPLE)
+            if self.settings_page == 'c5':
+                self._draw_c5_settings(px)
+                px.camera()
+                return
             if self.settings_page == "layers":
                 px.text(55,47,"MAP DOT LAYERS   arrows / ENTER / ESC",7)
                 for i, layer in enumerate(MAP_LAYERS):
@@ -2969,7 +3067,7 @@ class WardriveUI:
                 return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
             for i, (key, label) in enumerate(MAIN_SETTINGS):
-                if key in ("_map_layers", "_collectors", "_lora_settings"):
+                if key in ("_map_layers", "_collectors", "_lora_settings", '_c5_devices'):
                     value = "OPEN..."
                 elif key == "trail_mode":
                     value = self.trail_mode().upper()
@@ -3031,6 +3129,11 @@ class WardriveUI:
                         text += " NBR:PAUSED"
             px.rect(4,218,632,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)
+        pool = getattr(self.app, 'c5_pool', None)
+        if pool is not None and pool.available and not self.settings_open:
+            for index, line in enumerate(pool.health_lines()[:3]):
+                px.rect(4, 188+index*10, 632, 10, 0)
+                px.text(6, 189+index*10, line[:122], 13)
         if self.alerts:
             item = self.alerts[0]
             color = ORANGE if item["category"]=="axon" else PURPLE

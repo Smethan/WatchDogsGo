@@ -33,6 +33,10 @@ class HandshakeScreen(PassiveScreen):
             self.update_picker()
             return
         run = self.owner.capture.runs[self.storage]
+        pool = getattr(self.app,'c5_pool',None)
+        managed = pool is not None and pool.available
+        managed_group = next((g for g in pool.groups.values()
+            if g.operation == 'handshake' and g.state in ('starting','running','stopping')),None) if managed else None
         pending = capture_storage(self.app._pending_cmd) == self.storage
         if px.btnp(px.KEY_ESCAPE) or px.btnp(px.KEY_TAB):
             self.open = False
@@ -49,9 +53,12 @@ class HandshakeScreen(PassiveScreen):
             self.selection = max(0, self.selection-1)
         if px.btnp(px.KEY_DOWN):
             self.selection = min(max(0, len(run.rows)-1), self.selection+1)
-        if px.btnp(px.KEY_S) and (run.active or pending):
-            self.app._send("stop")
-        elif px.btnp(px.KEY_RETURN) and not run.active and not self.app._pending_cmd:
+        if px.btnp(px.KEY_S) and (run.active or pending or managed_group):
+            if managed:
+                pool.stop_operation('handshake')
+            else:
+                self.app._send("stop")
+        elif px.btnp(px.KEY_RETURN) and not run.active and not managed_group and not self.app._pending_cmd:
             # If the other capture variant is running, use the regular stop/start
             # transition rather than treating ENTER as a shared-state toggle.
             try:
@@ -71,6 +78,9 @@ class HandshakeScreen(PassiveScreen):
         import pyxel as px
         if self.picker:
             self.draw_picker()
+            return
+        pool = getattr(self.app,'c5_pool',None)
+        if pool is not None and pool.draw_capture(px,'handshake'):
             return
         run = self.owner.capture.runs[self.storage]
         state = run.state.upper()
@@ -120,6 +130,13 @@ class HandshakeScreen(PassiveScreen):
         if self.owner.scan.capture_targets_supported is not True:
             self.owner.scan.probe()
             self.picker_note = 'Network selection needs firmware 1.7.9+. Checking support; retry shortly.'
+            return
+        pool = getattr(self.app,'c5_pool',None)
+        if pool is not None and pool.available:
+            command = self.owner.targets.prepare_scan()
+            pool.start_command(command,'hs_target_scan','HS network scan')
+            self.picker_selection = 0
+            self.picker_note = 'Scanning both supported Wi-Fi bands; selections use BSSID/channel descriptors.'
             return
         # Stop first, then establish the new scan so stop cannot cancel its token.
         self.app._send('stop')

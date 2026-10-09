@@ -1,5 +1,31 @@
 # Smethan WatchDogsGo
 
+## 0.10.0 — Multiple USB ESP32-C5 devices — 2026-10-08
+
+- Discover and negotiate each USB endpoint independently, retain factory and USB
+  identity across tty renumbering, and accept repeatable `--esp-port` arguments.
+  Each endpoint has one bounded reader and its own parser, watchdog and job state.
+- Allocate XIAO 2.4 GHz Wi-Fi plus BLE and Waveshare Zero 5 GHz by default;
+  expose aliases, role preferences and a dedicated BLE preset in Wardrive settings.
+  Assign immutable target/channel groups within advertised operation capacities.
+- Preempt background collectors only after acknowledged stops, add a receive-only
+  spare helper, and restore prior allocations after clean foreground completion.
+  Preserve healthy passive peers after device loss; interrupt distributed
+  foreground work and require a new user start. Resolve uncertain delivery through
+  token status and compensating stops.
+- Merge observation inventory/maps while storing provenance separately. Keep
+  snapshots and capture assemblers isolated by device, boot and job, construct
+  validated host handshake artifacts, and suppress duplicate group rewards.
+- Reserve one physical endpoint for flashing/OTA, validate board/partition
+  geometry and hashes, support matching-profile application-only ROM updates,
+  and reject application OTA on the Zero factory layout. Legacy firmware retains
+  single-device command routing and board-local snapshots.
+
+See [MULTI_C5.md](MULTI_C5.md) for operation, storage, settings and validation
+boundaries. The [software report](https://github.com/Smethan/projectZero/blob/v1.8.0/docs/MULTI_C5_VALIDATION.md)
+records 1,232 passing host tests and the measured firmware packages.
+Hardware/RF acceptance remains unrun.
+
 ## 0.9.70 — Early OUI alerts with batched evidence — 2026-10-03
 
 - Negotiate firmware 1.7.14's optional `wardrive_live_oui_v1` side channel and

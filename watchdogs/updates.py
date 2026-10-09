@@ -9,6 +9,7 @@ import pwd
 import re
 import shlex
 import stat
+import struct
 import subprocess
 import tempfile
 from urllib.request import Request, urlopen
@@ -82,7 +83,7 @@ def validate_bundle(blob, board, version):
         if z.getinfo('manifest.json').file_size > 16384:
             raise ValueError('Oversized firmware manifest')
         manifest = json.loads(z.read('manifest.json'))
-        if (manifest.get('format') != 1 or manifest.get('repository') != FIRMWARE_REPO
+        if (manifest.get('format') not in (1, 2) or manifest.get('repository') != FIRMWARE_REPO
                 or manifest.get('board') != board or manifest.get('chip') != 'esp32c5'
                 or manifest.get('version') != version or set(manifest.get('files', {})) != set(offsets)):
             raise ValueError('Firmware manifest does not match the board/release')
@@ -94,7 +95,60 @@ def validate_bundle(blob, board, version):
                     or info.get('sha256') != hashlib.sha256(payload).hexdigest()):
                 raise ValueError('Firmware file verification failed: '+name)
             files[name] = payload
+        if manifest['format'] == 2:
+            validate_geometry(manifest, files, board)
+        elif board == 'waveshare-zero':
+            raise ValueError('Zero requires a board geometry manifest')
     return files
+
+
+def validate_geometry(manifest, files, board, device_info=None):
+    """Bind checked bytes to the physical profile and generated partition table."""
+    profile = FLASH_BOARDS[board]
+    zero = board == 'waveshare-zero'
+    if device_info is not None and device_info.get('board') != board:
+        raise ValueError('Selected firmware profile differs from connected device')
+    if device_info is not None and device_info.get('flash_bytes', 0) < profile['flash_bytes']:
+        raise ValueError('Selected device flash is too small for this image')
+    if (manifest.get('format') != 2 or manifest.get('board') != board
+            or manifest.get('flash_bytes') != profile['flash_bytes']
+            or manifest.get('application_limit') != profile['app_limit']
+            or manifest.get('application_offset') != 0x20000
+            or manifest.get('application_size') != (0x3E0000 if zero else 0x3F0000)
+            or manifest.get('console') != ('uart' if board == 'wroom' else 'usb-serial-jtag')
+            or manifest.get('updates') != (['rom'] if zero else ['usb-ota', 'rom'])
+            or manifest.get('psram') is not (not zero)):
+        raise ValueError('Firmware geometry/profile mismatch')
+    raw = files['partition-table.bin']
+    parts = []
+    for offset in range(0, len(raw)-31, 32):
+        magic, kind, subtype, address, size, name, flags = struct.unpack_from('<HBBII16sI', raw, offset)
+        if magic != 0x50AA:
+            break
+        parts.append(dict(name=name.split(b'\0',1)[0].decode('ascii'), type=kind,
+                          subtype=subtype, offset=address, size=size, flags=flags))
+    if parts != manifest.get('partitions'):
+        raise ValueError('Partition metadata does not match flashed bytes')
+    apps = [(p['subtype'],p['offset'],p['size']) for p in parts if p['type'] == 0]
+    expected = [(0,0x20000,0x3E0000)] if zero else [(0x10,0x20000,0x3F0000),(0x11,0x410000,0x3F0000)]
+    nvs = [(p['offset'],p['size']) for p in parts if (p['type'],p['subtype']) == (1,2)]
+    if apps != expected or nvs != [(0x9000,0x6000)]:
+        raise ValueError('Application/NVS partition layout mismatch')
+    if any(p['offset']+p['size'] > profile['flash_bytes'] for p in parts):
+        raise ValueError('Partition exceeds physical flash')
+    ordered = sorted(parts, key=lambda p:p['offset'])
+    if any(left['offset']+left['size'] > right['offset']
+           for left,right in zip(ordered,ordered[1:])):
+        raise ValueError('Partitions overlap')
+    bounds = {0x2000:0x8000,0x8000:0x9000,0xf000:0x11000,
+              0x20000:0x20000+expected[0][2]}
+    for name, payload in files.items():
+        address = int(profile['offsets'][name],0)
+        if address+len(payload) > bounds[address]:
+            raise ValueError('Firmware component exceeds reserved region: '+name)
+    if len(files[profile['bin_name']]) > profile['app_limit']:
+        raise ValueError('Application exceeds profile release limit')
+    return manifest
 
 def prepare_firmware(directory, board, release=None):
     if board not in FLASH_BOARDS:
@@ -105,7 +159,7 @@ def prepare_firmware(directory, board, release=None):
     tag = release['tag_name']
     release_version(tag)
     version = tag.removeprefix('v')
-    suffix = '-xiao' if board == 'xiao' else ''
+    suffix = '' if board == 'wroom' else '-'+board
     name = f'projectZerobyLOCOSP{suffix}-{version}.zip'
     sums = download(asset_url(release, 'SHA256SUMS'), 65536).decode('ascii')
     hashes = [line.split()[0] for line in sums.splitlines()
@@ -121,6 +175,8 @@ def prepare_firmware(directory, board, release=None):
     target = Path(tempfile.mkdtemp(prefix=f'{board}-{version}-', dir=directory))
     for filename, data in files.items():
         (target/filename).write_bytes(data)
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        (target/'manifest.json').write_bytes(archive.read('manifest.json'))
     (target/'release.json').write_text(json.dumps(dict(repository=FIRMWARE_REPO, tag=tag, board=board)))
     return tag, target
 

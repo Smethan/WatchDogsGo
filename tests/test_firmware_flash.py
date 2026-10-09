@@ -312,4 +312,8 @@ def test_serial_connection_retains_usb_identity_without_probing_other_ports(monk
     connection=sm.SerialManager(original.device);connection.setup();connection.close()
     assert connection.usb_port_info is original
     assert serial_open.call_count==1
-    assert serial_open.call_args.kwargs['port']==original.device
+    assert serial_open.call_args.kwargs['port'] is None
+    opened = serial_open.return_value
+    assert opened.port == original.device
+    assert opened.dtr is False and opened.rts is False
+    opened.open.assert_called_once_with()

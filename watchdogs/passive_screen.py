@@ -22,13 +22,20 @@ class PassiveScreen:
         scan = self.owner.scan
         if px.btnp(px.KEY_S):
             if (scan.mode == "hs_sniff" and scan.active) or (self.app._pending_cmd and self.app._pending_state == "hs_sniff"):
-                self.app._send("stop")
+                pool = getattr(self.app,'c5_pool',None)
+                if pool is not None and pool.available:
+                    pool.stop_operation('hs_sniff')
+                else:
+                    self.app._send("stop")
         if px.btnp(px.KEY_RETURN):
             if not (scan.mode == "hs_sniff" and scan.active) and not self.app._pending_cmd:
                 self.app._execute_item("start_hs_sniff_serial", "hs_sniff", "HS Sniff", [])
 
     def draw(self):
         import pyxel as px
+        pool = getattr(self.app,'c5_pool',None)
+        if pool is not None and pool.draw_capture(px,'hs_sniff'):
+            return
         scan, capture = self.owner.scan, self.owner.passive
         state = scan.state.upper() if scan.mode == "hs_sniff" else "IDLE"
         if self.app._pending_cmd and self.app._pending_state == "hs_sniff":

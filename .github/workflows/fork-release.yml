@@ -18,12 +18,20 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Check out matching firmware validator
+        uses: actions/checkout@v7
+        with:
+          repository: Smethan/projectZero
+          ref: 894e1cce408f47ec016702b844f4ef2296b6abdb # projectZero v1.8.0
+          path: .test-firmware
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install test dependencies
         run: python -m pip install pytest pyxel pyserial 'esptool>=5.4,<6' Pillow requests cryptography PyNaCl scapy bleak netifaces 'rns>=1.5.4,<1.6' 'lxmf>=1.1.1,<1.2'
       - name: Test
+        env:
+          WDG_FIRMWARE_SOURCE: ${{ github.workspace }}/.test-firmware/ESP32C5/main
         run: |
           python -m pytest -q tests
           for script in setup.sh run.sh update.sh docs/install watchdogs-launcher \

@@ -1,6 +1,8 @@
 """ESP32-C5 flashing helpers. No port is opened by discovery or planning."""
 from dataclasses import dataclass
 import os
+import json
+import hashlib
 from pathlib import Path
 import re
 import shlex
@@ -121,7 +123,29 @@ def ensure_esptool(cache_dir, report):
     return str(python), version
 
 
-def flash_command(python, port, board, directory, manual=False):
+def validate_flash_files(board, directory, device_info=None):
+    from .updates import validate_geometry
+    directory = Path(directory)
+    profile = FLASH_BOARDS[board]
+    manifest_path = directory / 'manifest.json'
+    if device_info and device_info.get('board') != board:
+        raise ValueError('Select the profile of the physical update target')
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get('format') == 2:
+            files = {name:(directory/name).read_bytes() for name in profile['offsets']}
+            for name, payload in files.items():
+                info = manifest.get('files',{}).get(name,{})
+                if (info.get('size') != len(payload) or info.get('sha256') != hashlib.sha256(payload).hexdigest()
+                        or info.get('offset') != profile['offsets'][name]):
+                    raise ValueError('Firmware changed after download: '+name)
+            return validate_geometry(manifest, files, board, device_info)
+    if board == 'waveshare-zero':
+        raise ValueError('Zero flashing requires a verified geometry manifest')
+    return None  # Historical checksummed WROOM/XIAO bundles remain supported.
+
+
+def flash_command(python, port, board, directory, manual=False, *, application_only=False):
     profile = FLASH_BOARDS[board]
     # default-reset auto-detects native USB-JTAG too. Manual BOOT must preserve
     # the already-running ROM/stub, as in the successful desktop flash log.
@@ -131,6 +155,8 @@ def flash_command(python, port, board, directory, manual=False):
                "--after", "watchdog-reset", "write-flash",
                "--flash-mode", "dio", "--flash-freq", "80m", "--flash-size", "detect"]
     for name, offset in profile["offsets"].items():
+        if application_only and name != profile['bin_name']:
+            continue
         command.extend([offset, str(Path(directory) / name)])
     return command
 

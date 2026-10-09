@@ -60,6 +60,18 @@ class OtaMixin:
         if not self.serial or not self.serial.is_open:
             self._ota_status = 'No firmware connection. Release BOOT, tap RESET, then reconnect WDG.'
             return
+        pool = getattr(self,'c5_pool',None)
+        if pool is not None and pool.available:
+            session = pool.endpoints.get(self.serial.device)
+            if session and 'usb-ota' not in session.device_info.get('updates',[]):
+                self._ota_status = 'Selected Zero uses a single factory slot. Use its ROM USB flash profile.'
+                return
+            reservation = pool.reserve(self.serial)
+            if reservation is False:
+                self._c5_pending_update = ('_start_ota',session)
+                self._ota_status = 'Waiting for selected board cleanup acknowledgement...'
+                return
+            self._c5_update_session = reservation
         from .firmware_flash import FlashTarget, select_target
         try:
             identity = self.serial.usb_port_info
@@ -68,16 +80,21 @@ class OtaMixin:
                 raise RuntimeError('Port changed')
         except (RuntimeError, AttributeError):
             self._ota_status = 'Cannot identify connected ESP32. Reconnect WDG to the intended board.'
+            reservation = getattr(self, '_c5_update_session', None)
+            if pool is not None and reservation:
+                self._c5_update_session = None
+                pool.release(reservation)
             return
         # GUI thread finishes its last poll before transferring ownership. Keep
         # the reservation even on failure until the user closes the result.
         self._flash_io_active = self._ota_reserved = True
         self._reconnect_flash_target = target
         self._pending_cmd = None
-        self.wardrive.on_stop()
-        self.wardrive.close_passive()
-        self.wardrive.capture.finish('disconnected')
-        self.sniffing = self.capturing_hs = False
+        if pool is None or not pool.available:
+            self.wardrive.on_stop()
+            self.wardrive.close_passive()
+            self.wardrive.capture.finish('disconnected')
+            self.sniffing = self.capturing_hs = False
         transport = SerialOtaTransport(self.serial, target)
         self.serial = None
         self.state.connected = self._esp32 = False
@@ -88,10 +105,18 @@ class OtaMixin:
         events = self._ota_events
         method, discard = self._ota_method, self._ota_discard
         cache = str(Path(self._app_dir) / 'firmware_cache')
+        selected_info = dict(self._c5_update_session.device_info) if getattr(self, '_c5_update_session', None) else None
         def worker():
             report = lambda text, pct: events.put(('status', (text, pct)))
             result = OtaResult('unconfirmed', 'Update did not complete; check ESP32 before retrying.')
             try:
+                if selected_info:
+                    from .updates import prepare_firmware
+                    from .firmware_flash import validate_flash_files
+                    report('Checking selected board profile and OTA partition layout...', None)
+                    _, directory = prepare_firmware(cache, selected_info['board'], release=release)
+                    if not validate_flash_files(selected_info['board'], directory, selected_info):
+                        raise ValueError('Negotiated device OTA requires a verified geometry manifest')
                 if method == 1:
                     from .usb_ota import UsbOtaRunner
                     result = UsbOtaRunner(transport, report, cache).run(release, discard=discard)
@@ -143,7 +168,12 @@ class OtaMixin:
             self._ota_screen = False
             if self._ota_reserved:
                 self._flash_io_active = self._ota_reserved = False
-                self._try_reconnect_esp32()
+                pool = getattr(self,'c5_pool',None)
+                if pool is not None:
+                    pool.release(getattr(self,'_c5_update_session',None))
+                    self._c5_update_session = None
+                else:
+                    self._try_reconnect_esp32()
             return
         if self._ota_running or self._ota_result:
             return

@@ -57,7 +57,7 @@ Or double-click **Watch Dogs Go** on your desktop.
 **On first launch the game will:**
 
 1. Load player profile (XP, level, badges) from `loot/loot_db.json`
-2. Auto-detect ESP32 on `/dev/ttyUSB0` or `/dev/ttyACM0` (no serial = "ESP32 not found", that's OK to test the UI)
+2. Discover supported ESP32-C5 serial devices; you can also select endpoints with the existing positional port or repeatable `--esp-port PORT` arguments (no serial device is OK for UI-only use)
 3. Try the documented AIO GPS UART (`/dev/ttyS0` on CM4,
    `/dev/ttyAMA0` on CM5) or a safe external GPS — optional
 4. Discover and load plugins from `plugins/` (currently: Wars Sync, JanOS Loot Import)
@@ -346,7 +346,7 @@ Evil Twin target list, so duplicate SSIDs remain separate.
 | Download WPA-SEC | — | Download cracked passwords (potfile) from wpa-sec.stanev.org |
 | Reboot ESP32 | `restart` | Restart ESP32 device |
 | Download Map | — | Download OSM tiles (~10 km radius around current position) for offline street-level map. Press again to cancel. |
-| Flash ESP32 | — | Download latest firmware from GitHub + flash via esptool. Board picker: WROOM / XIAO |
+| Flash ESP32 | — | Download a published firmware version from GitHub and flash via esptool, including first installation. Board picker: WROOM / XIAO / Waveshare Zero; reserve only the selected USB device |
 
 ## Flipper Zero
 
@@ -705,10 +705,17 @@ Saved to `loot/<session>/`:
 
 ## Architecture
 
+Multi-board serial discovery, per-device job sessions, and Wi-Fi channel
+allocation are implemented by `multi_device.py`, `device_registry.py`,
+`device_session.py`, `job_controller.py`, and `radio_scheduler.py`. See the
+[multi-device C5 guide](docs/MULTI_C5.md) for the `c5_jobs_v1` wire protocol,
+radio presets, storage boundaries, and the pending hardware acceptance gates.
+
 ```
 watchdogs/
   app.py              Main game loop, UI rendering, menu system
   serial_manager.py   ESP32 serial comm (115200 baud, USB auto-detect)
+  multi_device.py     Device discovery, job routing, capture and update dispatch
   gps_manager.py      NMEA parser (CM4/CM5 AIO UART or external GPS)
   loot_manager.py     Loot saving (CSV, PCAPNG, handshakes)
   network_manager.py  WiFi scan result parsing

@@ -445,6 +445,31 @@ def _print_bugreport():
         print()
 
 
+def parse_device_args(args):
+    """Keep the original positional port/loot arguments and explicit pool ports."""
+    serial_port = loot_path = None
+    esp_ports = []
+    args = iter(args)
+    for arg in args:
+        if arg == "--esp-port":
+            port = next(args, None)
+            if not port or port.startswith("--"):
+                raise ValueError("--esp-port requires a serial endpoint")
+            esp_ports.append(port)
+        elif arg.startswith("--esp-port="):
+            port = arg.partition("=")[2]
+            if not port:
+                raise ValueError("--esp-port requires a serial endpoint")
+            esp_ports.append(port)
+        elif _looks_like_serial(arg):
+            serial_port = arg
+        else:
+            loot_path = arg
+    if serial_port:
+        esp_ports.insert(0, serial_port)
+    return serial_port, loot_path, list(dict.fromkeys(esp_ports))
+
+
 def main():
     # Bug report mode — print the latest log session and exit
     if "--bugreport" in sys.argv or "--bug-report" in sys.argv:
@@ -461,17 +486,8 @@ def main():
     from .app import WatchDogsGame
     from .serial_manager import detect_esp32_port
 
-    serial_port = None
-    loot_path = None
-
-    args = sys.argv[1:]
-    for arg in args:
-        if _looks_like_serial(arg):
-            serial_port = arg
-        else:
-            loot_path = arg
-
-    if serial_port is None:
+    serial_port, loot_path, esp_ports = parse_device_args(sys.argv[1:])
+    if serial_port is None and not esp_ports:
         serial_port = detect_esp32_port()
 
     import logging
@@ -479,7 +495,7 @@ def main():
                  serial_port, loot_path)
     clean_exit = False
     try:
-        WatchDogsGame(serial_port=serial_port, loot_path=loot_path)
+        WatchDogsGame(serial_port=serial_port, loot_path=loot_path, esp_ports=esp_ports)
         clean_exit = True
     except BaseException:
         logging.exception("Game crashed")

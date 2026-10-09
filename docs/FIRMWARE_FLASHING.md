@@ -5,8 +5,18 @@ For a Wi-Fi update that avoids sending the image through USB, use
 
 For a full USB installation, update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
 
+This can install firmware on a blank board or replace other firmware: it uses
+the ESP32-C5's built-in ROM bootloader and does not require projectZero to be
+running. **Waveshare Zero requires WDG 0.10.0+ and its own release package.**
+Its single factory-app layout supports ROM flashing; application OTA is
+unsupported. The wizard downloads published releases from the Smethan fork;
+it does not import a local ZIP.
+
 1. Use **Up/Down** to choose the correct board. Use **XIAO ESP32-C5** for the Seeed
-   XIAO; the WROOM image is a different board build.
+   XIAO; use **Waveshare ESP32-C5-Zero** for the Zero. Each is a different board
+   build. Keep **Full install** selected for initial installation. On a running
+   device with matching negotiated profile and package geometry, **A** can
+   toggle an application-only update.
 2. Use **V/B** to move forward/backward through firmware versions. **Latest
    stable** remains available, or select an explicit tag such as **v1.7.3**.
    A short background request loads the published versions. If it fails, V/B
@@ -28,8 +38,10 @@ power on. It does not poll, send keepalives, or reconnect during this preparatio
 
 Escape closes an idle/failed wizard and resumes normal serial use. Escape during
 an active flash only hides the window; flashing continues and retains exclusive
-use of WDG's serial connection. Opening the wizard pauses the previous ESP32
-operation; it does not automatically resume that scan afterward.
+use of the selected device's serial connection. With multiple managed devices,
+only the selected endpoint is reserved; its peer can keep collecting. Opening
+the wizard pauses the selected ESP32 operation; it does not automatically resume
+that scan afterward.
 
 ## Why this differs from the old built-in flasher
 

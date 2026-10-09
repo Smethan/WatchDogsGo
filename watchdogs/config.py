@@ -134,6 +134,8 @@ MESHTASTIC_HELPER = "/usr/local/libexec/watchdogs-meshtastic"
 # Board-specific flash profiles
 FLASH_BOARDS = {
     "wroom": {
+        "flash_bytes": 8 * 1024 * 1024,
+        "app_limit": 0x3E0000,
         "label": "ESP32-C5 WROOM-1 (Dev Kit)",
         "baud": 460800,
         "before": "default-reset",
@@ -146,6 +148,8 @@ FLASH_BOARDS = {
         },
     },
     "xiao": {
+        "flash_bytes": 8 * 1024 * 1024,
+        "app_limit": 0x3E0000,
         "label": "XIAO ESP32-C5 (Seeed Studio, USB-JTAG)",
         "baud": 460800,
         "before": "default-reset",
@@ -155,6 +159,20 @@ FLASH_BOARDS = {
             "partition-table.bin": "0x8000",
             "ota_data_initial.bin": "0xf000",
             "projectZerobyLOCOSP-xiao.bin": "0x20000",
+        },
+    },
+    "waveshare-zero": {
+        "label": "Waveshare ESP32-C5 Zero (4 MB, USB-JTAG)",
+        "flash_bytes": 4 * 1024 * 1024,
+        "app_limit": 0x3D0000,
+        "baud": 460800,
+        "before": "default-reset",
+        "bin_name": "projectZerobyLOCOSP-waveshare-zero.bin",
+        "offsets": {
+            "bootloader.bin": "0x2000",
+            "partition-table.bin": "0x8000",
+            "ota_data_initial.bin": "0xf000",
+            "projectZerobyLOCOSP-waveshare-zero.bin": "0x20000",
         },
     },
 }

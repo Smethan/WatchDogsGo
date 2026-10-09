@@ -58,6 +58,8 @@ DEFAULTS = {
     "meshcore_ble_paired_address": "",
     "meshcore_ble_paired_name": "",
     "host_ble_adapter": "auto",
+    "c5_preset": "split-wifi-ble",
+    "c5_devices": {},
     "realert_seconds": 60,
     "suppressed_rules": [],
     "suppressed_devices": [],
@@ -164,6 +166,18 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
         result["wardrive_433"] = False
     if result["lora_protocol"] not in LORA_PROTOCOLS:
         result["lora_protocol"] = DEFAULTS["lora_protocol"]
+    if result['c5_preset'] not in ('split-wifi-ble', 'wifi-dedicated-ble'):
+        result['c5_preset'] = DEFAULTS['c5_preset']
+    devices = {}
+    for identity, preferences in result['c5_devices'].items():
+        if (not isinstance(identity,str) or not re.fullmatch(r'[0-9A-Fa-f]{12}',identity)
+                or not isinstance(preferences,dict)):
+            continue
+        alias = preferences.get('alias','')
+        role = preferences.get('role','auto')
+        if isinstance(alias,str) and len(alias) <= 32 and role in ('auto','wifi24-ble','wifi5','ble','wifi'):
+            devices[identity.upper()] = {'alias':alias, 'role':role}
+    result['c5_devices'] = devices
     # Stock-versus-WDG selection was removed with unified installation.  Keep
     # the serialized key for one migration release, but force the only
     # supported restricted local API.

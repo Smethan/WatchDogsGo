@@ -450,7 +450,7 @@ class MapProjection:
 
 class WatchDogsGame(OtaMixin):
 
-    def __init__(self, serial_port=None, loot_path=None):
+    def __init__(self, serial_port=None, loot_path=None, esp_ports=None):
         pyxel.init(W, H, title="ESP32 Watch Dogs", fps=FPS,
                    quit_key=pyxel.KEY_NONE, display_scale=2)
         try:
@@ -530,41 +530,24 @@ class WatchDogsGame(OtaMixin):
                     import time as _t
                     _t.sleep(6)  # ESP32 boot + USB enumerate on CM5
 
-        # Open serial (with probe retry for cold-boot)
-        port = serial_port or detect_esp32_port()
-        if not port and self._usb_enabled:
-            # USB just powered on — port may not be visible yet, retry
-            import time as _t
-            for _retry in range(3):
-                _t.sleep(2)
-                port = detect_esp32_port()
-                if port:
-                    break
-        if port:
+        # Discovery does not stop or reset existing radio owners. Each endpoint
+        # negotiates independently once the UI's source handlers are ready.
+        from .device_registry import supported_candidates
+        requested_ports = list(esp_ports or ([serial_port] if serial_port else []))
+        self._esp_ports = requested_ports
+        ports = requested_ports or [c['endpoint'] for c in supported_candidates()]
+        self._initial_serial_managers = []
+        port = ports[0] if ports else None
+        for candidate in ports:
             try:
-                self.serial = SerialManager(port)
-                self.serial.setup()
-                # Wait for firmware to be ready (cold-boot can take 2-6s)
-                import time as _t
-                _ready = False
-                for _attempt in range(10):  # up to 5s (10 × 0.5s)
-                    if self.serial.probe():
-                        _ready = True
-                        break
-                    _t.sleep(0.5)
-                if not _ready:
-                    # Drain anything that arrived late
-                    self.serial.serial_conn.reset_input_buffer()
-                self.state.connected = True
-                self._esp32 = True
-                # Clear any leftover state from previous crashed session
-                self.serial.send_command("stop")
-                self.serial.serial_conn.reset_input_buffer()
+                manager = SerialManager(candidate)
+                manager.setup()
+                self._initial_serial_managers.append(manager)
+                if self.serial is None:
+                    self.serial = manager
             except Exception as e:
-                self._esp32 = False
-                self._term_add(f"[ERR] Serial {port}: {e}", raw=True)
-        else:
-            self._esp32 = False
+                self._term_add(f"[ERR] Serial {candidate}: {e}", raw=True)
+        self.state.connected = self._esp32 = bool(self._initial_serial_managers)
 
         # Open GPS only after reading the AIO power rail. setup.sh configures
         # gpsd as the sole raw-UART owner, so this normally opens a local gpsd
@@ -1189,6 +1172,8 @@ class WatchDogsGame(OtaMixin):
                 raw=True)
 
         self.wardrive = WardriveUI(self, initial_settings=_wardrive_settings)
+        from .multi_device import MultiDeviceRuntime
+        self.c5_pool = MultiDeviceRuntime(self, self._initial_serial_managers, ports=self._esp_ports)
         pyxel.run(self.update, self.draw)
 
     # ------------------------------------------------------------------
@@ -1592,6 +1577,10 @@ class WatchDogsGame(OtaMixin):
 
     def _try_reconnect_esp32(self) -> bool:
         """Try to detect and reconnect ESP32. Like JanOS wait_for_esp32."""
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None:
+            pool.discover()
+            return any(s.connected for s in pool.endpoints.values())
         if getattr(self, '_flash_io_active', False):
             return False
         target = getattr(self, '_reconnect_flash_target', None)
@@ -1641,7 +1630,21 @@ class WatchDogsGame(OtaMixin):
 
     def _send(self, cmd: str):
         # Session lease renewals are transport housekeeping, not user actions.
-        quiet = cmd.startswith("wardrive_keepalive ")
+        quiet = cmd.startswith(("wardrive_keepalive ", "job_keepalive "))
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None and (pool.available or cmd == 'stop'):
+            if cmd == 'stop':
+                pool.stop_all()
+                for endpoint in pool.legacy_endpoints:
+                    session = pool.endpoints.get(endpoint)
+                    if (session and session.connected
+                            and session.device_id not in pool.reserved):
+                        session.serial.send_command('stop')
+                if hasattr(self, 'wardrive'):
+                    self.wardrive.on_stop()
+                return
+            if pool.start_command(cmd):
+                return
         if getattr(self, '_flash_io_active', False):
             if not quiet:
                 self._term_add("[FLASH] Serial reserved until flashing finishes", raw=True)
@@ -2330,7 +2333,11 @@ class WatchDogsGame(OtaMixin):
         if running:
             if state_key == "sniffer":
                 self._sniffer_results_pending = True
-            self._send("stop")
+            pool = getattr(self,'c5_pool',None)
+            if pool is not None and pool.available:
+                pool.stop_foreground()
+            else:
+                self._send("stop")
             self.msg(f"[STOP] {name}", C_DIM)
             self._set_running(state_key, False)
             # Reset rescan timers
@@ -2363,12 +2370,24 @@ class WatchDogsGame(OtaMixin):
         self._pending_deadline = 0.0
 
     def _start_scan_cmd(self, final_cmd: str, state_key: str, name: str):
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None and pool.start_command(final_cmd, state_key, name):
+            self._pending_cmd = None
+            self._pending_state = ''
+            return
         # All transitions wait for firmware's final stop message, never just a timer.
         if getattr(self, "sniffing", False):
             # Target-intel scans consume the same preserved firmware snapshot;
             # other transitions must not interleave a large export.
             self._sniffer_results_pending = False
-        self._send("stop")
+        selected = next((session for session in pool.endpoints.values()
+                         if session.serial is self.serial), None) if pool is not None else None
+        if (selected is not None and selected.endpoint in pool.legacy_endpoints
+                and selected.connected and selected.device_id not in pool.reserved):
+            self.wardrive.scan = self.wardrive.legacy_scan
+            selected.serial.send_command('stop')
+        else:
+            self._send("stop")
         self._clear_scan_state()
         self._pending_cmd = final_cmd
         self._pending_state = state_key
@@ -2408,6 +2427,16 @@ class WatchDogsGame(OtaMixin):
         )
 
     def _dispatch_evil_twin_start(self, pending: str) -> None:
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None and pool.available:
+            try:
+                if not pool.start_portal('evil_twin', None, self._portal_ssid,
+                                         getattr(self, '_et_targets', ()), 'evil_twin'):
+                    self._attack_step = 'error'
+            except (ValueError, OSError) as exc:
+                self._attack_step = 'error'
+                self.msg('[ET] '+str(exc), C_ERROR)
+            return
         prefix = "__evil_twin_start__ "
         if not pending.startswith(prefix):
             self.msg("[ET] Invalid queued target selection.", C_ERROR)
@@ -2426,6 +2455,11 @@ class WatchDogsGame(OtaMixin):
         self.msg(f"[ET] Starting — SSID: {self._portal_ssid}", C_WARNING)
 
     def _is_running(self, state_key: str) -> bool:
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None and pool.available:
+            if any(g.state_key == state_key and g.state in ('starting', 'running', 'stopping')
+                   for g in pool.groups.values()):
+                return True
         return {
             "all_wardrive": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and not self.wardrive.scan.wifi_only,
             "all_wardrive_host": self.wardrive.scan.active and self.wardrive.scan.mode == "wardrive" and self.wardrive.scan.wifi_only,
@@ -2488,6 +2522,18 @@ class WatchDogsGame(OtaMixin):
             if val:
                 self.state.reset_sniffer()
         elif state_key in ("handshake", "handshake_start"): self.capturing_hs = val
+        elif state_key == "portal":
+            self.state.portal_running = val
+            if val:
+                self.state.portal_ssid = self._portal_ssid
+                self._attack_step = "running"
+        elif state_key == "evil_twin":
+            self.state.evil_twin_running = val
+            self._evil_twin_starting = False
+            self._evil_twin_start_deadline = 0.0
+            if val:
+                self.state.evil_twin_ssid = self._portal_ssid
+                self._attack_step = "running"
 
     # ------------------------------------------------------------------
     # Python-native attacks (Dragon Drain, MITM, BlueDucky, RACE)
@@ -2608,6 +2654,11 @@ class WatchDogsGame(OtaMixin):
             self._et_scan_pending = True
             self.state.networks.clear()
             self._state_network_by_bssid.clear()
+            pool = getattr(self,'c5_pool',None)
+            if pool is not None and pool.available:
+                command = self.wardrive.targets.prepare_scan()
+                pool.start_command(command,'hs_target_scan','Evil Twin network intel scan')
+                return
             self._send("stop")
             command = self.wardrive.targets.prepare_scan()
             self._pending_cmd = command
@@ -4245,11 +4296,23 @@ class WatchDogsGame(OtaMixin):
             self._flash_screen = True
             self.menu_open = False
             return
+        pool = getattr(self,'c5_pool',None)
+        if pool is not None and pool.available and self.serial:
+            reservation = pool.reserve(self.serial)
+            if reservation is False:
+                self._c5_pending_update = ('_start_flash_esp32',pool.endpoints[self.serial.device])
+                self.msg('[FLASH] Waiting for selected board cleanup acknowledgement',C_DIM)
+                return
+            self._c5_update_session = reservation
         from .config import FLASH_BOARDS
         from .firmware_flash import FlashTarget, select_target
         self._flash_boards = list(FLASH_BOARDS.keys())
         self._flash_sel = getattr(self, '_flash_sel', 0)
+        selected_session = getattr(self, '_c5_update_session', None)
+        if selected_session and selected_session.device_info.get('board') in self._flash_boards:
+            self._flash_sel = self._flash_boards.index(selected_session.device_info['board'])
         self._flash_manual = getattr(self, '_flash_manual', False)
+        self._flash_application_only = False
         self._flash_screen = True
         self._flash_running = False
         self._flash_status = "Choose board and connection mode"
@@ -4262,7 +4325,10 @@ class WatchDogsGame(OtaMixin):
         # Hold the reservation throughout the wizard, including failed attempts.
         self._flash_io_active = True
         preferred = getattr(self.serial, 'device', None) or getattr(self, '_boot_serial_port', None)
-        if not getattr(self, '_flash_target', None):
+        # Every newly opened wizard binds the currently selected physical USB
+        # endpoint; an earlier wizard's target must not survive board selection.
+        self._flash_target = None
+        if not self._flash_target:
             try:
                 identity = getattr(self.serial, 'usb_port_info', None)
                 self._flash_target = (FlashTarget.from_port(identity) if identity is not None
@@ -4272,14 +4338,16 @@ class WatchDogsGame(OtaMixin):
                 self._term_add("[FLASH] " + str(exc), raw=True)
         self._reconnect_flash_target = self._flash_target
         self._flash_refresh_target(discover=False)
-        self.wardrive.on_stop()  # local state only: _send is now reserved
-        self.wardrive.close_passive()
-        self.wardrive.capture.finish("disconnected")
-        self.sniffing = self.capturing_hs = False
+        if pool is None or not pool.available:
+            self.wardrive.on_stop()  # local state only: _send is now reserved
+            self.wardrive.close_passive()
+            self.wardrive.capture.finish("disconnected")
+            self.sniffing = self.capturing_hs = False
         if self.serial:
             self.serial.close()
-        self._esp32 = False
-        self.state.connected = False
+        if pool is None:
+            self._esp32 = False
+            self.state.connected = False
         self._term_add("[FLASH] WDG serial paused; USB power is left on. ESC resumes normal use.", raw=True)
 
     def _flash_refresh_target(self, discover=True):
@@ -4343,6 +4411,11 @@ class WatchDogsGame(OtaMixin):
             self._flash_cycle_version(-1)
         elif pyxel.btnp(pyxel.KEY_R):
             self._flash_refresh_target()
+        elif pyxel.btnp(pyxel.KEY_A):
+            if getattr(self, '_c5_update_session', None):
+                self._flash_application_only = not self._flash_application_only
+            else:
+                self.msg('[FLASH] Application-only update needs a negotiated board profile.', C_WARNING)
         elif pyxel.btnp(pyxel.KEY_RETURN):
             if not getattr(self, '_flash_target', None):
                 self.msg("[FLASH] No target selected. Press R and check the USB device first", C_WARNING)
@@ -4355,6 +4428,10 @@ class WatchDogsGame(OtaMixin):
         elif pyxel.btnp(pyxel.KEY_ESCAPE):
             self._flash_screen = False
             self._flash_io_active = False
+            pool = getattr(self,'c5_pool',None)
+            if pool is not None:
+                pool.release(getattr(self,'_c5_update_session',None))
+                self._c5_update_session = None
             self._esc_consumed_frame = pyxel.frame_count
 
     def _flash_do(self, board: str):
@@ -4369,7 +4446,7 @@ class WatchDogsGame(OtaMixin):
         """Verify the release/tools, then flash the same selected USB device."""
         from .config import FLASH_BOARDS
         from .updates import prepare_firmware
-        from .firmware_flash import ensure_esptool, wait_for_target, flash_command, run_flash
+        from .firmware_flash import ensure_esptool, wait_for_target, flash_command, run_flash, validate_flash_files
         from pathlib import Path
         cache = Path(self._app_dir) / "firmware_cache"
         log_file = None
@@ -4396,6 +4473,11 @@ class WatchDogsGame(OtaMixin):
             report("Requested firmware: " + (requested or "latest stable"))
             self._flash_status = "Downloading and verifying firmware..."
             tag, fw_dir = prepare_firmware(cache, board, release=release)
+            session = getattr(self,'_c5_update_session',None)
+            geometry = validate_flash_files(board,fw_dir,session.device_info if session else None)
+            application_only = getattr(self, '_flash_application_only', False)
+            if application_only and (not session or not geometry):
+                raise ValueError('Application-only updates require a matching negotiated profile and geometry manifest')
             report(f"{tag}: board and checksums verified")
             self._flash_status = "Checking flashing tools..."
             python, version = ensure_esptool(cache, report)
@@ -4411,7 +4493,9 @@ class WatchDogsGame(OtaMixin):
             manual = getattr(self, '_flash_manual', False)
             report("Manual BOOT: no pre-reset, 115200 baud" if manual else "Automatic: script reset sequence, 460800 baud")
             self._flash_status = "Flashing; keep USB connected..."
-            run_flash(flash_command(python, port, board, fw_dir, manual), report)
+            report('Application region only' if application_only else 'Full install; NVS region preserved')
+            run_flash(flash_command(python, port, board, fw_dir, manual,
+                                   application_only=application_only), report)
             self._fw_version = ""
             self._fw_update_available = False
             self._flash_status = "Flash verified. ESC to reconnect."
@@ -4520,6 +4604,17 @@ class WatchDogsGame(OtaMixin):
                     )
                     return
                 primary = nets[selected[0]]
+                pool = getattr(self, 'c5_pool', None)
+                if pool is not None and pool.available:
+                    try:
+                        self._et_targets = [
+                            {key: self.wardrive.targets.rows[nets[i].bssid.upper()][key]
+                             for key in ('bssid', 'channel', 'auth', 'ssid_hex')}
+                            for i in selected
+                        ]
+                    except KeyError:
+                        self.msg("[ET] Scan changed; scan and select targets again.", C_ERROR)
+                        return
                 # First selected = clone SSID, rest = deauth targets
                 self._et_net_idx = primary.index if hasattr(primary, 'index') else selected[0]
                 # Build "select_networks 1 3 5" command args
@@ -4548,6 +4643,21 @@ class WatchDogsGame(OtaMixin):
                 tag = "EP" if self._attack_mode == "evil_portal" else "ET"
                 self._portal_select_screen = False
                 self.msg(f"[{tag}] Portal: {name}", C_HACK_CYAN)
+
+                pool = getattr(self, 'c5_pool', None)
+                if pool is not None and pool.available:
+                    operation = 'portal' if self._attack_mode == 'evil_portal' else 'evil_twin'
+                    self._attack_step = "preparing"
+                    try:
+                        accepted = pool.start_portal(operation, html, self._portal_ssid,
+                            getattr(self, '_et_targets', ()) if operation == 'evil_twin' else (),
+                            operation)
+                        if not accepted:
+                            self._attack_step = 'error'
+                    except (ValueError, OSError) as exc:
+                        self._attack_step = "error"
+                        self.msg(f"[{tag}] {exc}", C_ERROR)
+                    return
 
                 def _start_portal_attack():
                     if html is not None:
@@ -4831,6 +4941,10 @@ class WatchDogsGame(OtaMixin):
             return -1
 
     def _poll_serial(self):
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None:
+            pool.poll()
+            return
         if getattr(self, '_serial_busy', False) or getattr(self, '_flash_io_active', False):
             return
         if not self.serial or not self.serial.is_open:
@@ -4860,7 +4974,7 @@ class WatchDogsGame(OtaMixin):
         for line in lines:
             self._handle_serial_line(line)
 
-    def _handle_serial_line(self, line: str):
+    def _handle_serial_line(self, line: str, device_session=None):
         if self.wardrive.handle_line(line):
             return
         s = line.strip()
@@ -6902,7 +7016,10 @@ class WatchDogsGame(OtaMixin):
                     "preserving the Meshtastic socket", raw=True)
             else:
                 self._bluetooth_bond_thread = None
-        if self.serial and self.serial.is_open:
+        pool = getattr(self, 'c5_pool', None)
+        if pool is not None:
+            pool.close()
+        elif self.serial and self.serial.is_open:
             try:
                 self.serial.send_command("stop")
                 time.sleep(0.2)
@@ -9142,7 +9259,8 @@ class WatchDogsGame(OtaMixin):
             pyxel.text(dx + 8, dy + 174, identity[:119], C_DIM)
         pyxel.text(dx + 8, dy + 192, fw_info, C_DIM)
         pyxel.text(dx + 8, dy + 206, "R refreshes target (no USB reset). Check it before ENTER.", C_WARNING)
-        pyxel.text(dx + 8, dy + 220, "WDG serial is paused while this window is open.", C_DIM)
+        update_kind = 'application only' if getattr(self, '_flash_application_only', False) else 'full install'
+        pyxel.text(dx + 8, dy + 220, "A: " + update_kind + "; selected board paused, other boards keep collecting.", C_DIM)
         pyxel.text(dx + 8, dy + dh - 16, "UP/DOWN board   ENTER flash   ESC exit / reconnect", C_DIM)
 
     def _draw_captured_data(self):
