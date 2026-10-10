@@ -274,6 +274,168 @@ def test_ui_transfers_serial_ownership_clears_password_and_retains_reservation(m
     app._try_reconnect_esp32.assert_called_once()
 
 
+@pytest.mark.parametrize('pool_available', [False, True])
+def test_ota_claims_unknown_selected_endpoint_before_worker_handoff(monkeypatch, pool_available):
+    from queue import Queue
+    from watchdogs import firmware_flash, ota_ui
+
+    port = NS(device='/dev/ttyACM0', vid=0x303a, pid=0x1001,
+              serial_number='ESP-UNKNOWN', location='1-2')
+    monkeypatch.setattr(firmware_flash, 'ports_now', lambda: [port])
+    scheduled = []
+    monkeypatch.setattr(ota_ui.threading, 'Thread',
+                        lambda target, **kw: NS(start=lambda: scheduled.append(target)))
+
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._ota_running = False
+    app._ota_result = None
+    app._ota_releases = [release()]
+    app._ota_selection = 0
+    app._ota_method = 0
+    app._ota_discard = False
+    app._app_dir = '/tmp'
+    app._ota_fields = ['home', 'secret123']
+    app._ota_events = Queue()
+    app.wardrive = Mock()
+    app.serial = Mock(device=port.device, usb_port_info=port, is_open=True)
+    app.state = NS(connected=True)
+    app._term_add = Mock()
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    state = {'reserved': False}
+
+    class Pool:
+        available = pool_available
+        def __init__(self):
+            self.endpoints = {manager.device: session}
+        def reserve(self, selected):
+            assert selected is manager
+            state['reserved'] = True
+            return session
+        def is_reserved(self, selected):
+            return selected is session and state['reserved']
+        def release(self, selected):
+            assert selected is session
+            state['reserved'] = False
+
+    app.c5_pool = Pool()
+
+    class Runner:
+        def __init__(self, transport, _report):
+            assert app.c5_pool.is_reserved(session)
+            assert app._c5_update_session is session
+            assert transport.manager is manager
+            self.transport = transport
+        def run(self, _release, ssid, password):
+            assert app.c5_pool.is_reserved(session)
+            assert (ssid, password) == ('home', 'secret123')
+            return OtaResult('success', 'Verified update', '1.7.5')
+
+    monkeypatch.setattr(ota_ui, 'OtaRunner', Runner)
+    app._start_ota()
+
+    assert app.c5_pool.is_reserved(session)
+    assert app.serial is None and app._ota_reserved and app._flash_io_active
+    assert app._ota_fields[1] == ''
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert app.c5_pool.is_reserved(session)
+    manager.close.assert_called_once()
+    if pool_available:
+        app.wardrive.on_stop.assert_not_called()
+        app.wardrive.capture.finish.assert_not_called()
+    else:
+        app.wardrive.on_stop.assert_called_once_with(stop_scan=False)
+        app.wardrive.close_passive.assert_called_once_with()
+        app.wardrive.capture.finish.assert_called_once_with('disconnected')
+
+
+def test_ota_does_not_mistake_unknown_legacy_board_for_zero(monkeypatch):
+    from queue import Queue
+    from watchdogs import firmware_flash, ota_ui
+    from watchdogs import usb_ota
+    port = NS(device='/dev/ttyACM0', vid=0x303a, pid=0x1001,
+              serial_number='ESP-UNKNOWN', location='1-2')
+    monkeypatch.setattr(firmware_flash, 'ports_now', lambda: [port])
+    scheduled = []
+    monkeypatch.setattr(ota_ui.threading, 'Thread',
+                        lambda target, **kw: NS(start=lambda: scheduled.append(target)))
+    runner = Mock()
+    runner.run.return_value = OtaResult('success', 'Verified update', '1.7.5')
+    usb_factory = Mock(return_value=runner)
+    monkeypatch.setattr(usb_ota, 'UsbOtaRunner', usb_factory)
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._ota_running = False; app._ota_result = None
+    app._ota_releases = [release()]; app._ota_selection = 0
+    app._ota_method = 1; app._ota_discard = False
+    app._app_dir = '/tmp'; app._ota_fields = ['', '']; app._ota_events = Queue()
+    app._ota_status = ''
+    app.serial = Mock(device=port.device, usb_port_info=port, is_open=True)
+    app.state = NS(connected=True); app._term_add = Mock(); app.wardrive = Mock()
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    pool = NS(available=True, endpoints={manager.device: session},
+              reserve=Mock(return_value=session))
+    app.c5_pool = pool
+
+    app._start_ota()
+
+    pool.reserve.assert_called_once_with(manager)
+    assert app._ota_running and len(scheduled) == 1
+    assert app._ota_status != 'Selected Zero uses a single factory slot. Use its ROM USB flash profile.'
+    scheduled[0]()
+    usb_factory.assert_called_once()
+    runner.run.assert_called_once_with(app._ota_releases[0], discard=False)
+
+
+def test_ota_rejects_known_zero_before_claiming_unsupported_layout():
+    from queue import Queue
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._ota_running = False; app._ota_result = None
+    app._ota_releases = [release()]; app._ota_selection = 0
+    app._ota_method = 1; app._ota_discard = False
+    app._ota_fields = ['', '']; app._ota_events = Queue()
+    app.serial = Mock(device='/dev/ttyACM0', is_open=True)
+    session = NS(serial=app.serial, device_id='112233445566',
+                 device_info={'board':'waveshare-zero', 'flash_bytes':4*1024*1024,
+                              'updates':['rom']},
+                 c5_jobs_v1=True, active=False, external_busy=False,
+                 connected=True, endpoint='/dev/ttyACM0')
+    pool = NS(available=True, endpoints={'/dev/ttyACM0':session},
+              reserve=Mock())
+    app.c5_pool = pool
+
+    app._start_ota()
+
+    pool.reserve.assert_not_called()
+    app.serial.close.assert_not_called()
+    assert not app._ota_running
+    assert 'single factory slot' in app._ota_status
+
+
+def test_ota_fails_closed_on_missing_or_stale_endpoint_claim():
+    from queue import Queue
+    app = WatchDogsGame.__new__(WatchDogsGame)
+    app._ota_running = False; app._ota_result = None
+    app._ota_releases = [release()]; app._ota_selection = 0
+    app._ota_method = 1; app._ota_discard = False
+    app._ota_fields = ['', '']; app._ota_events = Queue()
+    app.serial = Mock(device='/dev/ttyACM0', is_open=True)
+    session = NS(serial=app.serial, device_info={}, endpoint='/dev/ttyACM0')
+    pool = NS(available=False, endpoints={'/dev/ttyACM0':session},
+              reserve=Mock(return_value=None))
+    app.c5_pool = pool
+
+    app._start_ota()
+
+    pool.reserve.assert_called_once_with(app.serial)
+    app.serial.close.assert_not_called()
+    assert app.serial is not None and not app._ota_running
+    assert 'Could not claim' in app._ota_status
+
+
 def test_escape_cannot_release_ownership_during_update(monkeypatch):
     from watchdogs import ota_ui
     from queue import Queue

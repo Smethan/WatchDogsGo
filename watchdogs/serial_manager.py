@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import logging
+import threading
 from collections import deque
 from typing import List, Optional, Callable, Tuple
 
@@ -175,6 +176,9 @@ class SerialManager:
         self.baud_rate = BAUD_RATE
         self.line_buffer = SerialLineBuffer()
         self._pending_lines = deque()
+        # read_available() is shared by the normal poller and updater workers.
+        # Keep close/setup from invalidating pyserial's POSIX fd mid-read.
+        self._io_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Connection
@@ -201,23 +205,25 @@ class SerialManager:
                 self.usb_port_info = matches[0]
         except Exception:
             pass
-        self.line_buffer = SerialLineBuffer()
-        self._pending_lines.clear()
-        self.serial_conn = serial.Serial(
-            port=None,
-            baudrate=self.baud_rate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=READ_TIMEOUT,
-            write_timeout=2,
-        )
-        # Opening a candidate must not pulse EN/BOOT. Set control lines before
-        # open, and keep any boot/lifecycle records for the endpoint's reader.
-        self.serial_conn.dtr = False
-        self.serial_conn.rts = False
-        self.serial_conn.port = self.device
-        self.serial_conn.open()
+        with self._io_lock:
+            self.line_buffer = SerialLineBuffer()
+            self._pending_lines.clear()
+            conn = serial.Serial(
+                port=None,
+                baudrate=self.baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=READ_TIMEOUT,
+                write_timeout=2,
+            )
+            # Opening a candidate must not pulse EN/BOOT. Set control lines before
+            # open, and keep any boot/lifecycle records for the endpoint's reader.
+            conn.dtr = False
+            conn.rts = False
+            conn.port = self.device
+            conn.open()
+            self.serial_conn = conn
         log.info("Serial port %s opened at %d baud", self.device, self.baud_rate)
 
     def probe(self) -> bool:
@@ -247,20 +253,29 @@ class SerialManager:
             return False
 
     def close(self) -> None:
-        if self.serial_conn:
-            self.serial_conn.close()
-            self.serial_conn = None
+        with self._io_lock:
+            conn = self.serial_conn
+            if conn is not None:
+                try:
+                    conn.close()
+                finally:
+                    if self.serial_conn is conn:
+                        self.serial_conn = None
 
     @property
     def is_open(self) -> bool:
-        return self.serial_conn is not None and self.serial_conn.is_open
+        with self._io_lock:
+            conn = self.serial_conn
+            return conn is not None and bool(conn.is_open)
 
     @property
     def fd(self) -> int:
         """Return the file descriptor for use with urwid watch_file."""
-        if self.serial_conn is None:
-            raise RuntimeError("Serial port not open")
-        return self.serial_conn.fileno()
+        with self._io_lock:
+            conn = self.serial_conn
+            if conn is None:
+                raise RuntimeError("Serial port not open")
+            return conn.fileno()
 
     # ------------------------------------------------------------------
     # I/O
@@ -304,18 +319,33 @@ class SerialManager:
     def read_available(self, max_bytes: int = 16384, max_lines: int = 64) -> List[str]:
         """Non-blocking read: grab whatever bytes are waiting and return
         complete lines via the internal line buffer."""
-        if not self.serial_conn:
-            return []
         if max_bytes < 1 or max_lines < 1:
             raise ValueError("Serial read budgets must be positive")
-        # Pending lines count against this tick before accepting more bytes.
-        # This bounds both dispatch time and the retained queue under floods.
-        if not self._pending_lines:
-            waiting = min(self.serial_conn.in_waiting, max_bytes)
-            if waiting > 0:
-                self._pending_lines.extend(self.line_buffer.feed(self.serial_conn.read(waiting)))
-        return [self._pending_lines.popleft()
-                for _ in range(min(max_lines, len(self._pending_lines)))]
+        with self._io_lock:
+            conn = self.serial_conn
+            if conn is None:
+                return []
+            if not conn.is_open:
+                raise ConnectionError("Serial endpoint is closed")
+            # pyserial POSIX keeps is_open true if a transport's descriptor is
+            # externally invalidated. Avoid calling ioctl(in_waiting, fd=None).
+            if hasattr(conn, "fd") and conn.fd is None:
+                raise ConnectionError("Serial endpoint has no file descriptor")
+            # Pending lines count against this tick before accepting more bytes.
+            # This bounds both dispatch time and the retained queue under floods.
+            if not self._pending_lines:
+                try:
+                    waiting = min(conn.in_waiting, max_bytes)
+                    if waiting > 0:
+                        self._pending_lines.extend(self.line_buffer.feed(conn.read(waiting)))
+                except TypeError as exc:
+                    # Only normalize pyserial's known invalid-fd failure. Keep
+                    # unrelated TypeErrors visible as programming errors.
+                    if hasattr(conn, "fd") and conn.fd is None:
+                        raise ConnectionError("Serial endpoint lost its file descriptor") from exc
+                    raise
+            return [self._pending_lines.popleft()
+                    for _ in range(min(max_lines, len(self._pending_lines)))]
 
     def read_response(self, timeout: float = SCAN_TIMEOUT, idle_timeout: float = 1.5) -> List[str]:
         """Blocking read with timeout — kept for legacy / direct-call use."""

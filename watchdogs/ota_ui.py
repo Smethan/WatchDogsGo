@@ -11,6 +11,21 @@ from .updates import release_version
 
 
 class OtaMixin:
+    def _prepare_update_local_state(self, pool, session):
+        """Stop app-owned collectors without stopping a healthy pool peer."""
+        if pool is None:
+            self.wardrive.on_stop()
+        elif (session is not None and not getattr(session, 'c5_jobs_v1', False)
+              and not pool.available):
+            # With only a legacy endpoint left, clean host collectors and UI
+            # state but do not call the pool's scan facade's stop hook.
+            self.wardrive.on_stop(stop_scan=False)
+        else:
+            return
+        self.wardrive.close_passive()
+        self.wardrive.capture.finish('disconnected')
+        self.sniffing = self.capturing_hs = False
+
     def _open_ota(self):
         if getattr(self, '_ota_screen', False):
             return
@@ -61,17 +76,37 @@ class OtaMixin:
             self._ota_status = 'No firmware connection. Release BOOT, tap RESET, then reconnect WDG.'
             return
         pool = getattr(self,'c5_pool',None)
-        if pool is not None and pool.available:
-            session = pool.endpoints.get(self.serial.device)
-            if session and 'usb-ota' not in session.device_info.get('updates',[]):
+        self._c5_update_session = None
+        selected_info = None
+        session = None
+        if pool is not None:
+            session = pool.endpoints.get(getattr(self.serial, 'device', None))
+            if session is None or session.serial is not self.serial:
+                self._ota_status = 'Selected serial endpoint is no longer registered. Reconnect WDG and retry.'
+                return
+            candidate_info = dict(getattr(session, 'device_info', {}) or {})
+            board = candidate_info.get('board')
+            known_profile = (board in ('xiao', 'wroom', 'waveshare-zero')
+                             and type(candidate_info.get('flash_bytes')) is int
+                             and candidate_info['flash_bytes'] > 0)
+            if (known_profile and board == 'waveshare-zero'
+                    and 'usb-ota' not in candidate_info.get('updates', [])):
                 self._ota_status = 'Selected Zero uses a single factory slot. Use its ROM USB flash profile.'
                 return
             reservation = pool.reserve(self.serial)
             if reservation is False:
+                if session is None:
+                    self._ota_status = 'Selected serial endpoint is no longer available. Reconnect and retry.'
+                    return
                 self._c5_pending_update = ('_start_ota',session)
                 self._ota_status = 'Waiting for selected board cleanup acknowledgement...'
                 return
+            if reservation is None:
+                self._ota_status = 'Could not claim the selected serial endpoint. Reconnect WDG and retry.'
+                return
             self._c5_update_session = reservation
+            if known_profile:
+                selected_info = candidate_info
         from .firmware_flash import FlashTarget, select_target
         try:
             identity = self.serial.usb_port_info
@@ -83,6 +118,7 @@ class OtaMixin:
             reservation = getattr(self, '_c5_update_session', None)
             if pool is not None and reservation:
                 self._c5_update_session = None
+                self.serial = None
                 pool.release(reservation)
             return
         # GUI thread finishes its last poll before transferring ownership. Keep
@@ -90,11 +126,7 @@ class OtaMixin:
         self._flash_io_active = self._ota_reserved = True
         self._reconnect_flash_target = target
         self._pending_cmd = None
-        if pool is None or not pool.available:
-            self.wardrive.on_stop()
-            self.wardrive.close_passive()
-            self.wardrive.capture.finish('disconnected')
-            self.sniffing = self.capturing_hs = False
+        self._prepare_update_local_state(pool, self._c5_update_session)
         transport = SerialOtaTransport(self.serial, target)
         self.serial = None
         self.state.connected = self._esp32 = False
@@ -105,7 +137,6 @@ class OtaMixin:
         events = self._ota_events
         method, discard = self._ota_method, self._ota_discard
         cache = str(Path(self._app_dir) / 'firmware_cache')
-        selected_info = dict(self._c5_update_session.device_info) if getattr(self, '_c5_update_session', None) else None
         def worker():
             report = lambda text, pct: events.put(('status', (text, pct)))
             result = OtaResult('unconfirmed', 'Update did not complete; check ESP32 before retrying.')

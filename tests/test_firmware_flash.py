@@ -143,6 +143,146 @@ def test_wizard_reserves_io_before_boot_buttons_and_keeps_failure_reserved(app, 
     assert not app._flash_io_active and not app._flash_screen
 
 
+def test_flash_claims_legacy_endpoint_even_when_pool_has_no_managed_devices(app):
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    state = {'reserved': False}
+    class Pool:
+        available = False
+        def __init__(self):
+            self.endpoints = {manager.device: session}
+        def reserve(self, selected):
+            assert selected is manager
+            state['reserved'] = True
+            return session
+        def is_reserved(self, selected):
+            return selected is session and state['reserved']
+        def release(self, selected):
+            assert selected is session
+            state['reserved'] = False
+    app.c5_pool = Pool()
+
+    app._start_flash_esp32()
+
+    assert app.c5_pool.is_reserved(session)
+    assert app._c5_update_session is session
+    assert app._flash_io_active and app._flash_screen
+    manager.close.assert_called_once()
+    app.wardrive.on_stop.assert_called_once_with(stop_scan=False)
+    app.wardrive.close_passive.assert_called_once_with()
+    app.wardrive.capture.finish.assert_called_once_with('disconnected')
+
+
+def test_flash_worker_keeps_unknown_endpoint_claim_until_wizard_closes(app):
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    state = {'reserved': False}
+    class Pool:
+        available = True  # A capable peer exists; the selected endpoint is legacy.
+        def __init__(self):
+            self.endpoints = {manager.device: session}
+        def reserve(self, selected):
+            assert selected is manager
+            state['reserved'] = True
+            return session
+        def is_reserved(self, selected):
+            return selected is session and state['reserved']
+        def release(self, selected):
+            assert selected is session
+            state['reserved'] = False
+    pool = Pool()
+    app.c5_pool = pool
+    app._start_flash_esp32()
+    def flash_while_claimed(_board):
+        assert pool.is_reserved(session)
+    app._flash_firmware = Mock(side_effect=flash_while_claimed)
+
+    app._flash_do('xiao')
+
+    assert pool.is_reserved(session)
+    assert app._flash_io_active and not app._flash_running
+    app.wardrive.on_stop.assert_not_called()
+
+
+def test_hidden_flash_completion_reopens_and_releases_original_endpoint(app, monkeypatch):
+    import watchdogs.app as appmod
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    state = {'reserved': False, 'reserve_calls': 0, 'released': []}
+    class Pool:
+        available = True
+        def __init__(self):
+            self.endpoints = {manager.device: session}
+        def reserve(self, selected):
+            state['reserve_calls'] += 1
+            assert selected is manager
+            state['reserved'] = True
+            return session
+        def is_reserved(self, selected):
+            return selected is session and state['reserved']
+        def release(self, selected):
+            state['released'].append(selected)
+            state['reserved'] = False
+    pool = Pool()
+    app.c5_pool = pool
+    app._start_flash_esp32()
+    assert state['reserve_calls'] == 1
+
+    px = appmod.pyxel
+    monkeypatch.setattr(px, 'btnp', lambda key, *args: key == px.KEY_ESCAPE)
+    app._flash_running = True
+    app._update_flash_screen()  # Hide the active wizard; the claim stays held.
+    app._flash_firmware = Mock()
+    app._flash_do('xiao')
+    assert not app._flash_screen and app._flash_io_active and pool.is_reserved(session)
+
+    peer = Mock(device='/dev/ttyACM1', is_open=True, usb_port_info=None)
+    app.serial = peer  # Runtime selected a healthy peer while the target rebooted.
+    app._start_flash_esp32()
+    assert app._flash_screen and app._c5_update_session is session
+    assert state['reserve_calls'] == 1
+    peer.close.assert_not_called()
+
+    monkeypatch.setattr(px, 'btnp', lambda key, *args: key == px.KEY_ESCAPE)
+    app._update_flash_screen()
+    assert state['released'] == [session]
+    assert app._c5_update_session is None and not app._flash_io_active
+
+
+def test_flash_fails_closed_when_pool_cannot_claim_selected_endpoint(app):
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=False, external_busy=False, connected=True, endpoint=manager.device)
+    pool = NS(available=False, endpoints={manager.device: session},
+              reserve=Mock(return_value=None))
+    app.c5_pool = pool
+
+    app._start_flash_esp32()
+
+    pool.reserve.assert_called_once_with(manager)
+    manager.close.assert_not_called()
+    assert not getattr(app, '_flash_screen', False)
+    assert not getattr(app, '_flash_io_active', False)
+
+
+def test_flash_waits_for_selected_legacy_endpoint_cleanup(app):
+    manager = app.serial
+    session = NS(serial=manager, device_id='', device_info={}, c5_jobs_v1=False,
+                 active=True, external_busy=False, connected=True, endpoint=manager.device)
+    pool = NS(available=False, endpoints={manager.device: session},
+              reserve=Mock(return_value=False))
+    app.c5_pool = pool
+
+    app._start_flash_esp32()
+
+    assert app._c5_pending_update == ('_start_flash_esp32', session)
+    assert not getattr(app, '_flash_screen', False)
+    manager.close.assert_not_called()
+
+
 def test_esc_hides_running_flash_without_releasing_io(app, monkeypatch):
     import watchdogs.app as appmod
     app._start_flash_esp32(); app._flash_running = True

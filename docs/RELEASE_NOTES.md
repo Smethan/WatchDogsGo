@@ -1,5 +1,24 @@
 # Smethan WatchDogsGo
 
+## 0.10.1 — Safe serial handoff for firmware updates — 2026-10-10
+
+- Fix the uConsole crash when opening the ROM flash wizard or running OTA with
+  legacy or unnegotiated firmware. Reserve the selected USB endpoint before
+  closing or handing off its serial connection, independently of whether a
+  board has advertised multi-device jobs. Keep the other endpoint polling.
+- Preserve that physical-device reservation across unknown or changed firmware
+  identity, USB renumbering, failed updates and a hidden flash window. Reopening
+  the window retains its original target; closing the finished window releases
+  only that endpoint. Missing or stale endpoint claims fail before update work.
+- Synchronize serial reads and close/reopen operations, report a closed POSIX
+  descriptor as a disconnect, and keep global Stop away from updater-owned
+  legacy endpoints. Preserve legacy OTA negotiation and require matching board
+  metadata and geometry for application-only flashing.
+
+The complete host suite passes 1,256 tests, including real POSIX pseudo-terminal
+close/read races and simulated update handoffs. This host fix does not replace
+the projectZero v1.8.0 images or establish physical flash/RF acceptance.
+
 ## 0.10.0 — Multiple USB ESP32-C5 devices — 2026-10-08
 
 - Discover and negotiate each USB endpoint independently, retain factory and USB

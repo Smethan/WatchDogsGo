@@ -14,6 +14,7 @@ def mixed_app():
     app.c5_pool = NS(available=True, start_command=Mock(return_value=False),
         stop_all=Mock(), legacy_endpoints={'/dev/old'},
         endpoints={'/dev/old':legacy, '/dev/new':peer}, reserved=set())
+    app.c5_pool.is_reserved = lambda session: session.device_id in app.c5_pool.reserved
     app.wardrive = NS(scan=object(), legacy_scan=object(), on_stop=Mock())
     app._clear_scan_state = Mock()
     app._term_add = Mock()
@@ -48,3 +49,16 @@ def test_global_stop_does_not_write_reserved_legacy_endpoint():
     app._send('stop')
     app.c5_pool.stop_all.assert_called_once()
     app.serial.send_command.assert_not_called()
+
+
+def test_global_stop_respects_endpoint_claim_before_firmware_identity_is_known():
+    app, peer = mixed_app()
+    selected = app.c5_pool.endpoints['/dev/old']
+    app.c5_pool.is_reserved = lambda session: session is selected
+    assert selected.device_id == '' and app.c5_pool.reserved == set()
+
+    app._send('stop')
+
+    app.c5_pool.stop_all.assert_called_once()
+    app.serial.send_command.assert_not_called()
+    peer.serial.send_command.assert_not_called()

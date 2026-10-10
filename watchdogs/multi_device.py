@@ -175,6 +175,11 @@ class MultiDeviceRuntime:
         self.validators = {}
         self.sniffers = {}
         self.reserved = set()
+        # Update ownership is endpoint-scoped because factory IDs are unknown
+        # before negotiation and can change while a device reboots.
+        self._reserved_sessions = {}
+        self._reserved_ids_by_endpoint = {}
+        self._reserved_usb_by_endpoint = {}
         self.legacy_owned = set()
         self.legacy_endpoints = set()
         self._portal_preparation = None
@@ -196,8 +201,40 @@ class MultiDeviceRuntime:
         return [entry for entry in self.registry.list(connected_only=True)
                 if entry.session and entry.session.c5_jobs_v1
                 and not entry.session.external_busy
-                and entry.device_id not in self.reserved
+                and not self.is_reserved(entry.session)
                 and entry.device_id not in self.legacy_owned]
+
+    def is_reserved(self, session):
+        """Return whether this exact endpoint is updater-owned.
+
+        ``reserved`` remains the public factory-ID set used by existing
+        scheduler and caller checks. Endpoint claims cover blank IDs and
+        identity changes without turning a blank ID into a global sentinel.
+        """
+        if session is None:
+            return False
+        return (self._reserved_sessions.get(session.endpoint) is session
+                or session.device_id in self.reserved)
+
+    @staticmethod
+    def _usb_identity(manager):
+        usb = getattr(manager, 'usb_port_info', None)
+        return {key: getattr(usb, key, None)
+                for key in ('vid', 'pid', 'serial_number', 'location')}
+
+    @staticmethod
+    def _same_reserved_usb(identity, candidate):
+        if not identity:
+            return False
+        candidate_identity = candidate.get('usb_identity', {})
+        if (identity.get('serial_number') and candidate_identity.get('serial_number')
+                and identity['serial_number'] == candidate_identity['serial_number']):
+            return (identity.get('vid') in (None, candidate_identity.get('vid'))
+                    and identity.get('pid') in (None, candidate_identity.get('pid')))
+        return (not identity.get('serial_number') and identity.get('location')
+                and identity.get('location') == candidate_identity.get('location')
+                and identity.get('vid') in (None, candidate_identity.get('vid'))
+                and identity.get('pid') in (None, candidate_identity.get('pid')))
 
     def attach(self, manager):
         endpoint = manager.device
@@ -221,7 +258,7 @@ class MultiDeviceRuntime:
 
     def probe(self):
         for session in self.endpoints.values():
-            if session.connected and session.device_id not in self.reserved:
+            if session.connected and not self.is_reserved(session):
                 session.serial.send_command('get_device_info')
                 session.serial.send_command('get_capabilities')
 
@@ -251,13 +288,16 @@ class MultiDeviceRuntime:
             candidate = next((item for item in candidates
                 if os.path.realpath(item['endpoint']) == os.path.realpath(endpoint)), None)
             if candidate:
-                identity = candidate['usb_identity']
-                if any(session.device_id in self.reserved and
-                    ((getattr(session.serial.usb_port_info, 'serial_number', None)
-                      and identity['serial_number'] == session.serial.usb_port_info.serial_number)
-                     or (not getattr(session.serial.usb_port_info, 'serial_number', None)
-                         and identity['location'] == getattr(session.serial.usb_port_info, 'location', None)))
-                    for session in self.endpoints.values()):
+                legacy_reserved_identities = [
+                    self._usb_identity(session.serial)
+                    for session in self.endpoints.values()
+                    if session.device_id in self.reserved
+                    and self._reserved_sessions.get(session.endpoint) is not session
+                ]
+                if (any(self._same_reserved_usb(identity, candidate)
+                        for identity in self._reserved_usb_by_endpoint.values())
+                        or any(self._same_reserved_usb(identity, candidate)
+                               for identity in legacy_reserved_identities)):
                     continue
             try:
                 manager = SerialManager(endpoint)
@@ -273,7 +313,7 @@ class MultiDeviceRuntime:
         if endpoints:
             start = self._round_robin % len(endpoints)
             for session in endpoints[start:]+endpoints[:start]:
-                if session.device_id in self.reserved:
+                if self.is_reserved(session):
                     continue
                 # Direct legacy transfers exclusively own only their endpoint.
                 if (getattr(self.app, '_serial_busy', False)
@@ -292,7 +332,8 @@ class MultiDeviceRuntime:
         if self.clock() >= self._next_discovery:
             self._next_discovery = self.clock()+3
             self.discover()
-        opened = [s.serial for s in self.endpoints.values() if s.connected and s.device_id not in self.reserved]
+        opened = [s.serial for s in self.endpoints.values()
+                  if s.connected and not self.is_reserved(s)]
         if self.app.serial not in opened:
             self.app.serial = opened[0] if opened else None
         self.app._esp32 = self.app.state.connected = bool(opened)
@@ -956,7 +997,7 @@ class MultiDeviceRuntime:
             if group.state in ('starting','running','stopping'):
                 self.controller.stop_group(group.identity)
         for session in self.endpoints.values():
-            if session.external_busy and session.connected and session.device_id not in self.reserved:
+            if session.external_busy and session.connected and not self.is_reserved(session):
                 session.serial.send_command_strict('stop')
                 session.serial.send_command('get_device_info')
         self.foreground = self.background = None
@@ -1127,8 +1168,10 @@ class MultiDeviceRuntime:
 
     def reserve(self, manager):
         session = self.endpoints.get(manager.device)
-        if not session:
+        if not session or session.serial is not manager:
             return None
+        if self._reserved_sessions.get(session.endpoint) is session:
+            return session
         if session.device_id in self.legacy_owned:
             return False
         if session.external_busy:
@@ -1143,33 +1186,47 @@ class MultiDeviceRuntime:
             else:
                 session.stop_job()
             return False  # UI retries only after acknowledged cleanup.
-        self.reserved.add(session.device_id)
+        self._reserved_sessions[session.endpoint] = session
+        reserved_id = session.device_id
+        self._reserved_ids_by_endpoint[session.endpoint] = reserved_id
+        self._reserved_usb_by_endpoint[session.endpoint] = self._usb_identity(session.serial)
+        if reserved_id:
+            self.reserved.add(reserved_id)
         return session
 
     def release(self, session):
-        if session:
-            session.serial.close()
-            self.reserved.discard(session.device_id)
-            self.endpoints.pop(session.endpoint,None)
-            self.registry.disconnect(session.endpoint)
-            self.sessions.pop(session.device_id,None)
-            self.controller.sessions.pop(session.device_id,None)
-            # Resolve a new tty by the saved physical USB identity before open.
-            usb = session.serial.usb_port_info
-            identity = {key:getattr(usb,key,None) for key in ('vid','pid','serial_number','location')}
-            matches = [p for p in supported_candidates()
-                if p['usb_identity'].get('serial_number') == identity['serial_number']
-                and identity['serial_number'] or
-                (not identity['serial_number'] and identity['location']
-                 and p['usb_identity'].get('location') == identity['location'])]
-            if len(matches) == 1:
-                try:
-                    manager = SerialManager(matches[0]['endpoint'])
-                    manager.setup()
-                    self.attach(manager)
-                except OSError:
-                    pass
-            self.discover()
+        if not session:
+            return
+        endpoint = session.endpoint
+        # A stale or repeated release must not tear down a replacement session
+        # or consume the replacement's endpoint-scoped reservation.
+        if self._reserved_sessions.get(endpoint) is not session:
+            return
+
+        self._reserved_sessions.pop(endpoint, None)
+        reserved_id = self._reserved_ids_by_endpoint.pop(endpoint, None)
+        identity = self._reserved_usb_by_endpoint.pop(
+            endpoint, self._usb_identity(session.serial))
+        session.serial.close()
+        if reserved_id and not any(value == reserved_id
+                                   for value in self._reserved_ids_by_endpoint.values()):
+            self.reserved.discard(reserved_id)
+        if self.endpoints.get(endpoint) is session:
+            self.endpoints.pop(endpoint, None)
+            self.registry.disconnect(endpoint)
+            self.sessions.pop(session.device_id, None)
+            self.controller.sessions.pop(session.device_id, None)
+        # Resolve a new tty by the saved physical USB identity before open.
+        matches = [p for p in supported_candidates()
+                   if self._same_reserved_usb(identity, p)]
+        if len(matches) == 1:
+            try:
+                manager = SerialManager(matches[0]['endpoint'])
+                manager.setup()
+                self.attach(manager)
+            except OSError:
+                pass
+        self.discover()
 
     def health_lines(self):
         lines = []
@@ -1237,5 +1294,5 @@ class MultiDeviceRuntime:
         for key in list(self.captures):
             self._close_capture(key)
         for session in self.endpoints.values():
-            if session.device_id not in self.reserved:
+            if not self.is_reserved(session):
                 session.serial.close()

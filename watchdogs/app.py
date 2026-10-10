@@ -1638,7 +1638,7 @@ class WatchDogsGame(OtaMixin):
                 for endpoint in pool.legacy_endpoints:
                     session = pool.endpoints.get(endpoint)
                     if (session and session.connected
-                            and session.device_id not in pool.reserved):
+                            and not pool.is_reserved(session)):
                         session.serial.send_command('stop')
                 if hasattr(self, 'wardrive'):
                     self.wardrive.on_stop()
@@ -2383,7 +2383,7 @@ class WatchDogsGame(OtaMixin):
         selected = next((session for session in pool.endpoints.values()
                          if session.serial is self.serial), None) if pool is not None else None
         if (selected is not None and selected.endpoint in pool.legacy_endpoints
-                and selected.connected and selected.device_id not in pool.reserved):
+                and selected.connected and not pool.is_reserved(selected)):
             self.wardrive.scan = self.wardrive.legacy_scan
             selected.serial.send_command('stop')
         else:
@@ -4292,18 +4292,43 @@ class WatchDogsGame(OtaMixin):
         if getattr(self, '_serial_busy', False):
             self.msg("[FLASH] Serial is busy; finish the current operation first", C_WARNING)
             return
+        if getattr(self, '_flash_screen', False):
+            return
         if getattr(self, '_flash_running', False):
             self._flash_screen = True
             self.menu_open = False
             return
         pool = getattr(self,'c5_pool',None)
-        if pool is not None and pool.available and self.serial:
-            reservation = pool.reserve(self.serial)
+        existing = getattr(self, '_c5_update_session', None)
+        is_reserved = getattr(pool, 'is_reserved', None) if pool is not None else None
+        if pool is not None and existing is not None and callable(is_reserved) and is_reserved(existing):
+            # A running flash may have been hidden with ESC. Reopen that exact
+            # wizard and keep its endpoint claim instead of reserving whichever
+            # peer the runtime selected while this board was in ROM mode.
+            self._flash_screen = True
+            self._flash_io_active = True
+            self.menu_open = False
+            return
+        if pool is not None:
+            manager = self.serial
+            if manager is None:
+                self.msg('[FLASH] Select a connected board before opening the flash wizard', C_WARNING)
+                return
+            session = pool.endpoints.get(getattr(manager, 'device', None))
+            reservation = pool.reserve(manager)
             if reservation is False:
-                self._c5_pending_update = ('_start_flash_esp32',pool.endpoints[self.serial.device])
+                if session is None:
+                    self.msg('[FLASH] Selected endpoint is no longer available; reconnect and retry', C_WARNING)
+                    return
+                self._c5_pending_update = ('_start_flash_esp32', session)
                 self.msg('[FLASH] Waiting for selected board cleanup acknowledgement',C_DIM)
                 return
+            if reservation is None:
+                self.msg('[FLASH] Could not claim the selected serial endpoint; reconnect and retry', C_WARNING)
+                return
             self._c5_update_session = reservation
+        else:
+            self._c5_update_session = None
         from .config import FLASH_BOARDS
         from .firmware_flash import FlashTarget, select_target
         self._flash_boards = list(FLASH_BOARDS.keys())
@@ -4338,11 +4363,7 @@ class WatchDogsGame(OtaMixin):
                 self._term_add("[FLASH] " + str(exc), raw=True)
         self._reconnect_flash_target = self._flash_target
         self._flash_refresh_target(discover=False)
-        if pool is None or not pool.available:
-            self.wardrive.on_stop()  # local state only: _send is now reserved
-            self.wardrive.close_passive()
-            self.wardrive.capture.finish("disconnected")
-            self.sniffing = self.capturing_hs = False
+        self._prepare_update_local_state(pool, self._c5_update_session)
         if self.serial:
             self.serial.close()
         if pool is None:
@@ -4412,7 +4433,11 @@ class WatchDogsGame(OtaMixin):
         elif pyxel.btnp(pyxel.KEY_R):
             self._flash_refresh_target()
         elif pyxel.btnp(pyxel.KEY_A):
-            if getattr(self, '_c5_update_session', None):
+            session = getattr(self, '_c5_update_session', None)
+            info = getattr(session, 'device_info', {}) if session else {}
+            if (info.get('board') in ('xiao', 'wroom', 'waveshare-zero')
+                    and type(info.get('flash_bytes')) is int
+                    and info.get('flash_bytes', 0) > 0):
                 self._flash_application_only = not self._flash_application_only
             else:
                 self.msg('[FLASH] Application-only update needs a negotiated board profile.', C_WARNING)
@@ -4439,7 +4464,12 @@ class WatchDogsGame(OtaMixin):
             self._flash_firmware(board)
         finally:
             # Keep ROM/stub untouched while the wizard remains open for retry.
-            self._flash_io_active = bool(getattr(self, '_flash_screen', False))
+            pool = getattr(self, 'c5_pool', None)
+            session = getattr(self, '_c5_update_session', None)
+            is_reserved = getattr(pool, 'is_reserved', None) if pool is not None else None
+            still_claimed = bool(session is not None and callable(is_reserved)
+                                 and is_reserved(session))
+            self._flash_io_active = bool(getattr(self, '_flash_screen', False) or still_claimed)
             self._flash_running = False
 
     def _flash_firmware(self, board: str):
@@ -4474,8 +4504,14 @@ class WatchDogsGame(OtaMixin):
             self._flash_status = "Downloading and verifying firmware..."
             tag, fw_dir = prepare_firmware(cache, board, release=release)
             session = getattr(self,'_c5_update_session',None)
-            geometry = validate_flash_files(board,fw_dir,session.device_info if session else None)
+            session_info = dict(session.device_info) if session else {}
             application_only = getattr(self, '_flash_application_only', False)
+            known_profile = (session_info.get('board') in ('xiao', 'wroom', 'waveshare-zero')
+                             and type(session_info.get('flash_bytes')) is int
+                             and session_info['flash_bytes'] > 0)
+            if application_only and (not known_profile or session_info.get('board') != board):
+                raise ValueError('Application-only updates require a matching negotiated board profile')
+            geometry = validate_flash_files(board, fw_dir, session_info if known_profile else None)
             if application_only and (not session or not geometry):
                 raise ValueError('Application-only updates require a matching negotiated profile and geometry manifest')
             report(f"{tag}: board and checksums verified")

@@ -3,7 +3,9 @@
 For a Wi-Fi update that avoids sending the image through USB, use
 [SYSTEM → OTA Update](FIRMWARE_OTA.md) in **WDG 0.9.23+**.
 
-For a full USB installation, update to **WDG 0.9.21+**, restart, and open **SYSTEM → Flash ESP32**.
+For a full USB installation, use **WDG 0.10.1+**, restart, and open **SYSTEM → Flash ESP32**.
+Version 0.10.1 fixes serial ownership during updates, including boards whose
+firmware has not answered or does not support the multi-device protocol.
 
 This can install firmware on a blank board or replace other firmware: it uses
 the ESP32-C5's built-in ROM bootloader and does not require projectZero to be
@@ -38,8 +40,10 @@ power on. It does not poll, send keepalives, or reconnect during this preparatio
 
 Escape closes an idle/failed wizard and resumes normal serial use. Escape during
 an active flash only hides the window; flashing continues and retains exclusive
-use of the selected device's serial connection. With multiple managed devices,
-only the selected endpoint is reserved; its peer can keep collecting. Opening
+use of the selected device's serial connection. Reopen **Flash ESP32** to see
+the result and press Escape after it finishes to release the original target.
+With multiple devices, only the selected endpoint is reserved, including legacy
+or blank-board connections; its peer can keep collecting. Opening
 the wizard pauses the selected ESP32 operation; it does not automatically resume
 that scan afterward.
 

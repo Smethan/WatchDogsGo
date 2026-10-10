@@ -149,7 +149,7 @@ class WardriveUI:
             or (reticulum is not None and reticulum.running))
         self._wdg_owned_sdr = False
 
-    def on_stop(self):
+    def on_stop(self, *, stop_scan=True):
         self.targets.cancel()
         if self.app._pending_cmd and self.app._pending_cmd.startswith("hs_scan "):
             self.app._pending_cmd = None
@@ -157,7 +157,8 @@ class WardriveUI:
         self.host_ble.stop()
         self.host_ble_batch_lines.clear()
         self.cell.stop()
-        self.scan.stop()
+        if stop_scan:
+            self.scan.stop()
         self.app._clear_scan_state()
         self.app._gps_wait = False
         self.app._gps_wait_cmd = ""

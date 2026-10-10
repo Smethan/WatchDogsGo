@@ -107,6 +107,16 @@ format 2 manifests include generated board geometry, file offsets, sizes and
 hashes, source dirty state, and a hash of the disposable build source. Existing
 WROOM and XIAO artifact names remain; Zero adds a board-specific asset name.
 
+Use WDG 0.10.1 or newer for firmware updates. The update reservation belongs to
+the selected serial endpoint and its saved physical USB identity, including
+legacy firmware and boards that have not answered capability queries. Normal
+polling, discovery and global Stop leave that endpoint to the updater while
+healthy peers continue. A hidden flash window retains its target and reservation
+until it is reopened and closed after completion. Failed or stale claims stop
+before handing off the connection; repeated release cannot close a replacement
+session. Serial reads and close/reopen are synchronized so a disconnected
+descriptor becomes a device disconnect instead of terminating WDG.
+
 The complete WDG suite passed 1,232 tests, the firmware native harness passed
 25 groups, and all three pinned ESP-IDF 6.0.1 builds and package checks passed.
 Actual application sizes are 2,297,952 bytes for XIAO, 1,910,624 bytes for Zero,

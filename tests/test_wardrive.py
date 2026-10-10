@@ -460,6 +460,25 @@ def test_live_cache_continuous_presence_absence_and_stop_cleanup(game, monkeypat
     assert len(w.alerts)==1
     w.on_stop(); assert not w.live_notifications and not w.alerts
 
+
+def test_local_stop_cleanup_can_preserve_shared_scan_owner(game):
+    w = game.wardrive
+    w.scan.stop = Mock()
+    w.targets.cancel = Mock()
+    w.capture.stop = Mock()
+    w.host_ble.stop = Mock()
+    w.cell.stop = Mock()
+    w.live_notifications['B4:1E:52:00:00:01'] = {'seen': 1}
+
+    w.on_stop(stop_scan=False)
+
+    w.scan.stop.assert_not_called()
+    w.targets.cancel.assert_called_once()
+    w.capture.stop.assert_called_once()
+    w.host_ble.stop.assert_called_once()
+    w.cell.stop.assert_called_once()
+    assert not w.live_notifications
+
 def test_live_cache_bound_disconnect_and_session_restart(game):
     w=game.wardrive; token=start_live_scan(w)
     for i in range(300):
