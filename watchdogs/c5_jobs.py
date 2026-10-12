@@ -236,6 +236,11 @@ def encode_job_start(token: str, request: Mapping[str, Any], *, boot_id: str | N
     if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
         raise ValueError("token")
     normalized = validate_job_request(request, boot_id=boot_id, limits=limits)
+    # Firmware through v1.8.1 compares this nonce to its lowercase boot value
+    # exactly; v1.8.2 accepts either hex case. Emit lowercase for compatibility
+    # with both while keeping validated host identities uppercase. This changes
+    # only the detached wire copy; stale-boot checks remain case-insensitive.
+    normalized["boot_id"] = normalized["boot_id"].lower()
     encoded = base64.urlsafe_b64encode(json.dumps(
         normalized, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     ).decode("ascii").rstrip("=")

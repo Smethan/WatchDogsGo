@@ -73,12 +73,36 @@ def test_device_info_validation_and_job_start_encoding():
     assert (prefix, token) == ("job_start", "abc_123")
     decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     assert decoded["targets"][0]["bssid"] == "00:11:22:33:44:55"
-    assert decoded["boot_id"] == BOOT_ID
+    assert decoded["boot_id"] == BOOT_ID.lower()
     invalid = info()
     invalid["limits"]["targets"] = 999
     assert parse_device_info(wire(invalid)) is None
     with pytest.raises(ValueError, match="stale boot_id"):
         validate_job_request(request, boot_id="FFFFFFFFFFFFFFFF")
+
+
+def test_job_start_lowercases_wire_nonce_without_mutating_request_and_keeps_stale_check():
+    lowercase_boot = "ef3738549b459d50"
+    request = {"boot_id": "EF3738549B459D50", "op": "wardrive",
+               "band": "wifi24", "channels": [1]}
+    original = dict(request)
+    validated = validate_job_request(request, boot_id=lowercase_boot)
+    assert validated["boot_id"] == lowercase_boot.upper()
+    command = encode_job_start("nonce_1", request, boot_id=lowercase_boot)
+    payload = command.split(" ")[2]
+    encoded_request = json.loads(base64.urlsafe_b64decode(
+        payload + "=" * (-len(payload) % 4)))
+    assert encoded_request["boot_id"] == lowercase_boot
+    assert request == original
+    with pytest.raises(ValueError, match="stale boot_id"):
+        encode_job_start("nonce_2", request, boot_id="0123456789abcdef")
+    assert request == original
+
+
+def test_device_info_preserves_uppercase_internal_identity_for_mixed_nonce():
+    mixed = "a1B2c3D4e5F60789"
+    parsed = parse_device_info(wire(info(boot_id=mixed)))
+    assert parsed["boot_id"] == mixed.upper()
 
 
 def test_v3_envelope_uses_frozen_payload_validation_and_monotonic_seq():
@@ -381,6 +405,59 @@ def test_stop_timeout_queries_and_retries_bounded_without_renewing_lease():
     now[0] += 10
     session.tick()
     assert len([command for command in serial.commands if command == "job_stop owned"]) == 3
+
+
+def test_stop_timeout_identity_probe_is_read_only_and_backoff_is_capped():
+    now = [0.0]
+    serial = FakeSerial()
+    session = DeviceSession(serial, "/dev/a", info(), clock=lambda: now[0])
+    session.c5_jobs_v1 = True
+    session.capabilities_seen = True
+    session.start_job("owned", {"boot_id": BOOT_ID, "op": "wardrive",
+                                 "band": "wifi24", "channels": [1]})
+    assert session.stop_job()
+    for _ in range(3):
+        now[0] += 5.1
+        session.tick()
+
+    assert session._stop_timeout_reported
+    assert session.request_stop_timeout_identity_probe()
+    assert serial.commands[-1] == "get_device_info"
+    assert session.job_token == "owned" and session.state == "stopping"
+    assert not any(command.startswith("job_keepalive ") for command in serial.commands)
+
+    # The first retry is five seconds later; the interval doubles but caps at
+    # fifteen seconds while ownership remains with the original token.
+    before = len(serial.commands)
+    now[0] += 4.9
+    assert not session.request_stop_timeout_identity_probe()
+    assert len(serial.commands) == before
+    now[0] += 0.2
+    assert session.request_stop_timeout_identity_probe()
+    now[0] += 10.1
+    assert session.request_stop_timeout_identity_probe()
+    now[0] += 14.9
+    assert not session.request_stop_timeout_identity_probe()
+    now[0] += 0.2
+    assert session.request_stop_timeout_identity_probe()
+    assert session.job_token == "owned" and session.state == "stopping"
+    assert session._identity_recovery_delay == 15.0
+
+
+def test_stop_timeout_identity_probe_requires_negotiated_managed_owner():
+    now = [10.0]
+    serial = FakeSerial()
+    session = DeviceSession(serial, "/dev/a", info(), clock=lambda: now[0])
+    session.c5_jobs_v1 = True
+    session.capabilities_seen = True
+    session.start_job("owned", {"boot_id": BOOT_ID, "op": "wardrive",
+                                 "band": "wifi24", "channels": [1]})
+    session.c5_jobs_v1 = False
+    session.legacy_capabilities_seen = True
+    session.state = "stopping"
+    session._stop_timeout_reported = True
+    assert not session.request_stop_timeout_identity_probe()
+    assert not any(command == "get_device_info" for command in serial.commands)
 
 
 def test_false_stop_send_reports_failure_and_retains_owner_for_retry():

@@ -2740,8 +2740,9 @@ class WardriveUI:
         else:
             px.text(55,203,'[ENTER] select update device  [R] role  [A] alias',3)
         px.text(55,224,'2.4 GHz + BLE shares radio airtime; sniffer coexistence can be unstable.',9)
-        px.text(55,240,'Wi-Fi + dedicated BLE assigns one Wi-Fi board and one BLE board.',13)
-        px.text(55,256,'Role/preset changes apply on the next start. Updates reserve the selected board.',13)
+        if pool and pool.available:
+            for index, line in enumerate(pool.health_lines()[:3]):
+                px.text(55,240+index*10,line[:105],13)
         if pool and pool.available:
             px.text(55,274,pool.coverage_gap()[:105],9)
         px.text(55,296,'ESC returns / TAB closes / S stops managed radio jobs',10)
@@ -3130,11 +3131,6 @@ class WardriveUI:
                         text += " NBR:PAUSED"
             px.rect(4,218,632,12,0)
             px.text(6,220,text,9 if self.scan.stats.get("drops",0) else 13)
-        pool = getattr(self.app, 'c5_pool', None)
-        if pool is not None and pool.available and not self.settings_open:
-            for index, line in enumerate(pool.health_lines()[:3]):
-                px.rect(4, 188+index*10, 632, 10, 0)
-                px.text(6, 189+index*10, line[:122], 13)
         if self.alerts:
             item = self.alerts[0]
             color = ORANGE if item["category"]=="axon" else PURPLE

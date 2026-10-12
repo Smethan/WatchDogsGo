@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 import json
 import hashlib
+import logging
 import math
 import os
 from pathlib import Path
@@ -45,6 +46,7 @@ AUTH = {'OPEN': 0, 'WEP': 1, 'WPA_PSK': 2, 'WPA2_PSK': 3,
         'WPA_WPA2_PSK': 4, 'WPA2_ENTERPRISE': 5, 'WPA3_PSK': 6,
         'WPA2_WPA3_PSK': 7, 'WAPI_PSK': 8, 'OWE': 9}
 MAX_TERMINAL_GROUPS = 32
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -330,7 +332,8 @@ class MultiDeviceRuntime:
                     session.poll()
                     if (session.last_poll_drained
                             and self._metadata_probe_allowed(session)):
-                        session.request_metadata_probe()
+                        if not session.request_stop_timeout_identity_probe():
+                            session.request_metadata_probe()
                 except (OSError, ConnectionError):
                     self._disconnected(session)
             self._round_robin += 1
@@ -532,6 +535,29 @@ class MultiDeviceRuntime:
             view.state = 'stopping'
 
     def _job_line(self, group, did, line):
+        # Keep this one firmware startup diagnostic visible without routing
+        # arbitrary legacy/RF output into the app terminal or job state.
+        if (isinstance(line, str) and len(line) <= 160
+                and line.startswith('Serial radio start failed at ')):
+            diagnostic = line[len('Serial radio start failed at '):]
+            stage, separator, result = diagnostic.partition(': ')
+            stage_ok = (bool(stage) and len(stage) <= 80
+                        and all(char.isalnum() or char in ' _-' for char in stage))
+            result_ok = (not separator or (1 <= len(result) <= 8
+                                           and (result.isdigit() or
+                                                (result.startswith('-') and result[1:].isdigit()))))
+            if stage_ok and result_ok:
+                session = self.sessions.get(did)
+                endpoint = str(session.endpoint if session else '')[:96]
+                source = (f'[C5 device={str(did)[:12]} endpoint={endpoint} '
+                          f'group={str(group.identity)[:16]} op={str(group.operation)[:24]} '
+                          f'role={str(group.roles.get(did, "unknown"))[:24]}]')
+                message = f'{source} Serial radio start failed at {stage}'
+                if separator:
+                    message += f': {result}'
+                self.app._term_add(message[:320], raw=True)
+                log.warning('%s', message[:320])
+            return
         # Import each completed sniffer transaction into its own collector.
         if line.startswith('SNIFF:'):
             collector = self.sniffers.setdefault((did,group.identity), SnifferIntelCollector())

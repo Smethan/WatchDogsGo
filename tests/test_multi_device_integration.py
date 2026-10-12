@@ -326,6 +326,113 @@ def test_active_group_disconnect_stops_survivor_and_does_not_restore(tmp_path):
     assert not group.restore
 
 
+def _timeout_foreground_stop(h, operation='hs_sniff'):
+    assert h.runtime.start(operation)
+    group = h.runtime.groups[h.runtime.foreground]
+    for index in (0, 1):
+        h.start_ack(index)
+    h.runtime.stop_foreground()
+    for _ in range(5):
+        h.now += 5.1
+        h.runtime.poll()
+        if all(h.runtime.sessions[did]._stop_timeout_reported for did in IDS):
+            break
+    assert all(h.runtime.sessions[did]._stop_timeout_reported for did in IDS)
+    return group
+
+
+def test_stop_timeout_identity_probe_preserves_same_boot_owner(tmp_path):
+    h = Harness(tmp_path)
+    group = _timeout_foreground_stop(h)
+    session = h.runtime.sessions[IDS[0]]
+    token = group.tokens[IDS[0]]
+    starts_before = sum(command.startswith('job_start ') for command in h.serials[0].commands)
+    info_queries = sum(command == 'get_device_info' for command in h.serials[0].commands)
+
+    h.runtime.poll()
+    assert sum(command == 'get_device_info' for command in h.serials[0].commands) == info_queries + 1
+    assert session.job_token == token and session.state == 'stopping'
+    assert IDS[0] not in group.disconnected and group.state == 'stopping'
+
+    # A same-boot identity reply confirms neither stop nor restart.
+    h.emit(0, device_info(0, 'xiao', [1, 6, 11, 36, 40]))
+    assert session.job_token == token and session.state == 'stopping'
+    assert IDS[0] not in group.disconnected
+    assert sum(command.startswith('job_start ') for command in h.serials[0].commands) == starts_before
+
+
+def test_stop_timeout_new_boot_retires_capture_stops_peer_and_renegotiates_caps(tmp_path):
+    h = Harness(tmp_path, loot=True)
+    group = _timeout_foreground_stop(h)
+    old_token = group.tokens[IDS[0]]
+    capture_key = (IDS[0], BOOTS[0], old_token)
+    assert capture_key in h.runtime.captures
+    starts_before = sum(command.startswith('job_start ') for command in h.serials[0].commands)
+
+    h.runtime.poll()  # Bounded identity query after the stop-timeout status/stop attempts.
+    rebooted = json.loads(device_info(0, 'xiao', [1, 6, 11, 36, 40])[4:])
+    rebooted['boot_id'] = 'FEDCBA9876543210'
+    h.emit(0, wire(rebooted))
+
+    session = h.runtime.sessions[IDS[0]]
+    assert session.boot_id == 'FEDCBA9876543210'
+    assert session.job_token is None and session.state == 'error'
+    assert IDS[0] in group.disconnected
+    assert capture_key not in h.runtime.captures
+    assert any(command.startswith('job_stop ') for command in h.serials[1].commands)
+    assert h.serials[0].commands[-1] == 'get_capabilities'
+    assert not session.c5_jobs_v1
+    assert sum(command.startswith('job_start ') for command in h.serials[0].commands) == starts_before
+
+    caps = {'v': 3, 'kind': 'capabilities', 'device_id': IDS[0],
+            'boot_id': 'FEDCBA9876543210', 'c5_jobs_v1': True,
+            'capabilities': ['wardrive_serial_v1']}
+    h.emit(0, wire(caps))
+    assert session.capabilities_seen and session.c5_jobs_v1
+    assert session.boot_id == 'FEDCBA9876543210'
+    assert sum(command.startswith('job_start ') for command in h.serials[0].commands) == starts_before
+
+
+@pytest.mark.parametrize('guard', ['reserved', 'legacy_owned', 'selected_serial_busy'])
+def test_stop_timeout_identity_probe_obeys_runtime_ownership_guards(tmp_path, guard):
+    h = Harness(tmp_path)
+    assert h.runtime.start('hs_sniff')
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    session = h.runtime.sessions[IDS[0]]
+    session.stop_job()
+    session._stop_timeout_reported = True
+    if guard == 'reserved':
+        # Simulate updater ownership acquired by the parent runtime.
+        h.runtime._reserved_sessions[session.endpoint] = session
+    elif guard == 'legacy_owned':
+        h.runtime.legacy_owned.add(IDS[0])
+    else:
+        h.app._serial_busy = True
+        h.app.serial = session.serial
+
+    before = sum(command == 'get_device_info' for command in session.serial.commands)
+    h.runtime.poll()
+    after = sum(command == 'get_device_info' for command in session.serial.commands)
+    assert after == before
+    assert session.job_token == group.tokens[IDS[0]]
+
+
+def test_healthy_managed_job_does_not_get_periodic_identity_queries(tmp_path):
+    h = Harness(tmp_path)
+    assert h.runtime.start('hs_sniff')
+    h.start_ack(0)
+    h.start_ack(1)
+    queries = [sum(command == 'get_device_info' for command in serial.commands)
+               for serial in h.serials]
+    for index in (0, 1):
+        h.emit(index, lifecycle('heartbeat', index, h.token(index), seq=2))
+    h.now += 4.0
+    h.runtime.poll()
+    assert [sum(command == 'get_device_info' for command in serial.commands)
+            for serial in h.serials] == queries
+
+
 def test_update_reservation_excludes_selected_endpoint_but_keeps_peer_polling(tmp_path):
     h = Harness(tmp_path)
     selected = h.serials[0]
@@ -969,6 +1076,43 @@ def test_error_during_cleanup_keeps_failed_owner_until_final_drain(tmp_path):
     h.stop_ack(0, token=first_token, seq=3)
     assert h.runtime.foreground is None and group.state == 'error'
     assert not h.runtime.captures
+
+
+def test_radio_start_diagnostic_is_bounded_and_source_contextual(tmp_path, caplog):
+    h = Harness(tmp_path)
+    assert h.runtime.start('hs_sniff')
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    state_before, error_before = group.state, group.error
+    diagnostic = 'Serial radio start failed at get_band_mode: -7'
+    record = {'v': 3, 'kind': 'legacy', 'device_id': IDS[0], 'boot_id': BOOTS[0],
+              'session': group.tokens[IDS[0]], 'seq': 2, 'line': diagnostic}
+
+    with caplog.at_level('WARNING', logger='watchdogs.multi_device'):
+        h.emit(0, wire(record))
+
+    emitted = [line for line, _raw in h.app.lines]
+    diagnostic_lines = [line for line in emitted if diagnostic in line]
+    assert len(diagnostic_lines) == 1
+    assert len(diagnostic_lines[0]) <= 320
+    assert all(context in diagnostic_lines[0] for context in
+               (IDS[0], '/dev/fake0', group.identity, 'op=hs_sniff', 'role=foreground'))
+    assert any('watchdogs.multi_device' == entry.name and IDS[0] in entry.message
+               and '/dev/fake0' in entry.message and group.identity in entry.message
+               and diagnostic in entry.message for entry in caplog.records)
+    assert group.state == state_before and group.error == error_before
+
+    # Ordinary firmware output and malformed lookalikes remain confined to
+    # the existing managed-job path; neither becomes terminal text or a warning.
+    line_count = len(h.app.lines)
+    record.update(seq=3, line='SSID: private-network RF dump')
+    h.emit(0, wire(record))
+    record.update(seq=4, line='Serial radio start failed at unexpected: dump with payload')
+    h.emit(0, wire(record))
+    assert len(h.app.lines) == line_count
+    assert len(caplog.records) == 1
+    assert group.state == state_before and group.error == error_before
 
 
 def test_passive_device_disconnect_preserves_peer_job_and_records(tmp_path):

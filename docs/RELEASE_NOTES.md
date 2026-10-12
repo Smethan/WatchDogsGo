@@ -1,5 +1,30 @@
 # Smethan WatchDogsGo
 
+## 0.10.3 — Restore C5 job starts and move device status — 2026-10-12
+
+- Serialize boot nonces as lowercase on the job wire while preserving host
+  identity normalization and stale-boot validation. Firmware through 1.8.1
+  rejected the uppercase request produced by 0.10.2; a live A/B check on the
+  XIAO reproduced that failure and verified the lowercase repair.
+- Detect an ESP reboot that leaves its USB endpoint open after an unanswered
+  managed stop. Probe identity with a throttled read-only request, retain the
+  existing owner until a validated changed nonce arrives, retire the old
+  job/capture state, and negotiate fresh capabilities. Reservations and
+  selected serial transfers retain exclusive endpoint ownership. Interrupted
+  foreground operations require a new user start.
+- Move XIAO/Zero foreground/background health text from the map/status overlay
+  to **WARDRIVE settings → USB C5 devices and roles**, where job, channel and
+  drop details remain visible without covering the main status line.
+- Keep bounded, source-tagged radio-start diagnostics in the terminal and
+  bug-report log. Add a cross-process regression that feeds WDG scheduler and
+  encoder output into the production firmware parser and verifies the job's
+  complete start/stop lifecycle, rather than testing the two sides in isolation.
+
+Pair with **projectZero 1.8.2** for the separately reproduced Packet Sniffer
+Wi-Fi event-task stack reset and structured sniffer-export repair. See
+[the recovery record](https://github.com/Smethan/projectZero/blob/main/docs/JOB_RUNTIME_RECOVERY_2026-10-12.md)
+for diagnosis and live/software acceptance boundaries.
+
 ## 0.10.2 — Restore native USB capability negotiation — 2026-10-11
 
 - Apply DTR and RTS together when opening an identified Linux Espressif native

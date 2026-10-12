@@ -22,6 +22,8 @@ HEARTBEAT_SECONDS = 2.0
 WATCHDOG_SECONDS = 7.0
 STOP_ACK_SECONDS = 5.0
 STOP_RETRY_LIMIT = 2
+IDENTITY_RECOVERY_INITIAL_SECONDS = 5.0
+IDENTITY_RECOVERY_MAX_SECONDS = 15.0
 METADATA_RETRY_INITIAL_SECONDS = 0.65
 METADATA_RETRY_MAX_SECONDS = 5.0
 
@@ -74,6 +76,9 @@ class DeviceSession:
         self._stop_status_queries = 0
         self._last_stop_attempt_at = 0.0
         self._stop_timeout_reported = False
+        self._identity_recovery_attempts = 0
+        self._next_identity_recovery_at = 0.0
+        self._identity_recovery_delay = IDENTITY_RECOVERY_INITIAL_SECONDS
         self.job_started_at = 0.0
         self._watchdog_expired = False
         self._pending_capabilities: dict[str, Any] | None = None
@@ -101,6 +106,9 @@ class DeviceSession:
             or (self.boot_id and next_boot != self.boot_id)
         )
         if identity_or_boot_changed:
+            self._identity_recovery_attempts = 0
+            self._next_identity_recovery_at = 0.0
+            self._identity_recovery_delay = IDENTITY_RECOVERY_INITIAL_SECONDS
             # Capabilities are bound to the new negotiation epoch. A v3 caps
             # record from the previous boot must not make this one look ready.
             self.c5_jobs_v1 = False
@@ -210,6 +218,33 @@ class DeviceSession:
             self._refresh_legacy_pair = bool(
                 self.legacy_capabilities_seen and not self.device_info_seen)
         return self.request_metadata_probe()
+
+    def request_stop_timeout_identity_probe(self) -> bool:
+        """Read identity after a timed-out managed stop, without changing ownership.
+
+        The runtime calls this only after draining this endpoint's bounded read
+        batch and after applying its reservation/serial-owner guards. A fresh
+        boot nonce can retire a rebooted owner; a same-boot reply is inert.
+        """
+        now = self.clock()
+        if (not self.connected or not self.active or self.state != "stopping"
+                or not self.job_token or not self._stop_timeout_reported
+                or not self.device_info_seen or not self.capabilities_seen
+                or not self.c5_jobs_v1 or self.legacy_capabilities_seen
+                or self.external_busy or now < self._next_identity_recovery_at):
+            return False
+        # Bound retries to 5, 10, then at most 15 seconds. A failed write is
+        # throttled too, and never clears the old token or renews its lease.
+        delay = self._identity_recovery_delay
+        self._identity_recovery_attempts += 1
+        self._next_identity_recovery_at = now + delay
+        self._identity_recovery_delay = min(delay * 2.0,
+                                            IDENTITY_RECOVERY_MAX_SECONDS)
+        try:
+            result = self._send("get_device_info")
+            return result is not False
+        except Exception:
+            return False
 
     def _read_lines(self) -> list[str]:
         reader = getattr(self.serial, "read_available", None)
@@ -443,6 +478,9 @@ class DeviceSession:
         self._stop_status_queries = 0
         self._last_stop_attempt_at = 0.0
         self._stop_timeout_reported = False
+        self._identity_recovery_attempts = 0
+        self._next_identity_recovery_at = 0.0
+        self._identity_recovery_delay = IDENTITY_RECOVERY_INITIAL_SECONDS
         try:
             self._send(command)
         except Exception:

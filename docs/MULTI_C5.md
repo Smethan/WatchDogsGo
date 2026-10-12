@@ -50,7 +50,11 @@ job_start TOKEN BASE64URLJSON
 
 `TOKEN` is 1–32 URL-safe alphanumeric/underscore/hyphen characters. The decoded
 JSON request is at most 4096 bytes; the Base64 URL-safe representation omits
-padding. Data and lifecycle records use the existing payloads inside a `WDG:`
+padding. WDG 0.10.3 serializes the boot nonce as lowercase hexadecimal so it
+matches firmware through 1.8.1, while retaining uppercase identities internally.
+Firmware 1.8.2 also accepts uppercase or mixed-case hexadecimal for the same
+16-digit nonce; another boot's nonce remains invalid. Data and lifecycle records
+use the existing payloads inside a `WDG:`
 JSON envelope with protocol version 3, `device_id`, `boot_id`, job `session`
 (the token), and a strictly increasing sequence number. Channel status may report `starting` while radio setup is in
 progress; a `request_error` rejects a new start without confirming ownership.
