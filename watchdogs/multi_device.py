@@ -252,15 +252,20 @@ class MultiDeviceRuntime:
                     self._configured_usb[configured] = identity
         if self.app.serial is None:
             self.app.serial = manager
-        manager.send_command('get_device_info')
-        manager.send_command('get_capabilities')
+        if self._metadata_probe_allowed(session):
+            session.request_metadata_probe()
         return session
 
     def probe(self):
         for session in self.endpoints.values():
-            if session.connected and not self.is_reserved(session):
-                session.serial.send_command('get_device_info')
-                session.serial.send_command('get_capabilities')
+            if self._metadata_probe_allowed(session):
+                session.refresh_metadata()
+
+    def _metadata_probe_allowed(self, session):
+        return (session.connected and not self.is_reserved(session)
+                and session.device_id not in self.legacy_owned
+                and not (getattr(self.app, '_serial_busy', False)
+                         and session.serial is self.app.serial))
 
     def discover(self):
         candidates = supported_candidates()
@@ -323,6 +328,9 @@ class MultiDeviceRuntime:
                     if not session.connected:
                         raise ConnectionError('endpoint closed')
                     session.poll()
+                    if (session.last_poll_drained
+                            and self._metadata_probe_allowed(session)):
+                        session.request_metadata_probe()
                 except (OSError, ConnectionError):
                     self._disconnected(session)
             self._round_robin += 1

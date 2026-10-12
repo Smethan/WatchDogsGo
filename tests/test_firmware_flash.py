@@ -448,7 +448,7 @@ def test_serial_connection_retains_usb_identity_without_probing_other_ports(monk
     monkeypatch.setattr(sm.os.path,'exists',lambda _:True)
     monkeypatch.setattr(sm.os,'access',lambda *a:True)
     monkeypatch.setattr(sm.serial.tools.list_ports,'comports',lambda:[original,other])
-    serial_open=Mock();monkeypatch.setattr(sm.serial,'Serial',serial_open)
+    serial_open=Mock();monkeypatch.setattr(sm,'_NativeJTAGSerial',serial_open)
     connection=sm.SerialManager(original.device);connection.setup();connection.close()
     assert connection.usb_port_info is original
     assert serial_open.call_count==1

@@ -3,9 +3,12 @@
 For a Wi-Fi update that avoids sending the image through USB, use
 [SYSTEM → OTA Update](FIRMWARE_OTA.md) in **WDG 0.9.23+**.
 
-For a full USB installation, use **WDG 0.10.1+**, restart, and open **SYSTEM → Flash ESP32**.
+For a full USB installation, use **WDG 0.10.2+**, restart, and open **SYSTEM → Flash ESP32**.
 Version 0.10.1 fixes serial ownership during updates, including boards whose
 firmware has not answered or does not support the multi-device protocol.
+Version 0.10.2 fixes Linux native USB reconnect control lines and retries
+unanswered capability discovery while reading the startup console. Use
+**projectZero 1.8.1+** to preserve commands sent during native USB REPL startup.
 
 This can install firmware on a blank board or replace other firmware: it uses
 the ESP32-C5's built-in ROM bootloader and does not require projectZero to be

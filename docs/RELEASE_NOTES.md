@@ -1,5 +1,26 @@
 # Smethan WatchDogsGo
 
+## 0.10.2 — Restore native USB capability negotiation — 2026-10-11
+
+- Apply DTR and RTS together when opening an identified Linux Espressif native
+  USB Serial/JTAG endpoint. The previous separate updates passed through an
+  RTS-only state that left the inspected XIAO console silent after reconnect.
+  USB-UART bridges and other platforms retain their existing serial behavior.
+- Keep the device reader running during the startup screen. Retry unanswered
+  identity/capability requests with a bounded backoff, drain replies before
+  retrying, and preserve explicit legacy-firmware negotiation and deliberate
+  metadata refresh. Updater reservations and radio ownership still suppress
+  discovery traffic on the selected endpoint.
+- Add actual POSIX-open regression coverage, startup-loss and reply-order tests,
+  prolonged-silence tests, and reservation/reattachment checks. The production
+  serial fix passed ten open/query/close cycles on the uConsole's XIAO running
+  projectZero 1.8.0, with capabilities and identity received every time and no
+  boot-nonce change. Firmware 1.8.1 also removes the destructive native USB
+  terminal probe; see [the recovery record](https://github.com/Smethan/projectZero/blob/v1.8.1/docs/USB_CONSOLE_RECOVERY.md).
+
+The complete host suite passes **1,272 tests**. Live console checks cover the
+connected XIAO; the unattached Zero and dual-board RF acceptance remain open.
+
 ## 0.10.1 — Safe serial handoff for firmware updates — 2026-10-10
 
 - Fix the uConsole crash when opening the ROM flash wizard or running OTA with

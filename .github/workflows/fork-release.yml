@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Smethan/projectZero
-          ref: 894e1cce408f47ec016702b844f4ef2296b6abdb # projectZero v1.8.0
+          ref: bc7a254b9763f7f9772d0cf77c48ad31c04841a0 # projectZero v1.8.1
           path: .test-firmware
       - uses: actions/setup-python@v7
         with:

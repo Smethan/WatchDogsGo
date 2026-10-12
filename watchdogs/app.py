@@ -1738,6 +1738,9 @@ class WatchDogsGame(OtaMixin):
     def update(self):
         # --- Boot screen phase ---
         if self._boot_phase:
+            # The USB REPL and discovery replies are live during the boot UI.
+            # Drain them and let each endpoint negotiate before leaving it.
+            self._poll_serial()
             self._boot_frame += 1
             if pyxel.btnp(pyxel.KEY_RETURN):
                 self._finish_boot()

@@ -28,6 +28,36 @@ _ESP32_VID_PIDS: List[Tuple[int, int]] = [
 _ESP32_NATIVE_VID_PIDS = {(0x303A, 0x1001), (0x303A, 0x4001)}
 
 
+class _NativeJTAGSerial(serial.Serial):
+    """Apply the Linux native USB modem lines in one control request.
+
+    cdc_acm may assert both lines on open. pyserial normally clears DTR and
+    RTS separately, briefly leaving RTS asserted with DTR cleared. On C5's
+    USB Serial/JTAG that intermediate state can reset/stall the console.
+    Keep this behavior scoped to identified native JTAG endpoints on Linux;
+    external USB-UART bridges retain pyserial's normal handling.
+    """
+
+    def _update_native_lines(self):
+        import fcntl
+        import struct
+        import termios
+
+        mask = termios.TIOCM_DTR | termios.TIOCM_RTS
+        state = ((termios.TIOCM_DTR if self._dtr_state else 0) |
+                 (termios.TIOCM_RTS if self._rts_state else 0))
+        # Clearing the pair together avoids the RTS-only intermediate state.
+        operation = termios.TIOCMSET if state else termios.TIOCMBIC
+        value = state if state else mask
+        fcntl.ioctl(self.fd, operation, struct.pack("I", value))
+
+    def _update_dtr_state(self):
+        self._update_native_lines()
+
+    def _update_rts_state(self):
+        self._update_native_lines()
+
+
 def detect_esp32_port() -> Optional[str]:
     """Prefer one native Espressif device; never guess from a tty number.
 
@@ -208,7 +238,12 @@ class SerialManager:
         with self._io_lock:
             self.line_buffer = SerialLineBuffer()
             self._pending_lines.clear()
-            conn = serial.Serial(
+            native_jtag = (sys.platform.startswith("linux") and
+                           self.usb_port_info is not None and
+                           (self.usb_port_info.vid, self.usb_port_info.pid) ==
+                           (0x303A, 0x1001))
+            serial_type = _NativeJTAGSerial if native_jtag else serial.Serial
+            conn = serial_type(
                 port=None,
                 baudrate=self.baud_rate,
                 bytesize=serial.EIGHTBITS,
@@ -217,8 +252,8 @@ class SerialManager:
                 timeout=READ_TIMEOUT,
                 write_timeout=2,
             )
-            # Opening a candidate must not pulse EN/BOOT. Set control lines before
-            # open, and keep any boot/lifecycle records for the endpoint's reader.
+            # Set the desired state before open; native Linux JTAG applies both
+            # lines together so pyserial does not introduce a reset sequence.
             conn.dtr = False
             conn.rts = False
             conn.port = self.device

@@ -68,6 +68,50 @@ class FakeSerial:
         self.is_open = False
 
 
+class StartupWindowSerial(FakeSerial):
+    """Drop ASCII queries for firmware's startup line-probe window."""
+
+    def __init__(self, endpoint, usb_serial, clock, *, ready_at=0.5,
+                 reply_order="info-before-caps", silent=False):
+        super().__init__(endpoint, usb_serial)
+        self.clock = clock
+        self.ready_at = ready_at
+        self.reply_order = reply_order
+        self.silent = silent
+        self.reply = set()
+        self.delivered = set()
+        self.command_times = []
+
+    def send_command(self, command):
+        super().send_command(command)
+        self.command_times.append((self.clock(), command))
+        if self.silent or self.clock() < self.ready_at:
+            return
+        if command == "get_device_info" and "info" not in self.reply:
+            if self.reply_order == "info-before-caps" or "caps" in self.delivered:
+                self.reply.add("info")
+                self.lines.append(device_info(0, "xiao", [1, 6, 11, 36, 40]))
+        elif command == "get_capabilities" and "caps" not in self.reply:
+            if self.reply_order == "caps-before-info" or "info" in self.delivered:
+                self.reply.add("caps")
+                self.lines.append(capabilities())
+
+    def read_available(self, *, max_bytes=16384, max_lines=64):
+        result = super().read_available(max_bytes=max_bytes, max_lines=max_lines)
+        for line in result:
+            if not line.startswith("WDG:"):
+                continue
+            try:
+                kind = json.loads(line[4:]).get("kind")
+            except (ValueError, TypeError):
+                continue
+            if kind == "device_info":
+                self.delivered.add("info")
+            elif kind == "capabilities":
+                self.delivered.add("caps")
+        return result
+
+
 class FakeLoot:
     def __init__(self, path):
         self.active = True
@@ -312,6 +356,285 @@ def test_legacy_capability_fallback_remains_visible_without_sharding(tmp_path):
     runtime.poll()
     assert any("Legacy USB /dev/legacy" in line and "single-device fallback" in line
                for line in runtime.health_lines())
+
+
+@pytest.mark.parametrize("reply_order", ["info-before-caps", "caps-before-info"])
+def test_metadata_retries_recover_queries_lost_in_firmware_startup_window(tmp_path, reply_order):
+    now = [0.0]
+    serial = StartupWindowSerial("/dev/startup", "usb-startup", lambda: now[0],
+                                 reply_order=reply_order)
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    session = runtime.endpoints[serial.device]
+    assert serial.commands == ["get_device_info", "get_capabilities"]
+    assert not runtime.devices()
+
+    # Initial requests were consumed by the firmware's 500 ms startup probe.
+    # Polling drains first and then retries only unanswered metadata.
+    for frame in range(1, 9):
+        now[0] = frame * 0.1
+        runtime.poll()
+    assert serial.commands.count("get_device_info") == 2
+    assert serial.commands.count("get_capabilities") == 2
+    assert runtime.endpoints[serial.device] is session
+
+    now[0] = 2.0
+    runtime.poll()  # Backoff expires; only the missing half is resent.
+    now[0] = 2.1
+    runtime.poll()  # Read and apply the delayed reply.
+    assert runtime.registry.get(IDS[0]) is not None
+    assert session.device_info_seen and session.capabilities_seen
+    assert session.c5_jobs_v1 is True
+    assert app.wardrive.scan is runtime.scan
+    if reply_order == "caps-before-info":
+        assert serial.commands.count("get_device_info") == 3
+        assert serial.commands.count("get_capabilities") == 2
+    else:
+        assert serial.commands.count("get_device_info") == 2
+        assert serial.commands.count("get_capabilities") == 3
+
+
+def test_explicit_legacy_capability_stops_metadata_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("watchdogs.multi_device.supported_candidates", lambda: [])
+    now = [0.0]
+    serial = StartupWindowSerial("/dev/legacy-startup", "usb-legacy",
+                                 lambda: now[0], silent=True)
+
+    def send_with_legacy_capability(command):
+        FakeSerial.send_command(serial, command)
+        serial.command_times.append((now[0], command))
+        if now[0] >= serial.ready_at and command == "get_capabilities" and not serial.reply:
+            serial.reply.add("caps")
+            serial.lines.append(wire({"v": 1, "kind": "capabilities",
+                                      "c5_jobs_v1": False,
+                                      "wardrive_serial_v1": True}))
+
+    serial.send_command = send_with_legacy_capability
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    for frame in range(1, 9):
+        now[0] = frame * 0.1
+        runtime.poll()
+    session = runtime.endpoints[serial.device]
+    assert session.legacy_capabilities_seen
+    assert serial.device in runtime.legacy_endpoints
+    commands_after_legacy_reply = len(serial.commands)
+    for frame in range(9, 101):
+        now[0] = frame * 0.1
+        runtime.poll()
+    assert len(serial.commands) == commands_after_legacy_reply
+
+
+def test_explicit_legacy_refresh_checks_caps_and_discovers_in_place_upgrade(tmp_path):
+    now = [0.0]
+    serial = FakeSerial("/dev/legacy-refresh", "usb-legacy-refresh")
+    firmware = {"mode": "legacy"}
+    pending_info = []
+
+    def send(command):
+        serial.commands.append(command)
+        if command == "get_device_info" and firmware["mode"] == "upgraded":
+            pending_info.append(device_info(0, "xiao", [1, 6, 11, 36, 40]))
+        elif command == "get_capabilities":
+            if firmware["mode"] == "legacy":
+                serial.lines.append(wire({"v": 1, "kind": "capabilities",
+                                          "c5_jobs_v1": False,
+                                          "wardrive_serial_v1": True}))
+            else:
+                # Firmware may report legacy-shaped capabilities before the
+                # identity reply; the host must bind them after device_info.
+                serial.lines.append(capabilities())
+                serial.lines.extend(pending_info)
+                pending_info.clear()
+
+    serial.send_command = send
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    session = runtime.endpoints[serial.device]
+    runtime.poll()
+    assert session.legacy_capabilities_seen and not session.device_info_seen
+
+    # A deliberate probe of a known legacy endpoint asks for both fields.
+    now[0] = 0.7
+    runtime.probe()
+    assert serial.commands[-2:] == ["get_device_info", "get_capabilities"]
+    runtime.poll()
+    assert session.legacy_capabilities_seen
+    assert not session._refresh_info_pending
+    assert not session._refresh_capabilities_pending
+
+    # Re-probing the same still-open endpoint can discover newly flashed C5
+    # firmware even though the earlier firmware never answered device_info.
+    firmware["mode"] = "upgraded"
+    now[0] = 2.1
+    runtime.probe()
+    assert serial.commands[-2:] == ["get_device_info", "get_capabilities"]
+    runtime.poll()
+    assert session.device_info_seen and session.capabilities_seen
+    assert session.c5_jobs_v1 and not session.legacy_capabilities_seen
+    assert session.device_id == IDS[0]
+
+
+def test_metadata_retry_backoff_has_a_per_endpoint_rate_ceiling(tmp_path, monkeypatch):
+    monkeypatch.setattr("watchdogs.multi_device.supported_candidates", lambda: [])
+    now = [0.0]
+    serial = StartupWindowSerial("/dev/silent", "usb-silent", lambda: now[0], silent=True)
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    for frame in range(1, 301):
+        now[0] = frame * 0.1
+        runtime.poll()
+    probe_times = [at for at, command in serial.command_times if command == "get_device_info"]
+    assert 7 <= len(probe_times) <= 9
+    assert all(later - earlier >= 0.64
+               for earlier, later in zip(probe_times, probe_times[1:]))
+    assert probe_times[-1] - probe_times[-2] >= 4.9
+
+
+def test_silent_endpoint_backoff_remains_bounded_after_thousands_of_retries(tmp_path):
+    now = [0.0]
+    serial = StartupWindowSerial("/dev/long-silent", "usb-long-silent",
+                                 lambda: now[0], silent=True)
+    session = MultiDeviceRuntime(FakeApp(), [serial], clock=lambda: now[0]).endpoints[
+        serial.device]
+    initial_commands = len(serial.commands)
+    for _ in range(2500):
+        now[0] += 5.01
+        session.request_metadata_probe()
+    assert session._metadata_probe_attempts == 2501
+    assert session._metadata_retry_delay == 5.0
+    assert len(serial.commands) == initial_commands + 2500 * 2
+
+
+def test_explicit_probe_refreshes_complete_metadata_and_detects_same_tty_reboot(tmp_path):
+    now = [0.0]
+    serial = FakeSerial("/dev/refresh", "usb-refresh",
+                        [device_info(0, "xiao", [1, 6, 11, 36, 40]), capabilities()])
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    session = runtime.endpoints[serial.device]
+    runtime.poll()
+    assert session.device_info_seen and session.capabilities_seen
+    baseline = len(serial.commands)
+
+    # Complete metadata is not polled periodically, but the explicit UI probe
+    # safely rearms a rate-limited info-then-capability refresh.
+    runtime.probe()
+    assert len(serial.commands) == baseline
+    now[0] = 0.7
+    runtime.probe()
+    assert serial.commands[-1] == "get_device_info"
+    runtime.probe()
+    assert len(serial.commands) == baseline + 1
+
+    rebooted = dict(json.loads(device_info(0, "xiao", [1, 6, 11, 36, 40])[4:]))
+    rebooted["boot_id"] = "FEDCBA9876543210"
+    serial.lines.append(wire(rebooted))
+    runtime.poll()  # Drain identity before the refresh requests capabilities.
+    assert session.boot_id == "FEDCBA9876543210"
+    assert serial.commands[-1] == "get_capabilities"
+    caps = {"v": 3, "kind": "capabilities", "device_id": IDS[0],
+            "boot_id": "FEDCBA9876543210", "c5_jobs_v1": True,
+            "capabilities": ["wardrive_serial_v1"]}
+    serial.lines.append(wire(caps))
+    runtime.poll()
+    assert session.capabilities_seen and session.c5_jobs_v1
+    assert not session._refresh_info_pending and not session._refresh_capabilities_pending
+
+    # Reservation suppresses even deliberate refresh traffic.
+    runtime.reserve(serial)
+    count = len(serial.commands)
+    runtime.probe()
+    assert len(serial.commands) == count
+
+
+def test_metadata_retry_waits_until_the_session_reader_drains(tmp_path):
+    now = [0.0]
+    serial = StartupWindowSerial("/dev/locked-reader", "usb-locked",
+                                 lambda: now[0], silent=True)
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    session = runtime.endpoints[serial.device]
+    now[0] = 0.7
+    assert session._reader_lock.acquire(blocking=False)
+    try:
+        runtime.poll()
+        assert not session.last_poll_drained
+        assert len(serial.commands) == 2
+    finally:
+        session._reader_lock.release()
+    runtime.poll()
+    assert session.last_poll_drained
+    assert len(serial.commands) == 4
+
+
+def test_selected_legacy_serial_busy_suppresses_probes_until_released(tmp_path):
+    now = [0.0]
+    app = FakeApp()
+    app._serial_busy = True
+    serial = StartupWindowSerial("/dev/legacy-transfer", "usb-transfer",
+                                 lambda: now[0], silent=True)
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    assert serial.commands == []
+    now[0] = 1.0
+    runtime.poll()
+    assert serial.commands == [] and serial.read_bounds == []
+    app._serial_busy = False
+    runtime.poll()
+    assert serial.commands == ["get_device_info", "get_capabilities"]
+
+
+def test_reserved_endpoint_suppresses_retry_while_peer_polls_and_release_restarts_probe(
+        tmp_path, monkeypatch):
+    now = [0.0]
+    app = FakeApp()
+    serial_a = StartupWindowSerial("/dev/reflash", "usb-reflash", lambda: now[0],
+                                   ready_at=1.2, reply_order="info-before-caps")
+    serial_b = StartupWindowSerial("/dev/peer", "usb-peer", lambda: now[0],
+                                   ready_at=0.5, reply_order="caps-before-info")
+    runtime = MultiDeviceRuntime(app, [serial_a, serial_b], clock=lambda: now[0])
+    old_session = runtime.endpoints[serial_a.device]
+    assert runtime.reserve(serial_a) is old_session
+    held_commands = len(serial_a.commands)
+    for frame in range(1, 9):
+        now[0] = frame * 0.1
+        runtime.poll()
+    assert len(serial_a.commands) == held_commands
+    assert serial_a.read_bounds == []
+    assert hasattr(serial_b, "read_bounds")
+
+    candidate = {"endpoint": serial_a.device, "usb_identity": {
+        "vid": 0x303A, "pid": 0x1001, "serial_number": "usb-reflash",
+        "location": "usb-reflash",
+    }}
+    monkeypatch.setattr("watchdogs.multi_device.supported_candidates", lambda: [candidate])
+    created = []
+
+    def manager_factory(endpoint):
+        manager = StartupWindowSerial(endpoint, "usb-reflash", lambda: now[0],
+                                      ready_at=now[0] + 0.5,
+                                      reply_order="info-before-caps")
+        manager.setup = lambda: None
+        created.append(manager)
+        return manager
+
+    monkeypatch.setattr("watchdogs.multi_device.SerialManager", manager_factory)
+    runtime.release(old_session)
+    assert created and runtime.endpoints[serial_a.device] is not old_session
+    new_session = runtime.endpoints[serial_a.device]
+    assert created[0].commands == ["get_device_info", "get_capabilities"]
+    now[0] += 0.6
+    runtime.poll()  # New session retries after the startup probe window.
+    now[0] += 0.1
+    runtime.poll()
+    now[0] += 0.1
+    runtime.poll()  # Read identity; the next retry is now cap-only.
+    now[0] = 2.8
+    runtime.poll()
+    now[0] = 2.9
+    runtime.poll()  # Read the reply queued by the cap-only retry.
+    assert new_session.device_info_seen and new_session.capabilities_seen
+    assert new_session.c5_jobs_v1
 
 
 def test_selected_legacy_fallback_precedes_target_parsing_and_restores_legacy_scan(tmp_path):

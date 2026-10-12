@@ -22,6 +22,8 @@ HEARTBEAT_SECONDS = 2.0
 WATCHDOG_SECONDS = 7.0
 STOP_ACK_SECONDS = 5.0
 STOP_RETRY_LIMIT = 2
+METADATA_RETRY_INITIAL_SECONDS = 0.65
+METADATA_RETRY_MAX_SECONDS = 5.0
 
 
 class DeviceSession:
@@ -44,8 +46,17 @@ class DeviceSession:
         self.device_info = dict(device_info or {})
         self.device_id = str(self.device_info.get("device_id", "")).upper()
         self.boot_id = str(self.device_info.get("boot_id", "")).upper()
+        self.device_info_seen = bool(self.device_id and self.boot_id)
         self.capabilities: set[str] = set()
         self.c5_jobs_v1 = False
+        self.capabilities_seen = False
+        self.legacy_capabilities_seen = False
+        self._metadata_probe_attempts = 0
+        self._next_metadata_probe_at = 0.0
+        self._metadata_retry_delay = METADATA_RETRY_INITIAL_SECONDS
+        self._refresh_info_pending = False
+        self._refresh_capabilities_pending = False
+        self._refresh_legacy_pair = False
         self.external_busy = self.device_info.get('legacy_busy') is True
         self._last_busy_probe = 0.0
         self.job_token: str | None = None
@@ -72,6 +83,7 @@ class DeviceSession:
         self.capture_state: dict[str, Any] = {}
         self.applied_channel: int | None = None
         self._reader_lock = threading.Lock()
+        self.last_poll_drained = False
 
     @property
     def connected(self) -> bool:
@@ -84,6 +96,18 @@ class DeviceSession:
     def set_device_info(self, device_info: Mapping[str, Any]) -> None:
         next_id = str(device_info["device_id"]).upper()
         next_boot = str(device_info["boot_id"]).upper()
+        identity_or_boot_changed = bool(
+            (self.device_id and next_id != self.device_id)
+            or (self.boot_id and next_boot != self.boot_id)
+        )
+        if identity_or_boot_changed:
+            # Capabilities are bound to the new negotiation epoch. A v3 caps
+            # record from the previous boot must not make this one look ready.
+            self.c5_jobs_v1 = False
+            self.capabilities.clear()
+            self.capabilities_seen = False
+            self.legacy_capabilities_seen = False
+            self._pending_capabilities = None
         if self.device_id and next_id != self.device_id:
             self.last_error = "factory identity changed on serial endpoint"
             if self.active:
@@ -109,6 +133,7 @@ class DeviceSession:
         self.external_busy = device_info.get('legacy_busy') is True
         self.device_id = next_id
         self.boot_id = next_boot
+        self.device_info_seen = True
         if self._pending_capabilities is not None:
             pending = self._pending_capabilities
             self._pending_capabilities = None
@@ -117,8 +142,74 @@ class DeviceSession:
 
     def _apply_job_capabilities(self, record: Mapping[str, Any]) -> None:
         self.c5_jobs_v1 = record.get("c5_jobs_v1") is True
+        self.capabilities_seen = True
+        self.legacy_capabilities_seen = not self.c5_jobs_v1
+        self._refresh_capabilities_pending = False
         self.capabilities = {key for key, value in record.items()
                              if key.endswith("_v1") and value is True}
+
+    def request_metadata_probe(self) -> list[str]:
+        """Request only unanswered identity/capability metadata.
+
+        Calls are throttled per endpoint. Runtime polling calls this after the
+        bounded read, so any response already buffered gets consumed first.
+        """
+        now = self.clock()
+        if now < self._next_metadata_probe_at:
+            return []
+        refreshing = self._refresh_info_pending or self._refresh_capabilities_pending
+        if (not self.connected or self.active or self.external_busy
+                or (self.legacy_capabilities_seen and not refreshing)):
+            return []
+        commands = []
+        # Explicit refresh is sequenced identity first so an old boot's caps
+        # cannot be mistaken for the refreshed boot. Ordinary first-time
+        # negotiation keeps the existing info+caps pair in either reply order.
+        if self._refresh_info_pending:
+            commands.append("get_device_info")
+            if self._refresh_legacy_pair:
+                # A legacy device may never answer get_device_info. Keep
+                # checking capabilities so an in-place firmware upgrade can
+                # move it into the managed protocol.
+                commands.append("get_capabilities")
+        elif self._refresh_capabilities_pending:
+            commands.append("get_capabilities")
+        else:
+            if not self.device_info_seen:
+                commands.append("get_device_info")
+            if not self.capabilities_seen:
+                commands.append("get_capabilities")
+        if not commands:
+            return []
+        for command in commands:
+            try:
+                self._send(command)
+            except Exception as exc:
+                self.last_error = f"metadata probe failed: {exc}"[:180]
+        self._metadata_probe_attempts += 1
+        delay = self._metadata_retry_delay
+        self._next_metadata_probe_at = now + delay
+        # Bound the interval itself rather than evaluating an ever-growing
+        # exponent; silent endpoints can remain connected for days.
+        self._metadata_retry_delay = min(delay * 2.0, METADATA_RETRY_MAX_SECONDS)
+        return commands
+
+    def refresh_metadata(self) -> list[str]:
+        """Rate-limited deliberate identity refresh, including known metadata.
+
+        Normal polling only asks for missing fields. An explicit UI probe may
+        re-arm a complete session to detect a reboot or firmware replacement
+        on the same tty. The runtime applies endpoint reservation and serial
+        ownership guards before calling this method.
+        """
+        if not self.connected or self.active or self.external_busy:
+            return []
+        if not (self._refresh_info_pending or self._refresh_capabilities_pending):
+            self._refresh_info_pending = True
+            self._refresh_capabilities_pending = True
+            self._refresh_legacy_pair = bool(
+                self.legacy_capabilities_seen and not self.device_info_seen)
+        return self.request_metadata_probe()
 
     def _read_lines(self) -> list[str]:
         reader = getattr(self.serial, "read_available", None)
@@ -143,8 +234,10 @@ class DeviceSession:
 
     def poll(self) -> list[dict[str, Any]]:
         """Read and dispatch one bounded serial batch; concurrent readers are skipped."""
+        self.last_poll_drained = False
         if not self._reader_lock.acquire(blocking=False):
             return []
+        self.last_poll_drained = True
         events: list[dict[str, Any]] = []
         try:
             for line in self._read_lines():
@@ -162,12 +255,36 @@ class DeviceSession:
                     validated = parse_record(line)
                     if validated is None:
                         continue
+                    self.capabilities_seen = True
                     if type(envelope.get("c5_jobs_v1")) is not bool:
+                        self.legacy_capabilities_seen = True
+                        self._refresh_capabilities_pending = False
+                        if self._refresh_legacy_pair:
+                            self._refresh_info_pending = False
+                            self._refresh_legacy_pair = False
                         self.on_line(line)
-                    elif self.device_id and self.boot_id:
+                    elif envelope["c5_jobs_v1"] is False:
+                        self.legacy_capabilities_seen = True
+                        self._refresh_capabilities_pending = False
+                        if self._refresh_legacy_pair:
+                            self._refresh_info_pending = False
+                            self._refresh_legacy_pair = False
+                        if self.device_id and self.boot_id:
+                            self._apply_job_capabilities(envelope)
+                            events.append(dict(envelope))
+                        else:
+                            # Legacy firmware has no v3 device_info reply.
+                            # Forward this explicit capability immediately and
+                            # stop retrying for metadata it cannot emit.
+                            self.on_line(line)
+                    elif (self.device_id and self.boot_id
+                          and not self._refresh_info_pending):
                         self._apply_job_capabilities(envelope)
                         events.append(dict(envelope))
                     else:
+                        self.legacy_capabilities_seen = False
+                        # During an explicit identity refresh, v1 caps carry no
+                        # nonce and may still belong to the previous boot.
                         self._pending_capabilities = dict(envelope)
                     continue
                 if version in (1, 2):
@@ -181,6 +298,13 @@ class DeviceSession:
                     if info is None:
                         continue
                     self.set_device_info(info)
+                    if self._refresh_info_pending:
+                        self._refresh_info_pending = False
+                        self._refresh_legacy_pair = False
+                        # The identity reply has been drained; capabilities
+                        # can be requested during this same runtime tick.
+                        self._next_metadata_probe_at = min(
+                            self._next_metadata_probe_at, self.clock())
                     events.append(info)
                 elif kind == "capabilities":
                     if (type(envelope.get("c5_jobs_v1")) is not bool
@@ -192,6 +316,9 @@ class DeviceSession:
                     if len(line.encode("utf-8", "replace")) > 1024:
                         continue
                     self.c5_jobs_v1 = envelope["c5_jobs_v1"]
+                    self.capabilities_seen = True
+                    self.legacy_capabilities_seen = not self.c5_jobs_v1
+                    self._refresh_capabilities_pending = False
                     self.capabilities = set(envelope.get("capabilities", [])) \
                         if isinstance(envelope.get("capabilities", []), list) else set()
                     event = dict(envelope)
