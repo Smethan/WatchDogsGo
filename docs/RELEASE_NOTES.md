@@ -20,8 +20,11 @@
   encoder output into the production firmware parser and verifies the job's
   complete start/stop lifecycle, rather than testing the two sides in isolation.
 
-Pair with **projectZero 1.8.2** for the separately reproduced Packet Sniffer
-Wi-Fi event-task stack reset and structured sniffer-export repair. See
+Pair with **projectZero 1.8.3**, which includes the Packet Sniffer Wi-Fi
+event-task stack/export repair from 1.8.2 and the follow-up first combined
+Wi-Fi/BLE startup and immediate job-handoff fixes. The inspected XIAO passed
+GUI wardriving, scans, Sniffer exports, passive frame storage and background
+preemption/restoration with this pair. See
 [the recovery record](https://github.com/Smethan/projectZero/blob/main/docs/JOB_RUNTIME_RECOVERY_2026-10-12.md)
 for diagnosis and live/software acceptance boundaries.
 

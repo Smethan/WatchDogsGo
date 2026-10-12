@@ -52,7 +52,7 @@ job_start TOKEN BASE64URLJSON
 JSON request is at most 4096 bytes; the Base64 URL-safe representation omits
 padding. WDG 0.10.3 serializes the boot nonce as lowercase hexadecimal so it
 matches firmware through 1.8.1, while retaining uppercase identities internally.
-Firmware 1.8.2 also accepts uppercase or mixed-case hexadecimal for the same
+Firmware 1.8.2 and newer also accept uppercase or mixed-case hexadecimal for the same
 16-digit nonce; another boot's nonce remains invalid. Data and lifecycle records
 use the existing payloads inside a `WDG:`
 JSON envelope with protocol version 3, `device_id`, `boot_id`, job `session`
@@ -65,7 +65,11 @@ change the established Wi-Fi, BLE, batch, or handshake payload fields.
 Jobs renew a 15-second firmware lease with `job_keepalive TOKEN` every five
 seconds. The firmware emits a heartbeat every two seconds. If no valid job
 record arrives for seven seconds, the host queries status and requests stop;
-the firmware's 15-second lease is the final disconnect cleanup bound. Terminal
+the firmware's 15-second lease is the final disconnect cleanup bound.
+Use firmware 1.8.3 for repaired first combined Wi-Fi/BLE startup and immediate
+external-job handoff after a stop. Replacement admission waits for the old
+supervisor's last shared-state access; cleanup timeout retains ownership and
+eventual terminal completion. Terminal
 results are cached for the most recent four job tokens. A repeated identical
 start is idempotent; a conflicting token/request or another active job returns
 busy. If delivery is uncertain, the host checks status and attempts bounded
