@@ -20,6 +20,10 @@
 
 The complete host suite passes **1,272 tests**. Live console checks cover the
 connected XIAO; the unattached Zero and dual-board RF acceptance remain open.
+The exact published projectZero **1.8.1** image was subsequently installed
+through WDG's real GUI USB-OTA flow: image verification, reboot, valid-slot
+confirmation, capability re-negotiation, and normal polling all passed. The
+uConsole's 140 targeted connection/update regressions also passed.
 
 ## 0.10.1 — Safe serial handoff for firmware updates — 2026-10-10
 
