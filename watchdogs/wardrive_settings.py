@@ -32,6 +32,19 @@ _BLUETOOTH_MAC = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 DEFAULTS = {
     "flock": True,
     "axon": True,
+    # Pig Detector is started explicitly from SNIFF.  These settings alone
+    # never claim radios or enable SDR power during an upgrade.
+    "pig_product_alerts": True,
+    "pig_estimates": True,
+    "pig_sdr_profile": "auto",
+    "pig_watchlist": [],
+    "pig_p25_control_hz": 0,
+    "pig_p25_system": "",
+    "pig_gain_db": 0,
+    "pig_ppm": 0,
+    "pig_agency_icao": [],
+    "pig_agency_rid": [],
+    "pig_talkgroups": {},
     "precise": True,
     "network_dots": True,
     "trail": False,
@@ -126,6 +139,37 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
         value = saved.get(key)
         if type(value) is type(default):
             result[key] = deepcopy(value)
+    if result["pig_sdr_profile"] not in (
+            "auto", "off", "watchlist", "p25", "433", "adsb"):
+        result["pig_sdr_profile"] = "auto"
+    channels = []
+    for raw in result["pig_watchlist"][:16]:
+        if not isinstance(raw, dict):
+            continue
+        hz, width, label = (raw.get("frequency_hz"),
+                            raw.get("bandwidth_hz"), raw.get("label"))
+        if (type(hz) is int and 24_000_000 <= hz <= 1_740_000_000
+                and type(width) is int and 2_000 <= width <= 200_000
+                and isinstance(label, str) and 1 <= len(label.strip()) <= 32):
+            channels.append({"frequency_hz": hz, "bandwidth_hz": width,
+                             "label": label.strip()})
+    result["pig_watchlist"] = channels
+    hz = result["pig_p25_control_hz"]
+    result["pig_p25_control_hz"] = (
+        hz if type(hz) is int and 24_000_000 <= hz <= 1_740_000_000 else 0)
+    gain = result["pig_gain_db"]
+    result["pig_gain_db"] = gain if type(gain) is int and 0 <= gain <= 50 else 0
+    ppm = result["pig_ppm"]
+    result["pig_ppm"] = ppm if type(ppm) is int and -200 <= ppm <= 200 else 0
+    result["pig_p25_system"] = result["pig_p25_system"][:32].strip()
+    for key, limit in (("pig_agency_icao", 6), ("pig_agency_rid", 32)):
+        result[key] = list(dict.fromkeys(
+            value.upper().strip() for value in result[key][:64]
+            if isinstance(value, str) and 1 <= len(value.strip()) <= limit))
+    result["pig_talkgroups"] = {
+        str(key)[:40]: value.strip()[:40]
+        for key, value in list(result["pig_talkgroups"].items())[:128]
+        if isinstance(key, str) and isinstance(value, str) and value.strip()}
 
     has_legacy_dots = type(saved.get("network_dots")) is bool
     legacy_dots = saved.get("network_dots")

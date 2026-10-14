@@ -5,7 +5,8 @@ MAC = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 KINDS = {"started", "stopped", "error", "stats", "wifi", "wifi_mgmt", "ble", "hs_packet"}
 V2_KINDS = {"started", "stopped", "error", "heartbeat", "status", "batch_start",
-            "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble", "live_oui"}
+            "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble", "live_oui",
+            "remote_id_wifi"}
 
 def integer(d, key, low, high):
     v = d.get(key)
@@ -32,6 +33,10 @@ def parse_record(line):
                     raise ValueError("live_oui capability")
                 if d["wardrive_live_oui_v1"]:
                     integer(d, "live_oui_max", 1, 8)
+            if "remote_id_wifi_v1" in d and type(d["remote_id_wifi_v1"]) is not bool:
+                raise ValueError("remote_id capability")
+            if d.get("remote_id_wifi_v1") is True:
+                integer(d, "remote_id_wifi_max_bytes", 25, 228)
             return d
         allowed = V2_KINDS if d["v"] == 2 else KINDS
         if kind not in allowed or not isinstance(d.get("session"), str) or not TOKEN.fullmatch(d["session"]):
@@ -40,7 +45,7 @@ def parse_record(line):
         if d["v"] == 2:
             integer(d, "batch", 0, 2**32-1)
             state = d.get("state")
-            if kind in V2_KINDS-{"wifi", "wifi_mgmt", "ble", "live_oui"} and state not in ("running", "reporting", "stopped", "error"):
+            if kind in V2_KINDS-{"wifi", "wifi_mgmt", "ble", "live_oui", "remote_id_wifi"} and state not in ("running", "reporting", "stopped", "error"):
                 raise ValueError("state")
             if kind in ("batch_start", "batch_results", "batch_done", "live_oui") and d["batch"] < 1:
                 raise ValueError("batch")
@@ -69,6 +74,20 @@ def parse_record(line):
                 raise ValueError("data_hex")
             if d["offset"] % 240 or len(value)//2 != min(240, d["total"]-d["offset"]):
                 raise ValueError("offset")
+            return d
+        if kind == "remote_id_wifi":
+            for key, low, high in (("capture_ms", 0, 2**63-1), ("age_ms", 0, 20000),
+                                   ("rssi", -127, 20), ("channel", 1, 196)):
+                integer(d, key, low, high)
+            if (not isinstance(d.get("mac"), str) or not MAC.fullmatch(d["mac"])
+                    or d.get("transport") not in ("beacon", "nan")
+                    or type(d.get("truncated")) is not bool):
+                raise ValueError("remote id metadata")
+            value = d.get("data_hex")
+            if (not isinstance(value, str) or len(value) > 456 or not value
+                    or not re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value)):
+                raise ValueError("remote id payload")
+            d["mac"] = d["mac"].upper()
             return d
         if kind in {"wifi", "wifi_mgmt", "ble"}:
             integer(d, "capture_ms", 0, 2**63-1)

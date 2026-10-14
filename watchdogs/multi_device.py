@@ -465,7 +465,7 @@ class MultiDeviceRuntime:
         if kind == 'started' or (kind in ('status','heartbeat')
                                 and record.get('state') in ('running','reporting')):
             self._open_capture(group, did, source)
-        if kind in ('wifi', 'wifi_mgmt', 'ble', 'live_oui'):
+        if kind in ('wifi', 'wifi_mgmt', 'ble', 'live_oui', 'remote_id_wifi'):
             event = dict(record, source_session=token, session=group.identity)
             self.scan.last_seen['ble' if kind == 'ble' else 'wifi'] = self.clock()
             self.scan.record_counts[kind] += 1
@@ -635,8 +635,9 @@ class MultiDeviceRuntime:
                 if not owner.host_ble.start(group.identity, adapter=owner.settings.get('host_ble_adapter','auto'),
                                             require_lease=owner._host_ble_requires_lease()):
                     owner.host_ble_error('Host scanner did not start')
-            owner.start_cell()
-            owner.start_auxiliary_collectors()
+            if group.state_key != 'pig_detector':
+                owner.start_cell()
+                owner.start_auxiliary_collectors()
         message = '[C5] '+group.operation+' running on '+str(len(group.requests))+' boards'
         if group.operation == 'sniffer':
             message += ' — ' + CHANNEL_COVERAGE_LABELS[self.scan.channel_coverage]

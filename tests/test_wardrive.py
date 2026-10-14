@@ -201,7 +201,7 @@ def test_timeouts_and_disconnect():
     c.supported=True;c.start();now[0]=18;c.tick();assert c.state=="error" and sent[-1]=="stop"
     c.reset();assert c.session=="" and c.supported is None
 
-@pytest.mark.parametrize("name,expected", [("Penguin-123",True),("Flock-abc",True),("pigvision",True),("FS Ext Battery",True),("myFlock-router",False),("Penguin",False),("1234567890",False)])
+@pytest.mark.parametrize("name,expected", [("Penguin-123",True),("Flock-abc",True),("pigvision",False),("FS Ext Battery",True),("myFlock-router",False),("Penguin",False),("1234567890",False)])
 def test_names(name,expected):
     d=NotableDetector();hits=d.classify(record("ble",mac="C2:00:00:00:00:01",addr_type=1,data_hex=ad(9,name.encode()).hex()),0)
     assert bool(hits)==expected

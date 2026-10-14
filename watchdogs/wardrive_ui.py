@@ -11,6 +11,8 @@ from .app_state import Network, SnifferAP
 from .wardrive_protocol import parse_record, display_bytes
 from .scan_controller import ScanController
 from .notable_detector import NotableDetector, ble_name
+from .pig_detector import PigDetector
+from .remote_id import RemoteIdDecoder, ble_messages, messages as remote_id_messages
 from .wardrive_trail import FixHistory, WardriveTrail, distance
 from .lora_manager import (
     MC_DISCOVERY_INTERVAL, MC_DISCOVERY_MIN_DISTANCE_M,
@@ -46,6 +48,7 @@ MAIN_SETTINGS = (
     ("_map_layers", "Map dot layers"),
     ("trail_mode", "Wardrive trail"),
     ("_collectors", "All Wardrive collectors"),
+    ("_pig_settings", "Pig Detector settings"),
     ("_c5_devices", "USB C5 devices and roles"),
     ("_lora_settings", "LoRa settings"),
     ("lte_modem", "LTE modem integration"),
@@ -108,11 +111,15 @@ class WardriveUI:
         self.settings_path = settings_path(app._app_dir)
         self.settings = (load_settings(app._app_dir) if initial_settings is None
                          else normalize_settings(initial_settings))
+        self.pig = PigDetector(self.settings)
+        self.remote_id = RemoteIdDecoder()
         self.settings_open = False
         self.settings_page = "main"
         self.selection = 0
         self.layer_selection = 0
         self.collector_selection = 0
+        self.pig_selection = 0
+        self.pig_channel_selection = 0
         self.c5_selection = 0
         self.c5_alias_draft = None
         self.lora_selection = 0
@@ -150,6 +157,7 @@ class WardriveUI:
         self._wdg_owned_sdr = False
 
     def on_stop(self, *, stop_scan=True):
+        self.stop_pig()
         self.targets.cancel()
         if self.app._pending_cmd and self.app._pending_cmd.startswith("hs_scan "):
             self.app._pending_cmd = None
@@ -169,6 +177,133 @@ class WardriveUI:
         self.mc_discovery_session = None
         self.mc_discovery_next = 0.0
         self.mc_discovery_last_fix = None
+
+    def start_pig(self):
+        """Subscribe to a wardrive receiver, claiming one only if none exists."""
+        if self.pig.active:
+            return True
+        app = self.app
+        session_dir = getattr(getattr(app, "loot", None), "session_dir", None)
+        self.pig.start(session_dir)
+        self.remote_id.clear()
+        pool = getattr(app, "c5_pool", None)
+        active_group = None
+        if pool is not None and pool.available:
+            active_group = next((g for g in pool.groups.values()
+                                 if g.operation == "wardrive" and
+                                 g.state in ("starting", "running")), None)
+            if active_group is None:
+                busy = next((g for g in pool.groups.values()
+                             if g.state in ("starting", "running", "stopping")), None)
+                if busy is not None:
+                    self.pig.status = "C5 BUSY: " + busy.operation.upper()
+                else:
+                    try:
+                        started = pool.start("wardrive", state_key="pig_detector",
+                                             live_ouis=self.detector.oui_prefixes())
+                    except (ValueError, RuntimeError) as exc:
+                        started = False
+                        app._term_add("[PIG] C5 assignment: " + str(exc)[:110], raw=True)
+                    if started:
+                        self.pig.owns_scan = True
+                        self.pig.owned_group = pool.background
+                    elif getattr(self, "scan", None) is self.legacy_scan:
+                        # The managed scheduler selected the existing legacy
+                        # endpoint because no managed C5 can run wardrive.
+                        self._start_pig_legacy_scan()
+                    else:
+                        self.pig.status = "NO C5 RECEIVER"
+            else:
+                self.pig.status = "ATTACHED TO WARDRIVE"
+        else:
+            self._start_pig_legacy_scan()
+        if self.pig.owns_scan:
+            self.pig.status = "SCAN STARTING"
+        self.start_pig_sdr()
+        app.msg("[PIG] " + self.pig.status, CYAN if self.pig.owns_scan else ORANGE)
+        return True
+
+    def _start_pig_legacy_scan(self):
+        if self.legacy_scan.active and self.legacy_scan.mode == "wardrive":
+            self.pig.status = "ATTACHED TO WARDRIVE"
+        elif (not self.app._anything_running_on_esp()
+              and self.legacy_scan.supported is True
+              and self.legacy_scan.start("wardrive", live_ouis=self.detector.oui_prefixes())):
+            self.pig.owns_scan = True
+            self.pig.owned_session = self.legacy_scan.session
+            self.pig.owned_serial = getattr(self.app, "serial", None)
+        else:
+            self.pig.status = "NO WIFI/BLE RECEIVER"
+            if not self.legacy_scan.supported:
+                self.legacy_scan.probe()
+
+    def stop_pig(self):
+        if not self.pig.active:
+            return
+        app = self.app
+        pool = getattr(app, "c5_pool", None)
+        if self.pig.owned_group and pool is not None:
+            group = pool.groups.get(self.pig.owned_group)
+            if group and group.state in ("starting", "running"):
+                pool.controller.stop_group(group.identity)
+        elif (self.pig.owned_session and self.legacy_scan.active
+              and self.legacy_scan.session == self.pig.owned_session):
+            self.legacy_scan.stop()
+            serial = self.pig.owned_serial
+            if serial is not None and serial.is_open:
+                # _send("stop") is global in a mixed managed/legacy pool.
+                # Address only the endpoint that Pig Detector started.
+                serial.send_command("stop")
+        if (self.pig.owns_sdr and getattr(app, "_sdr", None) is not None
+                and app._sdr.running and app._sdr.mode == self.pig.owned_sdr_mode):
+            app._sdr.stop()
+        self.pig.stop()
+        self.remote_id.clear()
+
+    def start_pig_sdr(self):
+        if not self.pig.active:
+            return
+        app = self.app
+        sdr = getattr(app, "_sdr", None)
+        profile = self.settings["pig_sdr_profile"]
+        if profile == "auto":
+            profile = "watchlist" if self.settings["pig_watchlist"] else "off"
+        if profile == "off":
+            app._term_add("[PIG] SDR profile OFF", raw=True)
+            return
+        if not getattr(app, "_sdr_enabled", False) or sdr is None:
+            app._term_add("[PIG] SDR power is OFF; Wi-Fi/BLE continues", raw=True)
+            return
+        desired = {"watchlist":"pig_rf", "p25":"pig_p25",
+                   "433":"433", "adsb":"adsb"}[profile]
+        if sdr.running:
+            if sdr.mode == desired:
+                app._term_add("[PIG] Using existing SDR " + desired + " profile", raw=True)
+            else:
+                app._term_add("[PIG] SDR busy: " + str(sdr.mode), raw=True)
+                app.msg("[PIG] SDR busy: " + str(sdr.mode), ORANGE)
+            return
+        loot_dir = getattr(getattr(app, "loot", None), "session_dir", "") or ""
+        gain = self.settings["pig_gain_db"] or None
+        ppm = self.settings["pig_ppm"]
+        if profile == "watchlist":
+            ok = bool(self.settings["pig_watchlist"]) and sdr.start_pig_watchlist(
+                self.settings["pig_watchlist"], gain=gain, ppm=ppm, loot_dir=loot_dir)
+        elif profile == "p25":
+            ok = bool(self.settings["pig_p25_control_hz"]) and sdr.start_pig_p25(
+                self.settings["pig_p25_control_hz"], self.settings["pig_p25_system"],
+                gain=gain, ppm=ppm, loot_dir=loot_dir)
+        elif profile == "433":
+            ok = sdr.start_433(loot_dir, app.player_lat, app.player_lon)
+        else:
+            ok = sdr.start_adsb(loot_dir)
+        self.pig.owns_sdr = bool(ok)
+        self.pig.owned_sdr_mode = sdr.mode if ok else None
+        if not ok:
+            app._term_add("[PIG] SDR profile unavailable or incomplete: " + profile,
+                          raw=True)
+        else:
+            app._term_add("[PIG] SDR profile: " + profile, raw=True)
 
     def tick(self):
         app = self.app
@@ -195,6 +330,21 @@ class WardriveUI:
         connection = app.serial if app.serial and app.serial.is_open else None
         pool = getattr(app, 'c5_pool', None)
         managed = pool is not None and pool.available
+        if self.pig.active:
+            if managed:
+                receiver_active = any(
+                    g.operation == "wardrive" and g.state in ("starting", "running")
+                    for g in pool.groups.values())
+                receiver_active = receiver_active or (
+                    self.legacy_scan.active and self.legacy_scan.mode == "wardrive")
+            else:
+                receiver_active = self.legacy_scan.active and self.legacy_scan.mode == "wardrive"
+            if receiver_active:
+                self.pig.status = "LISTENING"
+            elif self.pig.owns_sdr and app._sdr.running:
+                self.pig.status = "SDR ONLY"
+            else:
+                self.pig.status = "NO RECEIVER"
         if connection is not self.connection and not managed:
             self.host_ble.stop()
             self.host_ble_batch_lines.clear()
@@ -371,8 +521,9 @@ class WardriveUI:
                 else:
                     self.app._term_add("[ALL] Wi-Fi: ESP32 | BLE: uConsole (starting)", raw=True)
             if previous == "starting" and self.scan.state == "running":
-                self.start_cell()
-                self.start_auxiliary_collectors()
+                if not (self.pig.active and self.pig.owned_session == self.scan.session):
+                    self.start_cell()
+                    self.start_auxiliary_collectors()
             if d["kind"] == "stopped" and not self.scan.active:
                 self.clear_live_notifications()
                 self.host_ble.stop()
@@ -1031,6 +1182,12 @@ class WardriveUI:
         d = dict(d)
         d["fix"] = self.fixes.at(now - d["age_ms"] / 1000) if self.app.gps.available else None
         d["observed_at"] = time.time() - d["age_ms"] / 1000
+        if d["kind"] == "remote_id_wifi":
+            if not d["truncated"]:
+                self._ingest_remote_id(d, remote_id_messages(bytes.fromhex(d["data_hex"])))
+            return
+        if d["kind"] == "ble":
+            self._ingest_remote_id(d, ble_messages(d["data_hex"]))
         if d["kind"] == "wifi":
             net = Network(index="0", bssid=d["mac"], ssid=display_bytes(d["ssid_hex"]),
                           channel=str(d["channel"]), rssi=str(d["rssi"]),
@@ -1041,6 +1198,19 @@ class WardriveUI:
             self.app._ingest_ble(d["mac"], d["rssi"], name or "?", observation=d, terminal=terminal)
         else:
             self.detect(d)
+
+    def _ingest_remote_id(self, d, payload):
+        if not self.pig.active or not payload:
+            return
+        decoded = self.remote_id.accept(d["mac"], payload)
+        if decoded:
+            self.pig.ingest_broadcast(
+                "remote_id", decoded["identity"], decoded["position"], d.get("fix"),
+                label=decoded["label"], signal_dbm=d.get("rssi"),
+                observed_at=d.get("observed_at"), stable=decoded["stable"],
+                receiver=d.get("device_id") or ("ble-receiver" if d["kind"] == "ble" else "c5"),
+                session=d.get("source_session", d.get("session")), seq=d.get("seq"),
+                channel=d.get("channel"), transport=d.get("transport", "ble"))
 
     @staticmethod
     def save_args(observation):
@@ -1115,8 +1285,13 @@ class WardriveUI:
             return
         hits = self.detector.classify(d, now, self.app._whitelist.is_blocked, self.settings["suppressed_rules"])
         for hit in hits:
+            if hit["category"] not in ("flock", "axon"):
+                if self.pig.ingest_notable(d, hit):
+                    self.app.msg("[PIG] " + hit["label"], ORANGE)
+                continue
             if not self.settings[hit["category"]]:
                 continue
+            self.pig.ingest_notable(d, hit)
             hit["evidence"] = [h for h in hit["evidence"] if h["id"] not in self.settings["suppressed_rules"]]
             if not hit["evidence"]:
                 continue
@@ -1418,6 +1593,27 @@ class WardriveUI:
         if self.settings_page == 'c5':
             self._update_c5_settings(px)
             return
+        if self.settings_page == "pig":
+            self._update_pig_settings(px)
+            return
+        if self.settings_page == "pig_channels":
+            if px.btnp(px.KEY_TAB):
+                self.settings_open = False
+                self.settings_page = "main"
+            elif px.btnp(px.KEY_ESCAPE):
+                self.settings_page = "pig"
+            elif px.btnp(px.KEY_UP):
+                self.pig_channel_selection = max(0, self.pig_channel_selection-1)
+            elif px.btnp(px.KEY_DOWN):
+                self.pig_channel_selection = min(
+                    max(0, len(self.settings["pig_watchlist"])-1),
+                    self.pig_channel_selection+1)
+            elif px.btnp(px.KEY_BACKSPACE) and self.settings["pig_watchlist"]:
+                self.settings["pig_watchlist"].pop(self.pig_channel_selection)
+                self.pig_channel_selection = min(self.pig_channel_selection,
+                    max(0, len(self.settings["pig_watchlist"])-1))
+                self.persist_settings()
+            return
         if self.settings_page == "layers":
             if px.btnp(px.KEY_TAB):
                 self.settings_open = False
@@ -1600,6 +1796,9 @@ class WardriveUI:
             elif key == "_collectors":
                 self.settings_page = "collectors"
                 self.collector_selection = 0
+            elif key == "_pig_settings":
+                self.settings_page = "pig"
+                self.pig_selection = 0
             elif key == '_c5_devices':
                 self.settings_page = 'c5'
                 self.c5_selection = 0
@@ -2666,6 +2865,103 @@ class WardriveUI:
         except OSError as exc:
             self.app.msg("[WDG] Settings save failed: " + str(exc)[:50],8)
 
+    def _pig_input(self, action, fields):
+        self.app.input_mode = True
+        self.app.input_fields = [{"label": name, "value": ""} for name in fields]
+        self.app.input_field_idx = 0
+        self.app._input_pending_cat = -15
+        self.app._input_pending_item = action
+
+    def apply_pig_input(self, action, values):
+        """Validate the small editable Pig profile and identifier lists."""
+        draft = dict(self.settings)
+        try:
+            if action == 3:
+                hz = int(round(float(values[0]) * 1_000_000))
+                width = int(float(values[1]) * 1000)
+                label = values[2].strip()
+                draft["pig_watchlist"] = list(self.settings["pig_watchlist"]) + [
+                    {"frequency_hz": hz, "bandwidth_hz": width, "label": label}]
+            elif action == 5:
+                draft["pig_p25_control_hz"] = int(round(float(values[0]) * 1_000_000))
+                draft["pig_p25_system"] = values[1].strip()
+            elif action == 6:
+                draft["pig_gain_db"] = int(values[0])
+                draft["pig_ppm"] = int(values[1])
+            elif action in (7, 8):
+                key = "pig_agency_icao" if action == 7 else "pig_agency_rid"
+                draft[key] = list(self.settings[key]) + [values[0].strip().upper()]
+            elif action == 9:
+                mapping = dict(self.settings["pig_talkgroups"])
+                mapping[values[0].strip()] = values[1].strip()
+                draft["pig_talkgroups"] = mapping
+            else:
+                return
+        except (ValueError, IndexError):
+            self.app.msg("[PIG] Invalid number or missing field", ORANGE)
+            return
+        clean = normalize_settings(draft)
+        changed = any(clean[key] != draft[key] for key in (
+            "pig_watchlist", "pig_p25_control_hz", "pig_p25_system",
+            "pig_gain_db", "pig_ppm", "pig_agency_icao", "pig_agency_rid",
+            "pig_talkgroups"))
+        if changed:
+            self.app.msg("[PIG] Invalid or duplicate entry", ORANGE)
+            return
+        self.settings.update(clean)
+        self.persist_settings()
+        self.app.msg("[PIG] Setting saved", CYAN)
+
+    def _update_pig_settings(self, px):
+        if px.btnp(px.KEY_TAB):
+            self.settings_open = False
+            self.settings_page = "main"
+            return
+        if px.btnp(px.KEY_ESCAPE):
+            self.settings_page = "main"
+            return
+        if px.btnp(px.KEY_UP):
+            self.pig_selection = max(0, self.pig_selection - 1)
+        if px.btnp(px.KEY_DOWN):
+            self.pig_selection = min(10, self.pig_selection + 1)
+        if px.btnp(px.KEY_RETURN):
+            row = self.pig_selection
+            if row == 0:
+                profiles = ("auto", "off", "watchlist", "p25", "433", "adsb")
+                current = self.settings["pig_sdr_profile"]
+                self.settings["pig_sdr_profile"] = profiles[(profiles.index(current)+1) % len(profiles)]
+            elif row == 1:
+                self.settings["pig_product_alerts"] = not self.settings["pig_product_alerts"]
+            elif row == 2:
+                self.settings["pig_estimates"] = not self.settings["pig_estimates"]
+            elif row == 3:
+                self._pig_input(3, ("MHz", "kHz BW", "Label"))
+                return
+            elif row == 4:
+                self.settings_page = "pig_channels"
+                self.pig_channel_selection = 0
+                return
+            elif row == 5:
+                self._pig_input(5, ("Control MHz", "System label"))
+                return
+            elif row == 6:
+                self._pig_input(6, ("Gain dB 0=auto", "PPM"))
+                return
+            elif row == 7:
+                self._pig_input(7, ("Agency ICAO",))
+                return
+            elif row == 8:
+                self._pig_input(8, ("Agency Remote ID",))
+                return
+            elif row == 9:
+                self._pig_input(9, ("System:TGID", "Label"))
+                return
+            elif row == 10:
+                self.settings["pig_agency_icao"] = []
+                self.settings["pig_agency_rid"] = []
+                self.settings["pig_talkgroups"] = {}
+            self.persist_settings()
+
     def _update_c5_settings(self, px):
         pool = getattr(self.app,'c5_pool',None)
         devices = pool.registry.list(connected_only=True) if pool else []
@@ -2755,6 +3051,74 @@ class WardriveUI:
             px.rectb(40,35,560,285,PURPLE)
             if self.settings_page == 'c5':
                 self._draw_c5_settings(px)
+                px.camera()
+                return
+            if self.settings_page == "pig":
+                channels = self.settings["pig_watchlist"]
+                rows = (
+                    "SDR profile: " + self.settings["pig_sdr_profile"].upper(),
+                    "Product alerts: " + ("ON" if self.settings["pig_product_alerts"] else "OFF"),
+                    "Experimental RSSI areas: " + ("ON" if self.settings["pig_estimates"] else "OFF"),
+                    "Add RF channel (MHz, bandwidth kHz, label)",
+                    "RF watchlist and coverage (" + str(len(channels)) + " configured)",
+                    "P25 control: " + (f"{self.settings['pig_p25_control_hz']/1e6:.4f} MHz" if self.settings["pig_p25_control_hz"] else "unset"),
+                    f"SDR gain {self.settings['pig_gain_db']} dB / PPM {self.settings['pig_ppm']}",
+                    "Add agency ICAO (" + str(len(self.settings["pig_agency_icao"])) + ")",
+                    "Add agency Remote ID (" + str(len(self.settings["pig_agency_rid"])) + ")",
+                    "Map system:talkgroup to label (" + str(len(self.settings["pig_talkgroups"])) + ")",
+                    "Clear agency IDs and talkgroup labels",
+                )
+                px.text(55,47,"PIG DETECTOR SETTINGS   arrows / ENTER / ESC",7)
+                for index, row in enumerate(rows):
+                    px.text(55,64+index*16,
+                            (("> " if index == self.pig_selection else "  ")+row)[:104],
+                            11 if index == self.pig_selection else 7)
+                sdr = getattr(self.app, "_sdr", None)
+                if sdr is not None and sdr.running and sdr.mode == "pig_p25":
+                    quality = sdr.p25_quality
+                    blocks = quality.get("decoded_blocks")
+                    rate = quality.get("blocks_per_min")
+                    px.text(55,248,("P25 decoded blocks: " + str(blocks if blocks is not None else "waiting")
+                                    + (f"  {rate:.1f}/min" if rate is not None else ""))[:103],13)
+                elif channels:
+                    latest = channels[-1]
+                    px.text(55,248,("Last: " + latest["label"] + " "
+                           + f"{latest['frequency_hz']/1e6:.4f} MHz")[:103],13)
+                px.text(55,265,"Changes to the SDR profile take effect on next mode start.",13)
+                px.text(55,279,"Remote ID BLE 5 extended advertisements are not covered.",10)
+                px.text(55,297,"ESC returns  TAB closes settings",10)
+                px.camera()
+                return
+            if self.settings_page == "pig_channels":
+                px.text(55,47,"RF WATCHLIST   last visit / coverage gap",7)
+                channels = self.settings["pig_watchlist"]
+                states = getattr(self.app._sdr, "_pig_channel_state", {})
+                for index, channel in enumerate(channels[:16]):
+                    key = f"{channel['frequency_hz']}:{channel['bandwidth_hz']}:{index}"
+                    state = states.get(key, {})
+                    epoch = state.get("last_visit_epoch")
+                    age = max(0, int(time.time()-epoch)) if epoch else None
+                    expected = max(5, state.get("revisit_seconds") or len(channels)*2)
+                    p25_locked = (getattr(self.app._sdr, "running", False)
+                                  and self.app._sdr.mode == "pig_p25")
+                    coverage = ("PAUSED P25" if p25_locked else
+                                "NEVER" if age is None else
+                                "GAP " + str(age) + "s" if age > expected*2 else
+                                str(age) + "s ago")
+                    power = state.get("power_db")
+                    noise = state.get("noise_floor_db")
+                    strength = (f"{power:.0f}/{noise:.0f} dB" if
+                                type(power) in (int,float) and type(noise) in (int,float)
+                                else "no sample")
+                    row = (f"{channel['label'][:20]}  {channel['frequency_hz']/1e6:.4f} MHz "
+                           f"{coverage}  {strength}")
+                    px.text(55,63+index*13,
+                            (("> " if index == self.pig_channel_selection else "  ")+row)[:104],
+                            11 if index == self.pig_channel_selection else 7)
+                if not channels:
+                    px.text(55,70,"No channels. Add one from Pig Detector settings.",9)
+                px.text(55,279,"BACKSPACE removes selected channel. Changes apply on restart.",13)
+                px.text(55,297,"ESC returns  TAB closes settings",10)
                 px.camera()
                 return
             if self.settings_page == "layers":
@@ -3069,7 +3433,8 @@ class WardriveUI:
                 return
             px.text(55,47,"WARDRIVE SETTINGS   arrows / ENTER / ESC",7)
             for i, (key, label) in enumerate(MAIN_SETTINGS):
-                if key in ("_map_layers", "_collectors", "_lora_settings", '_c5_devices'):
+                if key in ("_map_layers", "_collectors", "_lora_settings", '_c5_devices',
+                           "_pig_settings"):
                     value = "OPEN..."
                 elif key == "trail_mode":
                     value = self.trail_mode().upper()
@@ -3077,7 +3442,7 @@ class WardriveUI:
                     value = "ON" if self.settings[key] else "OFF"
                 if key in ("cell_tracking", "cell_neighbors") and not self.settings["lte_modem"]:
                     value += " (LTE OFF)"
-                px.text(55,64+i*12,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
+                px.text(55,64+i*11,("> " if i==self.selection else "  ")+label+": "+value,11 if i==self.selection else 7)
             px.text(55,188,"LTE OFF skips ModemManager; AIO/external GPS and BLE still work.",13)
             px.text(55,199,"Precise = where YOU heard it, not the camera location.",13)
             px.text(55,210,"QMI neighbor dots are provisional and are not exported to WiGLE.",10)

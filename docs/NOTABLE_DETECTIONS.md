@@ -21,7 +21,7 @@ Flock alerts and markers use purple; Axon uses orange. Both categories use F/A l
 | Rule | All Wardrive | Legacy Wi-Fi/BLE wardrive | Meaning |
 |---|---|---|---|
 | flock-oui: B4:1E:52 | Wi-Fi transmitter/BSSID, public BLE | Wi-Fi only (legacy BLE omits address type) | Possible Flock |
-| flock-name: Penguin-…, Flock-…, exact pigvision / FS Ext Battery | Full SSID/local name | Available SSID/name | Flock signature match |
+| flock-name: Penguin-…, Flock-…, FS Ext Battery | Full SSID/local name | Available SSID/name | Flock signature match |
 | flock-wildcard-probe | Empty SSID probe request plus matching transmitter OUI | Unavailable | Flock signature match |
 | flock-oem: company 0x09C8 | All AD manufacturer sections | Unavailable | XUNTONG OEM clue; **no popup by itself** |
 | axon-oui: 00:25:DF | Wi-Fi/public BLE | Wi-Fi only | Possible Axon device |
@@ -31,7 +31,7 @@ Flock alerts and markers use purple; Axon uses orange. Both categories use F/A l
 
 Random/private BLE addresses and locally administered/multicast Wi-Fi addresses do not get OUI-based classification. Payload rules still apply to rotating BLE addresses. Advertisement and scan-response evidence share a bounded three-second cache by address/type; no attempt is made to identify a person or merge rotating addresses. Matches from both categories remain separate rather than arbitrarily choosing one.
 
-A bare 10-digit name, broad OEM prefix lists, receiver-only address matches, unrelated Axon Networks prefixes (00:58:28 and 84:70:03), and Biscuit's unpublished SOUI database are not implemented. This is documented public-signature coverage, not exact parity with Biscuit's private firmware.
+A bare 10-digit name, broad OEM prefix lists, receiver-only address matches, unrelated Axon Networks prefixes (00:58:28 and 84:70:03), and Biscuit's unpublished SOUI database are not implemented. `Pigvision` is retained as a diagnostic-only candidate, not a supported Flock match. The separate [Pig Detector](PIG_DETECTOR.md) view adds evidence-graded Raven and body-camera leads. This is documented public-signature coverage, not exact parity with Biscuit's private firmware.
 
 ## Early OUI popups with batched ESP scans
 

@@ -1,4 +1,4 @@
-"""Evidence-aware Flock/Axon matching. Never equate a vendor with a camera."""
+"""Evidence-aware radio signatures. Never equate a vendor with a product."""
 from collections import OrderedDict
 import json
 from pathlib import Path
@@ -48,12 +48,25 @@ class NotableDetector:
     @staticmethod
     def results(hits):
         results = []
-        for category in ("flock", "axon"):
+        labels = {
+            "raven": "Possible Flock Raven sensor",
+            "utility": "Possible BodyWorn Remote accessory",
+            "watchguard": "WatchGuard Video vendor lead; product unknown",
+            "bodycam_candidate": "Body-camera name lead; product unknown",
+        }
+        for category in ("flock", "axon", "raven", "utility",
+                         "watchguard", "bodycam_candidate"):
             evidence = [h for h in hits if h["category"] == category]
             if not evidence:
                 continue
             strength = max(h["strength"] for h in evidence)
-            label = ("Axon body-camera signature" if strength >= 3 else "Possible Axon device") if category == "axon" else ("Flock signature match" if strength >= 2 else "Possible Flock" if strength == 1 else "Flock-associated OEM clue")
+            if category == "axon":
+                label = "Axon body-camera signature" if strength >= 3 else "Possible Axon device"
+            elif category == "flock":
+                label = ("Flock signature match" if strength >= 2 else
+                         "Possible Flock" if strength == 1 else "Flock-associated OEM clue")
+            else:
+                label = labels[category]
             results.append(dict(category=category,strength=strength,label=label,evidence=evidence))
         return results
 
@@ -98,6 +111,13 @@ class NotableDetector:
                 for t,v in fields:
                     values = [int.from_bytes(v[i:i+2], "little") for i in range(0,len(v)-1,2)] if t in (2,3) and len(v)%2==0 else ([int.from_bytes(v[:2], "little")] if t==0x16 and len(v)>=2 else [])
                     match = match or value in values
+            elif method == "service_uuid128":
+                target = int(value.replace("-", ""), 16)
+                for t, v in fields:
+                    if t in (0x06, 0x07) and len(v) % 16 == 0:
+                        match = match or any(
+                            int.from_bytes(v[i:i+16], "little") == target
+                            for i in range(0, len(v), 16))
             elif method == "service_tag":
                 # Only actual service-data fields, following their UUID; never arbitrary AD bytes.
                 for t,v in fields:

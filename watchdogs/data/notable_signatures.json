@@ -15,7 +15,7 @@
       "id": "flock-name",
       "category": "flock",
       "method": "name",
-      "value": "(?i)(?:Penguin-[A-Za-z0-9-]+|Flock-[A-Za-z0-9-]+|pigvision|FS Ext Battery)",
+      "value": "(?i)(?:Penguin-[A-Za-z0-9-]+|Flock-[A-Za-z0-9-]+|FS Ext Battery)",
       "strength": 2,
       "source": "https://codehedge.github.io/Biscuit-Wiki/3rd-party-integration/wardrive.html",
       "checked": "2026-09-12",
@@ -70,6 +70,86 @@
       "source": "https://bitbucket.org/bluetooth-SIG/public/src/main/assigned_numbers/uuids/member_uuids.yaml",
       "checked": "2026-09-12",
       "provenance": "Bluetooth SIG assigned number; independently implemented matcher"
+    },
+    {
+      "id": "raven-gps-service",
+      "category": "raven",
+      "method": "service_uuid128",
+      "value": "00003100-0000-1000-8000-00805f9b34fb",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field capture; possible product signature"
+    },
+    {
+      "id": "raven-power-service",
+      "category": "raven",
+      "method": "service_uuid128",
+      "value": "00003200-0000-1000-8000-00805f9b34fb",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field capture; possible product signature"
+    },
+    {
+      "id": "raven-network-service",
+      "category": "raven",
+      "method": "service_uuid128",
+      "value": "00003300-0000-1000-8000-00805f9b34fb",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field capture; possible product signature"
+    },
+    {
+      "id": "raven-upload-service",
+      "category": "raven",
+      "method": "service_uuid128",
+      "value": "00003400-0000-1000-8000-00805f9b34fb",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field capture; possible product signature"
+    },
+    {
+      "id": "raven-error-service",
+      "category": "raven",
+      "method": "service_uuid128",
+      "value": "00003500-0000-1000-8000-00805f9b34fb",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field capture; possible product signature"
+    },
+    {
+      "id": "utility-bodyworn-name",
+      "category": "utility",
+      "method": "name",
+      "value": "(?i).*BodyWorn Remote.*",
+      "strength": 2,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Third-party field observation; identifies an accessory, not a camera"
+    },
+    {
+      "id": "watchguard-video-oui",
+      "category": "watchguard",
+      "method": "oui",
+      "value": "00:1D:96",
+      "strength": 0,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Vendor registration only; exact product unknown"
+    },
+    {
+      "id": "bodycam-name-candidate",
+      "category": "bodycam_candidate",
+      "method": "name",
+      "value": "(?i).*(?:BWC4000|IPS-BTS|BC-0[2-4]|TB-0[2-3]|HS-01).*",
+      "strength": 0,
+      "source": "https://github.com/soyboi1312/all-cameras-are-beacons/blob/main/docs/signatures.md",
+      "checked": "2026-10-14",
+      "provenance": "Capture candidate only; short names can be shared by unrelated devices"
     }
   ]
 }

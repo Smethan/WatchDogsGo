@@ -20,6 +20,8 @@ class ScanController:
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
         self.live_oui_supported = self.live_oui_enabled = False
+        self.remote_id_wifi_supported = False
+        self.remote_id_wifi_max_bytes = 0
         self.live_oui_max = 0
         self.wifi_only = self.batch = self.legacy = False
         self.record_counts = Counter()
@@ -63,6 +65,8 @@ class ScanController:
         self.wifi_supported = None
         self.batch_supported = self.wifi_batch_supported = False
         self.live_oui_supported = False
+        self.remote_id_wifi_supported = False
+        self.remote_id_wifi_max_bytes = 0
         self.live_oui_max = 0
         self.probing = True
         self.probe_error = ""
@@ -144,6 +148,8 @@ class ScanController:
             self.batch_supported = d.get("wardrive_batch_serial_v2", False) is True
             self.wifi_batch_supported = d.get("wardrive_wifi_batch_serial_v2", False) is True
             self.live_oui_supported = d.get("wardrive_live_oui_v1", False) is True
+            self.remote_id_wifi_supported = d.get("remote_id_wifi_v1", False) is True
+            self.remote_id_wifi_max_bytes = d.get("remote_id_wifi_max_bytes", 0) if self.remote_id_wifi_supported else 0
             self.live_oui_max = d.get("live_oui_max", 0) if self.live_oui_supported else 0
             self.probing = False
             self.probe_error = ""
@@ -162,7 +168,7 @@ class ScanController:
             self.last_control = now
             self._control_warned = False
             self.last_heartbeat = now
-        if kind in ("wifi", "wifi_mgmt", "ble", "hs_packet", "live_oui"):
+        if kind in ("wifi", "wifi_mgmt", "ble", "hs_packet", "live_oui", "remote_id_wifi"):
             self.last_data = now
             self.last_heartbeat = now
         if kind == "started" and self.state == "starting":
@@ -200,7 +206,7 @@ class ScanController:
             self.last_seen[kind] = now
         if self.mode == "hs_sniff":
             return self.state in ("running", "stopping") and kind == "hs_packet"
-        return self.state == "running" and kind in ("wifi", "wifi_mgmt", "ble", "live_oui")
+        return self.state == "running" and kind in ("wifi", "wifi_mgmt", "ble", "live_oui", "remote_id_wifi")
 
     def _status(self):
         if self.batch and self.session:

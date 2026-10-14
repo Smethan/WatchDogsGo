@@ -226,6 +226,7 @@ MENU_CATS = [
         ("2", "BT Wardrive",     "scan_bt",                "bt_scanning",  None),
         ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
         ("9", "All Wardrive (host BLE)", "start_wardrive_wifi_serial", "all_wardrive_host", None),
+        ("p", "Pig Detector", "_pig_detector", "_pig_detector", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer_all",      "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
@@ -2160,6 +2161,13 @@ class WatchDogsGame(OtaMixin):
             self.wardrive.settings_open = True
             self.wardrive.settings_page = "main"
             return
+        if state_key == "_pig_detector":
+            if self.wardrive.pig.active:
+                self.wardrive.stop_pig()
+                self.msg("[PIG] Detector stopped", C_DIM)
+            else:
+                self.wardrive.start_pig()
+            return
         if state_key == "hs_sniff" and not self._is_running("hs_sniff"):
             scan = self.wardrive.scan
             if scan.hs_supported is not True:
@@ -2188,6 +2196,7 @@ class WatchDogsGame(OtaMixin):
             self.msg("[SNIFFER] Current projectZero firmware required for explicit all-network scope.", C_WARNING)
             return
         if state_key == "_stop_all":
+            self.wardrive.stop_pig()
             if self.sniffing:
                 self._sniffer_results_pending = True
             self._send("stop")
@@ -2494,6 +2503,7 @@ class WatchDogsGame(OtaMixin):
                 else self._lora.running and self._lora.mode == "meshcore"),
             "_sdr_adsb":     self._sdr.running and "adsb" in self._sdr.mode,
             "_sdr_433":      self._sdr.running and "433" in self._sdr.mode,
+            "_pig_detector": self.wardrive.pig.active,
             "_watch":        self._watch.connected,
             "_gps_toggle":   self._gps_enabled,
             "_lora_toggle":  self._lora_enabled,
@@ -3876,6 +3886,7 @@ class WatchDogsGame(OtaMixin):
         else:
             self._sdr.stop()
             self.wardrive._wdg_owned_sdr = False
+            self.wardrive.pig.owns_sdr = False
             self.msg("[SDR] OFF", C_WARNING)
             self._term_add("[SYS] SDR disabled", raw=True)
         self.glitch_timer = 2
@@ -3887,6 +3898,7 @@ class WatchDogsGame(OtaMixin):
         if self._sdr.running and "adsb" in self._sdr.mode:
             self._sdr.stop()
             self.wardrive._wdg_owned_sdr = False
+            self.wardrive.pig.owns_sdr = False
             self.msg("[ADS-B] Stopped", C_WARNING)
             self._term_add("[SDR] ADS-B radar stopped", raw=True)
             return
@@ -3922,6 +3934,7 @@ class WatchDogsGame(OtaMixin):
         if self._sdr.running and "433" in self._sdr.mode:
             self._sdr.stop()
             self.wardrive._wdg_owned_sdr = False
+            self.wardrive.pig.owns_sdr = False
             self.msg("[433] Stopped", C_WARNING)
             self._term_add("[SDR] 433 MHz scanner stopped", raw=True)
             return
@@ -4058,11 +4071,24 @@ class WatchDogsGame(OtaMixin):
     def _poll_sdr(self):
         """Process SDR events (ADS-B aircraft, 433 MHz sensors)."""
         self._sync_sdr_map_history()
-        if not self._sdr.running:
-            return
         try:
+            pig = self.wardrive.pig
+            if pig.active and self._sdr.running and self._sdr.mode == "adsb":
+                fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
+                for aircraft in list(self._sdr.aircraft.values())[:128]:
+                    if aircraft.has_position and time.time() - aircraft.last_seen <= 60:
+                        pig.ingest_broadcast(
+                            "adsb", aircraft.icao,
+                            {"latitude": aircraft.lat, "longitude": aircraft.lon}, fix,
+                            label=aircraft.callsign or aircraft.icao,
+                            receiver="aio-sdr", transport="adsb")
+            if pig.active and self._sdr.running and self._sdr.mode == "433":
+                fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
+                for sensor in list(self._sdr.sensors.values())[:128]:
+                    if time.time() - sensor.last_seen <= 60:
+                        pig.ingest_sensor433(sensor, fix)
             # Prune stale entries every ~2 seconds
-            if pyxel.frame_count % 60 == 0:
+            if self._sdr.running and pyxel.frame_count % 60 == 0:
                 self._sdr.prune_stale()
                 self._sdr.update_gps(self.player_lat, self.player_lon)
             for etype, data in self._sdr.poll_events():
@@ -4079,6 +4105,12 @@ class WatchDogsGame(OtaMixin):
                         self.gain_xp(10)
                 elif etype == "sensor_new":
                     self.gain_xp(5)
+                elif etype == "pig_rf" and pig.active:
+                    fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
+                    pig.ingest_rf(data, fix)
+                elif etype == "pig_p25" and pig.active:
+                    fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
+                    pig.ingest_p25(data, fix)
         except Exception:
             pass
 
@@ -4858,6 +4890,9 @@ class WatchDogsGame(OtaMixin):
                         propagated_outbound=(
                             self.wardrive._reticulum_draft.propagated_outbound
                             if node_hash else False))
+                    return
+                if self._input_pending_cat == -15:  # Pig Detector settings
+                    self.wardrive.apply_pig_input(self._input_pending_item, vals)
                     return
                 if self._input_pending_cat == -6:  # WPA-sec token
                     token = vals[0].strip() if vals else ""
@@ -7196,6 +7231,7 @@ class WatchDogsGame(OtaMixin):
         self._draw_scan_fx()
         self._draw_player()
         self.wardrive.draw_markers()
+        self.wardrive.pig.draw_map(pyxel, self.proj)
         # Radar-style overlays go on top of the player skull so they're
         # visible even at low zoom, where every source within the dongle
         # range lands within the 12-pixel ring around the centre.
@@ -8229,6 +8265,8 @@ class WatchDogsGame(OtaMixin):
             tools.append(f"ADS-B:{n_pos}/{n_all}")
         if self._sdr.running and "433" in self._sdr.mode:
             tools.append(f"433:{self._sdr.total_sensors_seen}")
+        if self.wardrive.pig.active:
+            tools.append("PIG:" + self.wardrive.pig.status[:12])
         if tools:
             dots = "." * ((pyxel.frame_count // 10) % 4)
             status_x, status_txt = _fit_hud_text(
@@ -9389,6 +9427,7 @@ class WatchDogsGame(OtaMixin):
             -10: "Reticulum IFAC",
             -12: "Reticulum RF",
             -13: "Reticulum Name",
+            -15: "Pig Detector",
         }
         if self._input_pending_cat < 0:
             name = _SPECIAL_TITLES.get(self._input_pending_cat, "Input")

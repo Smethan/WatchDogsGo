@@ -30,6 +30,29 @@ def test_finds_source_install_outside_sudo_path(tmp_path, monkeypatch):
     assert sdr_tools.find_dump1090() is None
 
 
+def test_finds_optional_rtl_power_in_path(tmp_path, monkeypatch):
+    executable = tmp_path / "rtl_power"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(sdr_tools, "SYSTEM_BIN_DIRS", ())
+    assert sdr_tools.find_rtl_power() == str(executable)
+
+
+def test_op25_requires_reviewed_source_pin(tmp_path, monkeypatch):
+    executable = tmp_path / "op25/gr-op25_repeater/apps/rx.py"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/usr/bin/python3\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("WDG_OP25_ROOT", str(tmp_path))
+    monkeypatch.setattr(sdr_tools, "OP25_SOURCE_ROOTS", ())
+    run = Mock(return_value=Mock(stdout=sdr_tools.OP25_PIN + "\n"))
+    monkeypatch.setattr(sdr_tools.subprocess, "run", run)
+    assert sdr_tools.find_op25_rx() == str(executable)
+    run.return_value.stdout = "different-revision\n"
+    assert sdr_tools.find_op25_rx() is None
+
+
 def test_missing_optional_tools_never_rerun_setup(monkeypatch, capsys):
     monkeypatch.setattr(startup, "_check_deps", lambda: [
         ("pyxel", "OK", True, True),

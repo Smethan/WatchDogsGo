@@ -29,6 +29,7 @@ CHANNELS = frozenset((*range(1, 15), 36, 40, 44, 48, 52, 56, 60, 64,
 V3_DATA_KINDS = frozenset((
     "started", "stopped", "error", "heartbeat", "status", "batch_start",
     "batch_results", "batch_done", "wifi", "wifi_mgmt", "ble", "live_oui",
+    "remote_id_wifi",
     "hs_packet",
     "legacy",
 ))

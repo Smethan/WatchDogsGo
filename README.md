@@ -298,6 +298,7 @@ Or click the **Watch Dogs Go** desktop icon on the uConsole.
 | HS Sniff | `start_hs_sniff_serial` | Passive EAPOL/PMKID capture to uConsole |
 | All Wardrive | `start_wardrive_batch_serial` | Batched ESP32 WiFi+BLE, optional live Flock/Axon OUI popups (firmware 1.7.14+), host GPS, WiGLE loot, serving-cell tracking and selected LoRa/ADS-B/433 collectors |
 | All Wardrive (host BLE) | `start_wardrive_wifi_batch_serial` | Batched ESP32 WiFi with optional live OUI popups plus incremental uConsole BLE, the same host GPS and selected host collectors |
+| Pig Detector | Mode toggle | Passive, evidence-graded Wi-Fi/BLE/Remote ID observations and optional single-tuner SDR profile; see [mode guide](docs/PIG_DETECTOR.md) |
 
 ### ATTACK
 
