@@ -87,12 +87,37 @@ class DeviceSession:
         self.last_error = ""
         self.capture_state: dict[str, Any] = {}
         self.applied_channel: int | None = None
+        self.sniffer_stats = {"packets": 0, "aps": 0, "drops": 0}
         self._reader_lock = threading.Lock()
         self.last_poll_drained = False
 
     @property
     def connected(self) -> bool:
         return bool(getattr(self.serial, "is_open", True))
+
+    @property
+    def protocol_ready(self) -> bool:
+        """Identity and a capability reply are both bound to this boot."""
+        return bool(self.device_info_seen and self.capabilities_seen)
+
+    @property
+    def firmware_health(self) -> str:
+        """Expose readiness separately from USB-open and protocol negotiation."""
+        state = self.device_info.get("boot_state")
+        if state in ("ready", "degraded"):
+            return state
+        return "unknown" if self.protocol_ready else "negotiating"
+
+    @property
+    def health(self) -> dict[str, Any]:
+        return {
+            "usb_open": self.connected,
+            "protocol_ready": self.protocol_ready,
+            "firmware_health": self.firmware_health,
+            "firmware_version": self.device_info.get("firmware_version"),
+            "build_id": self.device_info.get("build_id"),
+            "boot_reason": self.device_info.get("boot_reason"),
+        }
 
     @property
     def active(self) -> bool:
@@ -397,7 +422,7 @@ class DeviceSession:
     def _update_snapshot(self, record: Mapping[str, Any]) -> None:
         kind = record.get("kind")
         state = record.get("state")
-        if state in ("running", "reporting", "stopping", "stopped", "error"):
+        if state in ("starting", "running", "reporting", "stopping", "stopped", "error"):
             self.state = state
         elif kind == "started":
             self.state = "running"
@@ -412,6 +437,12 @@ class DeviceSession:
         for key, value in record.get('losses', {}).items():
             if key in self.losses and value >= self.losses[key]:
                 self.losses[key] = value
+        for source, target in (("sniffer_packets", "packets"),
+                               ("sniffer_aps", "aps"),
+                               ("sniffer_drops", "drops")):
+            value = record.get(source)
+            if type(value) is int and value >= self.sniffer_stats[target]:
+                self.sniffer_stats[target] = value
         if kind == "error":
             self.last_error = str(record.get("error", record.get("message", "job error")))[:256]
         self.capture_state = dict(record)
@@ -468,6 +499,7 @@ class DeviceSession:
         self.counts = {"wifi_count": 0, "ble_count": 0, "drops": 0}
         self.losses = dict.fromkeys(LOSS_KEYS, 0)
         self.applied_channel = None
+        self.sniffer_stats = {"packets": 0, "aps": 0, "drops": 0}
         now = self.clock()
         self.last_keepalive_at = self.last_heartbeat_at = now
         self.job_started_at = now

@@ -233,10 +233,17 @@ class JobController:
                     group.states[member] = "uncertain_stopping" if stopped else "uncertain"
                 self.on_event("member_error", group, {"device_id": device_id, "error": group.error})
                 return
-            if kind == "started" or state in ("running", "reporting"):
+            if state in ("running", "reporting") or (
+                    kind == "started" and state not in (
+                        "starting", "stopping", "stopped", "error")):
                 group.states[device_id] = state or "running"
                 group.uncertain_since.pop(device_id, None)
                 self.on_event("member_running", group, {"device_id": device_id, "record": dict(record)})
+            elif state == "starting":
+                # Firmware may acknowledge an accepted job before its radio,
+                # callback, and worker are usable. Preserve pending ownership;
+                # only a later running/reporting record announces readiness.
+                group.states[device_id] = "starting"
             elif kind == "stopped" or state == "stopped":
                 group.states[device_id] = "stopped"
                 group.uncertain_since.pop(device_id, None)

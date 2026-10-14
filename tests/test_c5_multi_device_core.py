@@ -81,6 +81,25 @@ def test_device_info_validation_and_job_start_encoding():
         validate_job_request(request, boot_id="FFFFFFFFFFFFFFFF")
 
 
+def test_optional_boot_diagnostics_are_bounded_and_legacy_metadata_still_parses():
+    old = parse_device_info(wire(info()))
+    assert old is not None and "boot_state" not in old
+    extended = info(firmware_version="1.8.4", build_id="0123456789abcdef",
+                    boot_state="degraded", boot_reason="psram_buffer_alloc")
+    assert parse_device_info(wire(extended)) == extended
+    recovery = info(firmware_version="1.8.4", build_id="0123456789abcdef",
+                    boot_state="degraded", boot_reason="psram_buffer_failed",
+                    operations=[], channels=[], limits={key: 0 for key in
+                        ("targets", "exclusions", "batch", "aps", "clients", "probes")},
+                    updates=["rom"], capabilities={"c5_jobs_v1": False})
+    assert parse_device_info(wire(recovery)) == recovery
+    for changes in (
+            {"firmware_version": "x" * 33}, {"firmware_version": 12},
+            {"build_id": "0123456789abcde"}, {"boot_state": "ready-ish"},
+            {"boot_reason": "x" * 65}, {"boot_reason": "bad\nreason"}):
+        assert parse_device_info(wire(info(**changes))) is None
+
+
 def test_job_start_lowercases_wire_nonce_without_mutating_request_and_keeps_stale_check():
     lowercase_boot = "ef3738549b459d50"
     request = {"boot_id": "EF3738549B459D50", "op": "wardrive",
@@ -166,6 +185,29 @@ def test_controller_replacement_waits_for_stop_ack():
                                         "state": "stopped"})
     assert serial.commands[-1].startswith("job_start ")
     assert controller.active_group == second
+
+
+def test_controller_keeps_accepted_job_pending_until_firmware_reports_running():
+    registry = DeviceRegistry()
+    serial = FakeSerial()
+    registry.upsert('/dev/a', {'serial_number': 'a'}, info())
+    session = DeviceSession(serial, '/dev/a', info())
+    session.c5_jobs_v1 = True
+    events = []
+    controller = JobController(registry, {DEVICE_ID: session},
+                               on_event=lambda name, group, details:
+                               events.append((name, details)))
+    gid = controller.start_group({DEVICE_ID: {'op': 'wardrive', 'boot_id': BOOT_ID,
+                                               'band': 'wifi24', 'channels': [1]}})
+    token = controller.groups[gid].jobs[DEVICE_ID][0]
+    controller.handle_event(DEVICE_ID, {'kind': 'started', 'session': token,
+                                        'state': 'starting'})
+    assert controller.groups[gid].states[DEVICE_ID] == 'starting'
+    assert not any(name == 'member_running' for name, _ in events)
+    controller.handle_event(DEVICE_ID, {'kind': 'heartbeat', 'session': token,
+                                        'state': 'running'})
+    assert controller.groups[gid].states[DEVICE_ID] == 'running'
+    assert [name for name, _ in events].count('member_running') == 1
 
 
 def test_scheduler_assigns_every_target_and_emits_helper_restore_plan():
@@ -612,6 +654,73 @@ def test_channel_status_starting_does_not_announce_running():
     assert session.applied_channel == 6
     assert parse_job_record(started(kind='status',channel=True)) is None
     assert parse_job_record(started(kind='status',channel=199)) is None
+
+
+def test_sniffer_metrics_and_channel_failure_diagnostics_are_bounded_and_source_checked():
+    values = dict(sniffer_packets=123, sniffer_aps=7, sniffer_drops=2,
+                  requested_channel=6, actual_channel=1, radio_mode='sta',
+                  band='2g', sdk_error=-1)
+    parsed = parse_job_record(started(kind='heartbeat', state='starting', **values),
+                              expected_device_id=DEVICE_ID,
+                              expected_boot_id=BOOT_ID, last_seq=0)
+    assert parsed is not None
+    assert {key: parsed[key] for key in values} == values
+    for changes in (
+            {"sniffer_packets": True}, {"sniffer_aps": -1},
+            {"sniffer_drops": 2**32}, {"requested_channel": 0},
+            {"actual_channel": 197}, {"radio_mode": "monitor"},
+            {"band": "6g"}, {"sdk_error": 2**31}):
+        assert parse_job_record(started(**changes)) is None
+    assert parse_job_record(started(**values), expected_device_id="FFFFFFFFFFFF") is None
+    assert parse_job_record(started(**values), expected_boot_id="FFFFFFFFFFFFFFFF") is None
+    assert parse_job_record(started(seq=1, **values), last_seq=1) is None
+
+
+def test_device_session_keeps_starting_pending_and_sniffer_stats_token_scoped():
+    serial = FakeSerial([started(kind='heartbeat', state='starting', seq=1,
+                                 sniffer_packets=10, sniffer_aps=2, sniffer_drops=1)])
+    session = DeviceSession(serial, '/dev/fake', info())
+    session.c5_jobs_v1 = True
+    session.start_job('token', {'boot_id': BOOT_ID, 'op': 'sniffer',
+                                'band': 'wifi24', 'channels': [1]})
+    session.poll()
+    assert session.state == 'starting'
+    assert session.sniffer_stats == {'packets': 10, 'aps': 2, 'drops': 1}
+    serial.lines.append(started(kind='heartbeat', state='starting', seq=2,
+                                session='stale_token', sniffer_packets=99,
+                                sniffer_aps=99, sniffer_drops=99))
+    session.poll()
+    assert session.sniffer_stats == {'packets': 10, 'aps': 2, 'drops': 1}
+
+
+def test_device_session_health_separates_usb_identity_protocol_and_firmware_state():
+    session = DeviceSession(FakeSerial(), '/dev/fake')
+    assert session.health == {'usb_open': True, 'protocol_ready': False,
+                              'firmware_health': 'negotiating',
+                              'firmware_version': None, 'build_id': None,
+                              'boot_reason': None}
+    session.set_device_info(info(firmware_version='1.8.4', build_id='0123456789abcdef',
+                                 boot_state='ready', boot_reason='normal'))
+    assert session.health['usb_open'] is True
+    assert session.health['protocol_ready'] is False
+    assert session.health['firmware_health'] == 'ready'
+    session.capabilities_seen = True
+    assert session.protocol_ready is True
+
+
+def test_scheduler_keeps_fast_sniffer_default_and_full_coverage_is_opt_in():
+    xiao = info(operations=['sniffer'], channels=list(range(1, 15)))
+    scheduler = RadioScheduler()
+    fast = scheduler.plan([xiao], 'sniffer')['requests'][DEVICE_ID]
+    full = scheduler.plan([xiao], 'sniffer', channel_coverage='full')['requests'][DEVICE_ID]
+    assert fast['channels'] == [1, 6, 11]
+    assert full['channels'] == list(range(1, 15))
+    assert len(full['channels']) <= 40
+    assert parse_device_info(wire(info(channels=list(range(1, 15)))))['channels'] == list(range(1, 15))
+    with pytest.raises(ValueError, match='Packet Sniffer only'):
+        scheduler.plan([xiao], 'hs_sniff', channel_coverage='full')
+    with pytest.raises(ValueError, match='fast.*full'):
+        scheduler.plan([xiao], 'sniffer', channel_coverage='wide')
 
 
 def test_named_losses_are_validated_monotonic_and_reset_for_new_job():

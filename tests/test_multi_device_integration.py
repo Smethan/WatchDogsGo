@@ -1180,3 +1180,40 @@ def test_external_legacy_owner_is_excluded_from_allocation_and_updates_wait_for_
     metadata['legacy_busy'] = False
     h.emit(0, wire(metadata))
     assert h.runtime.reserve(h.serials[0]) is h.runtime.sessions[IDS[0]]
+
+
+def test_live_sniffer_health_displays_only_validated_source_counters(tmp_path):
+    h = Harness(tmp_path)
+    for session in h.runtime.sessions.values():
+        session.device_info['operations'].append('sniffer')
+        entry = h.runtime.registry.get(session.device_id)
+        entry.device_info['operations'].append('sniffer')
+    assert h.runtime.start('sniffer')
+    group = h.runtime.current
+    tokens = [h.token(0), h.token(1)]
+    h.start_ack(0, token=tokens[0])
+    h.start_ack(1, token=tokens[1])
+    previous_messages = len(h.app.messages)
+
+    h.emit(0, lifecycle('heartbeat', 0, tokens[0], 2, state='running',
+                        sniffer_packets=127, sniffer_aps=9, sniffer_drops=3))
+    assert len(h.app.messages) == previous_messages
+    assert any('pkts:127 APs:9 drops:3' in line for line in h.runtime.health_lines())
+    assert group.sniffer_stats[IDS[0]] == {'packets': 127, 'aps': 9, 'drops': 3}
+    assert h.runtime.scan.sniffer_stats[group.identity][IDS[0]] == group.sniffer_stats[IDS[0]]
+
+    # Replayed sequence, foreign token, and wrong boot are dropped before the
+    # runtime's display path and cannot replace or refresh this status.
+    h.emit(0, lifecycle('heartbeat', 0, tokens[0], 2, state='running',
+                        sniffer_packets=999, sniffer_aps=99, sniffer_drops=99))
+    h.emit(0, lifecycle('heartbeat', 0, 'foreign_token', 3, state='running',
+                        sniffer_packets=888, sniffer_aps=88, sniffer_drops=8))
+    wrong_boot = {'v': 3, 'kind': 'heartbeat', 'device_id': IDS[0],
+                  'boot_id': 'FFFFFFFFFFFFFFFF', 'session': tokens[0], 'seq': 3,
+                  'batch': 0, 'state': 'running', 'wifi_count': 0,
+                  'ble_count': 0, 'drops': 0, 'sniffer_packets': 777,
+                  'sniffer_aps': 77, 'sniffer_drops': 7}
+    h.emit(0, wire(wrong_boot))
+    assert len(h.app.messages) == previous_messages
+    assert any('pkts:127 APs:9 drops:3' in line for line in h.runtime.health_lines())
+    assert group.sniffer_stats[IDS[0]] == {'packets': 127, 'aps': 9, 'drops': 3}

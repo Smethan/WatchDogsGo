@@ -1,5 +1,28 @@
 # Smethan WatchDogsGo
 
+## 0.10.4 — C5 firmware health and capture readiness — 2026-10-14 (source candidate; hardware gate pending)
+
+- Show USB-port-open, identity/capability negotiation and firmware-ready health
+  as separate states. Validate optional firmware version, ELF build ID, boot
+  state and boot reason while retaining compatibility with firmware that does
+  not send those fields; do not send new probe commands to older firmware.
+- Keep managed jobs in `starting` while firmware reports pending readiness,
+  display bounded channel-apply diagnostics and validated start/failure
+  reasons, and accept source-bound Sniffer packet/AP/drop snapshots only for
+  the matching device, boot, job token and sequence. Show live Sniffer counts
+  in USB C5 device health without covering the main status display.
+- Add an explicit full-supported-channel coverage option alongside the
+  existing labeled fast 1/6/11 plan. Preserve country/channel validation,
+  target assignment, multi-device band splitting and the 40-channel wire
+  limit.
+
+The WatchDogsGo host suite passed **1,303 tests**. Firmware interoperability
+fixtures cover older and newer optional protocol fields, and the fork release
+workflow checks against projectZero 1.8.4 source `f34cf4f96683f4e1010d342ffb2a9672b23324e0`. This remains a source
+candidate, not a published release; no live-device test or flashing was
+performed. Exact-image identification, cold-boot/reconnect and RF capture
+acceptance remain open with the paired projectZero 1.8.4 candidate.
+
 ## 0.10.3 — Restore C5 job starts and move device status — 2026-10-12
 
 - Serialize boot nonces as lowercase on the job wire while preserving host

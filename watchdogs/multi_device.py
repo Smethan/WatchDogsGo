@@ -24,7 +24,8 @@ from .c5_jobs import limits_for_operation, validate_job_request
 from .device_registry import DeviceRegistry, supported_candidates
 from .device_session import DeviceSession
 from .job_controller import JobController
-from .radio_scheduler import RadioScheduler, CapacityError
+from .radio_scheduler import (CHANNEL_COVERAGE_LABELS, RadioScheduler,
+                              CapacityError)
 from .passive_capture import PassiveCapture, inspect_frame
 from .hs_exchange import ExchangeValidator
 from .serial_manager import SerialManager
@@ -67,6 +68,8 @@ class GroupView:
     deadline: float = 0.0
     announced: bool = False
     capture_metrics: dict = field(default_factory=dict)
+    sniffer_stats: dict = field(default_factory=dict)
+    channel_coverage: str = 'fast'
     host_ble: bool = False
     disconnected: set = field(default_factory=set)
     rewarded_exchanges: set = field(default_factory=set)
@@ -78,11 +81,14 @@ class ManagedScanView:
         self.runtime = runtime
         self.error = self.probe_error = ''
         self.mode = 'wardrive'
+        self.channel_coverage = 'fast'
         self.session = ''
         self.wifi_only = False
         self.last_seen = {}
         self.stats = {}
         self.record_counts = Counter()
+        # Final and live source snapshots keyed by managed group then device.
+        self.sniffer_stats = {}
         self.seq_gaps = 0
         self.seq = 0
         self.batch = self.legacy = False
@@ -154,9 +160,11 @@ class ManagedScanView:
     def handle(self, _record):
         return False  # Only the source session may validate managed records.
 
-    def start(self, mode='wardrive', wifi_only=False, live_ouis=()):
+    def start(self, mode='wardrive', wifi_only=False, live_ouis=(),
+              channel_coverage='fast'):
         return self.runtime.start(mode, state_key=mode, wifi_only=wifi_only,
-                                  live_ouis=live_ouis)
+                                  live_ouis=live_ouis,
+                                  channel_coverage=channel_coverage)
 
 
 class MultiDeviceRuntime:
@@ -246,6 +254,7 @@ class MultiDeviceRuntime:
         session.on_event = lambda record: self._record(session, record)
         session.on_line = lambda line: self._legacy_line(session, line)
         self.endpoints[endpoint] = session
+        self.app._term_add(f'[C5] USB port open on {endpoint}; negotiating identity', raw=True)
         usb = manager.usb_port_info
         identity = {key:getattr(usb, key, None) for key in ('vid','pid','serial_number','location')}
         if identity['serial_number'] or identity['location']:
@@ -397,6 +406,17 @@ class MultiDeviceRuntime:
                 self.registry.assign_role(did, preferences['role'])
             self.sessions[did] = self.controller.sessions[did] = session
             self.app._term_add(f'[C5] {entry.board} {did} on {session.endpoint}', raw=True)
+            health = session.health
+            firmware = health.get('firmware_version')
+            build = health.get('build_id')
+            suffix = f" v{firmware}" if firmware else ""
+            if build:
+                suffix += f" build {build}"
+            status = health['firmware_health']
+            reason = health.get('boot_reason')
+            detail = f" ({reason})" if status == 'degraded' and reason else ''
+            self.app._term_add(
+                f'[C5] {did} identity valid; firmware {status}{suffix}{detail}', raw=True)
             return
         if kind == 'capabilities':
             # A single legacy endpoint keeps its existing ScanController.
@@ -407,6 +427,10 @@ class MultiDeviceRuntime:
                 self.legacy_endpoints.add(session.endpoint)
                 if session.serial is self.app.serial:
                     self.app.wardrive.legacy_scan.handle(record)
+            if did:
+                self.app._term_add(
+                    f"[C5] {did} protocol {'ready' if session.protocol_ready else 'negotiating'}",
+                    raw=True)
             return
         token = record.get('session')
         group = next((g for g in self.groups.values() if g.tokens.get(did) == token), None)
@@ -416,8 +440,21 @@ class MultiDeviceRuntime:
             return
         if group.state in ('stopped','error'):
             return
+        if group.operation == 'sniffer':
+            stats = session.sniffer_stats
+            group.sniffer_stats[did] = dict(stats)
+            self.scan.sniffer_stats[group.identity] = dict(group.sniffer_stats)
         if kind == 'error' or record.get('state') == 'error':
             reason = record.get('error', record.get('message', 'device job error'))
+            detail = record.get('start_reason') or record.get('failure_reason')
+            if detail:
+                reason = f'{reason} ({detail})'
+            if 'requested_channel' in record:
+                reason = (f"{reason} (requested {record['requested_channel']}, "
+                          f"actual {record.get('actual_channel', 0)}, "
+                          f"mode {record.get('radio_mode', 'unknown')}, "
+                          f"band {record.get('band', 'unknown')}, "
+                          f"SDK {record.get('sdk_error', 'unknown')})")
             if record.get('state') == 'error' or not session.active:
                 self._retire_group_member(did, reason, group=group,
                     preserve_peers=group.passive and group.announced)
@@ -588,6 +625,9 @@ class MultiDeviceRuntime:
         self.scan.mode = group.operation
         self.scan.wifi_only = group.wifi_only
         self.scan.error = ''
+        self.scan.channel_coverage = group.channel_coverage
+        if group.operation == 'sniffer':
+            self.scan.sniffer_stats[group.identity] = {}
         self.app._set_running(group.state_key, True)
         if group.operation == 'wardrive':
             owner = self.app.wardrive
@@ -597,7 +637,10 @@ class MultiDeviceRuntime:
                     owner.host_ble_error('Host scanner did not start')
             owner.start_cell()
             owner.start_auxiliary_collectors()
-        self.app.msg('[C5] '+group.operation+' running on '+str(len(group.requests))+' boards', 3)
+        message = '[C5] '+group.operation+' running on '+str(len(group.requests))+' boards'
+        if group.operation == 'sniffer':
+            message += ' — ' + CHANNEL_COVERAGE_LABELS[self.scan.channel_coverage]
+        self.app.msg(message, 3)
 
     def start_portal(self, operation, html, ssid, targets, state_key):
         """Prepare and launch portal/Evil Twin on one explicit C5 owner.
@@ -852,7 +895,8 @@ class MultiDeviceRuntime:
         return True
 
     def start(self, operation, *, state_key='', targets=(), options=None,
-              wifi_only=False, live_ouis=(), passive=None):
+              wifi_only=False, live_ouis=(), passive=None,
+              channel_coverage='fast'):
         devices = self.devices()
         if self._select_legacy_fallback(operation, devices):
             return False
@@ -866,7 +910,8 @@ class MultiDeviceRuntime:
         if options.get('storage') == 'sd':
             devices = [d for d in devices if d.board != 'waveshare-zero']
         plan = self.scheduler.plan(devices, operation, targets=targets,
-            dwell_ms=400 if operation == 'handshake' else 160, options=options)
+            dwell_ms=400 if operation == 'handshake' else 160, options=options,
+            channel_coverage=channel_coverage)
         requests = plan['requests']
         if operation == 'wardrive':
             requests = self._wardrive_preferences(devices, requests)
@@ -905,7 +950,8 @@ class MultiDeviceRuntime:
         tokens = {did:secrets.token_hex(8) for did in requests}
         view = GroupView(gid, operation, state_key or operation, requests, roles, tokens,
                          passive=not foreground, restore=restore, wifi_only=wifi_only,
-                         host_ble=(operation == 'wardrive' and state_key == 'all_wardrive_host'))
+                         host_ble=(operation == 'wardrive' and state_key == 'all_wardrive_host'),
+                         channel_coverage=channel_coverage)
         if operation in ('wifi_scan','ble_scan') and state_key != 'bt_scanning':
             view.deadline = self.clock()+12
         self.groups[gid] = view
@@ -1274,9 +1320,18 @@ class MultiDeviceRuntime:
             role = group.roles[device.device_id] if group else (
                 'external legacy' if session and session.external_busy else 'idle')
             channel = session.applied_channel or '--' if session else '--'
-            lines.append(f"{alias}: {role} {req.get('band','')} ch:{channel} "
-                         f"{req.get('op','')} {session.state if session else 'offline'} "
-                         f"drops:{session.counts['drops'] if session else 0}")
+            sniffer = group.sniffer_stats.get(device.device_id) if group and group.operation == 'sniffer' else None
+            if sniffer is not None:
+                detail = (f"pkts:{sniffer['packets']} APs:{sniffer['aps']} "
+                          f"drops:{sniffer['drops']}")
+                lines.append(f"{alias[:16]}: {role[:14]} {detail} "
+                             f"{req.get('band','')} ch:{channel} "
+                             f"{session.state if session else 'offline'}")
+            else:
+                detail = f"drops:{session.counts['drops'] if session else 0}"
+                lines.append(f"{alias}: {role} {req.get('band','')} ch:{channel} "
+                             f"{req.get('op','')} {session.state if session else 'offline'} "
+                             f"{detail}")
             if session and any(session.losses.values()):
                 lines.append('  Losses ' + ' '.join(
                     f'{name}:{count}' for name, count in session.losses.items()))

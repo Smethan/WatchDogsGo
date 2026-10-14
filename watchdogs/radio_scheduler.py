@@ -5,6 +5,11 @@ from typing import Any, Iterable, Mapping
 
 from .c5_jobs import validate_job_request, limits_for_operation
 
+CHANNEL_COVERAGE_LABELS = {
+    "fast": "Fast 2.4 GHz (channels 1/6/11)",
+    "full": "Full supported 2.4 GHz (channels 1-14)",
+}
+
 
 class CapacityError(ValueError):
     """Raised when the requested targets/channels cannot be fully allocated."""
@@ -270,15 +275,21 @@ class RadioScheduler:
              targets: Iterable[Mapping[str, Any]] = (), channels: Iterable[int] | None = None,
              band: str | None = None, dwell_ms: int = 160, ble: str = "off",
              options: Mapping[str, Any] | None = None,
-             device_id: str | None = None) -> dict[str, Any]:
+             device_id: str | None = None,
+             channel_coverage: str = "fast") -> dict[str, Any]:
         """Plan any protocol-approved operation without reducing target coverage."""
+        if channel_coverage not in CHANNEL_COVERAGE_LABELS:
+            raise ValueError("channel_coverage must be 'fast' or 'full'")
+        if channel_coverage == "full" and operation != "sniffer":
+            raise ValueError("full channel coverage is available for Packet Sniffer only")
         if operation == "wardrive":
             return self.plan_wardrive(devices, targets=targets, dwell_ms=dwell_ms)
         supplied = list(devices)
         eligible = []
         wifi5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112,
                  116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
-        wifi24 = [1, 6, 11]
+        wifi24 = ([1, 6, 11] if channel_coverage == "fast"
+                  else list(range(1, 15)))
         single = False
         seen = set()
         for device in supplied:

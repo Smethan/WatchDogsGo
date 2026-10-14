@@ -11,6 +11,8 @@ from .wardrive_protocol import parse_record
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 DEVICE_RE = re.compile(r"[0-9A-Fa-f]{12}\Z")
 BOOT_RE = re.compile(r"[0-9A-Fa-f]{16}\Z")
+BUILD_ID_RE = re.compile(r"[0-9A-Fa-f]{16}\Z")
+FIRMWARE_VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}\Z")
 MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 HEX_RE = re.compile(r"(?:[0-9A-Fa-f]{2})*\Z")
 OPERATIONS = frozenset((
@@ -59,6 +61,25 @@ def parse_device_info(line: str) -> dict[str, Any] | None:
             raise ValueError("boot_id")
         if board not in BOARDS:
             raise ValueError("board")
+        # These fields were added after the v3 protocol shipped. Keep them
+        # optional so earlier firmware remains fully negotiable, but validate
+        # every supplied value before exposing it to UI or diagnostics.
+        if "firmware_version" in d and (
+                not isinstance(d["firmware_version"], str)
+                or not FIRMWARE_VERSION_RE.fullmatch(d["firmware_version"])):
+            raise ValueError("firmware_version")
+        if "build_id" in d and (
+                not isinstance(d["build_id"], str)
+                or not BUILD_ID_RE.fullmatch(d["build_id"])):
+            raise ValueError("build_id")
+        if "boot_state" in d and d["boot_state"] not in ("ready", "degraded"):
+            raise ValueError("boot_state")
+        if "boot_reason" in d and (
+                not isinstance(d["boot_reason"], str)
+                or len(d["boot_reason"].encode("utf-8")) > 64
+                or any(ord(char) < 0x20 or ord(char) > 0x7e
+                       for char in d["boot_reason"])):
+            raise ValueError("boot_reason")
         if 'legacy_busy' in d and type(d['legacy_busy']) is not bool:
             raise ValueError('legacy_busy')
         for key in ("flash_bytes", "psram_bytes"):
@@ -274,6 +295,30 @@ def parse_job_record(line: str, *, expected_device_id: str | None = None,
         if kind in ('status', 'started', 'heartbeat') and 'channel' in d:
             if type(d['channel']) is not int or d['channel'] not in CHANNELS:
                 raise ValueError('applied channel')
+        for key in ("sniffer_packets", "sniffer_aps", "sniffer_drops"):
+            if key in d and (type(d[key]) is not int or not 0 <= d[key] <= 2**32-1):
+                raise ValueError(key)
+        if "requested_channel" in d and (
+                type(d["requested_channel"]) is not int
+                or d["requested_channel"] not in CHANNELS):
+            raise ValueError("requested_channel")
+        if "actual_channel" in d and (
+                type(d["actual_channel"]) is not int
+                or d["actual_channel"] != 0 and d["actual_channel"] not in CHANNELS):
+            raise ValueError("actual_channel")
+        if "radio_mode" in d and d["radio_mode"] not in ("null", "sta", "ap", "sta_ap"):
+            raise ValueError("radio_mode")
+        if "band" in d and d["band"] not in ("2g", "5g", "auto", "unknown"):
+            raise ValueError("band")
+        if "sdk_error" in d and (
+                type(d["sdk_error"]) is not int
+                or not -(2**31) <= d["sdk_error"] <= 2**31-1):
+            raise ValueError("sdk_error")
+        for key in ("start_reason", "failure_reason"):
+            if key in d and (not isinstance(d[key], str)
+                             or not 1 <= len(d[key]) <= 40
+                             or re.fullmatch(r"[a-z0-9_]+", d[key]) is None):
+                raise ValueError(key)
         if kind == 'legacy':
             line = d.get('line')
             if not isinstance(line,str) or len(line.encode('utf-8')) > 750 or '\n' in line or '\r' in line:
