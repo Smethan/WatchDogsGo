@@ -45,8 +45,8 @@ operations, channels, per-operation limits, and supported update methods.
 Identity and capability queries use bounded serial writes. A write timeout or
 partial write is reported as a USB transport error in the device health view;
 the host retries missing metadata with a rate-limited backoff until a valid
-reply arrives. Firmware reports `device_info_too_large` or
-`device_info_serialization_failed` as a typed metadata error; WDG displays it in
+reply arrives. Firmware 1.8.5 reports metadata serialization, identity,
+channel-list, and app-description failures as typed errors; WDG displays them in
 health output and the terminal without treating it as a job error. During the
 specific `boot_state=degraded`, `boot_reason=initializing`,
 `c5_jobs_v1=false` startup state, WDG keeps identity and capability negotiation
@@ -60,6 +60,17 @@ then run `.venv/bin/python -m watchdogs.diagnose_firmware --port /dev/ttyACM0`
 native USB-JTAG line handling. WDG avoids pySerial `flush()`/POSIX `tcdrain()`
 after command writes, which can wait indefinitely when native USB CDC stops
 draining.
+
+On a revision 1.0 XIAO, an enumerated USB endpoint can still have a stalled
+command input path with the pinned pre-1.8.5 firmware SDK. The matching
+projectZero 1.8.5 release retains the required UART0 clock for USB
+Serial/JTAG and obtains its 16-digit build ID from the full app descriptor;
+earlier firmware could return capabilities while silently rejecting device
+info because its configured ELF hash text was only nine digits. See the
+[firmware recovery record](https://github.com/Smethan/projectZero/blob/main/docs/USB_CONSOLE_RECOVERY.md)
+for the exact diagnosis and physical reset gate after ROM flashing. WDG's
+bounded retries reveal transport or metadata failure; they do not replace
+flashing firmware that lacks these fixes.
 
 Commands remain newline-terminated console lines. A job starts with:
 

@@ -14,11 +14,15 @@
   readiness, and firmware health in device diagnostics. Add transport, startup,
   diagnostic, OTA, and stop-failure regression coverage.
 
-Pair this source with projectZero 1.8.5. At source preparation on 2026-10-15,
-the current XIAO had not replied to a USB console or ROM probe, and a Waveshare
-Zero was not attached. The Pi's installed WDG checkout was unchanged. Physical
-reconnect and paired runtime checks must be recorded before claiming the repair
-is verified on hardware.
+Pair this source with projectZero 1.8.5 at firmware commit
+`29b0fa581df4ea6ef1799f969427068d38135c19`. On the Pi, the staged
+0.10.5 `SerialManager` passed ten consecutive open/query/close cycles against
+the locally built, physically reset XIAO image. Each cycle returned version,
+ready XIAO device info with the exact 16-digit build ID, and supported
+capabilities under one stable boot nonce. The corrected standalone diagnostic
+reported All Wardrive supported. The installed WDG checkout and published
+firmware image still require their separate verification; no Waveshare Zero
+was attached for a physical check.
 
 ## 0.10.4 — C5 firmware health and capture readiness — 2026-10-14 (source candidate; hardware gate pending)
 
