@@ -20,9 +20,18 @@ Pair this source with projectZero 1.8.5 at firmware commit
 the locally built, physically reset XIAO image. Each cycle returned version,
 ready XIAO device info with the exact 16-digit build ID, and supported
 capabilities under one stable boot nonce. The corrected standalone diagnostic
-reported All Wardrive supported. The installed WDG checkout and published
-firmware image still require their separate verification; no Waveshare Zero
-was attached for a physical check.
+reported All Wardrive supported. The separate published-image verification is
+now complete: the Pi's installed WDG checkout is at this v0.10.5 source
+commit, and its `UsbOtaRunner` installed the checksummed projectZero v1.8.5
+XIAO release into the alternate valid slot. The board's read-back build ID
+`36971d204edee3b4` matches the published image. Ten further WDG serial
+reopen cycles returned version, ready identity, and supported capabilities;
+the installed `DeviceSession` negotiated `protocol_ready=true` with no
+transport or metadata error. See the
+[firmware recovery and install record](https://github.com/Smethan/projectZero/blob/main/docs/USB_CONSOLE_RECOVERY.md)
+for exact hashes and validation limits. No Waveshare Zero was attached for a
+physical check, and the full-screen WDG GUI was not launched during this final
+install check.
 
 ## 0.10.4 — C5 firmware health and capture readiness — 2026-10-14 (source candidate; hardware gate pending)
 
