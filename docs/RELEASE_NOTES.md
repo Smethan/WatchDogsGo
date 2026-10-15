@@ -1,5 +1,25 @@
 # Smethan WatchDogsGo
 
+## 0.10.5 — Native USB capability and update safeguards — 2026-10-15
+
+- Bound capability and identity writes, remove blocking serial `flush()` from
+  ESP32 console commands, and clear queued output after a failed write. Keep
+  transport errors visible until a valid reply arrives, and preserve scan and
+  device ownership when a stop command fails to send.
+- Use the same serial manager for standalone diagnostics and USB OTA writes.
+  Retain OTA framing and pacing, report a valid degraded capability reply as
+  jobs unavailable, and keep the firmware's brief `degraded/initializing`
+  state in metadata negotiation until it becomes ready.
+- Surface typed firmware metadata errors and distinguish USB-open, protocol
+  readiness, and firmware health in device diagnostics. Add transport, startup,
+  diagnostic, OTA, and stop-failure regression coverage.
+
+Pair this source with projectZero 1.8.5. At source preparation on 2026-10-15,
+the current XIAO had not replied to a USB console or ROM probe, and a Waveshare
+Zero was not attached. The Pi's installed WDG checkout was unchanged. Physical
+reconnect and paired runtime checks must be recorded before claiming the repair
+is verified on hardware.
+
 ## 0.10.4 — C5 firmware health and capture readiness — 2026-10-14 (source candidate; hardware gate pending)
 
 - Show USB-port-open, identity/capability negotiation and firmware-ready health
