@@ -42,6 +42,25 @@ can recover a response without starting the operation again.
 The host requests metadata with `get_device_info`. A capable board advertises
 `c5_jobs_v1` and reports `device_id`, `boot_id`, board, flash/PSRAM capacity,
 operations, channels, per-operation limits, and supported update methods.
+Identity and capability queries use bounded serial writes. A write timeout or
+partial write is reported as a USB transport error in the device health view;
+the host retries missing metadata with a rate-limited backoff until a valid
+reply arrives. Firmware reports `device_info_too_large` or
+`device_info_serialization_failed` as a typed metadata error; WDG displays it in
+health output and the terminal without treating it as a job error. During the
+specific `boot_state=degraded`, `boot_reason=initializing`,
+`c5_jobs_v1=false` startup state, WDG keeps identity and capability negotiation
+on a rate-limited retry. It does not route that transient response through the
+legacy scanner; permanent degraded recovery and firmware without this startup
+marker keep their existing no-jobs/legacy handling. For a
+standalone check, use a checkout containing this fix: the 0.10.4 diagnostic
+still uses raw pySerial and `flush()`. Close WDG and other serial monitors,
+then run `.venv/bin/python -m watchdogs.diagnose_firmware --port /dev/ttyACM0`
+(replace the endpoint if it differs). The corrected diagnostic uses WDG's
+native USB-JTAG line handling. WDG avoids pySerial `flush()`/POSIX `tcdrain()`
+after command writes, which can wait indefinitely when native USB CDC stops
+draining.
+
 Commands remain newline-terminated console lines. A job starts with:
 
 ```text

@@ -182,16 +182,66 @@ def test_release_requires_fork_assets_and_supported_version():
 
 
 def test_transport_never_flushes_or_uses_normal_logging_send():
-    manager = Mock()
-    manager.serial_conn.write.side_effect = len
+    from watchdogs.serial_manager import SerialManager
+
+    conn = Mock()
+    conn.write.side_effect = len
+    conn.write_timeout = 7
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
     target = Mock()
     transport = SerialOtaTransport(manager, target)
     transport.send('wifi_connect "home" "password"')
-    manager.serial_conn.flush.assert_not_called()
-    manager.send_command.assert_not_called()
+    conn.flush.assert_not_called()
+    assert conn.write_timeout == 7
+    conn.reset_output_buffer.assert_not_called()
     transport.close()
-    manager.serial_conn.reset_output_buffer.assert_called_once()
-    manager.close.assert_called_once()
+    conn.reset_output_buffer.assert_called_once()
+    assert manager.serial_conn is None
+    conn.close.assert_called_once()
+
+
+@pytest.mark.parametrize("result", ["timeout", "partial"])
+def test_ota_raw_write_failure_resets_output_restores_timeout_and_close_is_ordered(
+    result,
+):
+    import serial
+    from watchdogs.serial_manager import SerialManager
+
+    actions = []
+
+    class Connection:
+        is_open = True
+        write_timeout = 9
+
+        def write(self, payload):
+            actions.append("write")
+            if result == "timeout":
+                raise serial.SerialTimeoutException("Write timeout")
+            return len(payload) - 1
+
+        def reset_output_buffer(self):
+            actions.append("reset")
+
+        def close(self):
+            assert actions[-1] == "reset"
+            actions.append("close")
+            self.is_open = False
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    transport = SerialOtaTransport(manager, Mock())
+    expected = serial.SerialTimeoutException if result == "timeout" else OSError
+    with pytest.raises(expected) as exc:
+        transport.send("uota_begin")
+    if result == "partial":
+        size = len(b"uota_begin\r\n")
+        assert f"wrote {size - 1} of {size} bytes" in str(exc.value)
+    assert conn.write_timeout == 9
+    assert actions == ["write", "reset"]
+    transport.close()
+    assert actions == ["write", "reset", "reset", "close"]
 
 
 def test_reconnect_refuses_other_device(monkeypatch):
@@ -472,16 +522,21 @@ def test_firmware_171_project_name_bug_requires_usb_upgrade():
 
 def test_paced_usb_commands_preserve_bytes_and_bound_each_write(monkeypatch):
     from watchdogs import firmware_ota
-    monkeypatch.setattr(firmware_ota.time, 'sleep', Mock())
-    manager = Mock()
-    manager.serial_conn.write.side_effect = len
+    from watchdogs.serial_manager import SerialManager
+
+    monkeypatch.setattr(firmware_ota.time, "sleep", Mock())
+    conn = Mock()
+    conn.write.side_effect = len
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
     transport = SerialOtaTransport(manager, Mock())
     command = 'uota_chunk ' + 'a' * 620
     transport.send_paced(command)
-    writes = [c.args[0] for c in manager.serial_conn.write.call_args_list]
-    assert b''.join(writes) == command.encode() + b'\r'
+    writes = [c.args[0] for c in conn.write.call_args_list]
+    assert b"".join(writes) == command.encode() + b"\r"
     assert all(0 < len(part) <= 64 for part in writes)
-    manager.serial_conn.flush.assert_not_called()
-    manager.serial_conn.write.side_effect = lambda data: len(data) - 1
-    with pytest.raises(OSError, match='Incomplete command'):
+    conn.flush.assert_not_called()
+    conn.write.side_effect = lambda data: len(data) - 1
+    with pytest.raises(OSError, match="Incomplete serial write"):
         transport.send_paced(command)
+    conn.reset_output_buffer.assert_called_once()

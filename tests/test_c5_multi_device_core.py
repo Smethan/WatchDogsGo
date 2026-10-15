@@ -255,6 +255,119 @@ def test_device_session_accepts_firmware_v1_capabilities_and_rejects_foreign_own
     assert session.job_token == "token" and session.state == "running"
 
 
+@pytest.mark.parametrize("capabilities_first", [False, True])
+def test_initializing_device_info_and_false_capability_retry_until_ready(
+    capabilities_first,
+):
+    now = [0.0]
+    serial = FakeSerial()
+    session = DeviceSession(serial, "/dev/a", clock=lambda: now[0])
+    initializing = info(
+        boot_state="degraded",
+        boot_reason="initializing",
+        capabilities={"c5_jobs_v1": False},
+    )
+    ready = info(
+        boot_state="ready",
+        boot_reason="normal",
+        capabilities={"c5_jobs_v1": True},
+    )
+    false_caps = wire(
+        {"v": 1, "kind": "capabilities", "c5_jobs_v1": False, "max_line": 1024}
+    )
+    true_caps = wire(
+        {"v": 1, "kind": "capabilities", "c5_jobs_v1": True, "wardrive_serial_v1": True}
+    )
+
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    early = (
+        [false_caps, wire(initializing)]
+        if capabilities_first
+        else [wire(initializing), false_caps]
+    )
+    serial.lines.extend(early)
+    events = session.poll()
+    assert [event.get("kind") for event in events] == ["device_info"]
+    assert session._boot_initializing
+    assert session.device_info_seen and not session.capabilities_seen
+    assert not session.c5_jobs_v1 and not session.legacy_capabilities_seen
+    assert not session.protocol_ready
+    assert session.request_metadata_probe() == []
+    with pytest.raises(RuntimeError, match="does not advertise"):
+        session.start_job(
+            "booting",
+            {"boot_id": BOOT_ID, "op": "wardrive", "band": "wifi24", "channels": [1]},
+        )
+
+    now[0] = 0.7
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    assert serial.commands[-2:] == ["get_device_info", "get_capabilities"]
+
+    ready_lines = (
+        [true_caps, wire(ready)] if capabilities_first else [wire(ready), true_caps]
+    )
+    serial.lines.extend(ready_lines)
+    session.poll()
+    assert not session._boot_initializing
+    assert session.device_info["boot_state"] == "ready"
+    assert session.c5_jobs_v1 and session.capabilities_seen
+    assert not session.legacy_capabilities_seen
+    assert session.protocol_ready
+
+
+def test_initializing_negotiation_retries_transport_failure_with_bounded_backoff():
+    now = [0.0]
+    serial = FakeSerial()
+    calls = []
+
+    def fail_writes(command):
+        calls.append(command)
+        raise OSError("Write timeout")
+
+    serial.send_command = fail_writes
+    session = DeviceSession(serial, "/dev/a", clock=lambda: now[0])
+    session.set_device_info(
+        info(
+            boot_state="degraded",
+            boot_reason="initializing",
+            capabilities={"c5_jobs_v1": False},
+        )
+    )
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    assert session.transport_error
+    assert session.request_metadata_probe() == []
+    assert calls == ["get_device_info", "get_capabilities"]
+    now[0] = 0.65
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    assert calls == ["get_device_info", "get_capabilities"] * 2
+    assert not session.c5_jobs_v1 and not session.protocol_ready
+
+
+def test_permanent_degraded_false_capability_does_not_enter_initializing_retry():
+    serial = FakeSerial()
+    session = DeviceSession(serial, "/dev/a")
+    recovery = info(
+        boot_state="degraded",
+        boot_reason="psram_buffer_failed",
+        capabilities={"c5_jobs_v1": False},
+    )
+    serial.lines.extend(
+        [
+            wire(recovery),
+            wire(
+                {"v": 1, "kind": "capabilities", "c5_jobs_v1": False, "max_line": 1024}
+            ),
+        ]
+    )
+    events = session.poll()
+    assert session.firmware_health == "degraded"
+    assert not session._boot_initializing
+    assert session.capabilities_seen and session.legacy_capabilities_seen
+    assert not session.c5_jobs_v1
+    assert not session.request_metadata_probe()
+    assert [event.get("kind") for event in events] == ["device_info", "capabilities"]
+
+
 def test_legacy_capability_without_jobs_is_forwarded_and_jobs_capability_can_precede_identity():
     legacy = wire({"v": 1, "kind": "capabilities", "wardrive_serial_v1": True})
     job_caps = wire({"v": 1, "kind": "capabilities", "wardrive_serial_v1": True,
@@ -372,6 +485,384 @@ def test_serial_manager_strict_write_propagates_partial_write_without_flush():
     manager.serial_conn = Connection(partial=True)
     with pytest.raises(OSError, match="Incomplete serial command write"):
         manager.send_command_strict("set_html chunk")
+
+
+def test_serial_manager_ordinary_command_does_not_call_flush():
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+
+        def __init__(self):
+            self.writes = []
+            self.flushes = 0
+            self.resets = 0
+
+        def write(self, payload):
+            self.writes.append(payload)
+            return len(payload)
+
+        def flush(self):
+            self.flushes += 1
+            raise AssertionError("ordinary command must not call tcdrain")
+
+        def reset_output_buffer(self):
+            self.resets += 1
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    assert manager.send_command("stop") is True
+    assert conn.writes == [b"stop\r\n"]
+    assert conn.flushes == 0
+    assert conn.resets == 0
+
+
+def test_serial_manager_ordinary_disconnected_write_returns_false():
+    from watchdogs.serial_manager import SerialManager
+
+    manager = SerialManager("/dev/fake")
+    assert manager.send_command("status") is False
+
+
+def test_ordinary_write_timeout_resets_output_before_close():
+    import serial
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+        write_timeout = 2
+
+        def __init__(self):
+            self.actions = []
+
+        def write(self, payload):
+            raise serial.SerialTimeoutException("Write timeout")
+
+        def reset_output_buffer(self):
+            self.actions.append("reset")
+
+        def close(self):
+            assert self.actions == ["reset"]
+            self.actions.append("close")
+            self.is_open = False
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    # Ordinary commands retain their historical best-effort error behavior.
+    assert manager.send_command("status") is False
+    assert conn.actions == ["reset"]
+    manager.close()
+    assert conn.actions == ["reset", "close"]
+
+
+@pytest.mark.parametrize(
+    "command,strict",
+    [
+        ("status", False),
+        ("clear_html", True),
+        ("job_start token payload", False),
+        ("get_capabilities", False),
+    ],
+)
+def test_serial_manager_resets_output_after_any_write_failure(command, strict):
+    import serial
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+
+        def __init__(self):
+            self.resets = 0
+
+        def write(self, payload):
+            raise serial.SerialTimeoutException("Write timeout")
+
+        def reset_output_buffer(self):
+            self.resets += 1
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    if strict or command.startswith(("job_", "get_capabilities")):
+        with pytest.raises(serial.SerialTimeoutException):
+            (manager.send_command_strict if strict else manager.send_command)(command)
+    else:
+        manager.send_command(command)
+    assert conn.resets == 1
+
+
+@pytest.mark.parametrize("failure", ["timeout", "partial"])
+def test_serial_manager_metadata_write_errors_propagate_with_short_timeout(failure):
+    import serial
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+        write_timeout = 2
+
+        def __init__(self):
+            self.timeouts = []
+            self.resets = 0
+
+        def write(self, payload):
+            self.timeouts.append(self.write_timeout)
+            if failure == "timeout":
+                raise serial.SerialTimeoutException("Write timeout")
+            return len(payload) - 1
+
+        def reset_output_buffer(self):
+            self.resets += 1
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    expected = serial.SerialTimeoutException if failure == "timeout" else OSError
+    with pytest.raises(expected):
+        manager.send_command("get_capabilities")
+    assert conn.timeouts == [0.25]
+    assert conn.write_timeout == 2
+    assert conn.resets == 1
+
+
+def test_serial_manager_metadata_success_is_bounded_and_skips_flush():
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+        write_timeout = 2
+
+        def write(self, payload):
+            assert self.write_timeout == 0.25
+            return len(payload)
+
+        def flush(self):
+            raise AssertionError("metadata query must not call tcdrain")
+
+    conn = Connection()
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    assert manager.send_command("get_capabilities") is True
+    assert conn.write_timeout == 2
+
+
+@pytest.mark.parametrize(
+    "code", ["device_info_too_large", "device_info_serialization_failed"]
+)
+def test_pre_identity_firmware_metadata_error_is_visible_without_job_state_mutation(
+    code,
+):
+    record = wire({"v": 3, "kind": "error", "error": code})
+    serial = FakeSerial([record])
+    session = DeviceSession(serial, "/dev/a")
+    # Preserve a stale token/counters even though the session is not actively
+    # running; a metadata error is never a job terminal record.
+    session.state = "idle"
+    session.job_token = "owned-token"
+    session.seq = 7
+    session.counts["wifi_count"] = 12
+    session.capture_state = {"kind": "heartbeat", "seq": 7}
+    events = session.poll()
+    assert events == [{"kind": "metadata_error", "error": code}]
+    assert session.metadata_error == code
+    assert session.last_error == f"firmware metadata error: {code}"
+    assert session.health["metadata_error"] == code
+    assert (
+        session.state,
+        session.job_token,
+        session.seq,
+        session.counts["wifi_count"],
+        session.capture_state,
+    ) == ("idle", "owned-token", 7, 12, {"kind": "heartbeat", "seq": 7})
+
+
+def test_known_identity_metadata_refresh_accepts_firmware_error_only_when_idle():
+    session = DeviceSession(FakeSerial([wire(info())]), "/dev/a")
+    session.poll()
+    assert session.device_info_seen and session.device_id == DEVICE_ID
+    session.refresh_metadata()
+    assert session._refresh_info_pending
+    session.serial.lines.append(
+        wire({"v": 3, "kind": "error", "error": "device_info_too_large"})
+    )
+    events = session.poll()
+    assert events == [{"kind": "metadata_error", "error": "device_info_too_large"}]
+    assert session.device_id == DEVICE_ID
+    assert session.metadata_error == "device_info_too_large"
+    assert not session.active and session.job_token is None
+
+    session.state = "running"
+    session.job_token = "owned-token"
+    session.serial.lines.append(
+        wire({"v": 3, "kind": "error", "error": "device_info_serialization_failed"})
+    )
+    assert session.poll() == []
+    assert session.job_token == "owned-token" and session.state == "running"
+    assert session.metadata_error == "device_info_too_large"
+
+
+def test_unknown_or_post_identity_metadata_error_is_not_accepted_as_metadata():
+    serial = FakeSerial([wire({"v": 3, "kind": "error", "error": "radio_failed"})])
+    session = DeviceSession(serial, "/dev/a")
+    assert session.poll() == []
+    assert session.metadata_error == ""
+
+    serial.lines.append(
+        wire({"v": 3, "kind": "error", "error": "device_info_too_large"})
+    )
+    session.device_info_seen = True
+    assert session.poll() == []
+    assert session.metadata_error == ""
+
+
+def test_metadata_timeout_serializes_other_writes_from_timeout_and_buffer_reset():
+    import threading
+    import serial
+    from watchdogs.serial_manager import SerialManager
+
+    entered = threading.Event()
+    release = threading.Event()
+    ordinary_done = threading.Event()
+    actions = []
+    ordinary_timeout = []
+
+    class Connection:
+        is_open = True
+        write_timeout = 2
+
+        def write(self, payload):
+            if payload.startswith(b"get_capabilities"):
+                actions.append("metadata-write")
+                assert self.write_timeout == 0.25
+                entered.set()
+                assert release.wait(1)
+                raise serial.SerialTimeoutException("Write timeout")
+            ordinary_timeout.append(self.write_timeout)
+            actions.append("ordinary-write")
+            return len(payload)
+
+        def reset_output_buffer(self):
+            actions.append("reset")
+
+        def flush(self):
+            pass
+
+    manager = SerialManager("/dev/fake")
+    conn = Connection()
+    manager.serial_conn = conn
+
+    def metadata_write():
+        with pytest.raises(serial.SerialTimeoutException):
+            manager.send_command("get_capabilities")
+
+    def ordinary_write():
+        manager.send_command("ordinary_command")
+        ordinary_done.set()
+
+    metadata_thread = threading.Thread(target=metadata_write)
+    ordinary_thread = threading.Thread(target=ordinary_write)
+    metadata_thread.start()
+    assert entered.wait(1)
+    ordinary_thread.start()
+    assert not ordinary_done.wait(0.05)
+    release.set()
+    metadata_thread.join(1)
+    ordinary_thread.join(1)
+
+    assert not metadata_thread.is_alive() and not ordinary_thread.is_alive()
+    assert actions == ["metadata-write", "reset", "ordinary-write"]
+    assert ordinary_timeout == [2]
+    assert conn.write_timeout == 2
+
+
+def test_serial_manager_probe_uses_bounded_write_without_flush():
+    from watchdogs.serial_manager import SerialManager
+
+    class Connection:
+        is_open = True
+        in_waiting = 0
+        write_timeout = 2
+
+        def __init__(self, written=2):
+            self.written = written
+            self.resets = 0
+
+        def write(self, payload):
+            assert payload == b"\r\n"
+            assert self.write_timeout == 0.25
+            return self.written
+
+        def flush(self):
+            raise AssertionError("probe must not call tcdrain")
+
+        def reset_output_buffer(self):
+            self.resets += 1
+
+    manager = SerialManager("/dev/fake")
+    conn = Connection()
+    manager.serial_conn = conn
+    assert manager.probe() is True
+    assert conn.write_timeout == 2 and conn.resets == 0
+
+    conn = Connection(written=1)
+    manager.serial_conn = conn
+    assert manager.probe() is False
+    assert conn.write_timeout == 2 and conn.resets == 1
+
+
+def test_device_session_records_explicit_false_metadata_write_result():
+    class RejectedMetadata(FakeSerial):
+        def send_command(self, command):
+            self.commands.append(command)
+            if command == "get_device_info":
+                return False
+            return None
+
+    serial = RejectedMetadata()
+    session = DeviceSession(serial, "/dev/rejected")
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    assert (
+        "get_device_info write failed: serial adapter rejected metadata write"
+        in session.transport_error
+    )
+
+
+def test_device_session_surfaces_metadata_transport_failure_until_reply_recovers():
+    now = [0.0]
+
+    class MetadataSerial(FakeSerial):
+        def __init__(self):
+            super().__init__()
+            self.fail_capabilities = True
+
+        def send_command(self, command):
+            self.commands.append(command)
+            if command == "get_device_info":
+                self.lines.append(wire(info()))
+            elif command == "get_capabilities":
+                if self.fail_capabilities:
+                    self.fail_capabilities = False
+                    raise OSError("Write timeout")
+                self.lines.append(
+                    wire({"v": 1, "kind": "capabilities", "wardrive_serial_v1": True})
+                )
+
+    serial = MetadataSerial()
+    session = DeviceSession(serial, "/dev/a", clock=lambda: now[0])
+    assert session.request_metadata_probe() == ["get_device_info", "get_capabilities"]
+    assert "get_capabilities write failed: Write timeout" in session.transport_error
+    assert session.health["transport_error"] == session.transport_error
+
+    # Drain the successful identity, then retry only the missing capability
+    # after the endpoint's bounded retry interval.
+    session.poll()
+    assert session.device_info_seen
+    assert session.request_metadata_probe() == []
+    now[0] = 0.65
+    assert session.request_metadata_probe() == ["get_capabilities"]
+    session.poll()
+    assert session.capabilities_seen and session.transport_error == ""
 
 
 def test_scheduler_singleboard_can_plan_both_bands_and_generic_operations():
@@ -694,16 +1185,28 @@ def test_device_session_keeps_starting_pending_and_sniffer_stats_token_scoped():
 
 
 def test_device_session_health_separates_usb_identity_protocol_and_firmware_state():
-    session = DeviceSession(FakeSerial(), '/dev/fake')
-    assert session.health == {'usb_open': True, 'protocol_ready': False,
-                              'firmware_health': 'negotiating',
-                              'firmware_version': None, 'build_id': None,
-                              'boot_reason': None}
-    session.set_device_info(info(firmware_version='1.8.4', build_id='0123456789abcdef',
-                                 boot_state='ready', boot_reason='normal'))
-    assert session.health['usb_open'] is True
-    assert session.health['protocol_ready'] is False
-    assert session.health['firmware_health'] == 'ready'
+    session = DeviceSession(FakeSerial(), "/dev/fake")
+    assert session.health == {
+        "usb_open": True,
+        "protocol_ready": False,
+        "firmware_health": "negotiating",
+        "transport_error": "",
+        "metadata_error": "",
+        "firmware_version": None,
+        "build_id": None,
+        "boot_reason": None,
+    }
+    session.set_device_info(
+        info(
+            firmware_version="1.8.4",
+            build_id="0123456789abcdef",
+            boot_state="ready",
+            boot_reason="normal",
+        )
+    )
+    assert session.health["usb_open"] is True
+    assert session.health["protocol_ready"] is False
+    assert session.health["firmware_health"] == "ready"
     session.capabilities_seen = True
     assert session.protocol_ready is True
 

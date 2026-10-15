@@ -385,6 +385,11 @@ class MultiDeviceRuntime:
     def _record(self, session, record):
         kind = record['kind']
         did = session.device_id
+        if kind == 'metadata_error':
+            code = record.get('error', 'unknown')
+            self.app._term_add(
+                f'[C5] USB {session.endpoint} firmware metadata error: {code}', raw=True)
+            return
         if kind in ('boot_changed', 'identity_changed'):
             lost_id = record['device_id']
             self._source_lost(lost_id)
@@ -1070,18 +1075,35 @@ class MultiDeviceRuntime:
                 request.update(op='ble_scan', band='none', channels=[], ble='scan')
         return requests
 
-    def stop_all(self):
+    def stop_all(self) -> bool:
         if self._portal_preparation:
             self._portal_error(self._portal_preparation, 'Portal preparation cancelled by global stop')
+        stop_requests_accepted = True
         for group in list(self.groups.values()):
             group.restore.clear()
             if group.state in ('starting','running','stopping'):
-                self.controller.stop_group(group.identity)
+                try:
+                    accepted = self.controller.stop_group(group.identity)
+                except Exception as exc:
+                    accepted = False
+                    group.error = f"global stop request failed: {exc}"[:256]
+                if accepted is False:
+                    stop_requests_accepted = False
         for session in self.endpoints.values():
             if session.external_busy and session.connected and not self.is_reserved(session):
-                session.serial.send_command_strict('stop')
-                session.serial.send_command('get_device_info')
-        self.foreground = self.background = None
+                try:
+                    session.serial.send_command_strict('stop')
+                except Exception as exc:
+                    stop_requests_accepted = False
+                    session.last_error = f"external stop send failed: {exc}"[:180]
+                    continue
+                session.send_metadata_command('get_device_info')
+        # Keep the visible group selection while any owner may still be active;
+        # callers can retry stop and the controller retains the authoritative
+        # job-token ownership either way.
+        if stop_requests_accepted:
+            self.foreground = self.background = None
+        return stop_requests_accepted
 
     def _tick_groups(self):
         for group in list(self.groups.values()):
@@ -1257,7 +1279,7 @@ class MultiDeviceRuntime:
             return False
         if session.external_busy:
             session.serial.send_command_strict('stop')
-            session.serial.send_command('get_device_info')
+            session.send_metadata_command('get_device_info')
             return False
         if session.active:
             view = next((g for g in self.groups.values() if g.tokens.get(session.device_id) == session.job_token),None)
@@ -1311,6 +1333,8 @@ class MultiDeviceRuntime:
 
     def health_lines(self):
         lines = []
+        reported_transport_errors = set()
+        reported_metadata_errors = set()
         for device in self.registry.list():
             session = device.session
             alias = next(iter(device.aliases), device.board)
@@ -1336,6 +1360,22 @@ class MultiDeviceRuntime:
             if session and any(session.losses.values()):
                 lines.append('  Losses ' + ' '.join(
                     f'{name}:{count}' for name, count in session.losses.items()))
+            if session and session.transport_error:
+                lines.append('  Transport error: ' + session.transport_error[:180])
+                reported_transport_errors.add(session.endpoint)
+            if session and session.metadata_error:
+                lines.append('  Firmware metadata error: ' + session.metadata_error)
+                reported_metadata_errors.add(session.endpoint)
+        # Metadata can fail before a valid factory identity is available, so
+        # that endpoint is not present in the registry yet. Keep its USB
+        # transport failure visible in health output during negotiation.
+        for endpoint, session in sorted(self.endpoints.items()):
+            if session.transport_error and endpoint not in reported_transport_errors:
+                lines.append(f'USB {endpoint}: transport error: '
+                             + session.transport_error[:160])
+            if session.metadata_error and endpoint not in reported_metadata_errors:
+                lines.append(f'USB {endpoint}: firmware metadata error: '
+                             + session.metadata_error)
         for endpoint in sorted(self.legacy_endpoints):
             if endpoint in self.endpoints:
                 selected = ' selected' if self.endpoints[endpoint].serial is self.app.serial else ''

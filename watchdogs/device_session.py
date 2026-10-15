@@ -59,7 +59,8 @@ class DeviceSession:
         self._refresh_info_pending = False
         self._refresh_capabilities_pending = False
         self._refresh_legacy_pair = False
-        self.external_busy = self.device_info.get('legacy_busy') is True
+        self._boot_initializing = False
+        self.external_busy = self.device_info.get("legacy_busy") is True
         self._last_busy_probe = 0.0
         self.job_token: str | None = None
         self._terminal_tokens: list[str] = []
@@ -82,6 +83,8 @@ class DeviceSession:
         self.job_started_at = 0.0
         self._watchdog_expired = False
         self._pending_capabilities: dict[str, Any] | None = None
+        self._metadata_transport_errors: dict[str, str] = {}
+        self.metadata_error = ""
         self.counts = {"wifi_count": 0, "ble_count": 0, "drops": 0}
         self.losses = dict.fromkeys(LOSS_KEYS, 0)
         self.last_error = ""
@@ -114,10 +117,50 @@ class DeviceSession:
             "usb_open": self.connected,
             "protocol_ready": self.protocol_ready,
             "firmware_health": self.firmware_health,
+            "transport_error": self.transport_error,
+            "metadata_error": self.metadata_error,
             "firmware_version": self.device_info.get("firmware_version"),
             "build_id": self.device_info.get("build_id"),
             "boot_reason": self.device_info.get("boot_reason"),
         }
+
+    @property
+    def transport_error(self) -> str:
+        """Metadata write failures retained until their replies arrive."""
+        order = ("get_device_info", "get_capabilities", "version")
+        return "; ".join(
+            self._metadata_transport_errors[key]
+            for key in order
+            if key in self._metadata_transport_errors
+        )
+
+    def _metadata_send_failed(self, command: str, exc: Exception) -> None:
+        message = f"{command} write failed: {exc}"[:160]
+        self._metadata_transport_errors[command] = message
+        self.last_error = f"metadata transport error: {message}"[:180]
+
+    def _metadata_reply_received(self, command: str) -> None:
+        self._metadata_transport_errors.pop(command, None)
+        if not self._metadata_transport_errors and self.last_error.startswith(
+            "metadata transport error:"
+        ):
+            self.last_error = ""
+
+    def send_metadata_command(self, command: str) -> bool:
+        """Send one metadata query while retaining transport failures for health."""
+        if command not in ("version", "get_device_info", "get_capabilities"):
+            raise ValueError("unsupported metadata command")
+        try:
+            sent = self._send(command)
+        except Exception as exc:
+            self._metadata_send_failed(command, exc)
+            return False
+        if sent is False:
+            self._metadata_send_failed(
+                command, OSError("serial adapter rejected metadata write")
+            )
+            return False
+        return True
 
     @property
     def active(self) -> bool:
@@ -162,16 +205,42 @@ class DeviceSession:
                 self.on_event({"kind": "boot_changed", "device_id": next_id,
                                "old_boot_id": self.boot_id, "boot_id": next_boot})
             self.seq = 0
+        was_initializing = self._boot_initializing
         self.device_info = dict(device_info)
         self.external_busy = device_info.get('legacy_busy') is True
         self.device_id = next_id
         self.boot_id = next_boot
         self.device_info_seen = True
+        capabilities = device_info.get("capabilities")
+        self._boot_initializing = bool(
+            device_info.get("boot_state") == "degraded"
+            and device_info.get("boot_reason") == "initializing"
+            and isinstance(capabilities, Mapping)
+            and capabilities.get("c5_jobs_v1") is False
+        )
+        if self._boot_initializing:
+            # This exact firmware state is temporary. Neither its false job
+            # capability nor a capability reply from just before this identity
+            # record may route the endpoint through legacy scan handling.
+            self.c5_jobs_v1 = False
+            self.capabilities_seen = False
+            self.legacy_capabilities_seen = False
+            self.capabilities.clear()
+            self._pending_capabilities = None
+            self._refresh_info_pending = True
+            self._refresh_capabilities_pending = True
+            self._refresh_legacy_pair = True
+        elif was_initializing:
+            # A ready (or permanent recovery) identity ends the transient boot
+            # state. Re-negotiate capabilities after this identity is known.
+            self._refresh_capabilities_pending = True
+            self._refresh_legacy_pair = False
         if self._pending_capabilities is not None:
             pending = self._pending_capabilities
             self._pending_capabilities = None
-            self._apply_job_capabilities(pending)
-            self.on_event(dict(pending))
+            if not self._boot_initializing:
+                self._apply_job_capabilities(pending)
+                self.on_event(dict(pending))
 
     def _apply_job_capabilities(self, record: Mapping[str, Any]) -> None:
         self.c5_jobs_v1 = record.get("c5_jobs_v1") is True
@@ -215,10 +284,7 @@ class DeviceSession:
         if not commands:
             return []
         for command in commands:
-            try:
-                self._send(command)
-            except Exception as exc:
-                self.last_error = f"metadata probe failed: {exc}"[:180]
+            self.send_metadata_command(command)
         self._metadata_probe_attempts += 1
         delay = self._metadata_retry_delay
         self._next_metadata_probe_at = now + delay
@@ -263,13 +329,8 @@ class DeviceSession:
         delay = self._identity_recovery_delay
         self._identity_recovery_attempts += 1
         self._next_identity_recovery_at = now + delay
-        self._identity_recovery_delay = min(delay * 2.0,
-                                            IDENTITY_RECOVERY_MAX_SECONDS)
-        try:
-            result = self._send("get_device_info")
-            return result is not False
-        except Exception:
-            return False
+        self._identity_recovery_delay = min(delay * 2.0, IDENTITY_RECOVERY_MAX_SECONDS)
+        return self.send_metadata_command("get_device_info")
 
     def _read_lines(self) -> list[str]:
         reader = getattr(self.serial, "read_available", None)
@@ -312,9 +373,71 @@ class DeviceSession:
                     continue
                 version = envelope.get("v")
                 if version == 1 and envelope.get("kind") == "capabilities":
+                    false_job_capability = envelope.get("c5_jobs_v1") is False
+                    no_legacy_capability_shape = (
+                        false_job_capability
+                        and "wardrive_serial_v1" not in envelope
+                        and type(envelope.get("max_line")) is int
+                        and envelope.get("max_line") == 1024
+                    )
+                    if (
+                        false_job_capability
+                        and (no_legacy_capability_shape or self._boot_initializing)
+                        and len(line.encode("utf-8", "replace")) <= 1024
+                    ):
+                        self._metadata_reply_received("get_capabilities")
+                        if not self.device_info_seen or self._boot_initializing:
+                            # Capability-first replies cannot prove that this
+                            # endpoint is legacy. Hold the endpoint in bounded
+                            # identity+capability negotiation until device_info
+                            # identifies whether this is startup or recovery.
+                            self.c5_jobs_v1 = False
+                            self.capabilities_seen = False
+                            self.legacy_capabilities_seen = False
+                            self._refresh_info_pending = True
+                            self._refresh_capabilities_pending = True
+                            self._refresh_legacy_pair = True
+                            continue
+                        info_caps = self.device_info.get("capabilities")
+                        if (
+                            isinstance(info_caps, Mapping)
+                            and info_caps.get("c5_jobs_v1") is True
+                        ):
+                            # A false reply without a nonce can be from the
+                            # initializing phase of this same boot.
+                            self.capabilities_seen = False
+                            self.legacy_capabilities_seen = False
+                            self._refresh_capabilities_pending = True
+                            continue
+                        if (
+                            self.device_info.get("boot_state") == "degraded"
+                            and self.device_info.get("boot_reason") != "initializing"
+                            and isinstance(info_caps, Mapping)
+                            and info_caps.get("c5_jobs_v1") is False
+                        ):
+                            # Permanent recovery mode is terminal for this
+                            # negotiation; keep its established no-jobs path
+                            # distinct from the transient initializing state.
+                            self.capabilities_seen = True
+                            self.c5_jobs_v1 = False
+                            self.legacy_capabilities_seen = True
+                            self.capabilities.clear()
+                            self._refresh_capabilities_pending = False
+                            events.append(dict(envelope))
+                            continue
+                        self.capabilities_seen = False
+                        self.legacy_capabilities_seen = True
+                        self._refresh_capabilities_pending = False
+                        if self.device_id and self.boot_id:
+                            self._apply_job_capabilities(envelope)
+                            events.append(dict(envelope))
+                        else:
+                            self.on_line(line)
+                        continue
                     validated = parse_record(line)
                     if validated is None:
                         continue
+                    self._metadata_reply_received("get_capabilities")
                     self.capabilities_seen = True
                     if type(envelope.get("c5_jobs_v1")) is not bool:
                         self.legacy_capabilities_seen = True
@@ -353,18 +476,44 @@ class DeviceSession:
                 if version != 3:
                     continue
                 kind = envelope.get("kind")
+                if (
+                    kind == "error"
+                    and not self.active
+                    and (not self.device_info_seen or self._refresh_info_pending)
+                    and envelope.get("error")
+                    in {
+                        "device_info_too_large",
+                        "device_info_serialization_failed",
+                    }
+                    and len(line.encode("utf-8", "replace")) <= 1024
+                ):
+                    # Firmware metadata errors have no identity/session fields.
+                    # Accept only these exact codes before identity and emit a
+                    # sanitized event; never pass this record through job state.
+                    code = envelope["error"]
+                    if self.metadata_error != code:
+                        self.metadata_error = code
+                        self.last_error = f"firmware metadata error: {code}"[:180]
+                        events.append({"kind": "metadata_error", "error": code})
+                    continue
                 if kind == "device_info":
                     info = parse_device_info(line)
                     if info is None:
                         continue
+                    self._metadata_reply_received("get_device_info")
+                    self.metadata_error = ""
+                    if self.last_error.startswith("firmware metadata error:"):
+                        self.last_error = ""
                     self.set_device_info(info)
                     if self._refresh_info_pending:
-                        self._refresh_info_pending = False
-                        self._refresh_legacy_pair = False
-                        # The identity reply has been drained; capabilities
-                        # can be requested during this same runtime tick.
-                        self._next_metadata_probe_at = min(
-                            self._next_metadata_probe_at, self.clock())
+                        if not self._boot_initializing:
+                            self._refresh_info_pending = False
+                            self._refresh_legacy_pair = False
+                            # The identity reply has been drained; capabilities
+                            # can be requested during this same runtime tick.
+                            self._next_metadata_probe_at = min(
+                                self._next_metadata_probe_at, self.clock()
+                            )
                     events.append(info)
                 elif kind == "capabilities":
                     if (type(envelope.get("c5_jobs_v1")) is not bool
@@ -375,6 +524,7 @@ class DeviceSession:
                         continue
                     if len(line.encode("utf-8", "replace")) > 1024:
                         continue
+                    self._metadata_reply_received("get_capabilities")
                     self.c5_jobs_v1 = envelope["c5_jobs_v1"]
                     self.capabilities_seen = True
                     self.legacy_capabilities_seen = not self.c5_jobs_v1
@@ -560,7 +710,7 @@ class DeviceSession:
         if not self.active or not self.job_token:
             if self.external_busy and self.connected and self.clock()-self._last_busy_probe >= 5:
                 self._last_busy_probe = self.clock()
-                self._send('get_device_info')
+                self.send_metadata_command("get_device_info")
             return
         now = self.clock()
         if self._stop_pending or self.state == "stopping":

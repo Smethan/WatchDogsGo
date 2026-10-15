@@ -202,18 +202,26 @@ def test_unknown_fast_parameters_fall_back_to_legacy(setup, feature):
 
 def test_fast_large_wire_write_uses_one_bounded_write_without_flush():
     from watchdogs.firmware_ota import SerialOtaTransport
-    from types import SimpleNamespace
+    from watchdogs.serial_manager import SerialManager
+
     conn = Mock()
     conn.write.side_effect = len
-    transport = SerialOtaTransport(SimpleNamespace(serial_conn=conn), None)
-    command = 'uota_block ' + 'a'*64 + ' 0 123 ' + base64.b64encode(bytes(4096)).decode()
+    conn.write_timeout = 11
+    manager = SerialManager("/dev/fake")
+    manager.serial_conn = conn
+    transport = SerialOtaTransport(manager, None)
+    command = (
+        "uota_block " + "a" * 64 + " 0 123 " + base64.b64encode(bytes(4096)).decode()
+    )
     transport.send_fast(command)
     conn.write.assert_called_once_with((command+'\r').encode())
     conn.flush.assert_not_called()
-    assert conn.write_timeout == 2
-    conn.write.return_value = 0; conn.write.side_effect = None
-    with pytest.raises(OSError, match='Incomplete'):
+    assert conn.write_timeout == 11
+    conn.write.side_effect = None
+    conn.write.return_value = 0
+    with pytest.raises(OSError, match="Incomplete serial write"):
         transport.send_fast(command)
+    conn.reset_output_buffer.assert_called_once()
 
 
 def test_repeated_large_block_failure_falls_back_without_discard_or_restart(setup):

@@ -1635,33 +1635,70 @@ class WatchDogsGame(OtaMixin):
         pool = getattr(self, 'c5_pool', None)
         if pool is not None and (pool.available or cmd == 'stop'):
             if cmd == 'stop':
-                pool.stop_all()
+                sent_all = pool.stop_all() is not False
+                if not sent_all:
+                    self._term_add(
+                        "[ERR] stop not accepted; one or more device owners remain active",
+                        raw=True)
                 for endpoint in pool.legacy_endpoints:
                     session = pool.endpoints.get(endpoint)
                     if (session and session.connected
                             and not pool.is_reserved(session)):
-                        session.serial.send_command('stop')
-                if hasattr(self, 'wardrive'):
+                        try:
+                            sent = session.serial.send_command('stop')
+                        except Exception as exc:
+                            sent = False
+                            detail = str(exc)
+                        else:
+                            detail = 'write failed'
+                        if sent is False:
+                            sent_all = False
+                            self._term_add(
+                                f"[ERR] stop transport error on {endpoint}: {detail}", raw=True)
+                if sent_all and hasattr(self, 'wardrive'):
                     self.wardrive.on_stop()
-                return
+                return sent_all
             if pool.start_command(cmd):
-                return
+                return True
         if getattr(self, '_flash_io_active', False):
             if not quiet:
                 self._term_add("[FLASH] Serial reserved until flashing finishes", raw=True)
-            return
-        if cmd == "stop" and hasattr(self, "wardrive"):
-            self.wardrive.on_stop()
+            return False
         if self.serial and self.serial.is_open:
-            self.serial.send_command(cmd)
+            try:
+                sent = self.serial.send_command(cmd)
+            except Exception as exc:
+                if cmd not in ("version", "get_device_info", "get_capabilities"):
+                    raise
+                self._term_add(f"[ERR] {cmd} transport error: {exc}"[:180], raw=True)
+                return False
+            if sent is False:
+                self._term_add(f"[ERR] {cmd} transport error: write failed", raw=True)
+                return False
+            if cmd == "stop" and hasattr(self, "wardrive"):
+                self.wardrive.on_stop()
             if not quiet:
                 self._term_add(f"[TX] {cmd}", raw=True)
+            return True
         elif self._try_reconnect_esp32():
-            self.serial.send_command(cmd)
+            try:
+                sent = self.serial.send_command(cmd)
+            except Exception as exc:
+                if cmd not in ("version", "get_device_info", "get_capabilities"):
+                    raise
+                self._term_add(f"[ERR] {cmd} transport error: {exc}"[:180], raw=True)
+                return False
+            if sent is False:
+                self._term_add(f"[ERR] {cmd} transport error: write failed", raw=True)
+                return False
+            if cmd == "stop" and hasattr(self, "wardrive"):
+                self.wardrive.on_stop()
             if not quiet:
                 self._term_add(f"[TX] {cmd} (after reconnect)", raw=True)
+            return True
         else:
             self._term_add("[ERR] No serial connection", raw=True)
+            return False
 
     # ------------------------------------------------------------------
     # Terminal helpers
@@ -2396,10 +2433,14 @@ class WatchDogsGame(OtaMixin):
                          if session.serial is self.serial), None) if pool is not None else None
         if (selected is not None and selected.endpoint in pool.legacy_endpoints
                 and selected.connected and not pool.is_reserved(selected)):
+            if selected.serial.send_command('stop') is False:
+                self._term_add(
+                    f"[ERR] stop transport error on {selected.endpoint}: write failed",
+                    raw=True)
+                return
             self.wardrive.scan = self.wardrive.legacy_scan
-            selected.serial.send_command('stop')
-        else:
-            self._send("stop")
+        elif self._send("stop") is False:
+            return
         self._clear_scan_state()
         self._pending_cmd = final_cmd
         self._pending_state = state_key

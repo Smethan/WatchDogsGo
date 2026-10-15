@@ -60,30 +60,19 @@ class SerialOtaTransport:
         self.target = target
 
     def send(self, command):
-        payload = (command + '\r\n').encode('utf-8')
-        conn = self.manager.serial_conn
-        conn.write_timeout = 2
-        # flush() can wait indefinitely on the failing uConsole USB path.
-        if conn.write(payload) != len(payload):
-            raise OSError('Incomplete command write')
+        payload = (command + "\r\n").encode("utf-8")
+        self.manager.write_payload(payload, timeout=2)
 
     def send_paced(self, command):
-        payload = (command + '\r').encode('utf-8')
-        conn = self.manager.serial_conn
-        conn.write_timeout = 2
-        for offset in range(0, len(payload), 64):
-            part = payload[offset:offset+64]
-            if conn.write(part) != len(part):
-                raise OSError('Incomplete command write')
-            time.sleep(0.002)
+        payload = (command + "\r").encode("utf-8")
+        self.manager.write_payload(
+            payload, timeout=2, chunk_size=64, inter_chunk_delay=0.002
+        )
 
     def send_fast(self, command):
         """Only after the receiver advertises a full-block RX buffer."""
         payload = (command + "\r").encode("ascii")
-        conn = self.manager.serial_conn
-        conn.write_timeout = 2
-        if conn.write(payload) != len(payload):
-            raise OSError("Incomplete block write")
+        self.manager.write_payload(payload, timeout=2)
 
     def read(self):
         return self.manager.read_available()
@@ -91,7 +80,7 @@ class SerialOtaTransport:
     def close(self):
         if self.manager and self.manager.serial_conn:
             try:
-                self.manager.serial_conn.reset_output_buffer()
+                self.manager.reset_output_buffer()
             except Exception:
                 pass
             self.manager.close()

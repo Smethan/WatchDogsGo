@@ -501,6 +501,47 @@ def test_metadata_retries_recover_queries_lost_in_firmware_startup_window(tmp_pa
         assert serial.commands.count("get_capabilities") == 3
 
 
+def test_metadata_write_error_is_visible_before_identity_and_retries_are_rate_limited():
+    now = [0.0]
+    serial = FakeSerial("/dev/timeout", "usb-timeout")
+
+    def failed_write(command):
+        serial.commands.append(command)
+        raise OSError("Write timeout")
+
+    serial.send_command = failed_write
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial], clock=lambda: now[0])
+    assert any("USB /dev/timeout: transport error:" in line
+               and "Write timeout" in line for line in runtime.health_lines())
+    attempted = len(serial.commands)
+    now[0] = 0.64
+    runtime.poll()
+    assert len(serial.commands) == attempted
+    now[0] = 0.65
+    runtime.poll()
+    assert len(serial.commands) > attempted
+
+
+def test_firmware_metadata_error_is_visible_before_identity(tmp_path):
+    serial = FakeSerial("/dev/metadata", "usb-metadata")
+    app = FakeApp()
+    runtime = MultiDeviceRuntime(app, [serial])
+    serial.lines.append(wire({"v": 3, "kind": "error",
+                              "error": "device_info_too_large"}))
+
+    runtime.poll()
+
+    assert any("USB /dev/metadata: firmware metadata error: device_info_too_large" in line
+               for line in runtime.health_lines())
+    assert any("firmware metadata error: device_info_too_large" in line
+               for line, _raw in app.lines)
+    session = runtime.endpoints["/dev/metadata"]
+    assert not session.device_id
+    assert session.state == "idle"
+    assert session.job_token is None
+
+
 def test_explicit_legacy_capability_stops_metadata_retries(tmp_path, monkeypatch):
     monkeypatch.setattr("watchdogs.multi_device.supported_candidates", lambda: [])
     now = [0.0]
@@ -1180,6 +1221,101 @@ def test_external_legacy_owner_is_excluded_from_allocation_and_updates_wait_for_
     metadata['legacy_busy'] = False
     h.emit(0, wire(metadata))
     assert h.runtime.reserve(h.serials[0]) is h.runtime.sessions[IDS[0]]
+
+
+def test_failed_managed_stop_keeps_group_selected_and_blocks_replacement_scan(tmp_path):
+    from unittest.mock import Mock
+    from watchdogs.app import WatchDogsGame
+
+    h = Harness(tmp_path)
+    assert h.runtime.start('hs_sniff')
+    h.start_ack(0)
+    h.start_ack(1)
+    group_id = h.runtime.foreground
+    group = h.runtime.groups[group_id]
+    session = h.runtime.sessions[IDS[0]]
+    original_send = session.serial.send_command
+
+    def reject_stop(command):
+        if command.startswith('job_stop '):
+            session.serial.commands.append(command)
+            return False
+        return original_send(command)
+
+    session.serial.send_command = reject_stop
+    ui = WatchDogsGame.__new__(WatchDogsGame)
+    ui.c5_pool = h.runtime
+    ui.serial = session.serial
+    ui.wardrive = h.app.wardrive
+    ui.wardrive.on_stop = Mock()
+    ui.sniffing = False
+    ui._term_add = Mock()
+    ui._clear_scan_state = Mock()
+    ui.msg = Mock()
+
+    ui._start_scan_cmd('unsupported_replacement', 'wardriving', 'replacement scan')
+
+    assert h.runtime.foreground == group_id
+    assert h.runtime.groups[group_id] is group
+    assert session.active and session.job_token == group.tokens[IDS[0]]
+    assert not hasattr(ui, '_pending_cmd')
+    assert ui._term_add.call_args.args[0].startswith('[ERR] stop not accepted')
+
+
+def test_stop_all_contains_external_strict_stop_failure_and_preserves_busy_owner(tmp_path):
+    h = Harness(tmp_path)
+    session = h.runtime.sessions[IDS[0]]
+    session.external_busy = True
+
+    def failed_stop(command):
+        session.serial.commands.append(command)
+        raise OSError('Write timeout')
+
+    session.serial.send_command_strict = failed_stop
+
+    assert h.runtime.stop_all() is False
+    assert session.external_busy
+    assert session.last_error == 'external stop send failed: Write timeout'
+    assert session.serial.commands[-1] == 'stop'
+
+
+def test_stop_all_contains_metadata_write_failure_for_external_owner(tmp_path):
+    h = Harness(tmp_path)
+    session = h.runtime.sessions[IDS[0]]
+    session.external_busy = True
+
+    def failed_metadata(command):
+        session.serial.commands.append(command)
+        if command == "get_device_info":
+            raise OSError("Write timeout")
+
+    session.serial.send_command = failed_metadata
+    h.runtime.stop_all()
+
+    assert session.external_busy
+    assert session.serial.commands[-2:] == ["stop", "get_device_info"]
+    assert "get_device_info write failed: Write timeout" in session.transport_error
+    assert any("Transport error:" in line and "Write timeout" in line
+               for line in h.runtime.health_lines())
+
+
+def test_update_reservation_contains_metadata_write_failure_and_keeps_owner_state(tmp_path):
+    h = Harness(tmp_path)
+    session = h.runtime.sessions[IDS[0]]
+    session.external_busy = True
+
+    def failed_metadata(command):
+        session.serial.commands.append(command)
+        if command == "get_device_info":
+            raise OSError("Write timeout")
+
+    session.serial.send_command = failed_metadata
+    assert h.runtime.reserve(session.serial) is False
+
+    assert session.external_busy
+    assert not h.runtime._reserved_sessions
+    assert session.serial.commands[-2:] == ["stop", "get_device_info"]
+    assert "get_device_info write failed: Write timeout" in session.transport_error
 
 
 def test_live_sniffer_health_displays_only_validated_source_counters(tmp_path):

@@ -26,6 +26,8 @@ _ESP32_VID_PIDS: List[Tuple[int, int]] = [
     (0x303A, 0x4001),  # Espressif native USB-CDC (ESP32-S2)
 ]
 _ESP32_NATIVE_VID_PIDS = {(0x303A, 0x1001), (0x303A, 0x4001)}
+_METADATA_COMMANDS = {"version", "get_device_info", "get_capabilities"}
+_METADATA_WRITE_TIMEOUT = 0.25
 
 
 class _NativeJTAGSerial(serial.Serial):
@@ -262,12 +264,16 @@ class SerialManager:
         log.info("Serial port %s opened at %d baud", self.device, self.baud_rate)
 
     def probe(self) -> bool:
-        """Check if firmware is responsive.
+        """Check whether the serial transport is writable or has pending input."""
+        with self._io_lock:
+            return self._probe_locked()
 
-        Checks for pending data first (boot banner).  If nothing pending,
-        tries a quick write — on XIAO CDC, write blocks with
-        SerialTimeoutException until firmware boots.  A successful write
-        (no exception) means firmware is ready, even if it doesn't echo back.
+    def _probe_locked(self) -> bool:
+        """Run the responsiveness probe while holding the serial I/O lock.
+
+        Checks for pending data first (boot banner). If nothing is pending,
+        tries a bounded newline write. A successful write only means the host
+        accepted the bytes; firmware readiness still requires a validated reply.
         """
         if not self.serial_conn:
             return False
@@ -275,15 +281,29 @@ class SerialManager:
             # Check if anything is already waiting (boot output)
             if self.serial_conn.in_waiting > 0:
                 return True
-            # Try a non-blocking write probe — may timeout on XIAO CDC
+            # Bound the probe write and avoid flush(): POSIX tcdrain may block
+            # indefinitely when native CDC stops draining its output queue.
+            conn = self.serial_conn
+            previous_timeout = getattr(conn, "write_timeout", None)
             try:
-                self.serial_conn.write(b"\r\n")
-                self.serial_conn.flush()
-                return True  # write succeeded = firmware is running
-            except serial.SerialTimeoutException:
-                return False  # write blocked = firmware not ready
+                conn.write_timeout = _METADATA_WRITE_TIMEOUT
+                written = conn.write(b"\r\n")
+                if written != 2:
+                    reset = getattr(conn, "reset_output_buffer", None)
+                    if callable(reset):
+                        reset()
+                    return False
+                return True
             except Exception:
+                reset = getattr(conn, "reset_output_buffer", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception:
+                        pass
                 return False
+            finally:
+                conn.write_timeout = previous_timeout
         except Exception:
             return False
 
@@ -296,6 +316,80 @@ class SerialManager:
                 finally:
                     if self.serial_conn is conn:
                         self.serial_conn = None
+
+    def reset_output_buffer(self) -> bool:
+        """Best-effort discard of queued output while excluding other I/O."""
+        with self._io_lock:
+            conn = self.serial_conn
+            if conn is None:
+                return False
+            reset = getattr(conn, "reset_output_buffer", None)
+            if not callable(reset):
+                return False
+            try:
+                reset()
+                return True
+            except Exception as exc:
+                log.debug("Could not reset serial output buffer: %s", exc)
+                return False
+
+    def write_payload(
+        self,
+        payload: bytes,
+        *,
+        timeout: float | None = None,
+        chunk_size: int | None = None,
+        inter_chunk_delay: float = 0.0,
+    ) -> int:
+        """Write raw protocol bytes atomically with bounded recovery.
+
+        Unlike ``send_command``, this preserves the caller's payload exactly,
+        which is required by OTA transfer framing. It never calls ``flush``;
+        on an exception or short write it discards pending output best-effort
+        before releasing the shared I/O lock.
+        """
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("serial payload must be bytes-like")
+        data = bytes(payload)
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+        if inter_chunk_delay < 0:
+            raise ValueError("inter_chunk_delay must not be negative")
+        with self._io_lock:
+            conn = self.serial_conn
+            if conn is None:
+                raise ConnectionError("Serial endpoint is disconnected")
+            previous_timeout = getattr(conn, "write_timeout", None)
+            try:
+                if timeout is not None:
+                    conn.write_timeout = timeout
+                size = chunk_size or max(len(data), 1)
+                written_total = 0
+                for offset in range(0, len(data), size):
+                    part = data[offset : offset + size]
+                    written = conn.write(part)
+                    if written != len(part):
+                        raise OSError(
+                            f"Incomplete serial write: wrote {written} of {len(part)} bytes"
+                        )
+                    written_total += written
+                    if inter_chunk_delay and offset + size < len(data):
+                        time.sleep(inter_chunk_delay)
+                return written_total
+            except Exception:
+                reset = getattr(conn, "reset_output_buffer", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception as reset_exc:
+                        log.debug("Could not reset failed serial output: %s", reset_exc)
+                raise
+            finally:
+                if timeout is not None:
+                    try:
+                        conn.write_timeout = previous_timeout
+                    except Exception:
+                        pass
 
     @property
     def is_open(self) -> bool:
@@ -316,40 +410,76 @@ class SerialManager:
     # I/O
     # ------------------------------------------------------------------
 
-    def send_command(self, command: str) -> None:
-        self._send_command(command, strict=False)
+    def send_command(self, command: str) -> bool:
+        """Best-effort write; return whether the complete command was written."""
+        return self._send_command(command, strict=False)
 
     def send_command_strict(self, command: str) -> None:
-        """Write a command without hiding failures or blocking on ``flush``.
+        """Write a command without hiding short or failed writes.
 
         The portal HTML transfer is a multi-command transaction: continuing
         after a short or failed write could start a job with incomplete HTML.
-        Its worker also must not block the UI polling loop waiting for a USB
-        driver flush.
         """
         self._send_command(command, strict=True)
 
-    def _send_command(self, command: str, *, strict: bool) -> None:
+    def _send_command(self, command: str, *, strict: bool) -> bool:
+        # Serialize writes with each other and with reads. In particular, a
+        # metadata timeout must not temporarily change another writer's timeout
+        # or clear its queued bytes during recovery.
+        with self._io_lock:
+            return self._send_command_locked(command, strict=strict)
+
+    def _send_command_locked(self, command: str, *, strict: bool) -> bool:
+        metadata = command in _METADATA_COMMANDS
         if not self.serial_conn:
-            if strict or command.startswith("job_"):
+            if strict or command.startswith("job_") or metadata:
                 raise ConnectionError("Job endpoint is disconnected")
             log.error("Serial not connected — cannot send %r", command)
-            return
+            return False
+        conn = self.serial_conn
         try:
             payload = (command + "\r\n").encode("utf-8")
-            if self.serial_conn.write(payload) != len(payload):
+            if metadata:
+                # Capability/identity probes run from the UI polling path.
+                # Bound a blocked CDC write to a short interval and restore
+                # the normal timeout immediately after the small command.
+                previous_timeout = getattr(conn, "write_timeout", None)
+                conn.write_timeout = _METADATA_WRITE_TIMEOUT
+                try:
+                    written = conn.write(payload)
+                finally:
+                    conn.write_timeout = previous_timeout
+            else:
+                written = conn.write(payload)
+            if written != len(payload):
                 raise OSError("Incomplete serial command write")
-            if not strict and not command.startswith(("job_", "get_device_info", "get_capabilities")):
-                self.serial_conn.flush()
-            if not strict and not (command.startswith("wardrive_keepalive ") or
-                    command.startswith("wardrive_status ") or
-                    command.startswith(("job_", "get_device_info", "get_capabilities"))):
+            # Do not call pySerial flush(): on POSIX it uses tcdrain, which can
+            # wait forever when native USB CDC stops draining. USB writes retain
+            # their byte order without an additional drain operation.
+            if not strict and not (
+                command.startswith("wardrive_keepalive ")
+                or command.startswith("wardrive_status ")
+                or command.startswith("job_")
+                or metadata
+            ):
                 time.sleep(0.1)
                 log.debug("TX: %s", command)
+            return True
         except Exception as exc:
             log.error("Send error: %s", exc)
-            if strict or command.startswith("job_"):
+            # Any failed write may leave bytes queued in the OS or USB driver.
+            # Reset while holding _io_lock so close or a later command cannot
+            # wait on or inherit that stalled output. This is best effort only;
+            # USB adapters may not discard every byte already in flight.
+            reset = getattr(conn, "reset_output_buffer", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception as reset_exc:
+                    log.debug("Could not reset failed serial output: %s", reset_exc)
+            if strict or command.startswith("job_") or metadata:
                 raise
+            return False
 
     def read_available(self, max_bytes: int = 16384, max_lines: int = 64) -> List[str]:
         """Non-blocking read: grab whatever bytes are waiting and return
