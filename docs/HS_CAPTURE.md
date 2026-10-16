@@ -191,6 +191,30 @@ partial frames. They overlap and should not be added as unique RF packet loss.
 More than seven seconds without progress produces a note, not an automatic
 capture stop. Disconnects and final cleanup stop the local running indicator.
 
+## When a managed capture stops with an error
+
+`operation_failed` means the firmware stopped the job after a specific failure;
+it is a cleanup result, not the underlying cause. For channel failures, WDG
+keeps the first job error on the progress screen and records it in
+`~/.watchdogs/last_run.log` with the device, endpoint, failure type,
+requested and actual channel, Wi-Fi mode, band, and SDK error. A later `operation_failed` or
+`boot changed` should not replace that first reason. The log is rotated to
+`previous_run.log` on the next WDG launch, so save the relevant session before
+restarting WDG if the failure needs investigation.
+
+`boot changed` means WDG received a different firmware boot ID during an active
+job. This is evidence of a changed firmware session, but the message alone does
+not distinguish a device reset from stale metadata after a reconnect. Note the
+time and any USB disconnect or reset, then inspect the same WDG log session.
+If a channel error preceded it, diagnose that first. When reporting a failure,
+include the first detailed error and the later cleanup or boot message.
+
+The ESP32-C5's 5 GHz channel readback can report an automatically selected
+secondary channel even when capture requested `NONE`. Firmware checks the
+requested primary channel on both bands and requires `NONE` only on 2.4 GHz.
+This prevents a valid 5 GHz switch from being rejected solely because of the
+secondary readback; an SDK set error or wrong primary still stops capture.
+
 Native firmware tests cover framing, bounded queues, storage identity, cleanup,
 allocation failure, target parsing/filtering, scan lifecycle and exchange
 isolation. Synthetic WDG tests cover malformed messages, chunk loss,

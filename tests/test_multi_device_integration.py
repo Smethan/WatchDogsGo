@@ -865,7 +865,7 @@ def test_terminal_error_retires_source_and_stops_peer(tmp_path):
 
 
 def test_boot_change_retires_old_group_source_and_stops_surviving_peer(tmp_path):
-    h = Harness(tmp_path)
+    h = Harness(tmp_path, loot=True)
     assert h.runtime.start("hs_sniff")
     group = h.runtime.groups[h.runtime.foreground]
     h.start_ack(0)
@@ -879,6 +879,43 @@ def test_boot_change_retires_old_group_source_and_stops_surviving_peer(tmp_path)
                for command in h.serials[1].commands)
     h.stop_ack(1, token=group.tokens[IDS[1]], seq=2)
     assert group.state == "error"
+
+
+def test_hs_channel_error_survives_operation_failure_and_boot_change(tmp_path, caplog):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    token = group.tokens[IDS[0]]
+    h.emit(0, lifecycle('error', 0, token, seq=2, state='running',
+                        message='channel_apply_failed', channel_failure='readback',
+                        requested_channel=36, actual_channel=36,
+                        radio_mode='sta_ap', band='auto', sdk_error=-1))
+    first_error = group.error
+    assert 'readback: requested 36' in first_error and 'SDK -1' in first_error
+    h.emit(0, lifecycle('error', 0, token, seq=3, state='stopping',
+                        message='operation_failed', failure_reason='channel_apply_failed'))
+    rebooted = json.loads(device_info(0, 'xiao', [1, 6, 11, 36, 40])[4:])
+    rebooted['boot_id'] = 'ABCDEF0123456789'
+    h.emit(0, wire(rebooted))
+    assert group.error == first_error
+    assert 'requested 36' in caplog.text
+    assert 'boot_changed' in caplog.text
+
+
+def test_hs_storage_failure_survives_later_firmware_error(tmp_path):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    h.runtime._storage_failure(group, 'disk full')
+    first_error = group.error
+    assert first_error == 'Capture storage failed: disk full'
+    h.emit(0, lifecycle('error', 0, group.tokens[IDS[0]], seq=2, state='stopping',
+                        message='operation_failed', failure_reason='channel_apply_failed'))
+    assert group.error == first_error
 
 
 def test_portal_preparation_waits_for_required_passive_stops_uses_xiao_manager_and_snapshots_targets(

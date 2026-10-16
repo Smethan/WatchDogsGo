@@ -61,6 +61,7 @@ class GroupView:
     passive: bool = False
     state: str = 'starting'
     error: str = ''
+    first_error: str = ''
     restore: dict = field(default_factory=dict)
     stopped: set = field(default_factory=set)
     snapshots: dict = field(default_factory=dict)
@@ -392,6 +393,10 @@ class MultiDeviceRuntime:
             return
         if kind in ('boot_changed', 'identity_changed'):
             lost_id = record['device_id']
+            log.warning('C5 %s device=%s endpoint=%s old_boot=%s new_boot=%s',
+                        kind, lost_id, session.endpoint,
+                        str(record.get('old_boot_id', ''))[:16],
+                        str(record.get('boot_id', ''))[:16])
             self._source_lost(lost_id)
             self._retire_group_member(lost_id, kind.replace('_', ' '), preserve_peers=True)
             self._close_source(lost_id)
@@ -455,11 +460,19 @@ class MultiDeviceRuntime:
             if detail:
                 reason = f'{reason} ({detail})'
             if 'requested_channel' in record:
-                reason = (f"{reason} (requested {record['requested_channel']}, "
+                reason = (f"{reason} ({record.get('channel_failure', 'unknown')}: "
+                          f"requested {record['requested_channel']}, "
                           f"actual {record.get('actual_channel', 0)}, "
                           f"mode {record.get('radio_mode', 'unknown')}, "
                           f"band {record.get('band', 'unknown')}, "
                           f"SDK {record.get('sdk_error', 'unknown')})")
+            log.warning('C5 job error device=%s endpoint=%s group=%s op=%s: %s',
+                        did, session.endpoint, group.identity, group.operation,
+                        str(reason)[:180])
+            if not group.first_error:
+                group.first_error = str(reason)[:180]
+            group.error = group.first_error
+            self.scan.error = group.error
             if record.get('state') == 'error' or not session.active:
                 self._retire_group_member(did, reason, group=group,
                     preserve_peers=group.passive and group.announced)
@@ -509,7 +522,10 @@ class MultiDeviceRuntime:
                                ('starting', 'running', 'stopping')), None)
         if group is None or device_id not in group.requests:
             return
-        group.error = str(reason)[:180]
+        # Keep the first failure across generic cleanup and reboot messages.
+        if not group.first_error:
+            group.first_error = str(reason)[:180]
+        group.error = group.first_error
         group.restore.clear()
         group.state = (('running' if group.announced else 'starting')
                        if group.passive and preserve_peers else 'stopping')
@@ -1244,7 +1260,10 @@ class MultiDeviceRuntime:
                 self._close_capture(key)
 
     def _storage_failure(self, group, error):
-        group.error = 'Capture storage failed: '+error[:100]
+        reason = 'Capture storage failed: '+error[:100]
+        if not group.first_error:
+            group.first_error = reason
+        group.error = group.first_error
         group.restore.clear()
         self.controller.stop_group(group.identity)
         self.app.msg('[C5] '+group.error, 8)
