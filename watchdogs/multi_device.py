@@ -62,6 +62,8 @@ class GroupView:
     state: str = 'starting'
     error: str = ''
     first_error: str = ''
+    first_error_source: tuple | None = None
+    first_error_replaceable: bool = False
     restore: dict = field(default_factory=dict)
     stopped: set = field(default_factory=set)
     snapshots: dict = field(default_factory=dict)
@@ -466,11 +468,32 @@ class MultiDeviceRuntime:
                           f"mode {record.get('radio_mode', 'unknown')}, "
                           f"band {record.get('band', 'unknown')}, "
                           f"SDK {record.get('sdk_error', 'unknown')})")
-            log.warning('C5 job error device=%s endpoint=%s group=%s op=%s: %s',
-                        did, session.endpoint, group.identity, group.operation,
-                        str(reason)[:180])
+            error_text = str(reason)[:180]
+            error_source = (did, record['boot_id'], token)
+            replaceable_channel_cleanup = (
+                group.operation == 'handshake'
+                and record.get('message') == 'operation_failed'
+                and record.get('failure_reason') == 'channel_apply_failed')
+            detailed_channel_error = (
+                group.operation == 'handshake'
+                and record.get('message') == 'channel_apply_failed'
+                and ('requested_channel' in record or 'channel_failure' in record))
+            log.warning('C5 job error device=%s boot=%s job=%s endpoint=%s '
+                        'group=%s op=%s: %s', did, error_source[1], token,
+                        session.endpoint, group.identity, group.operation,
+                        error_text)
             if not group.first_error:
-                group.first_error = str(reason)[:180]
+                group.first_error = error_text
+                group.first_error_source = error_source
+                group.first_error_replaceable = replaceable_channel_cleanup
+            elif (group.first_error_replaceable and detailed_channel_error
+                  and group.first_error_source == error_source):
+                # The firmware can report a generic cleanup result before the
+                # detailed channel failure. Replace only that same job's
+                # placeholder; storage and other member failures remain final.
+                group.first_error = error_text
+                group.first_error_source = error_source
+                group.first_error_replaceable = False
             group.error = group.first_error
             self.scan.error = group.error
             if record.get('state') == 'error' or not session.active:
@@ -525,6 +548,9 @@ class MultiDeviceRuntime:
         # Keep the first failure across generic cleanup and reboot messages.
         if not group.first_error:
             group.first_error = str(reason)[:180]
+            group.first_error_source = (
+                device_id, group.requests[device_id]['boot_id'], group.tokens[device_id])
+            group.first_error_replaceable = False
         group.error = group.first_error
         group.restore.clear()
         group.state = (('running' if group.announced else 'starting')
@@ -1261,8 +1287,12 @@ class MultiDeviceRuntime:
 
     def _storage_failure(self, group, error):
         reason = 'Capture storage failed: '+error[:100]
-        if not group.first_error:
+        if not group.first_error or group.first_error_replaceable:
+            # A real storage failure outranks the generic channel cleanup
+            # placeholder and must block any later same-job channel upgrade.
             group.first_error = reason
+            group.first_error_source = None
+            group.first_error_replaceable = False
         group.error = group.first_error
         group.restore.clear()
         self.controller.stop_group(group.identity)

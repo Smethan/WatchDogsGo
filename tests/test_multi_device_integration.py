@@ -902,6 +902,113 @@ def test_hs_channel_error_survives_operation_failure_and_boot_change(tmp_path, c
     assert group.error == first_error
     assert 'requested 36' in caplog.text
     assert 'boot_changed' in caplog.text
+    assert IDS[0] in caplog.text and BOOTS[0] in caplog.text and token in caplog.text
+
+
+def test_hs_generic_channel_cleanup_is_replaced_by_same_job_diagnostic(tmp_path, caplog):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    token = group.tokens[IDS[0]]
+    with caplog.at_level('WARNING', logger='watchdogs.multi_device'):
+        h.emit(0, lifecycle('error', 0, token, seq=2, state='stopping',
+                            message='operation_failed',
+                            failure_reason='channel_apply_failed'))
+        generic = group.error
+        assert 'operation_failed' in generic
+        h.emit(0, lifecycle('error', 0, token, seq=3, state='running',
+                            message='channel_apply_failed', channel_failure='readback',
+                            requested_channel=36, actual_channel=36,
+                            radio_mode='sta_ap', band='5g', sdk_error=-1))
+    assert 'readback: requested 36' in group.error
+    assert group.first_error == group.error and not group.first_error_replaceable
+    messages = [record.message for record in caplog.records]
+    assert any('operation_failed' in message and token in message for message in messages)
+    assert any('readback: requested 36' in message and token in message for message in messages)
+
+
+def test_hs_channel_diagnostic_from_other_device_cannot_replace_cleanup(tmp_path):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    token0, token1 = group.tokens[IDS[0]], group.tokens[IDS[1]]
+    h.emit(0, lifecycle('error', 0, token0, seq=2, state='stopping',
+                        message='operation_failed',
+                        failure_reason='channel_apply_failed'))
+    generic = group.error
+    h.emit(1, lifecycle('error', 1, token1, seq=2, state='running',
+                        message='channel_apply_failed', channel_failure='readback',
+                        requested_channel=36, actual_channel=40,
+                        radio_mode='sta_ap', band='5g', sdk_error=-1))
+    assert group.error == generic
+
+
+def test_hs_channel_cleanup_stops_peer_and_new_group_has_clean_error(tmp_path):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    token = group.tokens[IDS[0]]
+    h.emit(0, lifecycle('error', 0, token, seq=2, state='error',
+                        message='operation_failed',
+                        failure_reason='channel_apply_failed'))
+    assert group.state == 'stopping'
+    assert any(command == 'job_stop ' + group.tokens[IDS[1]]
+               for command in h.serials[1].commands)
+    h.stop_ack(1, token=group.tokens[IDS[1]], seq=2)
+    assert group.state == 'error'
+
+    assert h.runtime.start_command('start_handshake_serial')
+    fresh = h.runtime.groups[h.runtime.foreground]
+    assert fresh is not group and fresh.error == fresh.first_error == ''
+    assert fresh.first_error_source is None and not fresh.first_error_replaceable
+
+
+def test_hs_no_sd_default_selects_all_capable_c5_devices_without_old_channel_144(tmp_path):
+    h = Harness(tmp_path, boards=('xiao', 'xiao'))
+    channels = [1, 6, 11, 36, 40, 140, 144, 149]
+    for index in (0, 1):
+        metadata = json.loads(device_info(index, 'xiao', channels)[4:])
+        if index == 0:
+            metadata['firmware_version'] = '1.8.5'
+        h.emit(index, wire(metadata))
+    assert h.runtime.start_command('start_handshake_serial')
+    group = h.runtime.groups[h.runtime.foreground]
+    assert set(group.requests) == set(IDS)
+    assert all(request['options'] == {'storage':'serial','scope':'all'}
+               for request in group.requests.values())
+    assert all(group.roles[did] == 'foreground' for did in IDS)
+    assert all(144 not in request['channels'] for request in group.requests.values())
+
+
+def test_hs_storage_failure_replaces_generic_channel_cleanup(tmp_path):
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    token = group.tokens[IDS[0]]
+    h.emit(0, lifecycle('error', 0, token, seq=2, state='stopping',
+                        message='operation_failed',
+                        failure_reason='channel_apply_failed'))
+    assert group.first_error_replaceable
+
+    h.runtime._storage_failure(group, 'disk full')
+    storage_error = 'Capture storage failed: disk full'
+    assert group.error == group.first_error == storage_error
+    assert group.first_error_source is None
+    assert not group.first_error_replaceable
+
+    h.emit(0, lifecycle('error', 0, token, seq=3, state='running',
+                        message='channel_apply_failed', channel_failure='readback',
+                        requested_channel=36, actual_channel=36,
+                        radio_mode='sta_ap', band='5g', sdk_error=-1))
+    assert group.error == group.first_error == storage_error
 
 
 def test_hs_storage_failure_survives_later_firmware_error(tmp_path):

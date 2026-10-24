@@ -10,6 +10,13 @@ minor versions.
 
 ## Unreleased
 
+### Fixed
+
+- Preserve the detailed C5 channel failure when its generic
+  `operation_failed` cleanup record arrives first, scoped to the same device,
+  boot, and job. Keep storage failures and other devices' errors intact, and
+  include source identity in managed-job error logs.
+
 ## [0.9.69] — 2026-10-01
 
 ### Fixed

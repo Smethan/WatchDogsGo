@@ -1,3 +1,32 @@
+# 0.10.6 — Managed C5 handshake error retention — 2026-10-24
+
+- Keep the all-capable C5 default and existing **HS Capture no SD** command and
+  serial storage path. If generic channel cleanup arrives before its diagnostic,
+  replace it on the progress screen only with a detailed error from the same
+  device, boot, and job. Preserve storage errors and other devices' causes.
+- Include device ID, boot ID, and job token in each managed-job error log entry.
+  Add regressions for event ordering, source isolation, peer cleanup, fresh
+  groups, and all-capable selection.
+- Work around the confirmed projectZero 1.8.5 channel 144 failure: the XIAO
+  advertises channel 144, but the managed handshake driver returns SDK 258
+  (`ESP_ERR_INVALID_ARG`); channels 140, 149 and 165 apply. For handshake jobs,
+  omit 144 from default plans when firmware version is missing or below 1.8.6.
+  Reject targetless explicit channel lists containing 144 if any included board
+  has missing or older firmware. Assign selected channel-144 networks only to
+  eligible 1.8.6-or-newer boards that advertise the channel, and fail planning
+  if no such board can cover them. The paired 1.8.6 candidate omits channel 144
+  from its metadata; later firmware can use it only when it advertises it.
+- The projectZero 1.8.6 secondary-channel readback fix is separate from this
+  channel 144 driver error: it accepts an SDK-selected secondary channel when
+  the requested 5 GHz primary matches.
+
+This host release pairs with projectZero firmware 1.8.6 at commit
+`609ae3c7a949ca441d1de3d4bfa9bc5ea5ed04bd`. The 1,387 host tests and
+native firmware suite passed. A board-matched XIAO candidate ran a bounded
+selected-scope no-SD job across channels 6, 140, and 149 for 15 seconds with no
+job errors and a clean stop. A controlled AP/client exchange, saved PCAPNG,
+and physical two-board operation remain unverified.
+
 # Smethan WatchDogsGo
 
 ## 0.10.5 — Native USB capability and update safeguards — 2026-10-15

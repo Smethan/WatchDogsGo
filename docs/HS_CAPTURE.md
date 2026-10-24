@@ -21,6 +21,29 @@ deauthentication behavior. [HS Sniff](PASSIVE_HS_SNIFF.md) is the passive option
 The original SD capture retains its warning triangle and SD requirement. Neither
 active capture mode needs GPS.
 
+## Confirmed channel 144 failure on firmware 1.8.5
+
+The installed XIAO running projectZero 1.8.5 advertises channel 144, but a
+managed handshake job on channel 144 alone fails with `channel_apply_failed`
+and ESP-IDF error 258 (`ESP_ERR_INVALID_ARG`). The same device successfully
+applies channels 140, 149 and 165. This matches the reported no-SD failure;
+the driver rejects channel 144 even though firmware advertises it.
+
+WatchDogsGo 0.10.6 omits channel 144 from targetless handshake plans when
+firmware version is missing or older than 1.8.6. A targetless explicit channel
+list containing 144 is rejected if any included device has missing or older
+firmware, because that list would be sent to that device. A selected network on
+channel 144 can instead be assigned to an eligible firmware 1.8.6-or-newer C5
+that advertises the channel; planning fails before dispatch if no such device
+can cover it. The projectZero 1.8.6 candidate in this release omits channel 144
+from its metadata, so it cannot use channel 144. A future firmware build can
+use it only when its metadata advertises the channel. Other supported channels
+remain available.
+
+The firmware 1.8.6 secondary-channel readback change is separate: it accepts an
+SDK-selected 5 GHz secondary channel when the requested primary channel matches.
+That check does not explain or fix the channel 144 driver invalid-argument error.
+
 ## Optional network selection
 
 Press **N** from either capture screen, then use:
@@ -195,10 +218,14 @@ capture stop. Disconnects and final cleanup stop the local running indicator.
 
 `operation_failed` means the firmware stopped the job after a specific failure;
 it is a cleanup result, not the underlying cause. For channel failures, WDG
-keeps the first job error on the progress screen and records it in
-`~/.watchdogs/last_run.log` with the device, endpoint, failure type,
-requested and actual channel, Wi-Fi mode, band, and SDK error. A later `operation_failed` or
-`boot changed` should not replace that first reason. The log is rotated to
+keeps the first job error on the progress screen and records each error in
+`~/.watchdogs/last_run.log` with the device, boot ID, job token, endpoint,
+failure type, requested and actual channel, Wi-Fi mode, band, and SDK error.
+If the generic `operation_failed (channel_apply_failed)` arrives first, a later
+detailed channel error replaces it only when it belongs to the same device,
+boot, and job. Storage errors and another device's errors are never replaced.
+A later cleanup or `boot changed` message does not replace a specific reason.
+The log is rotated to
 `previous_run.log` on the next WDG launch, so save the relevant session before
 restarting WDG if the failure needs investigation.
 
@@ -207,13 +234,12 @@ job. This is evidence of a changed firmware session, but the message alone does
 not distinguish a device reset from stale metadata after a reconnect. Note the
 time and any USB disconnect or reset, then inspect the same WDG log session.
 If a channel error preceded it, diagnose that first. When reporting a failure,
-include the first detailed error and the later cleanup or boot message.
+include the detailed channel error and any later cleanup or boot message.
 
-The ESP32-C5's 5 GHz channel readback can report an automatically selected
-secondary channel even when capture requested `NONE`. Firmware checks the
-requested primary channel on both bands and requires `NONE` only on 2.4 GHz.
-This prevents a valid 5 GHz switch from being rejected solely because of the
-secondary readback; an SDK set error or wrong primary still stops capture.
+The firmware 1.8.6 readback fix accepts the ESP32-C5 SDK's automatically
+selected 5 GHz secondary channel when the requested primary channel matches;
+2.4 GHz still requires no secondary channel. It handles readback validation and
+is separate from the confirmed 1.8.5 channel 144 SDK error described above.
 
 Native firmware tests cover framing, bounded queues, storage identity, cleanup,
 allocation failure, target parsing/filtering, scan lifecycle and exchange

@@ -1,11 +1,15 @@
 import base64
 import hashlib
 import json
+import struct
 import zlib
+import io
+import zipfile
 from unittest.mock import Mock
 import pytest
 from watchdogs.usb_ota import UsbOtaRunner
 from watchdogs import usb_ota
+from watchdogs.config import FLASH_BOARDS, FIRMWARE_REPO
 from test_firmware_ota import release, info
 
 
@@ -98,6 +102,60 @@ def setup(tmp_path, monkeypatch):
     dev = Device(image)
     runner = UsbOtaRunner(dev, Mock(), tmp_path, clock=lambda: dev.now, sleep=dev.sleep)
     return dev, runner, downloader
+
+
+def candidate_bundle(image, *, board='xiao', manifest_board=None, version='1.8.6',
+                    source_commit='a'*40, source_dirty=False, changed_hash=False,
+                    bad_geometry=False):
+    profile = FLASH_BOARDS[board]
+    if board == 'waveshare-zero':
+        raise ValueError('test helper only builds USB OTA boards')
+    parts = [
+        (0, 0x10, 0, 0x20000, 0x3F0000, 'ota_0'),
+        (0, 0x11, 0, 0x410000, 0x3F0000, 'ota_1'),
+        (1, 2, 0, 0x9000, 0x6000, 'nvs'),
+    ]
+    partition = b''.join(struct.pack('<HBBII16sI', 0x50AA, kind, subtype,
+                      offset, size, name.encode().ljust(16, b'\0'), flags)
+                      for kind, subtype, flags, offset, size, name in parts) + b'\xff'*32
+    files = {
+        'bootloader.bin': b'bootloader',
+        'partition-table.bin': partition,
+        'ota_data_initial.bin': b'ota-data',
+        profile['bin_name']: image,
+    }
+    partitions = [dict(name=name, type=kind, subtype=subtype, offset=offset,
+                       size=size, flags=flags)
+                  for kind, subtype, flags, offset, size, name in parts]
+    manifest = dict(
+        format=2, repository=FIRMWARE_REPO, board=manifest_board or board, chip='esp32c5',
+        version=version, flash_bytes=profile['flash_bytes'],
+        application_limit=profile['app_limit'] - (1 if bad_geometry else 0),
+        application_offset=0x20000, application_size=0x3F0000,
+        console='uart' if board == 'wroom' else 'usb-serial-jtag',
+        updates=['usb-ota', 'rom'], psram=True, partitions=partitions,
+        source_commit=source_commit, source_dirty=source_dirty,
+        files={name:dict(offset=profile['offsets'][name], size=len(data),
+                         sha256=hashlib.sha256(data).hexdigest())
+               for name, data in files.items()},
+    )
+    if changed_hash:
+        files[profile['bin_name']] = b'changed image'
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+        archive.writestr('manifest.json', json.dumps(manifest, separators=(',', ':')))
+    return output.getvalue()
+
+
+def _run_candidate(setup, tmp_path, **bundle_options):
+    dev, runner, downloader = setup
+    dev.version = '1.8.6'
+    path = tmp_path / 'candidate.zip'
+    path.write_bytes(candidate_bundle(dev.image, **bundle_options))
+    result = runner.run_candidate(path, 'a'*40)
+    return dev, result, downloader
 
 
 @pytest.mark.parametrize('reboot', [False, True])
@@ -254,3 +312,49 @@ def test_invalid_ready_state_cannot_send_data_or_finish(setup, offset, active):
     dev.send = send
     assert runner.run(release('v1.7.7')).state == 'unconfirmed'
     assert not dev.crc_seen and not dev.applied
+
+
+def test_local_candidate_bundle_uses_guarded_usb_ota_without_download(setup, tmp_path):
+    dev, result, downloader = _run_candidate(setup, tmp_path)
+    assert result.state == 'success' and result.version == '1.8.6'
+    assert dev.applied and downloader.call_count == 0
+
+
+def test_local_candidate_requires_full_expected_source_commit_before_io(setup, tmp_path):
+    dev, runner, downloader = setup
+    path = tmp_path / 'candidate.zip'
+    path.write_bytes(candidate_bundle(dev.image))
+    result = runner.run_candidate(path, 'a'*39)
+    assert result.state == 'failed'
+    assert dev.commands == [] and downloader.call_count == 0
+
+
+@pytest.mark.parametrize('options,expected_commit', [
+    ({'manifest_board':'invalid'}, 'a'*40),
+    ({}, 'b'*40),
+    ({'source_dirty':True}, 'a'*40),
+    ({'changed_hash':True}, 'a'*40),
+    ({'bad_geometry':True}, 'a'*40),
+    ({'version':'candidate'}, 'a'*40),
+])
+def test_local_candidate_rejections_happen_before_ota_write(
+        setup, tmp_path, options, expected_commit):
+    dev, runner, downloader = setup
+    dev.version = '1.8.6'
+    path = tmp_path / 'candidate.zip'
+    path.write_bytes(candidate_bundle(dev.image, **options))
+    result = runner.run_candidate(path, expected_commit)
+    assert result.state == 'failed'
+    assert not dev.applied and downloader.call_count == 0
+    assert dev.commands == []
+
+
+def test_valid_candidate_for_other_connected_board_is_rejected_before_stop(setup, tmp_path):
+    dev, runner, downloader = setup
+    dev.version = '1.8.6'
+    path = tmp_path / 'candidate.zip'
+    path.write_bytes(candidate_bundle(dev.image, board='wroom'))
+    result = runner.run_candidate(path, 'a'*40)
+    assert result.state == 'failed'
+    assert dev.commands == ['version', 'uota_status']
+    assert downloader.call_count == 0 and not dev.applied

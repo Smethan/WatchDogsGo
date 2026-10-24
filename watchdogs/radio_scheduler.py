@@ -40,6 +40,23 @@ def _identity(device: Any) -> tuple[str, str, list[int], dict[str, int], set[str
     return device_id, boot_id, channels, limits, operations
 
 
+def _supports_handshake_channel_144(device: Any) -> bool:
+    version = _info(device).get("firmware_version", _field(device, "firmware_version"))
+    if not isinstance(version, str):
+        return False
+    parts = version.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        return False
+    return tuple(int(part) for part in parts) >= (1, 8, 6)
+
+
+def _without_unsupported_handshake_144(device: Any, channels: list[int],
+                                         operation: str) -> list[int]:
+    if operation == "handshake" and not _supports_handshake_channel_144(device):
+        return [channel for channel in channels if channel != 144]
+    return channels
+
+
 def _target_channel(target: Mapping[str, Any]) -> int:
     channel = target.get("channel")
     if type(channel) is not int or not 1 <= channel <= 196:
@@ -305,7 +322,8 @@ class RadioScheduler:
             eligible.append({"id": current_id, "boot": boot,
                              "channels": supported_channels, "limits": limits,
                              "board": str(_field(device, "board", _info(device).get("board", ""))),
-                             "roles": set(_field(device, "roles", ()) or ())})
+                             "roles": set(_field(device, "roles", ()) or ()),
+                             "firmware_version": _info(device).get("firmware_version")})
         if not eligible:
             raise CapacityError(f"no connected device supports {operation}")
         if device_id:
@@ -327,6 +345,23 @@ class RadioScheduler:
         ble_ops = {"ble_scan", "bt_track", "airtag_scan"}
         if operation in ble_ops and target_list:
             raise ValueError("BLE-only operations do not accept WiFi targets")
+        requested_channels = list(channels) if channels is not None else sorted({
+            _target_channel(target) for target in target_list})
+        if operation == "handshake":
+            stale_devices = [device for device in eligible
+                             if not _supports_handshake_channel_144(device)]
+            if channels is not None and 144 in requested_channels and stale_devices:
+                raise CapacityError(
+                    "Handshake channel 144 requires firmware 1.8.6 or newer; "
+                    "update the listed C5 before selecting that channel")
+            for device in stale_devices:
+                device["channels"] = [channel for channel in device["channels"]
+                                      if channel != 144]
+            if (target_list and any(_target_channel(target) == 144 for target in target_list)
+                    and not any(144 in device["channels"] for device in eligible)):
+                raise CapacityError(
+                    "Handshake channel 144 requires firmware 1.8.6 or newer; "
+                    "update a capable C5 before selecting that network")
         if operation in {"portal", "evil_twin"}:
             if target_list and len(target_list) > eligible[0]["limits"].get("targets", 64):
                 raise CapacityError(f"{operation} targets exceed single-device capacity")
@@ -334,8 +369,6 @@ class RadioScheduler:
         else:
             assigned = self._assign_targets(target_list, eligible) if target_list else {
                 device["id"]: [] for device in eligible}
-        requested_channels = list(channels) if channels is not None else sorted({
-            _target_channel(target) for target in target_list})
         if operation in ble_ops:
             if channels is not None and requested_channels:
                 raise ValueError("BLE-only operations do not accept WiFi channels")

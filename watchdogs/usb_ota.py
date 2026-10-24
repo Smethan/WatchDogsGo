@@ -1,13 +1,19 @@
 """Verified app-only USB OTA with acknowledged chunks and durable resume."""
 import base64
 import hashlib
+import io
 import json
 from pathlib import Path
+import re
 import time
 import zlib
+import zipfile
 
 from .firmware_ota import OtaRunner, OtaResult, OtaError, validate_release
-from .updates import prepare_firmware, release_version
+from .updates import prepare_firmware, release_version, validate_bundle
+from .config import FLASH_BOARDS
+
+MAX_CANDIDATE_BUNDLE = 12 * 1024 * 1024
 
 
 class UsbOtaRunner(OtaRunner):
@@ -87,27 +93,108 @@ class UsbOtaRunner(OtaRunner):
         return position
 
     def run(self, release, ssid='', password='', *, discard=False):
+        return self._run(release, ssid, password, discard=discard)
+
+    def run_candidate(self, bundle_path, expected_source_commit, *, discard=False):
+        """Install a local source-pinned bundle through guarded USB OTA."""
+        return self._run(None, discard=discard, candidate_path=bundle_path,
+                         expected_source_commit=expected_source_commit)
+
+    def _load_candidate(self, bundle_path, expected_source_commit):
+        if not isinstance(expected_source_commit, str) or not re.fullmatch(
+                r'[0-9a-fA-F]{40}', expected_source_commit):
+            raise OtaError('Candidate source commit must be a full 40-character hash.')
+        path = Path(bundle_path)
         try:
-            tag = validate_release(release)
+            if not path.is_file() or path.stat().st_size > MAX_CANDIDATE_BUNDLE:
+                raise OtaError('Candidate bundle is missing or exceeds the size limit.')
+            blob = path.read_bytes()
+        except OtaError:
+            raise
+        except OSError as exc:
+            raise OtaError('Could not read the local firmware candidate bundle.') from exc
+        if len(blob) > MAX_CANDIDATE_BUNDLE:
+            raise OtaError('Candidate bundle exceeds the size limit.')
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+                names = archive.namelist()
+                if names.count('manifest.json') != 1:
+                    raise OtaError('Unexpected or missing candidate firmware manifest.')
+                if archive.getinfo('manifest.json').file_size > 16384:
+                    raise OtaError('Candidate manifest exceeds the size limit.')
+                manifest = json.loads(archive.read('manifest.json'))
+            if not isinstance(manifest, dict):
+                raise OtaError('Invalid candidate firmware manifest.')
+            board = manifest.get('board')
+            if board not in ('xiao', 'wroom'):
+                raise OtaError('Application USB OTA supports only XIAO and WROOM boards.')
+            expected = set(FLASH_BOARDS[board]['offsets']) | {'manifest.json'}
+            if len(names) != len(expected) or set(names) != expected:
+                raise OtaError('Unexpected or missing candidate bundle files.')
+            if manifest.get('format') != 2:
+                raise OtaError('Candidate requires a board geometry manifest.')
+            version = manifest.get('version')
+            if not isinstance(version, str):
+                raise OtaError('Candidate has an invalid firmware version.')
+            tag = 'v' + version
+            release_version(tag)
+            source_commit = manifest.get('source_commit')
+            if (not isinstance(source_commit, str)
+                    or not re.fullmatch(r'[0-9a-fA-F]{40}', source_commit)
+                    or source_commit.lower() != expected_source_commit.lower()):
+                raise OtaError('Candidate source commit does not match the expected commit.')
+            if manifest.get('source_dirty') is not False:
+                raise OtaError('Candidate was built from a dirty source tree.')
+            files = validate_bundle(blob, board, version)
+            return tag, board, files[FLASH_BOARDS[board]['bin_name']]
+        except OtaError:
+            raise
+        except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile) as exc:
+            raise OtaError('Candidate bundle failed manifest, hash, or geometry validation.') from exc
+
+    def _run(self, release, ssid='', password='', *, discard=False,
+             candidate_path=None, expected_source_commit=None):
+        try:
+            candidate_board = None
+            candidate_image = None
+            if candidate_path is None:
+                tag = validate_release(release)
+            else:
+                tag, candidate_board, candidate_image = self._load_candidate(
+                    candidate_path, expected_source_commit)
             self.report('Checking application-mode USB OTA support...', None)
+            candidate_current = None
+            if candidate_path is not None:
+                candidate_current = self.version()
+                if release_version(candidate_current) < (1, 7, 7):
+                    return OtaResult('failed', 'USB OTA requires firmware 1.7.7+. Install it once using Wi-Fi OTA.', candidate_current)
+                # Read-only board discovery comes before stop so a valid bundle
+                # for another connected board cannot interrupt the active job.
+                status = self.check(self.exchange('uota_status'), 'status')
+                if status['board'] != candidate_board:
+                    raise OtaError('Candidate board does not match the connected ESP32.')
             self.send('stop')
             self.wait(lambda line: line in ('All operations stopped.',
                       'USB OTA is active; finish or abort it first.'), 30,
                       'Could not stop scans or confirm the pending USB transfer.')
-            current = self.version()
+            current = candidate_current or self.version()
             if release_version(current) < (1, 7, 7):
                 return OtaResult('failed', 'USB OTA requires firmware 1.7.7+. Install it once using Wi-Fi OTA.', current)
-            status = self.check(self.exchange('uota_status'), 'status')
+            if candidate_path is None:
+                status = self.check(self.exchange('uota_status'), 'status')
             board = status['board']
             before = self.info()
             if before['boot'] != before['running'] or before['state'] != 2:
                 raise OtaError('Current OTA slot is not stable/valid. Reboot normally first.')
-            self.report('Downloading and verifying the selected firmware on the uConsole...', None)
-            selected, directory = prepare_firmware(self.directory, board, release=release)
-            if selected != tag:
-                raise OtaError('Unexpected firmware release')
-            filename = 'projectZerobyLOCOSP' + ('-xiao' if board == 'xiao' else '') + '.bin'
-            image = (Path(directory) / filename).read_bytes()
+            if candidate_path is None:
+                self.report('Downloading and verifying the selected firmware on the uConsole...', None)
+                selected, directory = prepare_firmware(self.directory, board, release=release)
+                if selected != tag:
+                    raise OtaError('Unexpected firmware release')
+                filename = 'projectZerobyLOCOSP' + ('-xiao' if board == 'xiao' else '') + '.bin'
+                image = (Path(directory) / filename).read_bytes()
+            else:
+                image = candidate_image
             digest = hashlib.sha256(image).hexdigest()
             if discard and status.get('sha256'):
                 self.check(self.exchange('uota_abort ' + status['sha256']), 'aborted')

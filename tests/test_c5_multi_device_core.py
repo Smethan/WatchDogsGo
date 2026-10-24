@@ -878,6 +878,62 @@ def test_scheduler_singleboard_can_plan_both_bands_and_generic_operations():
     assert scan["requests"][DEVICE_ID]["channels"] == [149]
 
 
+def test_handshake_default_omits_channel_144_for_missing_or_old_firmware():
+    channels = [1, 6, 11, 36, 40, 140, 144, 149]
+    scheduler = RadioScheduler()
+    for metadata in ({}, {"firmware_version": "1.8.5"}):
+        device = info(channels=channels, operations=["handshake"], **metadata)
+        request = scheduler.plan([device], "handshake", options={
+            "storage": "serial", "scope": "all"})["requests"][DEVICE_ID]
+        assert 144 not in request["channels"]
+        assert 140 in request["channels"] and 149 in request["channels"]
+
+
+def test_handshake_explicit_channel_and_selected_target_144_require_firmware_186():
+    scheduler = RadioScheduler()
+    for metadata in ({}, {"firmware_version": "1.8.5"}):
+        device = info(channels=[1, 6, 11, 36, 40, 140, 144, 149],
+                      operations=["handshake"], **metadata)
+        with pytest.raises(CapacityError, match="channel 144 requires firmware 1.8.6"):
+            scheduler.plan([device], "handshake", channels=[144])
+        with pytest.raises(CapacityError, match="channel 144 requires firmware 1.8.6"):
+            scheduler.plan([device], "handshake", targets=[target(channel=144)])
+
+
+def test_handshake_channel_144_remains_available_with_firmware_186():
+    device = info(channels=[1, 6, 11, 36, 40, 140, 144, 149],
+                  operations=["handshake"], firmware_version="1.8.6")
+    request = RadioScheduler().plan([device], "handshake", options={
+        "storage": "serial", "scope": "all"})["requests"][DEVICE_ID]
+    assert {140, 144, 149}.issubset(request["channels"])
+
+
+def test_handshake_channel_144_target_uses_new_firmware_device_in_mixed_pool():
+    old = info(device_id="A1B2C3D4E5F6", boot_id="0123456789ABCDEF",
+               channels=[144], operations=["handshake"], firmware_version="1.8.5")
+    new = info(device_id="112233445566", boot_id="1111111111111111",
+               board="waveshare-zero", channels=[144], operations=["handshake"],
+               firmware_version="1.8.6")
+    plan = RadioScheduler().plan([old, new], "handshake",
+                                 targets=[target(channel=144)])
+    assert set(plan["requests"]) == {"112233445566"}
+    assert plan["requests"]["112233445566"]["channels"] == [144]
+
+
+def test_handshake_channel_144_target_fails_when_new_firmware_capacity_is_insufficient():
+    limits = {"targets": 1, "exclusions": 32, "batch": 32, "aps": 128,
+              "clients": 64, "probes": 64}
+    old = info(device_id="A1B2C3D4E5F6", boot_id="0123456789ABCDEF",
+               channels=[144], operations=["handshake"], firmware_version="1.8.5")
+    new = info(device_id="112233445566", boot_id="1111111111111111",
+               board="waveshare-zero", channels=[144], operations=["handshake"],
+               firmware_version="1.8.6", limits=limits)
+    with pytest.raises(CapacityError, match="targets cannot be fully covered"):
+        RadioScheduler().plan([old, new], "handshake", targets=[
+            target(mac="00:11:22:33:44:55", channel=144),
+            target(mac="00:11:22:33:44:66", channel=144)])
+
+
 def test_generic_scheduler_splits_wifi_bands_skips_empty_target_jobs_and_keeps_ble_single_owner():
     xiao = info(channels=[1, 6], operations=["wifi_scan", "ble_scan", "portal"])
     zero = info("112233445566", "1111111111111111", "waveshare-zero", [36, 40],
