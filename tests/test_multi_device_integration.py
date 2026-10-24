@@ -986,6 +986,24 @@ def test_hs_no_sd_default_selects_all_capable_c5_devices_without_old_channel_144
     assert all(144 not in request['channels'] for request in group.requests.values())
 
 
+def test_hs_no_sd_mixed_default_keeps_all_c5s_and_routes_144_only_to_xiao(tmp_path):
+    h = Harness(tmp_path, boards=('xiao', 'wroom'))
+    xiao = json.loads(device_info(0, 'xiao', [1, 6, 11, 36, 40, 140, 144, 149])[4:])
+    xiao['firmware_version'] = '1.8.7'
+    wroom = json.loads(device_info(1, 'wroom', [1, 6, 11, 36, 40, 149])[4:])
+    wroom['firmware_version'] = '1.8.7'
+    h.emit(0, wire(xiao))
+    h.emit(1, wire(wroom))
+
+    assert h.runtime.start_command('start_handshake_serial')
+    group = h.runtime.groups[h.runtime.foreground]
+    assert set(group.requests) == set(IDS)
+    assert 144 in group.requests[IDS[0]]['channels']
+    assert 144 not in group.requests[IDS[1]]['channels']
+    assert all(request['options'] == {'storage':'serial','scope':'all'}
+               for request in group.requests.values())
+
+
 def test_hs_storage_failure_replaces_generic_channel_cleanup(tmp_path):
     h = Harness(tmp_path, loot=True)
     assert h.runtime.start('handshake', options={'storage':'serial','scope':'all'})

@@ -350,15 +350,12 @@ class RadioScheduler:
         if operation == "handshake":
             stale_devices = [device for device in eligible
                              if not _supports_handshake_channel_144(device)]
-            if channels is not None and 144 in requested_channels and stale_devices:
-                raise CapacityError(
-                    "Handshake channel 144 requires firmware 1.8.6 or newer; "
-                    "update the listed C5 before selecting that channel")
             for device in stale_devices:
                 device["channels"] = [channel for channel in device["channels"]
                                       if channel != 144]
-            if (target_list and any(_target_channel(target) == 144 for target in target_list)
-                    and not any(144 in device["channels"] for device in eligible)):
+            needs_144 = (144 in requested_channels or
+                         any(_target_channel(target) == 144 for target in target_list))
+            if needs_144 and not any(144 in device["channels"] for device in eligible):
                 raise CapacityError(
                     "Handshake channel 144 requires firmware 1.8.6 or newer; "
                     "update a capable C5 before selecting that network")
@@ -388,9 +385,16 @@ class RadioScheduler:
             if target_list and not own:
                 continue
             own_channels = sorted({_target_channel(target) for _, target in own}) or requested_channels
+            if operation == "handshake" and 144 in own_channels and 144 not in device["channels"]:
+                own_channels = [channel for channel in own_channels if channel != 144]
             if not own_channels and channels is None and not target_list and operation not in ble_ops:
                 defaults = wifi24 if device["board"] == "xiao" else wifi5 if device["board"] == "waveshare-zero" else wifi24 + wifi5
                 own_channels = [c for c in defaults if c in device["channels"]]
+                if (operation == "handshake" and device["board"] == "xiao"
+                        and 144 in device["channels"]):
+                    own_channels = sorted(set(own_channels + [144]))
+            if not own_channels and operation not in ble_ops:
+                continue
             if own_channels and any(channel not in device["channels"] for channel in own_channels):
                 raise CapacityError(f"requested channel unsupported by {device['id']}")
             request = {

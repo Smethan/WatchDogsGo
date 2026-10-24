@@ -1,3 +1,18 @@
+# 0.10.7 — Mixed-board HS Capture scheduling — 2026-10-24
+
+- Schedule managed HS Capture across mixed C5 boards using each board's
+  advertised capabilities, preserving all boards capable of covering the
+  requested channels.
+- Pair with projectZero 1.8.7 at commit
+  `1080f9f4548e8e9ff019584073247a005c9d8452`. The installed XIAO
+  candidate completed managed no-SD jobs on 144 alone and through
+  6/140/144/149 with no errors, clean stop, and ready recovery. These jobs
+  used synthetic selected BSSIDs with the previous 0.10.6 host; a controlled
+  AP/client exchange and a physical two-board run remain unverified.
+
+The host suite passed with the mixed-board scheduling tests. The 0.10.6
+notes below describe the previous channel 144 workaround.
+
 # 0.10.6 — Managed C5 handshake error retention — 2026-10-24
 
 - Keep the all-capable C5 default and existing **HS Capture no SD** command and

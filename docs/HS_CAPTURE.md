@@ -44,6 +44,21 @@ The firmware 1.8.6 secondary-channel readback change is separate: it accepts an
 SDK-selected 5 GHz secondary channel when the requested primary channel matches.
 That check does not explain or fix the channel 144 driver invalid-argument error.
 
+## Channel 144 evidence with firmware 1.8.7
+
+projectZero 1.8.7 sets the US country at Wi-Fi initialization
+and enables channel 144 only on the XIAO profile. WROOM and Zero remain
+conservative, and US 2.4 GHz channels 12–14 remain excluded. A live direct
+`packet_monitor` tune/readback on XIAO succeeded for US primary 144 with
+`ESP_OK`. The installed XIAO candidate also completed a managed no-SD job on
+144 alone and another across 6/140/144/149 with no errors, clean stop, and
+ready recovery. Those jobs used synthetic selected BSSIDs with WatchDogsGo
+0.10.6, so they do not establish a controlled AP/client handshake or PCAPNG
+save. WatchDogsGo 0.10.7 uses capability-aware mixed-board scheduling so all
+capable boards are retained; a physical two-board run remains unverified.
+
+The 1.8.5 failure and 1.8.6 workaround above are historical.
+
 ## Optional network selection
 
 Press **N** from either capture screen, then use:

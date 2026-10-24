@@ -908,6 +908,126 @@ def test_handshake_channel_144_remains_available_with_firmware_186():
     assert {140, 144, 149}.issubset(request["channels"])
 
 
+def test_handshake_channel_144_default_is_added_to_advertising_xiao_alone():
+    device = info(
+        channels=[1, 6, 11, 36, 40, 140, 144, 149],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    request = RadioScheduler().plan(
+        [device], "handshake", options={"storage": "serial", "scope": "all"}
+    )["requests"][DEVICE_ID]
+    assert 144 in request["channels"]
+    assert request["options"] == {"storage": "serial", "scope": "all"}
+
+
+def test_handshake_mixed_default_keeps_all_boards_and_only_adds_144_to_xiao():
+    xiao = info(
+        channels=[1, 6, 11, 36, 40, 140, 144, 149],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    wroom = info(
+        device_id="112233445566",
+        boot_id="1111111111111111",
+        board="wroom",
+        channels=[1, 6, 11, 36, 40, 149],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    plan = RadioScheduler().plan(
+        [xiao, wroom], "handshake", options={"storage": "serial", "scope": "all"}
+    )
+    assert set(plan["requests"]) == {DEVICE_ID, "112233445566"}
+    assert 144 in plan["requests"][DEVICE_ID]["channels"]
+    assert 144 not in plan["requests"]["112233445566"]["channels"]
+    assert all(
+        request["options"] == {"storage": "serial", "scope": "all"}
+        for request in plan["requests"].values()
+    )
+
+
+def test_handshake_explicit_144_only_plans_advertising_device_in_mixed_pool():
+    xiao = info(
+        channels=[1, 6, 11, 144], operations=["handshake"], firmware_version="1.8.7"
+    )
+    wroom = info(
+        device_id="112233445566",
+        boot_id="1111111111111111",
+        board="wroom",
+        channels=[1, 6, 11, 36, 40],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    plan = RadioScheduler().plan([xiao, wroom], "handshake", channels=[144])
+    assert set(plan["requests"]) == {DEVICE_ID}
+    assert plan["requests"][DEVICE_ID]["channels"] == [144]
+
+
+def test_handshake_mixed_explicit_shared_and_144_keeps_each_supported_channel():
+    xiao = info(
+        channels=[1, 6, 11, 144], operations=["handshake"], firmware_version="1.8.7"
+    )
+    wroom = info(
+        device_id="112233445566",
+        boot_id="1111111111111111",
+        board="wroom",
+        channels=[1, 6, 11],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    plan = RadioScheduler().plan([xiao, wroom], "handshake", channels=[6, 144])
+    assert set(plan["requests"]) == {DEVICE_ID, "112233445566"}
+    assert plan["requests"][DEVICE_ID]["channels"] == [6, 144]
+    assert plan["requests"]["112233445566"]["channels"] == [6]
+
+
+def test_handshake_selected_144_target_only_assigns_to_advertising_device():
+    xiao = info(
+        channels=[1, 6, 11, 144], operations=["handshake"], firmware_version="1.8.7"
+    )
+    wroom = info(
+        device_id="112233445566",
+        boot_id="1111111111111111",
+        board="wroom",
+        channels=[1, 6, 11, 36, 40],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    plan = RadioScheduler().plan(
+        [xiao, wroom], "handshake", targets=[target(channel=144)]
+    )
+    assert set(plan["requests"]) == {DEVICE_ID}
+    assert plan["requests"][DEVICE_ID]["channels"] == [144]
+    assert plan["coverage"] == {DEVICE_ID: [0]}
+
+
+def test_handshake_mixed_selected_shared_and_144_preserves_target_coverage():
+    xiao = info(
+        channels=[1, 6, 11, 144], operations=["handshake"], firmware_version="1.8.7"
+    )
+    wroom = info(
+        device_id="112233445566",
+        boot_id="1111111111111111",
+        board="wroom",
+        channels=[1, 6, 11],
+        operations=["handshake"],
+        firmware_version="1.8.7",
+    )
+    plan = RadioScheduler().plan(
+        [xiao, wroom], "handshake", targets=[target(channel=6), target(mac="02:11:22:33:44:66", channel=144)]
+    )
+    assert sorted(
+        index for assigned in plan["coverage"].values() for index in assigned
+    ) == [0, 1]
+    assert 1 in plan["coverage"][DEVICE_ID]
+    assert 144 in plan["requests"][DEVICE_ID]["channels"]
+    assert 6 in {channel for request in plan["requests"].values()
+                 for channel in request["channels"]}
+    assert all(144 not in request["channels"] for device_id, request
+               in plan["requests"].items() if device_id != DEVICE_ID)
+
+
 def test_handshake_channel_144_target_uses_new_firmware_device_in_mixed_pool():
     old = info(device_id="A1B2C3D4E5F6", boot_id="0123456789ABCDEF",
                channels=[144], operations=["handshake"], firmware_version="1.8.5")
