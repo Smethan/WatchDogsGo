@@ -542,14 +542,12 @@ def _prepare_test_transaction_lock(helper, tmp_path, monkeypatch):
 
     def trusted_fstat(descriptor):
         info = real_fstat(descriptor)
-        return NS(
-            st_mode=info.st_mode,
-            st_uid=0,
-            st_gid=expected_gid if stat.S_ISDIR(info.st_mode) else 0,
-            st_nlink=info.st_nlink,
-            st_dev=info.st_dev,
-            st_ino=info.st_ino,
-        )
+        # fdopen() reads fields such as st_size from os.fstat on Python 3.12.
+        # Keep a complete stat_result while modeling the protected owner/group.
+        values = list(info)
+        values[stat.ST_UID] = 0
+        values[stat.ST_GID] = expected_gid if stat.S_ISDIR(info.st_mode) else 0
+        return os.stat_result(values)
 
     monkeypatch.setattr(helper, "LOCK_DIRECTORY", lock_directory)
     monkeypatch.setattr(helper, "LOCK_PATH", lock_path)

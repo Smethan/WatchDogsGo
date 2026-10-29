@@ -1,5 +1,8 @@
-# 0.10.8 — Managed capture visibility and repeat-run recovery — 2026-10-29
+# 0.10.9 — Managed capture visibility and repeat-run recovery — 2026-10-29
 
+- Use a complete `os.stat_result` in the Meshtastic lock test fixture.
+  Python 3.12 calls `fstat()` from `fdopen()`, exposing the fixture's missing
+  `st_size` in the 0.10.8 tag workflow. No lock implementation changed.
 - Restore the target/network evidence table in managed HS Capture, with an
   aggregate view and a separate foreground-device tab for each C5. Retain
   completed rows after stop and keep passive-helper observations separate from
