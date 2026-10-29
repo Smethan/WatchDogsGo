@@ -1,6 +1,7 @@
 """End-to-end host runtime tests with two fake USB serial endpoints."""
 import json
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace as NS
 
@@ -275,6 +276,296 @@ def test_same_capture_packet_ids_remain_isolated_per_device(tmp_path):
         capture = h.runtime.captures[key]
         assert capture.partial is None and capture.frames == 1
         assert capture.path.is_file()
+
+
+def _ui_capture_screen(h, monkeypatch):
+    from unittest.mock import Mock
+    from watchdogs.handshake_capture import HandshakeCapture
+    from watchdogs.handshake_screen import HandshakeScreen
+
+    h.app.c5_pool = h.runtime
+    h.app._pending_cmd = None
+    h.app._whitelist = NS(entries=[])
+    h.app.msgs = []
+    owner = NS(
+        capture=HandshakeCapture(),
+        targets=NS(
+            choices={"sd": None, "serial": None},
+            label=lambda _storage: "ALL NEARBY",
+            token="",
+            draft=set(),
+        ),
+        scan=NS(capture_targets_supported=True),
+    )
+    px = NS(
+        KEY_ESCAPE=1,
+        KEY_TAB=2,
+        KEY_N=3,
+        KEY_A=4,
+        KEY_UP=5,
+        KEY_DOWN=6,
+        KEY_S=7,
+        KEY_RETURN=8,
+        KEY_LEFT=9,
+        KEY_RIGHT=10,
+        btnp=lambda _key: False,
+        cls=Mock(),
+        rect=Mock(),
+        line=Mock(),
+        text=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "pyxel", px)
+    screen = HandshakeScreen(h.app, owner)
+    screen.show("serial")
+    return screen, px
+
+
+def _emit_hs_frame(h, index, frame, *, packet=1, seq=2, channel=6):
+    group = h.runtime.groups[h.runtime.foreground]
+    for chunk_index, offset in enumerate(range(0, len(frame), 240)):
+        record = {
+            "v": 3,
+            "kind": "hs_packet",
+            "device_id": IDS[index],
+            "boot_id": BOOTS[index],
+            "session": group.tokens[IDS[index]],
+            "seq": seq + chunk_index,
+            "packet": packet,
+            "offset": offset,
+            "total": len(frame),
+            "capture_ms": 123,
+            "age_ms": 5,
+            "channel": channel,
+            "rssi": -45,
+            "data_hex": frame[offset : offset + 240].hex(),
+        }
+        h.emit(index, wire(record))
+
+
+def test_managed_hs_rows_preserve_per_frame_channels_end_to_end(tmp_path, monkeypatch):
+    from test_wardrive import passive_frame
+    from watchdogs.pcapng import EPB, _iter_blocks
+    import struct
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    channels = (1, 6, 11, 40, 44, 149)
+    for index, channel in enumerate(channels):
+        frame = bytearray(passive_frame())
+        frame[10:16] = bytes.fromhex(f"02000000{index:02x}01")
+        _emit_hs_frame(
+            h, 0, bytes(frame), packet=index + 1, seq=index + 2, channel=channel
+        )
+
+    key = (IDS[0], BOOTS[0], group.tokens[IDS[0]])
+    capture = h.runtime.captures[key]
+    screen, _px = _ui_capture_screen(h, monkeypatch)
+    screen.device_tab = 1  # XIAO tab, without cross-device aggregation.
+    view = screen._managed_capture_view()
+    rows_by_ap = {row["bssid"]: row["channel"] for row in view["rows"].values()}
+    assert rows_by_ap == {
+        f"02:00:00:00:{index:02X}:01": channel for index, channel in enumerate(channels)
+    }
+
+    # PCAPNG radiotap and the UI row both originate from the same hs_packet
+    # channel metadata, so a disagreement cannot be hidden by row aggregation.
+    data = capture.path.read_bytes()
+    frequencies = [
+        struct.unpack_from("<H", data, offset + 38)[0]
+        for offset, kind, _size in _iter_blocks(data)
+        if kind == EPB
+    ]
+    expected = [
+        2407 + channel * 5 if channel <= 13 else 5000 + channel * 5
+        for channel in channels
+    ]
+    assert frequencies == expected
+
+
+def test_managed_hs_ui_aggregate_tabs_rows_counts_and_target_scope(
+    tmp_path, monkeypatch
+):
+    from test_wardrive import passive_frame
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    frame = passive_frame()
+    _emit_hs_frame(h, 0, frame)
+    _emit_hs_frame(h, 1, frame)
+    capture0 = h.runtime.captures[(IDS[0], BOOTS[0], group.tokens[IDS[0]])]
+    capture1 = h.runtime.captures[(IDS[1], BOOTS[1], group.tokens[IDS[1]])]
+    capture0.ssids["02:00:00:00:00:02"] = "44657669636530"
+    capture1.ssids["02:00:00:00:00:02"] = "44657669636531"
+    second_frame = bytearray(frame)
+    second_frame[4:10] = bytes.fromhex("020000000004")
+    second_frame[10:16] = bytes.fromhex("020000000003")
+    second_frame[16:22] = bytes.fromhex("020000000003")
+    _emit_hs_frame(h, 0, bytes(second_frame), packet=2, seq=3)
+
+    group.requests[IDS[0]]["options"]["scope"] = "selected"
+    group.requests[IDS[1]]["options"]["scope"] = "selected"
+    group.requests[IDS[0]]["targets"] = [{"bssid": "02:00:00:00:00:01"}]
+    group.requests[IDS[1]]["targets"] = [{"bssid": "02:00:00:00:00:02"}]
+
+    screen, px = _ui_capture_screen(h, monkeypatch)
+    view = screen._managed_capture_view()
+    assert [tab["id"] for tab in view["tabs"]] == ["all", *IDS]
+    assert len(view["rows"]) == 2
+    shared = next(row for row in view["rows"].values() if row["pmkids"] == 2)
+    assert shared["messages"][0] == 2
+    assert "SELECTED 2 NETWORKS" in view["scope"]
+    assert "summed" in view["scope"]
+
+    px.btnp = lambda key: key == px.KEY_RIGHT
+    screen.update()
+    view = screen._managed_capture_view()
+    assert screen.device_tab == 1 and screen.selection == 0
+    assert view["selected"]["device_id"] == IDS[0]
+    assert "SELECTED 1 NETWORKS" in view["scope"]
+    px.btnp = lambda key: key == px.KEY_DOWN
+    screen.update()
+    assert screen.selection == 1
+    px.btnp = lambda key: key == px.KEY_RIGHT
+    screen.update()
+    view = screen._managed_capture_view()
+    assert screen.device_tab == 2 and len(view["rows"]) == 1
+    assert view["selected"]["device_id"] == IDS[1]
+    assert "SELECTED 1 NETWORKS" in view["scope"]
+    px.btnp = lambda key: key == px.KEY_DOWN
+    screen.update()
+    assert screen.selection == 0
+
+    px.text.reset_mock()
+    screen.draw()
+    labels = [call.args[2] for call in px.text.call_args_list]
+    assert any("Targets: SELECTED 1 NETWORKS" in label for label in labels)
+    assert any("Device1" in label for label in labels)
+    assert any("[LEFT/RIGHT]" in label for label in labels)
+
+
+def test_managed_hs_ui_excludes_passive_helper_from_tabs_and_rows(
+    tmp_path, monkeypatch
+):
+    from test_wardrive import passive_frame
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    _emit_hs_frame(h, 0, passive_frame())
+    _emit_hs_frame(h, 1, passive_frame())
+    group.roles[IDS[1]] = "passive-helper"
+
+    screen, _px = _ui_capture_screen(h, monkeypatch)
+    view = screen._managed_capture_view()
+    assert view is not None
+    assert len(view["tabs"]) == 1
+    assert view["selected"]["device_id"] == IDS[0]
+    assert view["helpers"] == [IDS[1]]
+    assert len(view["rows"]) == 1
+    assert next(iter(view["rows"].values()))["pmkids"] == 1
+
+    screen.draw()
+    labels = [(call.args[1], call.args[2]) for call in _px.text.call_args_list]
+    assert any(y == 63 and label.startswith("Frames:") for y, label in labels)
+    assert any(y == 301 and label.startswith("Helpers:") for y, label in labels)
+    assert not any(y == 63 and label.startswith("Helpers:") for y, label in labels)
+    group.error = "capture failure"
+    _px.text.reset_mock()
+    screen.draw()
+    assert any(
+        call.args[1:3] == (312, "capture failure") for call in _px.text.call_args_list
+    )
+
+
+def test_managed_hs_ui_uses_selected_target_name_without_beacon(tmp_path, monkeypatch):
+    from test_wardrive import passive_frame
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    _emit_hs_frame(h, 0, passive_frame())
+    bssid = "02:00:00:00:00:02"
+    capture = h.runtime.captures[(IDS[0], BOOTS[0], group.tokens[IDS[0]])]
+    capture.ssids.clear()
+    group.requests[IDS[0]]["targets"] = [
+        {"bssid": bssid, "ssid_hex": b"SelectedNet".hex()}
+    ]
+    group.requests[IDS[0]]["options"]["scope"] = "selected"
+
+    screen, px = _ui_capture_screen(h, monkeypatch)
+    view = screen._managed_capture_view()
+    assert view["ssids"][bssid] == b"SelectedNet".hex()
+    screen.draw()
+    assert any("SelectedNet" in call.args[2] for call in px.text.call_args_list)
+
+
+def test_managed_hs_ui_keeps_rows_after_capture_stops(tmp_path, monkeypatch):
+    from test_wardrive import passive_frame
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    h.start_ack(1)
+    _emit_hs_frame(h, 0, passive_frame())
+    h.runtime.stop_operation("handshake")
+    h.stop_ack(0, token=group.tokens[IDS[0]], seq=3)
+    h.stop_ack(1, token=group.tokens[IDS[1]], seq=2)
+
+    screen, _px = _ui_capture_screen(h, monkeypatch)
+    view = screen._managed_capture_view()
+    assert group.state == "stopped" and view is not None
+    assert len(view["rows"]) == 1
+    assert next(iter(view["rows"].values()))["pmkids"] == 1
+    assert IDS[0] in group.capture_rows
+
+
+def test_managed_hs_ui_keeps_sd_and_serial_capture_rows_isolated(tmp_path, monkeypatch):
+    from test_wardrive import passive_frame
+
+    h = Harness(tmp_path, loot=True)
+    assert h.runtime.start("handshake", options={"storage": "sd", "scope": "all"})
+    sd_group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    if IDS[1] in sd_group.requests:
+        h.start_ack(1)
+    _emit_hs_frame(h, 0, passive_frame())
+    h.runtime.stop_operation("handshake")
+    h.stop_ack(0, token=sd_group.tokens[IDS[0]], seq=3)
+    if IDS[1] in sd_group.requests:
+        h.stop_ack(1, token=sd_group.tokens[IDS[1]], seq=2)
+
+    assert h.runtime.start("handshake", options={"storage": "serial", "scope": "all"})
+    serial_group = h.runtime.groups[h.runtime.foreground]
+    h.start_ack(0)
+    if IDS[1] in serial_group.requests:
+        h.start_ack(1)
+    serial_frame = bytearray(passive_frame())
+    serial_frame[4:10] = bytes.fromhex("020000000004")
+    serial_frame[10:16] = bytes.fromhex("020000000003")
+    serial_frame[16:22] = bytes.fromhex("020000000003")
+    _emit_hs_frame(h, 0, bytes(serial_frame))
+
+    screen, _px = _ui_capture_screen(h, monkeypatch)
+    serial_view = screen._managed_capture_view()
+    assert serial_view["group"] is serial_group
+    assert len(serial_view["rows"]) == 1
+    assert next(iter(serial_view["rows"].values()))["pmkids"] == 1
+    screen.show("sd")
+    sd_view = screen._managed_capture_view()
+    assert sd_view["group"] is sd_group and sd_group.state == "stopped"
+    assert len(sd_view["rows"]) == 1
+    assert next(iter(sd_view["rows"].values()))["pmkids"] == 1
 
 
 def test_foreground_stops_acknowledged_background_then_restores_after_clean_stop(tmp_path):

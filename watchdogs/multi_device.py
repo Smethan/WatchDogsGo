@@ -76,6 +76,9 @@ class GroupView:
     host_ble: bool = False
     disconnected: set = field(default_factory=set)
     rewarded_exchanges: set = field(default_factory=set)
+    # Final UI snapshots survive closure; PassiveCapture bounds these at 512 rows and 1024 SSIDs.
+    capture_rows: dict = field(default_factory=dict)
+    capture_ssids: dict = field(default_factory=dict)
 
 
 class ManagedScanView:
@@ -1279,6 +1282,19 @@ class MultiDeviceRuntime:
                 capture.close()
             except OSError as exc:
                 self.app.msg('[C5] Capture flush failed: '+str(exc)[:70], 8)
+            did, boot_id, token = key
+            group = next((candidate for candidate in self.groups.values()
+                          if candidate.tokens.get(did) == token
+                          and candidate.requests.get(did, {}).get('boot_id') == boot_id), None)
+            if group:
+                group.capture_rows[did] = [dict(row, messages=list(row['messages']))
+                                           for row in list(capture.rows.values())[-512:]]
+                group.capture_ssids[did] = dict(list(capture.ssids.items())[-1024:])
+                previous = group.capture_metrics.get(did, {})
+                group.capture_metrics[did] = dict(
+                    previous, frames=capture.frames, eapol=capture.eapol,
+                    pmkids=capture.pmkids, lost=capture.lost,
+                    validated=previous.get('validated', 0))
 
     def _close_source(self, did):
         for key in list(self.captures):

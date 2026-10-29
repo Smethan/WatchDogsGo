@@ -1,5 +1,7 @@
 """Background-friendly progress screen for both existing HS Capture modes."""
 import time
+from collections import OrderedDict
+from types import SimpleNamespace
 from .handshake_capture import COMMANDS, capture_storage
 from .passive_screen import PassiveScreen
 
@@ -12,10 +14,12 @@ class HandshakeScreen(PassiveScreen):
         self.picker_selection = 0
         self.editing_filter = False
         self.picker_note = ""
+        self.device_tab = 0
 
     def show(self, storage):
         if storage != self.storage:
             self.selection = 0
+            self.device_tab = 0
         self.storage = storage
         self.picker = False
         self.open = True
@@ -26,6 +30,128 @@ class HandshakeScreen(PassiveScreen):
             entry.mac for entry in getattr(self.app._whitelist, "entries", ())
             if str(getattr(entry, "type", "")).lower() == "wifi"
         )
+
+    def _managed_capture_view(self):
+        """Return the latest managed handshake group matching this storage mode."""
+        pool = getattr(self.app, "c5_pool", None)
+        if pool is None:
+            return None
+        candidates = []
+        for group in pool.groups.values():
+            if group.operation != "handshake":
+                continue
+            devices = [did for did, request in group.requests.items()
+                       if group.roles.get(did) == "foreground"
+                       and request.get("op") == "handshake"
+                       and request.get("options", {}).get("storage") == self.storage]
+            if devices:
+                candidates.append((group, devices))
+        if not candidates:
+            return None
+        group, devices = candidates[-1]
+        tabs = []
+        if len(devices) >= 2:
+            tabs.append({"id": "all", "label": "ALL", "device_id": None})
+        for did in devices:
+            entry = pool.registry.get(did)
+            alias = sorted(entry.aliases)[0] if entry and entry.aliases else ""
+            board = entry.board if entry else "ESP32"
+            prefix = "COMBINED / " if len(devices) == 1 else ""
+            tabs.append({"id": did, "label": prefix + ((alias + " / ") if alias else "") + board,
+                         "device_id": did})
+        self.device_tab %= len(tabs)
+        selected = tabs[self.device_tab]
+
+        def read_device(did):
+            request = group.requests[did]
+            key = (did, request.get("boot_id"), group.tokens.get(did))
+            capture = pool.captures.get(key)
+            if capture:
+                return capture.rows, capture.ssids
+            rows = OrderedDict(((row["bssid"], row["station"]), row)
+                               for row in group.capture_rows.get(did, ()))
+            return rows, group.capture_ssids.get(did, {})
+
+        visible_devices = devices if selected["device_id"] is None else [selected["device_id"]]
+        rows, ssids, sources = OrderedDict(), {}, {}
+        for did in visible_devices:
+            device_rows, device_ssids = read_device(did)
+            for target in group.requests[did].get("targets", ()):
+                if target.get("ssid_hex"):
+                    ssids.setdefault(target["bssid"], target["ssid_hex"])
+            ssids.update(device_ssids)
+            for identity, source_row in device_rows.items():
+                row = dict(source_row, messages=list(source_row["messages"]))
+                if identity not in rows:
+                    rows[identity], sources[identity] = row, 1
+                else:
+                    target = rows[identity]
+                    target["pmkids"] += row["pmkids"]
+                    target["messages"] = [a+b for a,b in zip(target["messages"], row["messages"])]
+                    sources[identity] += 1
+                    if row.get("last", 0) >= target.get("last", 0):
+                        target.update(channel=row.get("channel"), rssi=row.get("rssi"),
+                                      last=row.get("last"))
+        target_devices = devices if selected["device_id"] is None else [selected["device_id"]]
+        targets, excluded = [], set()
+        for did in target_devices:
+            request = group.requests[did]
+            targets.extend(request.get("targets", ()))
+            excluded.update(request.get("exclude", ()))
+        unique_targets = list({target["bssid"]: target for target in targets}.values())
+        options = group.requests[target_devices[0]].get("options", {})
+        scope = ("ALL NEARBY" if options.get("scope") == "all" else
+                 f"SELECTED {len(unique_targets)} NETWORKS (" +
+                 ",".join(target.get("bssid", "")[-8:] for target in unique_targets[:3]) +
+                 (" ...)" if len(unique_targets) > 3 else ")"))
+        if excluded:
+            scope += f" / EXCLUDES {len(excluded)} WL"
+        if selected["device_id"] is None:
+            scope += " / summed counts; duplicate AP/client sightings may be included"
+        did = selected["device_id"]
+        entry = pool.registry.get(did) if did else None
+        session = entry.session if entry else None
+        # AP/client row channels come from captured frames; the current radio
+        # hop is separate telemetry for each foreground C5.
+        radio = []
+        for index, radio_id in enumerate(target_devices, 1):
+            radio_entry = pool.registry.get(radio_id)
+            radio_session = radio_entry.session if radio_entry else None
+            channels = group.requests[radio_id].get("channels", ())
+            current = (radio_session.applied_channel
+                       if radio_session and radio_session.job_token == group.tokens.get(radio_id)
+                       else None)
+            if did is None:
+                radio.append(f"D{index} ch:{current if current is not None else '--'}/{len(channels)}")
+            else:
+                radio.append(f"ch:{current if current is not None else '--'} "
+                             f"plan:{len(channels)} [{self._format_channel_plan(channels)}]")
+        if did in group.disconnected or (entry and not entry.connected):
+            device_state = "DISCONNECTED"
+        elif did in group.stopped or group.state == "stopped":
+            device_state = "STOPPED"
+        elif group.state == "error" or (session and session.state == "error"):
+            device_state = "STOPPED / ERROR"
+        elif session and session.job_token == group.tokens.get(did):
+            device_state = session.state.upper()
+        elif group.state in ("starting", "stopping"):
+            device_state = group.state.upper()
+        else:
+            device_state = "RUNNING"
+        helpers = [helper for helper, role in group.roles.items() if role == "passive-helper"]
+        return {"group": group, "tabs": tabs, "tab_index": self.device_tab,
+                "selected": selected, "rows": rows, "ssids": ssids, "sources": sources,
+                "scope": scope, "device_state": device_state, "entry": entry,
+                "helpers": helpers, "state": group.state.upper(),
+                "radio_summary": " | ".join(radio)}
+
+    @staticmethod
+    def _format_channel_plan(channels):
+        """Show plan bounds without implying every channel in between."""
+        values = sorted(set(channels))
+        if not values:
+            return "none"
+        return str(values[0]) if len(values) == 1 else f"bounds {values[0]}..{values[-1]}"
 
     def update(self):
         import pyxel as px
@@ -49,10 +175,19 @@ class HandshakeScreen(PassiveScreen):
             return
         if px.btnp(px.KEY_A) and not run.active and not self.app._pending_cmd:
             self.owner.targets.choices[self.storage] = None
+        view = self._managed_capture_view()
+        row_count = len(view["rows"]) if view else len(run.rows)
         if px.btnp(px.KEY_UP):
-            self.selection = max(0, self.selection-1)
+            self.selection = min(max(0, row_count-1), max(0, self.selection-1))
         if px.btnp(px.KEY_DOWN):
-            self.selection = min(max(0, len(run.rows)-1), self.selection+1)
+            self.selection = min(max(0, row_count-1), self.selection+1)
+        if view and len(view["tabs"]) > 1:
+            if px.btnp(px.KEY_LEFT):
+                self.device_tab = (self.device_tab-1) % len(view["tabs"])
+                self.selection = 0
+            if px.btnp(px.KEY_RIGHT):
+                self.device_tab = (self.device_tab+1) % len(view["tabs"])
+                self.selection = 0
         if px.btnp(px.KEY_S) and (run.active or pending or managed_group):
             if managed:
                 pool.stop_operation('handshake')
@@ -79,8 +214,9 @@ class HandshakeScreen(PassiveScreen):
         if self.picker:
             self.draw_picker()
             return
-        pool = getattr(self.app,'c5_pool',None)
-        if pool is not None and pool.draw_capture(px,'handshake'):
+        view = self._managed_capture_view()
+        if view:
+            self._draw_managed_capture(px, view)
             return
         run = self.owner.capture.runs[self.storage]
         state = run.state.upper()
@@ -122,6 +258,48 @@ class HandshakeScreen(PassiveScreen):
         px.text(8,331,"[ENTER] Start  [N] Networks  [A] All nearby  [S] Stop  [ESC/TAB] Map",3)
         px.text(8,345,"Leaving this screen keeps capture running. Active capture uses deauth.",13)
 
+
+    def _draw_managed_capture(self, px, view):
+        group, selected = view["group"], view["selected"]
+        did = selected["device_id"]
+        label = "COMBINED" if did is None else selected["label"]
+        px.cls(0)
+        px.rect(0,0,640,18,9)
+        destination = "ESP32 SD CARD" if self.storage == "sd" else "SERIAL TO uCONSOLE / NO SD"
+        px.text(8,5,"HS CAPTURE / ACTIVE / "+destination,0)
+        px.text(8,22,"Capture: "+view["state"]+"   Device: "+label[:28],11)
+        if did:
+            px.text(430,22,view["device_state"],11 if view["device_state"] == "RUNNING" else 9)
+        if len(view["tabs"]) > 1:
+            tab_labels = "  ".join(("["+tab["label"]+"]") if i == view["tab_index"] else tab["label"]
+                                  for i,tab in enumerate(view["tabs"]))
+            px.text(8,36,"ESP32: "+tab_labels[:90]+"  [LEFT/RIGHT]",7)
+        scope = "ALL NEARBY / SUMMED" if did is None else view["scope"][:44]
+        radio_limit = 72 if did is None else 55
+        px.text(8,50,"Targets: "+scope+"  Radio hop: "+view["radio_summary"][:radio_limit],13)
+        metric_devices = ([did] if did else [tab["device_id"] for tab in view["tabs"]
+                                                   if tab["device_id"]])
+        metrics = [group.capture_metrics.get(source, {}) for source in metric_devices]
+        total = {key: sum(metric.get(key, 0) for metric in metrics)
+                 for key in ("frames", "eapol", "pmkids", "validated", "lost")}
+        px.text(8,63,f"Frames:{total['frames']} EAPOL:{total['eapol']} PMKID:{total['pmkids']} "
+                f"VALID:{total['validated']} LOST:{total['lost']}",7)
+        self.draw_rows(SimpleNamespace(rows=view["rows"],ssids=view["ssids"]),active=True)
+        destination_line = ("Files: ESP32 SD /lab/handshakes/" if self.storage == "sd"
+                            else "Files: uConsole loot/handshakes after capture stops.")
+        px.text(8,289,destination_line,13)
+        if view["helpers"]:
+            pool = getattr(self.app,"c5_pool",None)
+            names = []
+            for helper_id in view["helpers"]:
+                helper = pool.registry.get(helper_id) if pool else None
+                names.append((helper.board if helper else "ESP32")+" passive helper")
+            px.text(8,301,("Helpers: "+", ".join(names))[:120],3)
+        note = group.error or "Packet sightings; matching EAPOL pairs are not checked."
+        px.text(8,312,note[:120],9)
+        px.line(8,323,631,323,5)
+        px.text(8,331,"[LEFT/RIGHT] ESP32  [UP/DOWN] Rows  [N] Networks  [S] Stop  [ESC/TAB] Map",3)
+        px.text(8,345,"Leaving this screen keeps capture running. Active capture uses deauth.",13)
 
     def scan_networks(self):
         if self.app._pending_cmd or getattr(self.app, '_ota_reserved', False):

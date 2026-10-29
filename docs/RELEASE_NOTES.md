@@ -1,3 +1,28 @@
+# 0.10.8 — Managed capture visibility and repeat-run recovery — 2026-10-29
+
+- Restore the target/network evidence table in managed HS Capture, with an
+  aggregate view and a separate foreground-device tab for each C5. Retain
+  completed rows after stop and keep passive-helper observations separate from
+  active handshake counts.
+- Label the current radio hop and the requested plan independently of each
+  network row's `CH` field. A row channel comes from a captured EAPOL/PMKID
+  frame; the current hop is job telemetry. Add a packet-to-row channel
+  regression across multiple 2.4 and 5 GHz APs.
+- Pair with projectZero 1.8.8 at commit
+  `406c856a1451e5b02bc3ae984b3bf8469c7803d3`, which retires a managed BLE
+  scan and its owned NimBLE host before releasing the job. Live XIAO
+  diagnostics found that a BLE-enabled Wardrive left about 29 KiB of internal RAM unavailable after
+  stop; the next handshake worker then failed allocation. Wi-Fi-only Wardrive
+  and handshake repeats did not reproduce that failure.
+
+The 1,403-test host suite passed. The XIAO 1.8.8 candidate installed through
+application USB OTA and passed a same-boot repeat-run matrix: BLE-enabled
+Wardrive stop followed by handshake capture succeeded with no errors or power
+cycle. A managed scan found 76 APs across six distinct channels and no AP on
+144. A separate capture received 81 frames on varied channels but no EAPOL or
+PMKID row, so the reported all-144 network rows remain unverified without a
+same-run captured exchange. A physical two-board run remains unverified.
+
 # 0.10.7 — Mixed-board HS Capture scheduling — 2026-10-24
 
 - Schedule managed HS Capture across mixed C5 boards using each board's

@@ -1,4 +1,5 @@
 """Synthetic active capture telemetry and background menu tests; no radios."""
+
 import base64
 import json
 import sys
@@ -20,13 +21,26 @@ def wire(d):
 
 
 def status(kind="started", seq=1, session="a", storage="serial", **extra):
-    return dict(v=1, kind=kind, seq=seq, session=session, storage=storage,
-                wifi_count=0, ble_count=0, drops=0, **extra)
+    return dict(
+        v=1,
+        kind=kind,
+        seq=seq,
+        session=session,
+        storage=storage,
+        wifi_count=0,
+        ble_count=0,
+        drops=0,
+        **extra,
+    )
 
 
 def packet(frame=None, **kw):
-    return [dict(d, channel=None, rssi=None) for d in passive_records(
-        passive_frame() if frame is None else frame, session="a", **kw)]
+    return [
+        dict(d, channel=None, rssi=None)
+        for d in passive_records(
+            passive_frame() if frame is None else frame, session="a", **kw
+        )
+    ]
 
 
 def started():
@@ -37,41 +51,66 @@ def started():
 
 
 def test_all_except_command_parsing_and_scope_label():
-    command = ("start_handshake_scope serial all-except "
-               "02:00:00:00:00:01,02:00:00:00:00:02")
+    command = (
+        "start_handshake_scope serial all-except 02:00:00:00:00:01,02:00:00:00:00:02"
+    )
     assert capture_storage(command) == "serial"
-    capture = HandshakeCapture();capture.start(command)
+    capture = HandshakeCapture()
+    capture.start(command)
     assert capture.current.scope == "ALL NEARBY / 2 WHITELISTED"
     assert capture_storage("start_handshake_scope serial all-except bad") is None
 
 
-@pytest.mark.parametrize("change", [dict(v=True), dict(seq=0), dict(storage="other"),
-    dict(drops=-1), dict(session="bad\n"), dict(kind=[]), dict(kind="oops")])
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(v=True),
+        dict(seq=0),
+        dict(storage="other"),
+        dict(drops=-1),
+        dict(session="bad\n"),
+        dict(kind=[]),
+        dict(kind="oops"),
+    ],
+)
 def test_bad_status(change):
-    d = status(); d.update(change)
+    d = status()
+    d.update(change)
     assert parse_progress(wire(d)) is None
 
 
-@pytest.mark.parametrize("change", [dict(offset=1), dict(total=2305), dict(data_hex="aa "),
-    dict(age_ms=2001), dict(packet=False), dict(capture_ms=-1), dict(data_hex="aa"*241)])
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(offset=1),
+        dict(total=2305),
+        dict(data_hex="aa "),
+        dict(age_ms=2001),
+        dict(packet=False),
+        dict(capture_ms=-1),
+        dict(data_hex="aa" * 241),
+    ],
+)
 def test_bad_packet(change):
-    d = packet(seq=2)[0]; d.update(change)
+    d = packet(seq=2)[0]
+    d.update(change)
     assert parse_progress(wire(d)) is None
 
 
 def test_messages_clients_and_pmkid_dedup():
     c = started()
-    for i, key_info in enumerate((0x008a, 0x010a, 0x13ca, 0x030a), 1):
+    for i, key_info in enumerate((0x008A, 0x010A, 0x13CA, 0x030A), 1):
         frame = bytearray(passive_frame(i == 1))
         frame[37:39] = key_info.to_bytes(2, "big")
-        frame[49:81] = b"\x42"*32 if i != 4 else b"\x00"*32
-        c.handle(wire(packet(frame, seq=i+1, packet=i)[0]))
+        frame[49:81] = b"\x42" * 32 if i != 4 else b"\x00" * 32
+        c.handle(wire(packet(frame, seq=i + 1, packet=i)[0]))
     c.handle(wire(packet(seq=6, packet=5)[0]))
-    other = bytearray(passive_frame()); other[4:10] = bytes.fromhex("020000000099")
+    other = bytearray(passive_frame())
+    other[4:10] = bytes.fromhex("020000000099")
     c.handle(wire(packet(other, seq=7, packet=6)[0]))
     run = c.current
     rows = list(run.rows.values())
-    assert rows[0]["messages"] == [2,1,1,1] and rows[1]["messages"] == [1,0,0,0]
+    assert rows[0]["messages"] == [2, 1, 1, 1] and rows[1]["messages"] == [1, 0, 0, 0]
     assert run.pmkids == 2 and rows[0]["pmkids"] == 1
     assert run.frames == run.eapol == 6
     assert rows[0]["channel"] is None and rows[0]["rssi"] is None
@@ -79,12 +118,16 @@ def test_messages_clients_and_pmkid_dedup():
 
 
 def test_missing_chunks_duplicates_stop_drain_and_retired_sessions():
-    c = started(); run = c.current
-    parts = packet(passive_frame()+b"\x00"*600, seq=2)
-    c.handle(wire(parts[0])); c.handle(wire(parts[2]))
+    c = started()
+    run = c.current
+    parts = packet(passive_frame() + b"\x00" * 600, seq=2)
+    c.handle(wire(parts[0]))
+    c.handle(wire(parts[2]))
     assert run.frames == 0 and run.lost == 1 and run.gaps == 1
     d = packet(seq=8, packet=2)[0]
-    c.stop(); c.handle(wire(d)); c.handle(wire(d))
+    c.stop()
+    c.handle(wire(d))
+    c.handle(wire(d))
     assert run.frames == 1 and run.state == "stopping"
     c.handle(wire(status("stopped", seq=9)))
     assert run.state == "finishing" and run.active
@@ -100,7 +143,8 @@ def test_missing_chunks_duplicates_stop_drain_and_retired_sessions():
 
 
 def test_legacy_fallback_replaced_by_telemetry_and_mode_checked():
-    c = HandshakeCapture(); c.start(COMMANDS["sd"])
+    c = HandshakeCapture()
+    c.start(COMMANDS["sd"])
     line = "[HS-SNIFF] EAPOL M1 captured for 'lab' (02:00:00:00:00:02)"
     assert not c.handle(line)
     assert next(iter(c.current.rows.values()))["pmkids"] is None
@@ -117,13 +161,16 @@ def test_legacy_fallback_replaced_by_telemetry_and_mode_checked():
 @pytest.mark.parametrize("storage", ["sd", "serial"])
 def test_capture_menu_start_back_reopen_stop(game, monkeypatch, storage):
     from watchdogs.app import MENU_CATS
-    w = game.wardrive; px = sys.modules["pyxel"]
-    cmd = COMMANDS[storage]; key = f"_hs_capture_{storage}_menu"
+
+    w = game.wardrive
+    px = sys.modules["pyxel"]
+    cmd = COMMANDS[storage]
+    key = f"_hs_capture_{storage}_menu"
     assert sum(item[3] == key for _, items in MENU_CATS for item in items) == 2
     game._is_running = Mock(return_value=False)
     game._execute_item(cmd, key, "HS Capture", [])
     assert w.capture_screen.open and w.capture.current is None
-    monkeypatch.setattr(px, "btnp", lambda k:k == px.KEY_RETURN)
+    monkeypatch.setattr(px, "btnp", lambda k: k == px.KEY_RETURN)
     w.capture_screen.update()
     assert game._pending_cmd == cmd
     w.handle_line("All operations stopped.")
@@ -131,51 +178,64 @@ def test_capture_menu_start_back_reopen_stop(game, monkeypatch, storage):
     assert game.capturing_hs and w.capture.storage == storage
     w.handle_line(wire(status(storage=storage)))
     game.serial.send_command.reset_mock()
-    monkeypatch.setattr(px, "btnp", lambda k:k == px.KEY_ESCAPE)
+    monkeypatch.setattr(px, "btnp", lambda k: k == px.KEY_ESCAPE)
     w.capture_screen.update()
     assert not w.capture_screen.open and w.capture.current.active
     game._execute_item(cmd, key, "HS Capture", [])
     assert w.capture_screen.open and w.capture.current.state == "running"
     game.serial.send_command.assert_not_called()
-    monkeypatch.setattr(px, "btnp", lambda k:k == px.KEY_S)
+    monkeypatch.setattr(px, "btnp", lambda k: k == px.KEY_S)
     w.capture_screen.update()
     assert game.serial.send_command.call_args.args == ("stop",)
     assert w.capture.current.state == "stopping"
 
 
 def test_variant_switch_preserves_previous_results_and_disconnect(game, monkeypatch):
-    w = game.wardrive; game._is_running = Mock(return_value=True)
-    w.capture.start(COMMANDS["sd"]); w.capture.handle(wire(status(storage="sd")))
+    w = game.wardrive
+    game._is_running = Mock(return_value=True)
+    w.capture.start(COMMANDS["sd"])
+    w.capture.handle(wire(status(storage="sd")))
     w.capture.handle(wire(packet(seq=2)[0]))
     # Actual _execute_item must see handshake_start as false even with old HS active.
     original = game._execute_item
+
     def execute(cmd, key, name, values):
         assert key == "handshake_start"
         game._is_running.return_value = False
         original(cmd, key, name, values)
+
     game._execute_item = execute
     w.capture_screen.show("serial")
     px = sys.modules["pyxel"]
-    monkeypatch.setattr(px, "btnp", lambda k:k == px.KEY_RETURN)
+    monkeypatch.setattr(px, "btnp", lambda k: k == px.KEY_RETURN)
     w.capture_screen.update()
     assert game._pending_cmd == COMMANDS["serial"]
     w.handle_line("All operations stopped.")
     assert w.capture.runs["sd"].pmkids == 1 and not w.capture.runs["sd"].active
     assert w.capture.storage == "serial" and w.capture.current.state == "starting"
-    game.serial = None; w.tick()
+    game.serial = None
+    w.tick()
     assert w.capture.current.state == "disconnected" and not game.capturing_hs
 
 
 def test_legacy_file_output_not_swallowed_and_end_flag_cleared(game, tmp_path):
     from watchdogs.loot_manager import LootManager
+
     game.loot = LootManager(str(tmp_path))
-    w = game.wardrive; w.capture.start(COMMANDS["serial"])
+    w = game.wardrive
+    w.capture.start(COMMANDS["serial"])
     w.handle_line(wire(status()))
-    game._fw_version = "1.7.4"; game.net_mgr = NS(parse_network_line=lambda _:None)
-    game._bt_airtag = False; game._trigger_hs_event = Mock()
+    game._fw_version = "1.7.4"
+    game.net_mgr = NS(parse_network_line=lambda _: None)
+    game._bt_airtag = False
+    game._trigger_hs_event = Mock()
     raw = b"synthetic PCAP preserved byte-for-byte"
-    lines = ["--- PCAP BEGIN ---", base64.b64encode(raw).decode(), "--- PCAP END ---",
-             "SSID: lab AP: 02:00:00:00:00:02"]
+    lines = [
+        "--- PCAP BEGIN ---",
+        base64.b64encode(raw).decode(),
+        "--- PCAP END ---",
+        "SSID: lab AP: 02:00:00:00:00:02",
+    ]
     for line in lines:
         assert not w.handle_line(line)
         game._handle_serial_line(line)
@@ -189,7 +249,9 @@ def test_legacy_file_output_not_swallowed_and_end_flag_cleared(game, tmp_path):
     game.loot.close()
 
 
-def test_serial_artifact_kind_precedes_blocks_and_sequential_artifacts_keep_metadata(tmp_path, monkeypatch):
+def test_serial_artifact_kind_precedes_blocks_and_sequential_artifacts_keep_metadata(
+    tmp_path, monkeypatch
+):
     """Firmware 1.7.9 classifies each artifact before its binary blocks.
 
     The classification line must not trigger the legacy missing-metadata
@@ -228,22 +290,49 @@ def test_serial_artifact_kind_precedes_blocks_and_sequential_artifacts_keep_meta
             f"PCAP_SIZE: {len(pcap)}",
         ]
         if hccapx is not None:
-            lines.extend((
-                "--- HCCAPX BEGIN ---",
-                base64.b64encode(hccapx).decode(),
-                "--- HCCAPX END ---",
-            ))
+            lines.extend(
+                (
+                    "--- HCCAPX BEGIN ---",
+                    base64.b64encode(hccapx).decode(),
+                    "--- HCCAPX END ---",
+                )
+            )
         lines.append(f"SSID: {ssid}  AP: {bssid}")
         for line in lines:
             loot._detect_pcap_stream(line)
 
-    pcaps = {path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.pcap")}
-    hccapx = {path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.hccapx")}
+    pcaps = {
+        path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.pcap")
+    }
+    hccapx = {
+        path.name: path.read_bytes() for path in loot._handshake_dir.glob("*.hccapx")
+    }
     assert len(pcaps) == 2
-    assert next(data for name, data in pcaps.items() if name.startswith("OwnedLab_020000000011_")) == valid_pcap
-    assert next(data for name, data in pcaps.items() if name.startswith("GuestLab_020000000022_")) == partial_pcap
+    assert (
+        next(
+            data
+            for name, data in pcaps.items()
+            if name.startswith("OwnedLab_020000000011_")
+        )
+        == valid_pcap
+    )
+    assert (
+        next(
+            data
+            for name, data in pcaps.items()
+            if name.startswith("GuestLab_020000000022_")
+        )
+        == partial_pcap
+    )
     assert len(hccapx) == 1
-    assert next(data for name, data in hccapx.items() if name.startswith("OwnedLab_020000000011_")) == valid_hccapx
+    assert (
+        next(
+            data
+            for name, data in hccapx.items()
+            if name.startswith("OwnedLab_020000000011_")
+        )
+        == valid_hccapx
+    )
     assert not any("unknown" in name for name in (*pcaps, *hccapx))
     loot.close()
 
@@ -256,8 +345,13 @@ def test_serial_artifact_metadata_cannot_inject_bssid_or_path(tmp_path, monkeypa
     payload = base64.b64encode(b"P" * 40).decode()
     hccapx = base64.b64encode(b"H" * 393).decode()
     for line in (
-        "--- PCAP BEGIN ---", payload, "--- PCAP END ---", "PCAP_SIZE: 40",
-        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
+        "--- PCAP BEGIN ---",
+        payload,
+        "--- PCAP END ---",
+        "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---",
+        hccapx,
+        "--- HCCAPX END ---",
         "SSID: Trap AP: ../../outside  AP: 02:00:00:00:00:33",
     ):
         loot._detect_pcap_stream(line)
@@ -271,9 +365,16 @@ def test_serial_artifact_metadata_cannot_inject_bssid_or_path(tmp_path, monkeypa
     # A line-split or otherwise malformed legacy commit cannot supply path
     # characters as a BSSID. The fallback may preserve it under "unknown".
     for line in (
-        "--- PCAP BEGIN ---", payload, "--- PCAP END ---", "PCAP_SIZE: 40",
-        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
-        "SSID: split", "AP: ../../outside", "capture cleanup",
+        "--- PCAP BEGIN ---",
+        payload,
+        "--- PCAP END ---",
+        "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---",
+        hccapx,
+        "--- HCCAPX END ---",
+        "SSID: split",
+        "AP: ../../outside",
+        "capture cleanup",
     ):
         loot._detect_pcap_stream(line)
     new_paths = [path for path in loot._handshake_dir.glob("*") if path not in paths]
@@ -282,7 +383,9 @@ def test_serial_artifact_metadata_cannot_inject_bssid_or_path(tmp_path, monkeypa
     loot.close()
 
 
-def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, monkeypatch):
+def test_typed_serial_artifact_requires_complete_valid_transaction(
+    tmp_path, monkeypatch
+):
     from watchdogs.loot_manager import LootManager, _TARGET_PCAP_MAX
 
     loot = LootManager(str(tmp_path))
@@ -301,8 +404,13 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
     # invoke the legacy unknown-name fallback for a typed transaction.
     for line in (
         "CAPTURE_KIND: VALID",
-        "--- PCAP BEGIN ---", pcap, "--- PCAP END ---", "PCAP_SIZE: 40",
-        "--- HCCAPX BEGIN ---", hccapx, "--- HCCAPX END ---",
+        "--- PCAP BEGIN ---",
+        pcap,
+        "--- PCAP END ---",
+        "PCAP_SIZE: 40",
+        "--- HCCAPX BEGIN ---",
+        hccapx,
+        "--- HCCAPX END ---",
         "Handshake attack cleanup complete.",
     ):
         loot._detect_pcap_stream(line)
@@ -312,20 +420,31 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
     # length and malformed base64 are rejected before either file is created.
     for stream in (
         (
-            "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---", pcap,
-            "--- PCAP END ---", "PCAP_SIZE: 41",
+            "CAPTURE_KIND: PARTIAL",
+            "--- PCAP BEGIN ---",
+            pcap,
+            "--- PCAP END ---",
+            "PCAP_SIZE: 41",
             "SSID: BadSize  AP: 02:00:00:00:00:44",
         ),
         (
-            "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---", "not_base64!",
-            "--- PCAP END ---", "PCAP_SIZE: 40",
+            "CAPTURE_KIND: PARTIAL",
+            "--- PCAP BEGIN ---",
+            "not_base64!",
+            "--- PCAP END ---",
+            "PCAP_SIZE: 40",
             "SSID: BadBase64  AP: 02:00:00:00:00:55",
         ),
         (
-            "CAPTURE_KIND: VALID", "--- PCAP BEGIN ---", pcap,
-            "--- PCAP END ---", "PCAP_SIZE: 40",
-            "--- HCCAPX BEGIN ---", base64.b64encode(b"short").decode(),
-            "--- HCCAPX END ---", "SSID: BadHccapx  AP: 02:00:00:00:00:66",
+            "CAPTURE_KIND: VALID",
+            "--- PCAP BEGIN ---",
+            pcap,
+            "--- PCAP END ---",
+            "PCAP_SIZE: 40",
+            "--- HCCAPX BEGIN ---",
+            base64.b64encode(b"short").decode(),
+            "--- HCCAPX END ---",
+            "SSID: BadHccapx  AP: 02:00:00:00:00:66",
         ),
     ):
         for line in stream:
@@ -334,8 +453,10 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
 
     at_limit = b"L" * _TARGET_PCAP_MAX
     for line in (
-        "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---",
-        base64.b64encode(at_limit).decode(), "--- PCAP END ---",
+        "CAPTURE_KIND: PARTIAL",
+        "--- PCAP BEGIN ---",
+        base64.b64encode(at_limit).decode(),
+        "--- PCAP END ---",
         f"PCAP_SIZE: {_TARGET_PCAP_MAX}",
         "SSID: AtLimit  AP: 02:00:00:00:00:77",
     ):
@@ -345,8 +466,10 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
 
     too_large = b"X" * (_TARGET_PCAP_MAX + 1)
     for line in (
-        "CAPTURE_KIND: PARTIAL", "--- PCAP BEGIN ---",
-        base64.b64encode(too_large).decode(), "--- PCAP END ---",
+        "CAPTURE_KIND: PARTIAL",
+        "--- PCAP BEGIN ---",
+        base64.b64encode(too_large).decode(),
+        "--- PCAP END ---",
         f"PCAP_SIZE: {_TARGET_PCAP_MAX + 1}",
         "SSID: TooLarge  AP: 02:00:00:00:00:88",
     ):
@@ -355,7 +478,9 @@ def test_typed_serial_artifact_requires_complete_valid_transaction(tmp_path, mon
     loot.close()
 
 
-def test_typed_artifact_events_distinguish_valid_pmkid_and_partial(game, tmp_path, monkeypatch):
+def test_typed_artifact_events_distinguish_valid_pmkid_and_partial(
+    game, tmp_path, monkeypatch
+):
     from watchdogs.loot_manager import LootManager
 
     game.loot = LootManager(str(tmp_path))
@@ -369,14 +494,19 @@ def test_typed_artifact_events_distinguish_valid_pmkid_and_partial(game, tmp_pat
     def feed(kind, ssid, suffix, include_hccapx=False, declared=40):
         lines = [
             f"CAPTURE_KIND: {kind}",
-            "--- PCAP BEGIN ---", base64.b64encode(b"P" * 40).decode(),
-            "--- PCAP END ---", f"PCAP_SIZE: {declared}",
+            "--- PCAP BEGIN ---",
+            base64.b64encode(b"P" * 40).decode(),
+            "--- PCAP END ---",
+            f"PCAP_SIZE: {declared}",
         ]
         if include_hccapx:
-            lines.extend((
-                "--- HCCAPX BEGIN ---", base64.b64encode(b"H" * 393).decode(),
-                "--- HCCAPX END ---",
-            ))
+            lines.extend(
+                (
+                    "--- HCCAPX BEGIN ---",
+                    base64.b64encode(b"H" * 393).decode(),
+                    "--- HCCAPX END ---",
+                )
+            )
         lines.append(f"SSID: {ssid}  AP: 02:00:00:00:00:{suffix}")
         for line in lines:
             game._handle_serial_line(line)
@@ -401,10 +531,12 @@ def test_typed_artifact_events_distinguish_valid_pmkid_and_partial(game, tmp_pat
 
 
 def test_capture_draw_unknown_values_and_progress_late(game, monkeypatch):
-    w = game.wardrive; w.capture.start(COMMANDS["sd"])
+    w = game.wardrive
+    w.capture.start(COMMANDS["sd"])
     w.capture.handle("[HS-SNIFF] EAPOL M2 captured for 'lab' (02:00:00:00:00:02)")
     w.capture_screen.show("sd")
-    px = sys.modules["pyxel"]; text = Mock()
+    px = sys.modules["pyxel"]
+    text = Mock()
     for name in ("cls", "rect", "line"):
         monkeypatch.setattr(px, name, Mock())
     monkeypatch.setattr(px, "text", text)
@@ -414,9 +546,69 @@ def test_capture_draw_unknown_values_and_progress_late(game, monkeypatch):
     assert any("requires SD card on ESP32" in s for s in labels)
     w.capture.handle(wire(status(storage="sd")))
     w.capture.current.last_progress = -100
-    text.reset_mock(); w.capture_screen.draw()
+    text.reset_mock()
+    w.capture_screen.draw()
     assert any("capture has not been stopped" in c.args[2] for c in text.call_args_list)
     assert w.capture.current.active
+
+
+def test_capture_variants_keep_independent_rows_and_preserve_network_picker(
+    game, monkeypatch
+):
+    w = game.wardrive
+    px = sys.modules["pyxel"]
+    text = Mock()
+    for name in ("cls", "rect", "line"):
+        monkeypatch.setattr(px, name, Mock())
+    monkeypatch.setattr(px, "text", text)
+
+    sd, serial = w.capture.runs["sd"], w.capture.runs["serial"]
+    sd.rows["sd"] = dict(
+        bssid="02:00:00:00:00:01",
+        station="02:00:00:00:00:11",
+        channel=6,
+        rssi=-40,
+        pmkids=1,
+        messages=[0, 1, 0, 0],
+        last=1,
+    )
+    sd.ssids["02:00:00:00:00:01"] = b"SD-Network".hex()
+    sd.eapol, sd.pmkids, sd.frames, sd.session = 2, 1, 3, "sd-session"
+    serial.rows["serial"] = dict(
+        bssid="02:00:00:00:00:02",
+        station="02:00:00:00:00:22",
+        channel=11,
+        rssi=-55,
+        pmkids=2,
+        messages=[1, 0, 0, 0],
+        last=1,
+    )
+    serial.ssids["02:00:00:00:00:02"] = b"Serial-Network".hex()
+    serial.eapol, serial.pmkids, serial.frames, serial.session = (
+        4,
+        2,
+        5,
+        "serial-session",
+    )
+
+    w.capture_screen.show("sd")
+    w.capture_screen.draw()
+    labels = [call.args[2] for call in text.call_args_list]
+    assert any("SD-Network" in label for label in labels)
+    assert any("EAPOL:2  PMKID:1  Frames:3" in label for label in labels)
+    assert not any("Serial-Network" in label for label in labels)
+
+    monkeypatch.setattr(px, "btnp", lambda key: key == px.KEY_N)
+    w.capture_screen.update()
+    assert w.capture_screen.picker and w.capture_screen.storage == "sd"
+    w.capture_screen.picker = False
+    text.reset_mock()
+    w.capture_screen.show("serial")
+    w.capture_screen.draw()
+    labels = [call.args[2] for call in text.call_args_list]
+    assert any("Serial-Network" in label for label in labels)
+    assert any("EAPOL:4  PMKID:2  Frames:5" in label for label in labels)
+    assert not any("SD-Network" in label for label in labels)
 
 
 def test_early_stop_ack_waits_for_file_cleanup_before_next_mode(game):
@@ -439,7 +631,8 @@ def test_early_stop_ack_waits_for_file_cleanup_before_next_mode(game):
 
 
 def test_old_firmware_cleanup_and_forced_stop():
-    c = HandshakeCapture(); c.start(COMMANDS["serial"])
+    c = HandshakeCapture()
+    c.start(COMMANDS["serial"])
     c.handle("Handshake attack cleanup...")
     assert c.current.cleanup_pending
     c.handle("Handshake attack task forcefully stopped.")
@@ -448,22 +641,162 @@ def test_old_firmware_cleanup_and_forced_stop():
     assert c.current.state == "error"
 
 
+def test_managed_hs_channel_plan_and_live_channel_are_visible(game, monkeypatch):
+    channels = [
+        1,
+        6,
+        11,
+        36,
+        40,
+        44,
+        48,
+        52,
+        56,
+        60,
+        64,
+        100,
+        104,
+        108,
+        112,
+        116,
+        120,
+        124,
+        128,
+        132,
+        136,
+        140,
+        144,
+        149,
+        153,
+        157,
+        161,
+        165,
+    ]
+    did = "10BDA3CF2B0C"
+    token, boot_id = "job-1", "boot-1"
+    session = NS(job_token=token, applied_channel=1, state="running")
+    entry = NS(
+        aliases={"uConsole C5"}, board="XIAO ESP32-C5", session=session, connected=True
+    )
+    request = {
+        "op": "handshake",
+        "boot_id": boot_id,
+        "channels": channels,
+        "targets": [],
+        "exclude": [],
+        "options": {"storage": "serial", "scope": "all"},
+    }
+    group = NS(
+        operation="handshake",
+        requests={did: request},
+        roles={did: "foreground"},
+        tokens={did: token},
+        state="running",
+        capture_rows={},
+        capture_ssids={},
+        capture_metrics={},
+        disconnected=set(),
+        stopped=set(),
+        error=None,
+    )
+    pool = NS(groups={"group-1": group}, registry={did: entry}, captures={})
+    game.c5_pool = pool
+    screen = game.wardrive.capture_screen
+    screen.storage = "serial"
+
+    expected = "ch:1 plan:28 [bounds 1..165]"
+    view = screen._managed_capture_view()
+    assert view["radio_summary"] == expected
+
+    px = sys.modules["pyxel"]
+    text = Mock()
+    for name in ("cls", "rect", "line"):
+        monkeypatch.setattr(px, name, Mock())
+    monkeypatch.setattr(px, "text", text)
+    screen._draw_managed_capture(px, view)
+    rendered = [call.args[2] for call in text.call_args_list]
+    assert any("Radio hop: " + expected in line for line in rendered)
+
+    for channel in (144, 6):
+        session.applied_channel = channel
+        view = screen._managed_capture_view()
+        assert view["radio_summary"].startswith(f"ch:{channel} plan:28 [bounds 1..165]")
+
+
+def test_managed_hs_all_tab_shows_each_device_channel_and_plan_count(game, monkeypatch):
+    screen = game.wardrive.capture_screen
+    ids = ("device-0001", "device-0002")
+    requests, roles, tokens, registry = {}, {}, {}, {}
+    for did, channel, plan in ((ids[0], 6, [1, 6, 11]), (ids[1], 144, [36, 40, 144])):
+        token, boot_id = "token-" + did[-1], "boot-" + did[-1]
+        requests[did] = {
+            "op": "handshake",
+            "boot_id": boot_id,
+            "channels": plan,
+            "targets": [],
+            "exclude": [],
+            "options": {"storage": "serial", "scope": "all"},
+        }
+        roles[did], tokens[did] = "foreground", token
+        registry[did] = NS(
+            aliases={"C5 " + did[-1]},
+            board="ESP32-C5",
+            session=NS(job_token=token, applied_channel=channel, state="running"),
+            connected=True,
+        )
+    group = NS(
+        operation="handshake",
+        requests=requests,
+        roles=roles,
+        tokens=tokens,
+        state="running",
+        capture_rows={},
+        capture_ssids={},
+        capture_metrics={},
+        disconnected=set(),
+        stopped=set(),
+        error=None,
+    )
+    game.c5_pool = NS(groups={"group-1": group}, registry=registry, captures={})
+    screen.storage, screen.device_tab = "serial", 0
+
+    view = screen._managed_capture_view()
+    assert view["selected"]["id"] == "all"
+    assert view["radio_summary"] == "D1 ch:6/3 | D2 ch:144/3"
+
+    px = sys.modules["pyxel"]
+    text = Mock()
+    for name in ("cls", "rect", "line"):
+        monkeypatch.setattr(px, name, Mock())
+    monkeypatch.setattr(px, "text", text)
+    screen._draw_managed_capture(px, view)
+    rendered = [call.args[2] for call in text.call_args_list]
+    assert any("D1 ch:6/3 | D2 ch:144/3" in line for line in rendered)
+
+
 def test_empty_capture_with_drops_explains_usb_ring_fix(game, monkeypatch):
     w = game.wardrive
-    w.capture.start(COMMANDS['serial'])
+    w.capture.start(COMMANDS["serial"])
     w.capture.handle(wire(status()))
-    w.capture.handle(wire(status('stats', seq=10, storage='serial')).replace('"drops":0', '"drops":9'))
-    w.capture_screen.show('serial')
-    game._fw_version = '1.7.5'
-    px = sys.modules['pyxel']; text = Mock()
-    for name in ('cls', 'rect', 'line'):
+    w.capture.handle(
+        wire(status("stats", seq=10, storage="serial")).replace(
+            '"drops":0', '"drops":9'
+        )
+    )
+    w.capture_screen.show("serial")
+    game._fw_version = "1.7.5"
+    px = sys.modules["pyxel"]
+    text = Mock()
+    for name in ("cls", "rect", "line"):
         monkeypatch.setattr(px, name, Mock())
-    monkeypatch.setattr(px, 'text', text)
+    monkeypatch.setattr(px, "text", text)
     w.capture_screen.draw()
-    assert any('1.7.6 fixes the USB buffer' in c.args[2] for c in text.call_args_list)
+    assert any("1.7.6 fixes the USB buffer" in c.args[2] for c in text.call_args_list)
 
 
-def test_serial_artifact_pcapng_is_required_validated_rebased_and_saved(tmp_path, monkeypatch):
+def test_serial_artifact_pcapng_is_required_validated_rebased_and_saved(
+    tmp_path, monkeypatch
+):
     import io
     from watchdogs.loot_manager import LootManager
     from watchdogs.pcapng import PcapngWriter, validate_pcapng
@@ -478,8 +811,10 @@ def test_serial_artifact_pcapng_is_required_validated_rebased_and_saved(tmp_path
     lines = (
         "CAPTURE_KIND: PARTIAL",
         "CAPTURE_FORMAT: PCAPNG",
-        "--- PCAPNG BEGIN ---", base64.b64encode(pcapng).decode(),
-        "--- PCAPNG END ---", f"PCAPNG_SIZE: {len(pcapng)}",
+        "--- PCAPNG BEGIN ---",
+        base64.b64encode(pcapng).decode(),
+        "--- PCAPNG END ---",
+        f"PCAPNG_SIZE: {len(pcapng)}",
         "SSID: RichCapture  AP: 02:00:00:00:00:91",
     )
     for line in lines:
@@ -498,12 +833,15 @@ def test_serial_artifact_pcapng_is_required_validated_rebased_and_saved(tmp_path
         loot._detect_pcap_stream(line)
     assert set(loot._handshake_dir.glob("*")) == before
 
-    corrupt = bytearray(pcapng); corrupt[-1] ^= 1
+    corrupt = bytearray(pcapng)
+    corrupt[-1] ^= 1
     for line in (
         "CAPTURE_KIND: PARTIAL",
         "CAPTURE_FORMAT: PCAPNG",
-        "--- PCAPNG BEGIN ---", base64.b64encode(corrupt).decode(),
-        "--- PCAPNG END ---", f"PCAPNG_SIZE: {len(corrupt)}",
+        "--- PCAPNG BEGIN ---",
+        base64.b64encode(corrupt).decode(),
+        "--- PCAPNG END ---",
+        f"PCAPNG_SIZE: {len(corrupt)}",
         "SSID: BadNG  AP: 02:00:00:00:00:93",
     ):
         loot._detect_pcap_stream(line)

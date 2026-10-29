@@ -12,9 +12,21 @@ opens a progress screen. It does not immediately start capture.
 - **Escape / Tab** returns to the map. Capture keeps running while WDG remains
   open; reopen the same menu item to check its progress.
 - **Up / Down** scrolls AP/client rows and shows full addresses below the table.
+- **Left / Right** switches between the combined view and individual ESP32
+  views when multiple managed ESP32s are capturing. With one capture ESP32,
+  its identified view is shown directly.
 
 Results remain visible after stopping. SD and no-SD results are separate; starting
 a new run of a variant clears that variant's previous display.
+
+On managed ESP32-C5 jobs, the capture screen keeps the selected target scope
+and the observed AP/client, EAPOL and PMKID table visible. The combined view
+groups rows by AP and client and adds packet sightings from the participating
+capture ESP32s; the individual views show each device's own observations and
+status. A passive helper is identified separately and does not contribute to
+handshake tabs or totals. Repeated sightings on different ESP32s can appear in
+the combined packet counts. These counts remain observations, not proof of a
+validated exchange; use the saved capture artifacts for that distinction.
 
 These are the existing **active** capture commands, including their existing
 deauthentication behavior. [HS Sniff](PASSIVE_HS_SNIFF.md) is the passive option.
@@ -58,6 +70,43 @@ save. WatchDogsGo 0.10.7 uses capability-aware mixed-board scheduling so all
 capable boards are retained; a physical two-board run remains unverified.
 
 The 1.8.5 failure and 1.8.6 workaround above are historical.
+
+## Reading channel numbers during managed capture
+
+The progress screen labels the ESP32's **Radio hop** separately from the
+network table. The hop is the channel currently applied by that ESP32; it can
+reach 144 during an all-nearby sweep without assigning channel 144 to every
+network. A network row's **CH** is the receive channel of its latest captured
+EAPOL or PMKID frame. With multiple foreground ESP32s, the ALL tab merges
+matching AP/client rows and uses the channel of the latest such frame; a
+per-device tab shows that ESP32's own row. The optional **N** network picker
+shows the channel reported by the completed Wi-Fi scan for each BSSID.
+
+If a picker or evidence row reports 144 for an AP known to use another channel,
+record that AP's BSSID and compare it with the saved capture or scan record
+from the same run. A hop display alone cannot establish the AP's channel.
+
+Firmware 1.8.8 also closes the managed BLE scan and its owned NimBLE host when
+BLE-enabled Wardrive stops. A live XIAO diagnostic run of the preceding source
+retained about 29 KiB of internal RAM after this stop; the next handshake task
+then failed allocation. Wi-Fi-only Wardrive did not reproduce that failure.
+
+On 2026-10-29, the XIAO 1.8.8 application-USB OTA candidate (build ID
+`4bf86c248c4b409d`) passed a same-boot sequence of two handshake captures,
+Wi-Fi-only Wardrive, another handshake, BLE-enabled Wardrive, and a final
+handshake. Every job started, stopped, released its token, and returned ready
+without errors. After the BLE Wardrive stop, internal free memory was about
+46 KiB, and the following handshake worker started successfully. The active
+handshake status crossed channel 144 and continued to 149 without a power
+cycle.
+
+A separate managed Wi-Fi scan on that build found 76 APs on channels 1, 6,
+11, 40, 44, and 157, with no AP reported on 144. A bounded no-SD capture
+received 81 frames on those same varied channels and stopped cleanly, but
+contained no EAPOL or PMKID evidence row. Therefore the specific report that
+all progress-screen network rows show 144 was not reproduced or disproved by
+that run. A controlled AP/client exchange or a saved same-run row with its
+packet evidence is still needed for that display claim.
 
 ## Optional network selection
 
