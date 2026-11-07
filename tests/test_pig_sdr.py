@@ -230,6 +230,7 @@ def test_p25_launch_has_full_blacklist_no_audio_and_loopback_metadata(monkeypatc
 
     assert manager.start_pig_p25(851_012_500, "City P25", gain=30, ppm=2)
     command = popen.call_args.args[0]
+    assert popen.call_args.kwargs["cwd"] == "/opt/op25"
     assert command[0:2] == ["/opt/op25/rx.py", "--args"]
     assert "--frequency" in command and "851012500" in command
     assert "--terminal-type" in command

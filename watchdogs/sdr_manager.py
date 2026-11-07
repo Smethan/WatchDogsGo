@@ -440,7 +440,7 @@ class SDRManager:
         try:
             self._pig_p25_proc = subprocess.Popen(
                 command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid)
+                preexec_fn=os.setsid, cwd=os.path.dirname(executable))
         except Exception as exc:
             self._remove_p25_tmpdir()
             self._events.put(("error", f"OP25 failed to start: {str(exc)[:160]}"))
