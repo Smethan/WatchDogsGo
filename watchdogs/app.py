@@ -4142,6 +4142,7 @@ class WatchDogsGame(OtaMixin):
                     if callable(record_p25_error):
                         record_p25_error(str(data))
                     self.msg(f"[SDR] {data}", C_ERROR)
+                    self._term_add(f"[SDR] {data}", raw=True)
                 elif etype == "aircraft_new":
                     ac = data
                     if ac.icao not in self._sdr_aircraft_xp:

@@ -105,6 +105,12 @@ class SDRManager:
         self._pig_p25_proc: Optional[subprocess.Popen] = None
         self._pig_p25_tmpdir: str = ""
         self._pig_p25_url: str = ""
+        self._pig_p25_stderr_tail = deque(maxlen=12)
+        self._pig_p25_stderr_lock = threading.Lock()
+        self._pig_p25_stderr_owner = None
+        self._pig_p25_stderr_thread = None
+        self._readsb_paused = False
+        self._readsb_lease_lock = threading.RLock()
 
         # Event queue for app.py
         self._events: Queue = Queue()
@@ -156,6 +162,112 @@ class SDRManager:
         active = self.mode or "Pig Detector"
         self._events.put(("error", f"{active} is active; stop it before starting {requested}"))
         return True
+
+    def _readsb_state(self) -> str:
+        """Return readsb's systemd state, or unsupported/missing when absent."""
+        if not shutil.which("systemctl"):
+            return "unsupported"
+        result = subprocess.run(
+            ["systemctl", "show", "readsb.service",
+             "--property=LoadState", "--property=ActiveState"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError("cannot query readsb.service" +
+                               (": " + detail[:100] if detail else ""))
+        properties = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key.strip()] = value.strip().lower()
+        if properties.get("LoadState") == "not-found":
+            return "missing"
+        state = properties.get("ActiveState", "")
+        if state not in ("active", "inactive", "failed"):
+            raise RuntimeError("readsb.service state is unknown" +
+                               (f" ({state})" if state else ""))
+        return state
+
+    def _acquire_readsb_lease(self) -> bool:
+        """Temporarily stop active readsb so a WDG profile can own the RTL-SDR."""
+        with self._readsb_lease_lock:
+            if self._readsb_paused:
+                return True
+            try:
+                state = self._readsb_state()
+            except Exception as exc:
+                self._events.put(("error", f"SDR handoff failed: {str(exc)[:120]}"))
+                return False
+            if state in ("unsupported", "missing", "inactive", "failed"):
+                return True
+            self._events.put(("status",
+                              "Pausing readsb ADS-B feed while WatchDogsGo uses the SDR"))
+            try:
+                result = subprocess.run(
+                    ["systemctl", "stop", "readsb.service"],
+                    capture_output=True, text=True, timeout=12)
+            except subprocess.TimeoutExpired:
+                # systemd may have completed the stop before the command timed out.
+                # Restore only when the service is now stopped; do not launch SDR
+                # after an uncertain handoff.
+                try:
+                    state = self._readsb_state()
+                except Exception:
+                    state = "unknown"
+                if state in ("inactive", "failed", "unknown"):
+                    # It was active before our stop request. If the follow-up
+                    # query also fails, try to restore that previous state.
+                    self._readsb_paused = True
+                    self._release_readsb_lease()
+                self._events.put(("error", "SDR handoff failed: readsb stop timed out"))
+                return False
+            except Exception as exc:
+                self._events.put(("error",
+                                  f"SDR handoff failed stopping readsb: {str(exc)[:100]}"))
+                return False
+            if result.returncode:
+                # A failed command gives us no ownership even if another actor
+                # made the service inactive at the same time.
+                self._events.put(("error",
+                                  f"SDR handoff failed: readsb stop exited {result.returncode}"))
+                return False
+            self._readsb_paused = True
+            try:
+                state = self._readsb_state()
+            except Exception as exc:
+                self._events.put(("error",
+                                  f"SDR handoff failed verifying readsb: {str(exc)[:100]}"))
+                self._release_readsb_lease()
+                return False
+            if state not in ("inactive", "failed"):
+                self._events.put(("error", "SDR handoff failed: readsb is still active"))
+                self._release_readsb_lease()
+                return False
+            self._events.put(("status", "readsb ADS-B feed paused for SDR use"))
+            return True
+
+    def _release_readsb_lease(self) -> bool:
+        """Restore readsb only if this manager stopped it for an SDR profile."""
+        with self._readsb_lease_lock:
+            if not self._readsb_paused:
+                return True
+            self._events.put(("status", "Restoring readsb ADS-B feed"))
+            try:
+                subprocess.run(
+                    ["systemctl", "start", "readsb.service"],
+                    capture_output=True, text=True, timeout=12)
+                state = self._readsb_state()
+            except Exception as exc:
+                self._events.put(("error",
+                                  f"Could not restore readsb ADS-B feed: {str(exc)[:100]}"))
+                return False
+            if state != "active":
+                self._events.put(("error",
+                                  "Could not restore readsb ADS-B feed: service is not active"))
+                return False
+            self._readsb_paused = False
+            self._events.put(("status", "readsb ADS-B feed restored"))
+            return True
 
     def _put_pig_event(self, name: str, payload: dict):
         with self._pig_events_lock:
@@ -232,6 +344,8 @@ class SDRManager:
         if not executable:
             self._events.put(("error", "rtl_power not installed"))
             return False
+        if not self._acquire_readsb_lease():
+            return False
 
         self._stop_event.clear()
         self._pig_stop_event.clear()
@@ -307,6 +421,11 @@ class SDRManager:
                     self._pig_rf_proc = None
                 if proc and proc.poll() is None:
                     self._terminate_proc(proc)
+            if failures >= 3:
+                self._events.put((
+                    "error", "rtl_power failed three times; stopping SDR profile"))
+                self.stop()
+                return
             if self._pig_stop_event.wait(2.0 if failures else 0.05):
                 break
 
@@ -402,7 +521,6 @@ class SDRManager:
             active = self.mode or "another SDR profile"
             self._events.put(("error", f"{active} is active; stop it before starting Pig P25"))
             return False
-
         import tempfile
         self._stop_event.clear()
         self._pig_stop_event.clear()
@@ -437,14 +555,33 @@ class SDRManager:
         if configured_gain is not None and configured_gain >= 0:
             command.extend(("--gains", f"LNA:{int(configured_gain)}"))
         # Deliberately omit OP25's --vocoder, --udp-player, audio, and record options.
+        if not self._acquire_readsb_lease():
+            self._remove_p25_tmpdir()
+            return False
         try:
+            with self._pig_p25_stderr_lock:
+                self._pig_p25_stderr_tail.clear()
+                self._pig_p25_stderr_owner = None
+                self._pig_p25_stderr_thread = None
             self._pig_p25_proc = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
                 preexec_fn=os.setsid, cwd=os.path.dirname(executable))
         except Exception as exc:
             self._remove_p25_tmpdir()
-            self._events.put(("error", f"OP25 failed to start: {str(exc)[:160]}"))
+            self._events.put(("error", f"OP25 failed to start: {str(exc)[:120]}"))
+            self._release_readsb_lease()
             return False
+        stderr_stream = getattr(self._pig_p25_proc, "stderr", None)
+        if stderr_stream is not None:
+            self._pig_p25_stderr_owner = self._pig_p25_proc
+            stderr_thread = threading.Thread(
+                target=self._drain_op25_stderr,
+                args=(self._pig_p25_proc, stderr_stream),
+                daemon=True, name="pig-p25-stderr")
+            self._pig_p25_stderr_thread = stderr_thread
+            self._threads.append(stderr_thread)
+            stderr_thread.start()
         self._pig_p25_url = f"http://127.0.0.1:{port}/"
         self._pig_p25_control_hz = control_hz
         self._pig_p25_system_label = system
@@ -470,20 +607,72 @@ class SDRManager:
             return False
         return self._start_pig_p25(frequency, system_label, gain, ppm, loot_dir)
 
+    def _drain_op25_stderr(self, proc, stream=None):
+        """Drain child output, retaining only useful lines for this OP25 run."""
+        if stream is None:
+            stream = proc
+            proc = None
+        try:
+            for raw_line in iter(stream.readline, ""):
+                line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw_line).strip()
+                if not line or "added talkgroup " in line.lower():
+                    continue
+                line = "".join(char for char in line if char.isprintable())[:240]
+                if line:
+                    with self._pig_p25_stderr_lock:
+                        if proc is None or self._pig_p25_stderr_owner is proc:
+                            self._pig_p25_stderr_tail.append(line)
+        except Exception:
+            pass
+
+    def _await_op25_stderr(self, proc, timeout=0.5):
+        with self._pig_p25_stderr_lock:
+            thread = (self._pig_p25_stderr_thread
+                      if self._pig_p25_stderr_owner is proc else None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, min(float(timeout), 1.0)))
+
+    def _op25_failure_detail(self, proc):
+        with self._pig_p25_stderr_lock:
+            lines = (list(self._pig_p25_stderr_tail)
+                     if self._pig_p25_stderr_owner in (None, proc) else [])
+        preferred = ("usb_claim_interface", "osmosdr source_c creation failure",
+                     "no module named", "error", "failed", "exception")
+        detail = ""
+        for marker in preferred:
+            detail = next((line for line in lines if marker in line.lower()), "")
+            if detail:
+                break
+        if not detail and lines:
+            detail = lines[-1]
+        code = proc.poll()
+        if code is None:
+            prefix = "OP25 failure"
+        else:
+            prefix = f"OP25 stopped (exit {code})"
+        if detail:
+            return f"{prefix}: {detail[:110]}"
+        return prefix
+
     def _pig_p25_worker(self):
         last_verified = time.monotonic()
         verified_once = False
+        last_status_error = ""
         while not self._pig_stop_event.wait(1.0):
             proc = self._pig_p25_proc
             if not proc:
                 return
             if proc.poll() is not None:
-                self._events.put(("error", "OP25 stopped"))
+                self._await_op25_stderr(proc)
+                self._events.put(("error", self._op25_failure_detail(proc)))
                 if self.mode == "pig_p25" and self._pig_p25_proc is proc:
                     self.stop()
                 return
             if time.monotonic() - last_verified > (10 if verified_once else 30):
-                self._events.put(("error", "OP25 tuning status unavailable; stopping P25 profile"))
+                detail = "OP25 tuning status unavailable; stopping P25 profile"
+                if last_status_error:
+                    detail += f" ({last_status_error[:80]})"
+                self._events.put(("error", detail[:180]))
                 if self.mode == "pig_p25" and self._pig_p25_proc is proc:
                     self.stop()
                 return
@@ -501,6 +690,7 @@ class SDRManager:
                         continue
                     last_verified = time.monotonic()
                     verified_once = True
+                    last_status_error = ""
                     if abs(observed_hz - self._pig_p25_control_hz) > 1000:
                         self._events.put(("error", "OP25 left the configured control channel; stopping P25 profile"))
                         if self.mode == "pig_p25" and self._pig_p25_proc is proc:
@@ -528,8 +718,9 @@ class SDRManager:
                     })
                     self._put_pig_event("pig_p25", parsed)
                     self._write_pig_log(parsed)
-            except Exception:
+            except Exception as exc:
                 # OP25's loopback dashboard may take a few seconds to start.
+                last_status_error = f"{type(exc).__name__}: {str(exc)[:80]}"
                 continue
 
     @staticmethod
@@ -675,6 +866,8 @@ class SDRManager:
             return False
         if self._dump1090_proc:
             return True  # already running
+        if not self._acquire_readsb_lease():
+            return False
 
         self._stop_event.clear()
 
@@ -705,6 +898,7 @@ class SDRManager:
                 )
         except Exception as e:
             self._events.put(("error", f"dump1090 failed: {e}"))
+            self._release_readsb_lease()
             return False
 
         # Open loot file
@@ -719,13 +913,13 @@ class SDRManager:
             except Exception:
                 pass
 
-        # Start SBS parser thread (connects to port 30003)
-        t = threading.Thread(target=self._sbs_reader, daemon=True)
-        t.start()
-        self._threads.append(t)
-
+        # Publish ownership before the reader can observe an immediate exit.
         self.running = True
         self.mode = "adsb"
+        t = threading.Thread(target=self._sbs_reader, daemon=True,
+                             name="adsb-sbs-reader")
+        self._threads.append(t)
+        t.start()
         self._events.put(("status", "ADS-B started (dump1090)"))
         return True
 
@@ -743,6 +937,8 @@ class SDRManager:
             return False
         if self._rtl433_proc:
             return True
+        if not self._acquire_readsb_lease():
+            return False
 
         self._stop_event.clear()
         self._gps_lat = gps_lat
@@ -757,6 +953,7 @@ class SDRManager:
             )
         except Exception as e:
             self._events.put(("error", f"rtl_433 failed: {e}"))
+            self._release_readsb_lease()
             return False
 
         # Open loot file
@@ -770,12 +967,12 @@ class SDRManager:
             except Exception:
                 pass
 
-        t = threading.Thread(target=self._rtl433_reader, daemon=True)
-        t.start()
-        self._threads.append(t)
-
         self.running = True
         self.mode = "433"
+        t = threading.Thread(target=self._rtl433_reader, daemon=True,
+                             name="rtl433-reader")
+        self._threads.append(t)
+        t.start()
         self._events.put(("status", "433 MHz scanner started (rtl_433)"))
         return True
 
@@ -795,7 +992,8 @@ class SDRManager:
 
         current = threading.current_thread()
         for thread in tuple(self._threads):
-            if thread is not current and thread.name in ("pig-rf-watchlist", "pig-p25-metadata"):
+            if thread is not current and thread.name in (
+                    "pig-rf-watchlist", "pig-p25-metadata", "pig-p25-stderr"):
                 thread.join(timeout=1.5)
         self._threads = [thread for thread in self._threads if thread.is_alive()]
 
@@ -814,6 +1012,7 @@ class SDRManager:
         self._sensor_log = None
         self._pig_log = None
         self._remove_p25_tmpdir()
+        self._release_readsb_lease()
         self._pig_p25_url = ""
         self._pig_channels = []
         self._pig_channel_state = {}
@@ -821,6 +1020,10 @@ class SDRManager:
         self.p25_quality = {}
         self._pig_p25_last_blocks = None
         self._pig_p25_last_block_at = None
+        with self._pig_p25_stderr_lock:
+            self._pig_p25_stderr_tail.clear()
+            self._pig_p25_stderr_owner = None
+            self._pig_p25_stderr_thread = None
 
         self.running = False
         self.mode = ""
@@ -859,12 +1062,30 @@ class SDRManager:
     # ------------------------------------------------------------------
     # SBS BaseStation format parser (ADS-B via dump1090 port 30003)
     # ------------------------------------------------------------------
+    def _stop_on_owned_child_exit(self, proc, attr_name, label):
+        """Stop the profile and release its tuner lease after child termination."""
+        if self._stop_event.is_set() or getattr(self, attr_name, None) is not proc:
+            return False
+        try:
+            returncode = proc.poll()
+        except Exception:
+            return False
+        if returncode is None:
+            return False
+        self._events.put((
+            "error", f"{label} exited unexpectedly (status {returncode}); stopping SDR"))
+        self.stop()
+        return True
+
     def _sbs_reader(self):
         """Connect to dump1090 SBS output and parse aircraft data."""
         import socket
         time.sleep(2)  # wait for dump1090 to start
 
         while not self._stop_event.is_set():
+            if self._stop_on_owned_child_exit(
+                    self._dump1090_proc, "_dump1090_proc", "dump1090"):
+                return
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
@@ -881,12 +1102,18 @@ class SDRManager:
                             line, buf = buf.split("\n", 1)
                             self._parse_sbs_line(line.strip())
                     except socket.timeout:
+                        if self._stop_on_owned_child_exit(
+                                self._dump1090_proc, "_dump1090_proc", "dump1090"):
+                            return
                         continue
                     except Exception:
                         break
                 sock.close()
             except Exception:
                 if self._stop_event.is_set():
+                    return
+                if self._stop_on_owned_child_exit(
+                        self._dump1090_proc, "_dump1090_proc", "dump1090"):
                     return
                 time.sleep(3)  # retry connection
 
@@ -990,8 +1217,9 @@ class SDRManager:
             try:
                 line = proc.stdout.readline()
                 if not line:
-                    if proc.poll() is not None:
-                        break
+                    if self._stop_on_owned_child_exit(
+                            proc, "_rtl433_proc", "rtl_433"):
+                        return
                     continue
                 self._parse_rtl433_line(
                     line.decode("utf-8", errors="replace").strip())
@@ -999,6 +1227,7 @@ class SDRManager:
                 if self._stop_event.is_set():
                     return
                 continue
+        self._stop_on_owned_child_exit(proc, "_rtl433_proc", "rtl_433")
 
     def _parse_rtl433_line(self, line: str):
         """Parse a JSON line from rtl_433."""

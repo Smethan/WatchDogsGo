@@ -470,6 +470,7 @@ def test_p25_sdr_error_event_reaches_settings_status(game, monkeypatch):
 
     assert w.p25_status_text() == "P25 error: OP25 stopped"
     game.msg.assert_called_once()
+    game._term_add.assert_any_call("[SDR] OP25 stopped", raw=True)
 
 
 def test_live_popup_draws_pending_status_without_gps_claim(game, monkeypatch):

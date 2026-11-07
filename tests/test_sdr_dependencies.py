@@ -90,6 +90,7 @@ def test_adsb_launches_resolved_binary_including_retry(monkeypatch, retry):
     monkeypatch.setattr(sdr_manager.time, "sleep", Mock())
     monkeypatch.setattr(sdr_manager.threading, "Thread", Mock())
     manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(manager, "_readsb_state", lambda: "missing")
     assert manager.start_adsb()
     commands = [call.args[0] for call in popen.call_args_list]
     expected = [[binary, "--net", "--quiet"]]

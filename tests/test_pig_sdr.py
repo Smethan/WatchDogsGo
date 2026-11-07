@@ -1,11 +1,64 @@
 """Pig Detector SDR profiles: ownership, bounded events and metadata only."""
 
+import io
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from watchdogs import sdr_manager
+
+
+@pytest.fixture(autouse=True)
+def no_readsb_service_by_default(monkeypatch):
+    original_which = sdr_manager.shutil.which
+
+    def which(name):
+        return None if name == "systemctl" else original_which(name)
+
+    monkeypatch.setattr(sdr_manager.shutil, "which", which)
+
+
+def _mock_readsb(monkeypatch, initial="active", *, fail_stop=False,
+                 fail_start=False, deactivate_on_failed_stop=False,
+                 timeout_stop=False):
+    state = {"value": initial}
+    calls = []
+
+    monkeypatch.setattr(
+        sdr_manager.shutil, "which",
+        lambda name: "/usr/bin/systemctl" if name == "systemctl" else None)
+
+    def run(command, **kwargs):
+        action = command[1]
+        calls.append(action)
+        if action == "show":
+            if state["value"] == "missing":
+                stdout = "LoadState=not-found\nActiveState=inactive\n"
+            else:
+                stdout = f"LoadState=loaded\nActiveState={state['value']}\n"
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if action == "stop":
+            if fail_stop:
+                if deactivate_on_failed_stop:
+                    state["value"] = "inactive"
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="stop rejected")
+            state["value"] = "inactive"
+            if timeout_stop:
+                raise sdr_manager.subprocess.TimeoutExpired(command, 12)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if action == "start":
+            if not fail_start:
+                state["value"] = "active"
+            return SimpleNamespace(
+                returncode=0 if not fail_start else 1,
+                stdout="", stderr="start rejected" if fail_start else "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(sdr_manager.subprocess, "run", run)
+    return state, calls
 
 
 def test_watchlist_validates_frequency_bandwidth_and_bounds():
@@ -250,7 +303,293 @@ def test_p25_launch_has_full_blacklist_no_audio_and_loopback_metadata(monkeypatc
     assert blacklist_path == tempdir + "/all-talkgroups.tsv"
     with open(blacklist_path, encoding="utf-8") as source:
         assert source.read() == "0\t65535\n"
-    thread.start.assert_called_once()
+    assert thread.start.call_count == 2  # stderr drainer and metadata worker
     manager._pig_p25_proc = None  # mocked process has no OS process group
     manager.stop()
     assert not os.path.exists(tempdir)
+
+
+def test_readsb_lease_pauses_and_restores_only_previously_active_service(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    assert manager._acquire_readsb_lease()
+    assert state["value"] == "inactive"
+    assert manager._readsb_paused is True
+    assert "readsb ADS-B feed paused" in " ".join(
+        str(data) for kind, data in manager.poll_events() if kind == "status")
+
+    assert manager._release_readsb_lease()
+    assert state["value"] == "active"
+    assert manager._readsb_paused is False
+    assert calls.count("stop") == 1
+    assert calls.count("start") == 1
+
+
+@pytest.mark.parametrize("initial", ["inactive", "failed", "missing"])
+def test_readsb_lease_leaves_nonactive_service_alone(monkeypatch, initial):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, initial)
+    assert manager._acquire_readsb_lease()
+    assert not manager._readsb_paused
+    assert state["value"] == initial
+    assert "stop" not in calls
+    assert manager._release_readsb_lease()
+    assert "start" not in calls
+
+
+def test_readsb_query_failure_fails_closed(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(
+        sdr_manager.shutil, "which", lambda name: "/usr/bin/systemctl")
+
+    def broken_run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="bus unavailable")
+
+    monkeypatch.setattr(sdr_manager.subprocess, "run", broken_run)
+    assert not manager._acquire_readsb_lease()
+    assert not manager._readsb_paused
+    assert "cannot query readsb.service" in manager.poll_events()[0][1]
+
+
+@pytest.mark.parametrize("deactivated", [False, True])
+def test_readsb_failed_stop_does_not_claim_service(monkeypatch, deactivated):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(
+        monkeypatch, "active", fail_stop=True,
+        deactivate_on_failed_stop=deactivated)
+    assert not manager._acquire_readsb_lease()
+    assert state["value"] == ("inactive" if deactivated else "active")
+    assert manager._readsb_paused is False
+    assert calls.count("stop") == 1
+    assert calls.count("start") == 0
+
+
+def test_readsb_stop_timeout_restores_if_it_stopped_service(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active", timeout_stop=True)
+    assert not manager._acquire_readsb_lease()
+    assert state["value"] == "active"
+    assert manager._readsb_paused is False
+    assert calls.count("stop") == 1
+    assert calls.count("start") == 1
+
+
+def test_readsb_stop_timeout_with_failed_query_attempts_restore(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    states = iter(["active", RuntimeError("bus unavailable"), "active"])
+    calls = []
+
+    def state():
+        value = next(states)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def run(command, **kwargs):
+        calls.append(command[1])
+        if command[1] == "stop":
+            raise sdr_manager.subprocess.TimeoutExpired(command, 12)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(manager, "_readsb_state", state)
+    monkeypatch.setattr(sdr_manager.subprocess, "run", run)
+    assert not manager._acquire_readsb_lease()
+    assert calls == ["stop", "start"]
+    assert manager._readsb_paused is False
+
+
+def test_readsb_unknown_state_fails_closed(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    _state, calls = _mock_readsb(monkeypatch, "activating")
+    assert not manager._acquire_readsb_lease()
+    assert "stop" not in calls
+
+
+def test_p25_start_failure_restores_readsb(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    monkeypatch.setattr(sdr_manager, "find_op25_rx", lambda: "/opt/op25/rx.py")
+    monkeypatch.setattr(
+        sdr_manager.subprocess, "Popen", Mock(side_effect=OSError("launch failed")))
+
+    assert not manager.start_pig_p25(851_012_500, "City P25")
+    assert state["value"] == "active"
+    assert manager._readsb_paused is False
+    assert calls.count("stop") == 1
+    assert calls.count("start") == 1
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("OP25 failed to start" in data for data in errors)
+
+
+def test_p25_stop_restores_readsb_once(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    monkeypatch.setattr(sdr_manager, "find_op25_rx", lambda: "/opt/op25/rx.py")
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(
+        sdr_manager.threading, "Thread", Mock(return_value=Mock()))
+
+    assert manager.start_pig_p25(851_012_500, "City P25")
+    assert state["value"] == "inactive"
+    manager._pig_p25_proc = None
+    manager.stop()
+    manager.stop()
+    assert state["value"] == "active"
+    assert calls.count("start") == 1
+
+
+def test_p25_stderr_drain_filters_blacklist_noise_and_bounds_detail():
+    manager = sdr_manager.SDRManager()
+    lines = ["added talkgroup 100 from /tmp/all-talkgroups.tsv\n"] * 100
+    lines.extend(["usb_claim_interface error -6\n", "later warning\n"])
+    manager._drain_op25_stderr(io.StringIO("".join(lines)))
+    assert len(manager._pig_p25_stderr_tail) == 2
+    assert "usb_claim_interface error -6" in manager._op25_failure_detail(
+        SimpleNamespace(poll=lambda: 1))
+
+
+def test_p25_child_exit_error_includes_op25_cause(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager.running = True
+    manager.mode = "pig_p25"
+    proc = Mock()
+    proc.poll.return_value = 1
+    manager._pig_p25_proc = proc
+    manager._pig_p25_stderr_tail.extend([
+        "usb_claim_interface error -6",
+        "AttributeError: source was None",
+    ])
+    stop = Mock()
+    monkeypatch.setattr(manager, "stop", stop)
+
+    manager._pig_p25_worker()
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("usb_claim_interface error -6" in data for data in errors)
+    stop.assert_called_once()
+
+
+def test_p25_early_exit_waits_for_its_stderr_drainer(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager.running = True
+    manager.mode = "pig_p25"
+    proc = Mock()
+    proc.poll.return_value = 1
+    manager._pig_p25_proc = proc
+    manager._pig_p25_stderr_owner = proc
+
+    def finish_drain(*, timeout):
+        manager._pig_p25_stderr_tail.append("usb_claim_interface error -6")
+
+    drainer = Mock()
+    drainer.join.side_effect = finish_drain
+    manager._pig_p25_stderr_thread = drainer
+    stop = Mock()
+    monkeypatch.setattr(manager, "stop", stop)
+
+    manager._pig_p25_worker()
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("usb_claim_interface error -6" in data for data in errors)
+    drainer.join.assert_called_once()
+    stop.assert_called_once()
+
+
+def test_p25_old_stderr_cannot_be_attributed_to_new_process():
+    manager = sdr_manager.SDRManager()
+    old_proc = Mock()
+    new_proc = Mock()
+    manager._pig_p25_stderr_owner = new_proc
+    manager._pig_p25_stderr_tail.append("old session USB failure")
+
+    assert "old session" not in manager._op25_failure_detail(old_proc)
+
+
+def test_rtl433_unexpected_exit_restores_readsb(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    assert manager._acquire_readsb_lease()
+    manager.running = True
+    manager.mode = "433"
+    proc = Mock()
+    proc.poll.return_value = 1
+    proc.stdout = Mock()
+    proc.stdout.readline.return_value = b""
+    manager._rtl433_proc = proc
+
+    manager._rtl433_reader()
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("rtl_433 exited unexpectedly" in data for data in errors)
+    assert state["value"] == "active"
+    assert calls.count("start") == 1
+    assert manager.running is False
+
+
+def test_adsb_unexpected_exit_restores_readsb(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    assert manager._acquire_readsb_lease()
+    manager.running = True
+    manager.mode = "adsb"
+    proc = Mock()
+    proc.poll.return_value = 1
+    manager._dump1090_proc = proc
+    monkeypatch.setattr(sdr_manager.time, "sleep", Mock())
+
+    manager._sbs_reader()
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("dump1090 exited unexpectedly" in data for data in errors)
+    assert state["value"] == "active"
+    assert calls.count("start") == 1
+    assert manager.running is False
+
+
+def test_rf_watchlist_stops_after_three_child_failures_and_restores_readsb(
+        monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    assert manager._acquire_readsb_lease()
+    manager.running = True
+    manager.mode = "pig_rf"
+    manager._pig_channels = manager._validated_channels([
+        {"frequency_hz": 155_000_000, "bandwidth_hz": 25_000},
+    ])
+    process = Mock()
+    process.returncode = 1
+    process.poll.return_value = 1
+    process.communicate.return_value = ("", "")
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
+    monkeypatch.setattr(manager._pig_stop_event, "wait", Mock(return_value=False))
+
+    manager._pig_rf_worker("/usr/bin/rtl_power")
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert popen.call_count == 3
+    assert any("failed three times" in data for data in errors)
+    assert state["value"] == "active"
+    assert calls.count("start") == 1
+    assert manager.running is False
+
+
+def test_p25_status_timeout_is_reported(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager.running = True
+    manager.mode = "pig_p25"
+    proc = Mock()
+    proc.poll.return_value = None
+    manager._pig_p25_proc = proc
+    monkeypatch.setattr(sdr_manager.time, "monotonic", Mock(side_effect=[100.0, 131.0]))
+    monkeypatch.setattr(manager._pig_stop_event, "wait", Mock(return_value=False))
+    stop = Mock()
+    monkeypatch.setattr(manager, "stop", stop)
+
+    manager._pig_p25_worker()
+
+    errors = [data for kind, data in manager.poll_events() if kind == "error"]
+    assert any("tuning status unavailable" in data for data in errors)
+    stop.assert_called_once()
