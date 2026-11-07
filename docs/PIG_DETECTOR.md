@@ -20,15 +20,16 @@ Enter local RF channels as center frequency in MHz, bandwidth in kHz, and label.
 
 The **P25 control** profile monitors one user-selected control channel with optional boatbod OP25. WDG creates an all-talkgroup blacklist, starts no vocoder, UDP player, recording, or voice output, and checks OP25's reported tuned frequency. It stops the profile if that frequency is unavailable or leaves the chosen control channel. The settings view shows decoded control blocks and their recent rate as a tuning clue; this is not a calibrated signal-quality score. While P25 holds the tuner, the RF watchlist is paused. A mapped system/talkgroup is shown as *configured network activity*; it never places a patrol unit on the map. `433` remains an `rtl_433` sensor decoder and produces neutral heard-at observations; `ADS-B` uses the existing aircraft collector.
 
-For the optional OP25 dependency, WDG accepts a source checkout of [boatbod/op25 commit `71abcd0ead32f86f51615ea6cc8a6a4dba4c949a`](https://github.com/boatbod/op25/commit/71abcd0ead32f86f51615ea6cc8a6a4dba4c949a). After installing its build dependencies per [upstream instructions](https://github.com/boatbod/op25/blob/71abcd0ead32f86f51615ea6cc8a6a4dba4c949a/README-installation.md), the source steps are:
+For the optional OP25 dependency, WDG accepts a source checkout of [boatbod/op25 commit `71abcd0ead32f86f51615ea6cc8a6a4dba4c949a`](https://github.com/boatbod/op25/commit/71abcd0ead32f86f51615ea6cc8a6a4dba4c949a). Clone and pin the source:
 
 ```sh
 git clone https://github.com/boatbod/op25.git "$HOME/op25-wdg"
 git -C "$HOME/op25-wdg" checkout --detach 71abcd0ead32f86f51615ea6cc8a6a4dba4c949a
-(cd "$HOME/op25-wdg" && ./install.sh)
 ```
 
-Set `WDG_OP25_ROOT` to that source directory in WDG's launch environment. WDG checks the checkout's exact commit before offering P25; it neither installs OP25 nor downloads frequencies at runtime. This integration has software fixture coverage but still needs reception and no-audio validation on the actual uConsole after the separate hardware-test authorization.
+Build dependencies are described in [upstream's installation guide](https://github.com/boatbod/op25/blob/71abcd0ead32f86f51615ea6cc8a6a4dba4c949a/README-installation.md). Review the package transaction before using its `install.sh` on an existing uConsole. On the Parrot 7.4 image with `sdrpp-brown` and `tar1090`, its `gnuradio-dev`/`libvolk-dev` dependencies would remove those installed SDR packages. The uConsole setup instead installed GNU Radio runtime packages with apt's `--no-remove` guard and built OP25 against separately extracted development headers, leaving both packages installed.
+
+The bundled `run.sh` sets `WDG_OP25_ROOT` to the launch user's `~/op25-wdg` when that directory exists. An explicit `WDG_OP25_ROOT` in the launch environment takes precedence. WDG checks the checkout's exact commit before offering P25; it neither installs OP25 nor downloads frequencies at runtime. This integration has software fixture coverage but still needs reception and no-audio validation on the actual uConsole after the separate hardware-test authorization.
 
 ## Practical limits
 

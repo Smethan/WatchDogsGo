@@ -26,6 +26,16 @@ fi
 # Never create .pyc files — prevents root-owned cache blocking updates
 export PYTHONDONTWRITEBYTECODE=1
 
+# Use the launch user's pinned OP25 checkout for the optional P25 profile.
+# Resolve the user explicitly because this script can also be started with sudo.
+if [ -z "${WDG_OP25_ROOT:-}" ]; then
+    OP25_LAUNCH_USER="${SUDO_USER:-$(id -un)}"
+    OP25_LAUNCH_HOME="$(getent passwd "$OP25_LAUNCH_USER" | cut -d: -f6)"
+    if [ -n "$OP25_LAUNCH_HOME" ] && [ -d "$OP25_LAUNCH_HOME/op25-wdg" ]; then
+        export WDG_OP25_ROOT="$OP25_LAUNCH_HOME/op25-wdg"
+    fi
+fi
+
 # Suppress PulseAudio warnings when running as root
 RUN_UID="${SUDO_UID:-$(id -u)}"
 export XDG_RUNTIME_DIR="/run/user/${RUN_UID}"
