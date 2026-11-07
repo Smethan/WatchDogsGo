@@ -4138,6 +4138,9 @@ class WatchDogsGame(OtaMixin):
                 elif etype == "status":
                     self._term_add(f"[SDR] {data}", raw=True)
                 elif etype == "error":
+                    record_p25_error = getattr(self.wardrive, "record_p25_error", None)
+                    if callable(record_p25_error):
+                        record_p25_error(str(data))
                     self.msg(f"[SDR] {data}", C_ERROR)
                 elif etype == "aircraft_new":
                     ac = data
@@ -8307,7 +8310,8 @@ class WatchDogsGame(OtaMixin):
         if self._sdr.running and "433" in self._sdr.mode:
             tools.append(f"433:{self._sdr.total_sensors_seen}")
         if self.wardrive.pig.active:
-            tools.append("PIG:" + self.wardrive.pig.status[:12])
+            p25_status = self.wardrive.p25_status_text(compact=True)
+            tools.insert(0, p25_status or "PIG:" + self.wardrive.pig.status[:12])
         if tools:
             dots = "." * ((pyxel.frame_count // 10) % 4)
             status_x, status_txt = _fit_hud_text(

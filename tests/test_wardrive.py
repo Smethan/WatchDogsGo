@@ -399,6 +399,79 @@ def test_live_negotiation_through_actual_scan_menu_transition(game, state, comma
     w.handle_line("All operations stopped.")
     assert game.serial.send_command.call_args.args[0]==command+" "+w.scan.session+" live_oui=0025DF,B41E52"
 
+@pytest.mark.parametrize("state,expected", [
+    ("unset", "P25: set a control frequency"),
+    ("ready", "P25 ready; start Pig Detector"),
+    ("off", "P25: SDR power is off"),
+    ("waiting", "P25: waiting for OP25 status"),
+    ("zero", "P25 decoded blocks: 0  0.0/min"),
+    ("decoded", "P25 decoded blocks: 42  60.0/min"),
+    ("error", "P25 error: OP25 stopped"),
+    ("busy", "P25 unavailable: SDR busy in adsb"),
+    ("failed", "P25 not running; restart Pig Detector or check terminal"),
+])
+def test_p25_settings_always_show_actionable_runtime_status(
+        game, monkeypatch, state, expected):
+    import sys
+    w = game.wardrive
+    w.settings_open = True
+    w.settings_page = "pig"
+    w.settings["pig_sdr_profile"] = "p25"
+    w.settings["pig_p25_control_hz"] = 0 if state == "unset" else 856_212_500
+    game._sdr_enabled = state != "off"
+    game._sdr = NS(running=False, mode="", p25_quality={})
+    if state in ("waiting", "zero", "decoded"):
+        game._sdr.running = True
+        game._sdr.mode = "pig_p25"
+    if state == "zero":
+        game._sdr.p25_quality = {"decoded_blocks": 0, "blocks_per_min": 0.0}
+    if state == "decoded":
+        game._sdr.p25_quality = {"decoded_blocks": 42, "blocks_per_min": 60.0}
+    if state == "busy":
+        game._sdr.running = True
+        game._sdr.mode = "adsb"
+    if state in ("error", "failed"):
+        w.pig.active = True
+    if state == "error":
+        w.record_p25_error("OP25 stopped")
+
+    px = Mock()
+    monkeypatch.setitem(sys.modules, "pyxel", px)
+    w.draw_overlay()
+    lines = [call.args[2] for call in px.text.call_args_list]
+    assert expected in lines
+
+
+def test_p25_hud_status_is_compact_and_profile_specific(game):
+    w = game.wardrive
+    w.settings["pig_sdr_profile"] = "p25"
+    w.settings["pig_p25_control_hz"] = 856_212_500
+    game._sdr_enabled = True
+    game._sdr = NS(running=True, mode="pig_p25",
+                   p25_quality={"decoded_blocks": 42, "blocks_per_min": 60.0})
+    assert w.p25_status_text(compact=True) == "P25:42"
+    w.settings["pig_sdr_profile"] = "auto"
+    assert w.p25_status_text(compact=True) == ""
+
+
+def test_p25_sdr_error_event_reaches_settings_status(game, monkeypatch):
+    import watchdogs.app as appmod
+
+    w = game.wardrive
+    w.settings["pig_sdr_profile"] = "p25"
+    w.settings["pig_p25_control_hz"] = 856_212_500
+    w.pig.active = True
+    game._sdr_enabled = True
+    game._sdr = NS(running=False, mode="", aircraft={}, sensors={},
+                   poll_events=lambda: [("error", "OP25 stopped")])
+    monkeypatch.setattr(appmod, "pyxel", NS(frame_count=1))
+
+    game._poll_sdr()
+
+    assert w.p25_status_text() == "P25 error: OP25 stopped"
+    game.msg.assert_called_once()
+
+
 def test_live_popup_draws_pending_status_without_gps_claim(game, monkeypatch):
     import watchdogs.wardrive_ui as ui
     w=game.wardrive; token=start_live_scan(w)

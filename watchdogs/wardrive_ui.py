@@ -112,6 +112,7 @@ class WardriveUI:
         self.settings = (load_settings(app._app_dir) if initial_settings is None
                          else normalize_settings(initial_settings))
         self.pig = PigDetector(self.settings)
+        self._pig_p25_error = ""
         self.remote_id = RemoteIdDecoder()
         self.settings_open = False
         self.settings_page = "main"
@@ -184,6 +185,7 @@ class WardriveUI:
             return True
         app = self.app
         session_dir = getattr(getattr(app, "loot", None), "session_dir", None)
+        self._pig_p25_error = ""
         self.pig.start(session_dir)
         self.remote_id.clear()
         pool = getattr(app, "c5_pool", None)
@@ -258,6 +260,7 @@ class WardriveUI:
                 and app._sdr.running and app._sdr.mode == self.pig.owned_sdr_mode):
             app._sdr.stop()
         self.pig.stop()
+        self._pig_p25_error = ""
         self.remote_id.clear()
 
     def start_pig_sdr(self):
@@ -304,6 +307,55 @@ class WardriveUI:
                           raw=True)
         else:
             app._term_add("[PIG] SDR profile: " + profile, raw=True)
+
+    def record_p25_error(self, detail):
+        """Keep the latest P25 startup/runtime error visible while Pig runs."""
+        if (self.pig.active
+                and self.settings.get("pig_sdr_profile") == "p25"):
+            self._pig_p25_error = str(detail).replace("\n", " ")[:96]
+        else:
+            self._pig_p25_error = ""
+
+    def p25_status_text(self, *, compact=False):
+        """Return a visible P25 runtime state for the settings page and HUD."""
+        if (not self.pig.active
+                or self.settings.get("pig_sdr_profile") != "p25"):
+            self._pig_p25_error = ""
+        if self.settings.get("pig_sdr_profile") != "p25":
+            return ""
+
+        def render(short, detail):
+            return short if compact else detail
+
+        if not self.settings.get("pig_p25_control_hz"):
+            return render("P25:SET", "P25: set a control frequency")
+
+        app = self.app
+        sdr = getattr(app, "_sdr", None)
+        if not getattr(app, "_sdr_enabled", False) or sdr is None:
+            return render("P25:OFF", "P25: SDR power is off")
+
+        if getattr(sdr, "running", False) and getattr(sdr, "mode", "") == "pig_p25":
+            quality = getattr(sdr, "p25_quality", {}) or {}
+            blocks = quality.get("decoded_blocks")
+            rate = quality.get("blocks_per_min")
+            if blocks is None:
+                return render("P25:WAIT", "P25: waiting for OP25 status")
+            if compact:
+                return "P25:" + str(blocks)
+            status = "P25 decoded blocks: " + str(blocks)
+            if rate is not None:
+                status += f"  {rate:.1f}/min"
+            return status
+
+        if self._pig_p25_error:
+            return render("P25:ERR", "P25 error: " + self._pig_p25_error)
+        if getattr(sdr, "running", False):
+            mode = str(getattr(sdr, "mode", "") or "another profile")
+            return render("P25:BUSY", "P25 unavailable: SDR busy in " + mode)
+        if self.pig.active:
+            return render("P25:FAIL", "P25 not running; restart Pig Detector or check terminal")
+        return render("P25:READY", "P25 ready; start Pig Detector")
 
     def tick(self):
         app = self.app
@@ -3073,13 +3125,9 @@ class WardriveUI:
                     px.text(55,64+index*16,
                             (("> " if index == self.pig_selection else "  ")+row)[:104],
                             11 if index == self.pig_selection else 7)
-                sdr = getattr(self.app, "_sdr", None)
-                if sdr is not None and sdr.running and sdr.mode == "pig_p25":
-                    quality = sdr.p25_quality
-                    blocks = quality.get("decoded_blocks")
-                    rate = quality.get("blocks_per_min")
-                    px.text(55,248,("P25 decoded blocks: " + str(blocks if blocks is not None else "waiting")
-                                    + (f"  {rate:.1f}/min" if rate is not None else ""))[:103],13)
+                p25_status = self.p25_status_text()
+                if p25_status:
+                    px.text(55,248,p25_status[:103],13)
                 elif channels:
                     latest = channels[-1]
                     px.text(55,248,("Last: " + latest["label"] + " "
