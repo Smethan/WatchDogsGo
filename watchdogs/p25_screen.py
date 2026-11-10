@@ -41,6 +41,7 @@ class P25Screen:
         self._observed_wacn = ""
         self._observed_rfss = ""
         self._observed_site = ""
+        self._observed_session_id = None
 
     def show(self):
         self.open = True
@@ -129,6 +130,18 @@ class P25Screen:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log.append(f"{stamp}  {value}")
 
+    def _reset_observed_activity(self):
+        """Keep the visible history while making each receiver run distinct."""
+        self._log_keys.clear()
+        self._log_key_set.clear()
+        self._last_blocks = None
+        self._last_block_milestone = 0
+        self._logged_talkgroups.clear()
+        self._observed_sysid = ""
+        self._observed_wacn = ""
+        self._observed_rfss = ""
+        self._observed_site = ""
+
     def record_error(self, message):
         if self.pending_start and time.monotonic() > self.pending_start_until:
             self.pending_start = False
@@ -190,25 +203,30 @@ class P25Screen:
         comparable = [
             (got, want) for got, want in zip(observed, expected) if got and want
         ]
-        matches = all(got == want for got, want in comparable)
         has_expected_system_ids = bool(expected_sysid and expected_wacn)
         has_observed_system_ids = bool(self._observed_sysid and self._observed_wacn)
-        if matches and has_expected_system_ids and has_observed_system_ids:
-            label = "Decoded frequency matches selected system IDs"
-            key = ("identity-match", site["id"], expected)
-        else:
+        if not (has_expected_system_ids and has_observed_system_ids):
+            return
+        if any(got != want for got, want in comparable):
             label = (
                 "Frequency decoded, but system ID does not match selected site "
                 f"(observed SYS {observed[0] or '?'} / WACN {observed[1] or '?'} / "
                 f"RFSS {observed[2] or '?'} / site {observed[3] or '?'})"
             )
             key = ("identity-mismatch", site["id"], observed)
+        else:
+            label = "Decoded frequency matches selected system IDs"
+            key = ("identity-match", site["id"], expected)
         self._append_log(label, key=key)
 
     def ingest(self, data):
         """Add meaningful metadata changes, deduplicating periodic status polls."""
         if not isinstance(data, dict):
             return
+        session_id = getattr(getattr(self.app, "_sdr", None), "p25_session_id", None)
+        if session_id is not None and session_id != self._observed_session_id:
+            self._reset_observed_activity()
+            self._observed_session_id = session_id
         frequency = data.get("tuned_frequency_hz") or data.get("frequency_hz")
         try:
             frequency = int(frequency) if frequency is not None else 0
@@ -557,8 +575,8 @@ class P25Screen:
             self.pending_start_until = 0.0
             self.scan_mode = bool(scan)
             self.last_error = ""
-            self._last_blocks = None
-            self._logged_talkgroups.clear()
+            self._reset_observed_activity()
+            self._observed_session_id = self.owned_session_id
             self._append_log(
                 ("Scanning site " if scan else "Listening on ")
                 + f"{site['site']} / {self._mhz(frequency)} MHz"
