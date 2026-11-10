@@ -1,0 +1,12 @@
+# P25 Monitor
+
+Open **SNIFF > P25 Monitor**. The screen opens idle so you can inspect the selected control channel and recent metadata before claiming the SDR. Enable the AIO SDR rail under **SYSTEM > SDR** if it is off.
+
+- **F** opens the folder picker: **Texas > county > site > control frequency**. Enter descends or selects a frequency; Escape goes up one folder. The built-in catalog is a snapshot of the seven sites and 19 frequencies marked `Ctrl` on the [Denton County Regional Radio System page](https://www.radioreference.com/db/sid/8438), which reports an August 9, 2026 update. These are control-capable candidates, not a live channel assignment or a network lookup at runtime.
+- **Enter** listens on the selected frequency. **H** searches the selected site's control frequencies in one OP25 session. OP25 moves to the next candidate after control-channel timeouts; the dwell is driven by OP25 rather than a fixed timer. The screen shows the current tuned frequency and decoded-block progress. A frequency hit is evidence of decoded P25 control data; the named system is confirmed only when decoded identifiers match the catalog's system ID and WACN.
+- **A** adds a custom region/county/site/control frequency, or another frequency under a selected custom site. **D** removes a selected custom site. Built-in entries stay read-only. Existing manually configured P25 frequency and system label remain available after the upgrade.
+- **S** stops a session started from this screen. **Escape/Tab** closes the screen and stops only the session this screen started. If Pig Detector already owns P25, the screen can show its status but leaves that session under Pig Detector's control.
+
+The log contains recent decoded control metadata such as system/site identifiers, talkgroup IDs, frequency changes, and errors. It is bounded on screen; when a writable loot session exists, OP25 metadata also goes to `pig_p25.jsonl`. P25 Monitor has no voice decoder, audio output, recording, or transmission. A rising block count supports that a control signal is being decoded; zero blocks does not by itself prove a listed frequency is inactive.
+
+The AIO RTL-SDR has one tuner. WatchDogsGo temporarily pauses an active `readsb.service` while its P25 receiver uses the tuner and restores that service when the session stops. The separate ADS-B feed from `readsb` pauses during this interval. If the receiver exits or its tuning status disappears, the screen and terminal show the error and release the tuner.

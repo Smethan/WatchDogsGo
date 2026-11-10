@@ -227,6 +227,7 @@ MENU_CATS = [
         ("6", "All Wardrive", "start_wardrive_serial", "all_wardrive", None),
         ("9", "All Wardrive (host BLE)", "start_wardrive_wifi_serial", "all_wardrive_host", None),
         ("p", "Pig Detector", "_pig_detector", "_pig_detector", None),
+        ("8", "P25 Monitor", "_p25_monitor", "_p25_monitor", None),
         ("o", "Wardrive Settings", "_wardrive_settings", "_wardrive_settings", None),
         ("3", "Pkt Sniffer",     "start_sniffer_all",      "sniffer",      None),
         ("4", "HS Capture",      "start_handshake",        "_hs_capture_sd_menu",    None),
@@ -1871,6 +1872,13 @@ class WatchDogsGame(OtaMixin):
         if self.wardrive.settings_open and self.input_mode:
             self._update_input_dialog()
             return
+        if self.wardrive.p25_screen.open:
+            if self.input_mode:
+                self._update_input_dialog()
+            else:
+                self.wardrive.p25_screen.update()
+            self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
+            return
         if self.wardrive.capture_screen.open:
             self.wardrive.capture_screen.update()
             self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
@@ -2197,6 +2205,9 @@ class WatchDogsGame(OtaMixin):
         if state_key == "_wardrive_settings":
             self.wardrive.settings_open = True
             self.wardrive.settings_page = "main"
+            return
+        if state_key == "_p25_monitor":
+            self.wardrive.p25_screen.show()
             return
         if state_key == "_pig_detector":
             if self.wardrive.pig.active:
@@ -4141,6 +4152,9 @@ class WatchDogsGame(OtaMixin):
                     record_p25_error = getattr(self.wardrive, "record_p25_error", None)
                     if callable(record_p25_error):
                         record_p25_error(str(data))
+                    p25_screen = getattr(self.wardrive, "p25_screen", None)
+                    if p25_screen is not None:
+                        p25_screen.record_error(str(data))
                     self.msg(f"[SDR] {data}", C_ERROR)
                     self._term_add(f"[SDR] {data}", raw=True)
                 elif etype == "aircraft_new":
@@ -4153,9 +4167,13 @@ class WatchDogsGame(OtaMixin):
                 elif etype == "pig_rf" and pig.active:
                     fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
                     pig.ingest_rf(data, fix)
-                elif etype == "pig_p25" and pig.active:
-                    fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
-                    pig.ingest_p25(data, fix)
+                elif etype == "pig_p25":
+                    p25_screen = getattr(self.wardrive, "p25_screen", None)
+                    if p25_screen is not None:
+                        p25_screen.ingest(data)
+                    if pig.active:
+                        fix = self.wardrive.fixes.at(time.monotonic()) if self.gps.available else None
+                        pig.ingest_p25(data, fix)
         except Exception:
             pass
 
@@ -4938,6 +4956,9 @@ class WatchDogsGame(OtaMixin):
                     return
                 if self._input_pending_cat == -15:  # Pig Detector settings
                     self.wardrive.apply_pig_input(self._input_pending_item, vals)
+                    return
+                if self._input_pending_cat == -16:  # P25 Monitor catalog
+                    self.wardrive.p25_screen.apply_input(self._input_pending_item, vals)
                     return
                 if self._input_pending_cat == -6:  # WPA-sec token
                     token = vals[0].strip() if vals else ""
@@ -7174,6 +7195,9 @@ class WatchDogsGame(OtaMixin):
         else:
             self._term_add(
                 "[LoRa] Radio handoff still active during shutdown", raw=True)
+        p25_screen = getattr(self.wardrive, "p25_screen", None)
+        if p25_screen is not None:
+            p25_screen.stop_owned()
         if self._sdr.running:
             self._sdr.stop()
         status_stop = getattr(self, "_sx1262_status_stop", None)
@@ -7213,12 +7237,15 @@ class WatchDogsGame(OtaMixin):
         self._draw_inner()
         self._draw_plugin_pin()
         self.wardrive.draw_overlay()
-        if self.input_mode and self.wardrive.settings_open:
+        if self.input_mode and (self.wardrive.settings_open or self.wardrive.p25_screen.open):
             self._draw_input_dialog()
 
     def _draw_inner(self):
         if self._boot_phase:
             self._draw_boot_screen()
+            return
+        if self.wardrive.p25_screen.open:
+            self.wardrive.p25_screen.draw()
             return
         if self.wardrive.capture_screen.open:
             self.wardrive.capture_screen.draw()

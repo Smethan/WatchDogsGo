@@ -593,3 +593,136 @@ def test_p25_status_timeout_is_reported(monkeypatch):
     errors = [data for kind, data in manager.poll_events() if kind == "error"]
     assert any("tuning status unavailable" in data for data in errors)
     stop.assert_called_once()
+
+
+def test_p25_launch_uses_comma_separated_control_channel_list(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(sdr_manager, "find_op25_rx", lambda: "/opt/op25/rx.py")
+    process = Mock()
+    process.poll.return_value = None
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
+    monkeypatch.setattr(sdr_manager.threading, "Thread", Mock(return_value=Mock()))
+
+    assert manager.start_pig_p25(
+        856_212_500,
+        "Lewisville",
+        control_channels=[
+            856_212_500,
+            858_212_500,
+            859_212_500,
+        ],
+    )
+    tempdir = manager._pig_p25_tmpdir
+    with open(tempdir + "/trunk.tsv", encoding="utf-8") as source:
+        _, row = source.read().rstrip("\n").splitlines()
+    assert row.split("\t")[1] == "856.212500,858.212500,859.212500"
+    assert manager._pig_p25_control_channels == (856_212_500, 858_212_500, 859_212_500)
+    manager._pig_p25_proc = None
+    manager.stop()
+
+
+def test_p25_control_channel_list_validation_is_bounded(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    popen = Mock()
+    monkeypatch.setattr(sdr_manager, "find_op25_rx", lambda: "/opt/op25/rx.py")
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
+    assert not manager.start_pig_p25(
+        851_000_000,
+        control_channels=[851_000_000 + index for index in range(1, 17)],
+    )
+    assert "exceeds 16" in manager.poll_events()[0][1]
+    assert not manager.start_pig_p25(
+        851_000_000, control_channels=[851_000_000, "852000000"]
+    )
+    assert "integer Hz" in manager.poll_events()[0][1]
+    assert not manager.start_pig_p25(
+        851_000_000, control_channels=[851_000_000, 2_000_000_000]
+    )
+    assert "outside supported" in manager.poll_events()[0][1]
+    popen.assert_not_called()
+
+
+def test_p25_decode_delta_is_attributed_only_after_same_frequency_samples(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager.mode = "pig_p25"
+    manager.running = True
+    manager._pig_p25_proc = Mock()
+    manager._pig_p25_proc.poll.return_value = None
+    manager._pig_p25_control_hz = 856_212_500
+    manager._pig_p25_control_channels = (856_212_500, 858_212_500)
+    manager._pig_p25_url = "http://127.0.0.1:18080/"
+    manager._pig_p25_system_label = "Lewisville"
+    manager._pig_stop_event.wait = Mock(side_effect=[False, False, False, True])
+
+    def response(frequency, blocks):
+        value = (
+            '[{"json_type":"trunk_update","0x293":{"tsbks":%d}},'
+            '{"json_type":"change_freq","freq":%d}]'
+        ) % (blocks, frequency)
+        wrapped = MagicMock()
+        wrapped.read.return_value = value.encode()
+        wrapped.__enter__ = Mock(return_value=wrapped)
+        wrapped.__exit__ = Mock(return_value=None)
+        return wrapped
+
+    monkeypatch.setattr(
+        sdr_manager.urllib.request,
+        "urlopen",
+        Mock(
+            side_effect=[
+                response(856_212_500, 10),
+                response(856_212_500, 12),
+                response(858_212_500, 20),
+            ]
+        ),
+    )
+    manager._pig_p25_worker()
+
+    assert manager.p25_quality["tuned_frequency_hz"] == 858_212_500
+    assert manager.p25_quality["last_decoded_frequency_hz"] == 856_212_500
+    assert manager.p25_quality["recent_decoded_frequency_hz"] == 856_212_500
+    events = [data for kind, data in manager.poll_events() if kind == "pig_p25"]
+    assert [event["control_frequency_hz"] for event in events] == [
+        856_212_500,
+        856_212_500,
+        858_212_500,
+    ]
+    assert events[0]["decoded_frequency_hz"] is None
+    assert events[1]["decoded_frequency_hz"] == 856_212_500
+    # The first sample after a hop cannot prove activity on the newly tuned channel.
+    assert events[2]["decoded_frequency_hz"] == 856_212_500
+
+
+def test_p25_counter_reset_does_not_create_a_false_decode(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager.mode = "pig_p25"
+    manager.running = True
+    manager._pig_p25_proc = Mock()
+    manager._pig_p25_proc.poll.return_value = None
+    manager._pig_p25_control_hz = 856_212_500
+    manager._pig_p25_control_channels = (856_212_500,)
+    manager._pig_p25_url = "http://127.0.0.1:18080/"
+    manager._pig_stop_event.wait = Mock(side_effect=[False, False, False, True])
+    responses = []
+    for blocks in (10, 2, 3):
+        wrapped = MagicMock()
+        wrapped.read.return_value = (
+            '[{"json_type":"trunk_update","0x293":{"tsbks":%d}},'
+            '{"json_type":"change_freq","freq":856212500}]' % blocks
+        ).encode()
+        wrapped.__enter__ = Mock(return_value=wrapped)
+        wrapped.__exit__ = Mock(return_value=None)
+        responses.append(wrapped)
+    monkeypatch.setattr(
+        sdr_manager.urllib.request, "urlopen", Mock(side_effect=responses)
+    )
+
+    manager._pig_p25_worker()
+
+    events = [data for kind, data in manager.poll_events() if kind == "pig_p25"]
+    assert [event["decoded_frequency_hz"] for event in events] == [
+        None,
+        None,
+        856_212_500,
+    ]

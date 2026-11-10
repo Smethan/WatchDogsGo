@@ -12,6 +12,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
+from .p25_catalog import BUILTIN_SITES, find_builtin_site_for_frequency
 from .map_display import (
     DEFAULT_LAYER_MODES,
     MAP_LAYERS,
@@ -40,6 +41,8 @@ DEFAULTS = {
     "pig_watchlist": [],
     "pig_p25_control_hz": 0,
     "pig_p25_system": "",
+    "p25_custom_sites": [],
+    "p25_selected_site_id": "",
     "pig_gain_db": 0,
     "pig_ppm": 0,
     "pig_agency_icao": [],
@@ -157,6 +160,114 @@ def normalize_settings(saved: Mapping[str, Any] | None) -> dict[str, Any]:
     hz = result["pig_p25_control_hz"]
     result["pig_p25_control_hz"] = (
         hz if type(hz) is int and 24_000_000 <= hz <= 1_740_000_000 else 0)
+    # User sites are deliberately small and bounded because this settings file
+    # is copied and normalized on every load/save.
+    custom_sites = []
+    seen_site_ids = set()
+    raw_custom = result.get("p25_custom_sites", [])
+    if isinstance(raw_custom, list):
+        for index, raw in enumerate(raw_custom[:64]):
+            if not isinstance(raw, Mapping):
+                continue
+            fields = {}
+            valid = True
+            for key, limit in (("region", 32), ("county", 40), ("site", 48)):
+                value = raw.get(key)
+                if not isinstance(value, str):
+                    valid = False
+                    break
+                cleaned = "".join(ch for ch in value.strip() if ch.isprintable())[
+                    :limit
+                ]
+                if not cleaned:
+                    valid = False
+                    break
+                fields[key] = cleaned
+            if not valid:
+                continue
+            system = raw.get("system", "")
+            if not isinstance(system, str):
+                system = ""
+            system = "".join(ch for ch in system.strip() if ch.isprintable())[:48]
+            controls = []
+            raw_controls = raw.get("control_hz", raw.get("frequencies_hz", ()))
+            if isinstance(raw_controls, (list, tuple)):
+                for frequency in raw_controls:
+                    if (
+                        type(frequency) is int
+                        and 24_000_000 <= frequency <= 1_740_000_000
+                        and frequency not in controls
+                    ):
+                        controls.append(frequency)
+                    if len(controls) >= 16:
+                        break
+            if not controls:
+                continue
+            site_id = raw.get("id")
+            if not isinstance(site_id, str) or not site_id.startswith("custom:"):
+                site_id = f"custom:user-{index + 1}"
+            site_id = site_id[:64]
+            if site_id in seen_site_ids:
+                continue
+            seen_site_ids.add(site_id)
+            normalized_site = {
+                "id": site_id,
+                **fields,
+                "system": system,
+                "control_hz": controls,
+            }
+            for key in ("sysid", "wacn"):
+                value = raw.get(key)
+                if isinstance(value, str) and re.fullmatch(
+                    r"(?:0x)?[0-9A-Fa-f]{1,8}", value.strip()
+                ):
+                    digits = value.strip().removeprefix("0x").removeprefix("0X")
+                    normalized_site[key] = "0x" + digits.upper()
+            custom_sites.append(normalized_site)
+    result["p25_custom_sites"] = custom_sites
+
+    selected_site_id = result.get("p25_selected_site_id", "")
+    if not isinstance(selected_site_id, str):
+        selected_site_id = ""
+    available_sites = [*BUILTIN_SITES, *custom_sites]
+    if selected_site_id not in {site["id"] for site in available_sites}:
+        selected_site_id = ""
+    if selected_site_id and result["pig_p25_control_hz"]:
+        selected_site = next(
+            site for site in available_sites if site["id"] == selected_site_id
+        )
+        if result["pig_p25_control_hz"] not in selected_site["control_hz"]:
+            selected_site_id = ""
+    if not selected_site_id and result["pig_p25_control_hz"]:
+        saved_hz = result["pig_p25_control_hz"]
+        matched = find_builtin_site_for_frequency(saved_hz)
+        if matched is None:
+            matched = next(
+                (site for site in custom_sites if saved_hz in site["control_hz"]), None
+            )
+        if matched is not None:
+            selected_site_id = matched["id"]
+        else:
+            # Keep the pre-catalog user frequency visible as a custom entry.
+            label = result["pig_p25_system"] or f"Saved {saved_hz / 1e6:.4f} MHz"
+            legacy = {
+                "id": "custom:legacy-p25",
+                "region": "Custom",
+                "county": "Saved channels",
+                "site": label[:48],
+                "system": result["pig_p25_system"],
+                "control_hz": [saved_hz],
+            }
+            existing = next(
+                (site for site in custom_sites if site["id"] == legacy["id"]), None
+            )
+            if existing is None and len(custom_sites) < 64:
+                custom_sites.append(legacy)
+                result["p25_custom_sites"] = custom_sites
+            elif existing is not None and saved_hz not in existing["control_hz"]:
+                existing["control_hz"].append(saved_hz)
+            selected_site_id = legacy["id"]
+    result["p25_selected_site_id"] = selected_site_id
     gain = result["pig_gain_db"]
     result["pig_gain_db"] = gain if type(gain) is int and 0 <= gain <= 50 else 0
     ppm = result["pig_ppm"]

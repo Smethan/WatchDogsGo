@@ -134,8 +134,16 @@ class SDRManager:
         self._pig_ppm = 0
         self._pig_channel_state: dict[str, dict] = {}
         self.p25_quality: dict = {}
+        # Monotonic identity lets UI owners distinguish successive OP25 runs.
+        self.p25_session_id = 0
+        self._pig_p25_control_hz = 0
+        self._pig_p25_control_channels: tuple[int, ...] = ()
+        self._pig_p25_system_label = ""
         self._pig_p25_last_blocks = None
         self._pig_p25_last_block_at = None
+        self._pig_p25_last_tuned_hz = None
+        self._pig_p25_last_decoded_hz = None
+        self._pig_p25_last_decoded_at = None
 
     @staticmethod
     def has_dump1090() -> bool:
@@ -495,17 +503,31 @@ class SDRManager:
         self._put_pig_event("pig_rf", event)
         self._write_pig_log(event)
 
-    def _start_pig_p25(self, control_hz: int, system_label: str,
-                       gain: Optional[float], ppm: int, loot_dir: str) -> bool:
+    def _start_pig_p25(
+        self,
+        control_hz: int,
+        control_channels: tuple[int, ...],
+        system_label: str,
+        gain: Optional[float],
+        ppm: int,
+        loot_dir: str,
+    ) -> bool:
         executable = find_op25_rx()
         if not executable:
-            self._events.put(("error", "Pinned OP25 source checkout unavailable; P25 metadata is unavailable"))
+            self._events.put(
+                (
+                    "error",
+                    "Pinned OP25 source checkout unavailable; P25 metadata is unavailable",
+                )
+            )
             return False
-        if not PIG_RF_MIN_HZ <= control_hz <= PIG_RF_MAX_HZ:
-            self._events.put(("error", "P25 control frequency is outside supported RTL-SDR range"))
+        if not control_channels or control_hz not in control_channels:
+            self._events.put(("error", "P25 control channel list is empty or invalid"))
             return False
         if system_label and len(system_label) > 48:
-            self._events.put(("error", "P25 system label must contain at most 48 characters"))
+            self._events.put(
+                ("error", "P25 system label must contain at most 48 characters")
+            )
             return False
         try:
             correction = int(ppm)
@@ -519,9 +541,12 @@ class SDRManager:
             return False
         if self.mode or self.running or self._dump1090_proc or self._rtl433_proc:
             active = self.mode or "another SDR profile"
-            self._events.put(("error", f"{active} is active; stop it before starting Pig P25"))
+            self._events.put(
+                ("error", f"{active} is active; stop it before starting Pig P25")
+            )
             return False
         import tempfile
+
         self._stop_event.clear()
         self._pig_stop_event.clear()
         self._pig_p25_tmpdir = tempfile.mkdtemp(prefix="wdg-pig-p25-")
@@ -534,24 +559,66 @@ class SDRManager:
         # grants cannot make this metadata receiver follow a voice channel.
         with open(blacklist_path, "w", encoding="utf-8") as out:
             out.write("0\t65535\n")
+        # OP25 accepts a comma-separated control-channel list and hunts through
+        # it after repeated decode timeouts. Keep the selected channel first.
+        control_list = ",".join(
+            f"{frequency / 1e6:.6f}" for frequency in control_channels
+        )
         # OP25's TSV parser maps columns by a required header row.
         with open(trunk_path, "w", encoding="utf-8") as out:
-            out.write("\t".join(("Sysname", "Control Channel List", "Offset",
-                                  "NAC", "Modulation", "TGID Tags File",
-                                  "Whitelist", "Blacklist", "Center Frequency")) + "\n")
-            out.write("\t".join((system, f"{control_hz / 1e6:.6f}", "0", "0x0",
-                                  "cqpsk", "", "", blacklist_path,
-                                  f"{control_hz / 1e6:.6f}")) + "\n")
+            out.write(
+                "\t".join(
+                    (
+                        "Sysname",
+                        "Control Channel List",
+                        "Offset",
+                        "NAC",
+                        "Modulation",
+                        "TGID Tags File",
+                        "Whitelist",
+                        "Blacklist",
+                        "Center Frequency",
+                    )
+                )
+                + "\n"
+            )
+            out.write(
+                "\t".join(
+                    (
+                        system,
+                        control_list,
+                        "0",
+                        "0x0",
+                        "cqpsk",
+                        "",
+                        "",
+                        blacklist_path,
+                        f"{control_hz / 1e6:.6f}",
+                    )
+                )
+                + "\n"
+            )
         try:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
         except OSError:
             port = 18080
-        command = [executable, "--args", "rtl", "--frequency", str(control_hz),
-                   "--sample-rate", "1000000", "--trunk-conf-file", trunk_path,
-                   "--terminal-type", f"http:127.0.0.1:{port}",
-                   "--freq-corr", str(correction)]
+        command = [
+            executable,
+            "--args",
+            "rtl",
+            "--frequency",
+            str(control_hz),
+            "--sample-rate",
+            "1000000",
+            "--trunk-conf-file",
+            trunk_path,
+            "--terminal-type",
+            f"http:127.0.0.1:{port}",
+            "--freq-corr",
+            str(correction),
+        ]
         if configured_gain is not None and configured_gain >= 0:
             command.extend(("--gains", f"LNA:{int(configured_gain)}"))
         # Deliberately omit OP25's --vocoder, --udp-player, audio, and record options.
@@ -564,9 +631,16 @@ class SDRManager:
                 self._pig_p25_stderr_owner = None
                 self._pig_p25_stderr_thread = None
             self._pig_p25_proc = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                preexec_fn=os.setsid, cwd=os.path.dirname(executable))
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                preexec_fn=os.setsid,
+                cwd=os.path.dirname(executable),
+            )
         except Exception as exc:
             self._remove_p25_tmpdir()
             self._events.put(("error", f"OP25 failed to start: {str(exc)[:120]}"))
@@ -578,34 +652,90 @@ class SDRManager:
             stderr_thread = threading.Thread(
                 target=self._drain_op25_stderr,
                 args=(self._pig_p25_proc, stderr_stream),
-                daemon=True, name="pig-p25-stderr")
+                daemon=True,
+                name="pig-p25-stderr",
+            )
             self._pig_p25_stderr_thread = stderr_thread
             self._threads.append(stderr_thread)
             stderr_thread.start()
         self._pig_p25_url = f"http://127.0.0.1:{port}/"
         self._pig_p25_control_hz = control_hz
+        self._pig_p25_control_channels = control_channels
         self._pig_p25_system_label = system
         self.p25_quality = {}
         self._pig_p25_last_blocks = None
         self._pig_p25_last_block_at = None
+        self._pig_p25_last_tuned_hz = None
+        self._pig_p25_last_decoded_hz = None
+        self._pig_p25_last_decoded_at = None
         self._pig_log = self._open_pig_log(loot_dir, "pig_p25.jsonl")
-        thread = threading.Thread(target=self._pig_p25_worker, daemon=True,
-                                  name="pig-p25-metadata")
+        thread = threading.Thread(
+            target=self._pig_p25_worker, daemon=True, name="pig-p25-metadata"
+        )
         self._threads.append(thread)
         self.running = True
         self.mode = "pig_p25"
+        self.p25_session_id += 1
         thread.start()
         self._events.put(("status", "Pig P25 metadata started (audio disabled)"))
         return True
 
-    def start_pig_p25(self, control_hz, system_label="", gain=None, ppm=0,
-                      loot_dir="") -> bool:
+    def start_pig_p25(
+        self,
+        control_hz,
+        system_label="",
+        gain=None,
+        ppm=0,
+        loot_dir="",
+        *,
+        control_channels=None,
+    ) -> bool:
         try:
             frequency = int(control_hz)
         except (TypeError, ValueError):
             self._events.put(("error", "P25 control frequency must be in Hz"))
             return False
-        return self._start_pig_p25(frequency, system_label, gain, ppm, loot_dir)
+        channels = [frequency]
+        if control_channels is not None:
+            if not isinstance(control_channels, (list, tuple)):
+                self._events.put(
+                    ("error", "P25 control channel list must be a sequence")
+                )
+                return False
+            if len(control_channels) > 16:
+                self._events.put(
+                    ("error", "P25 control channel list exceeds 16 frequencies")
+                )
+                return False
+            for candidate in control_channels:
+                if type(candidate) is not int:
+                    self._events.put(
+                        ("error", "P25 control frequencies must be integer Hz")
+                    )
+                    return False
+                if not PIG_RF_MIN_HZ <= candidate <= PIG_RF_MAX_HZ:
+                    self._events.put(
+                        (
+                            "error",
+                            "P25 control frequency is outside supported RTL-SDR range",
+                        )
+                    )
+                    return False
+                if candidate not in channels:
+                    channels.append(candidate)
+            if len(channels) > 16:
+                self._events.put(
+                    ("error", "P25 control channel list exceeds 16 frequencies")
+                )
+                return False
+        if not PIG_RF_MIN_HZ <= frequency <= PIG_RF_MAX_HZ:
+            self._events.put(
+                ("error", "P25 control frequency is outside supported RTL-SDR range")
+            )
+            return False
+        return self._start_pig_p25(
+            frequency, tuple(channels), system_label, gain, ppm, loot_dir
+        )
 
     def _drain_op25_stderr(self, proc, stream=None):
         """Drain child output, retaining only useful lines for this OP25 run."""
@@ -677,10 +807,15 @@ class SDRManager:
                     self.stop()
                 return
             try:
-                body = json.dumps([{"command": "update", "arg1": 0, "arg2": 0}]).encode()
+                body = json.dumps(
+                    [{"command": "update", "arg1": 0, "arg2": 0}]
+                ).encode()
                 request = urllib.request.Request(
-                    self._pig_p25_url, data=body,
-                    headers={"Content-Type": "application/json"}, method="POST")
+                    self._pig_p25_url,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
                 with urllib.request.urlopen(request, timeout=0.6) as response:
                     data = response.read(65536).decode("utf-8", errors="replace")
                 parsed = self._parse_op25_status(data)
@@ -691,31 +826,87 @@ class SDRManager:
                     last_verified = time.monotonic()
                     verified_once = True
                     last_status_error = ""
-                    if abs(observed_hz - self._pig_p25_control_hz) > 1000:
-                        self._events.put(("error", "OP25 left the configured control channel; stopping P25 profile"))
+                    tuned_hz = min(
+                        self._pig_p25_control_channels or (self._pig_p25_control_hz,),
+                        key=lambda candidate: abs(observed_hz - candidate),
+                    )
+                    if abs(observed_hz - tuned_hz) > 1000:
+                        self._events.put(
+                            (
+                                "error",
+                                "OP25 left the configured control channel/list; stopping P25 profile",
+                            )
+                        )
                         if self.mode == "pig_p25" and self._pig_p25_proc is proc:
                             self.stop()
                         return
+                    # Attribute decoder activity to a frequency only when the
+                    # block counter rises across two consecutive samples on that
+                    # same tuned channel. A change/reset at a hop is not a hit.
                     blocks = parsed.get("decoded_blocks")
+                    rate = None
+                    sample_at = time.monotonic()
+                    same_frequency = self._pig_p25_last_tuned_hz == tuned_hz
                     if type(blocks) is int:
-                        rate = None
-                        if (self._pig_p25_last_blocks is not None
-                                and blocks >= self._pig_p25_last_blocks
-                                and self._pig_p25_last_block_at is not None):
-                            elapsed = max(0.1, time.monotonic()-self._pig_p25_last_block_at)
-                            rate = round((blocks-self._pig_p25_last_blocks)*60/elapsed, 1)
+                        if (
+                            same_frequency
+                            and self._pig_p25_last_blocks is not None
+                            and blocks > self._pig_p25_last_blocks
+                            and self._pig_p25_last_block_at is not None
+                        ):
+                            elapsed = max(0.1, sample_at - self._pig_p25_last_block_at)
+                            rate = round(
+                                (blocks - self._pig_p25_last_blocks) * 60 / elapsed, 1
+                            )
+                            self._pig_p25_last_decoded_hz = tuned_hz
+                            self._pig_p25_last_decoded_at = sample_at
+                        elif (
+                            same_frequency
+                            and self._pig_p25_last_blocks is not None
+                            and blocks >= self._pig_p25_last_blocks
+                            and self._pig_p25_last_block_at is not None
+                        ):
+                            elapsed = max(0.1, sample_at - self._pig_p25_last_block_at)
+                            rate = round(
+                                (blocks - self._pig_p25_last_blocks) * 60 / elapsed, 1
+                            )
                         self._pig_p25_last_blocks = blocks
-                        self._pig_p25_last_block_at = time.monotonic()
-                        self.p25_quality = {"decoded_blocks": blocks,
-                                            "blocks_per_min": rate}
+                        self._pig_p25_last_block_at = sample_at
+                        self._pig_p25_last_tuned_hz = tuned_hz
+                        recent_hz = (
+                            self._pig_p25_last_decoded_hz
+                            if (
+                                self._pig_p25_last_decoded_at is not None
+                                and sample_at - self._pig_p25_last_decoded_at <= 30.0
+                            )
+                            else None
+                        )
+                        self.p25_quality = {
+                            "decoded_blocks": blocks,
+                            "blocks_per_min": rate,
+                            "tuned_frequency_hz": tuned_hz,
+                            "last_decoded_frequency_hz": self._pig_p25_last_decoded_hz,
+                            "recent_decoded_frequency_hz": recent_hz,
+                            "control_channels_hz": self._pig_p25_control_channels,
+                        }
                         parsed["decode_blocks_per_min"] = rate
-                    parsed.update({
-                        "source": "op25",
-                        "profile": "pig_p25",
-                        "control_frequency_hz": self._pig_p25_control_hz,
-                        "system_label": self._pig_p25_system_label,
-                        "evidence": "configured_network_activity",
-                    })
+                        parsed["decoded_frequency_hz"] = recent_hz
+                    else:
+                        self._pig_p25_last_blocks = None
+                        self._pig_p25_last_block_at = None
+                        self._pig_p25_last_tuned_hz = tuned_hz
+                        self.p25_quality["tuned_frequency_hz"] = tuned_hz
+                    parsed.update(
+                        {
+                            "source": "op25",
+                            "profile": "pig_p25",
+                            "control_frequency_hz": tuned_hz,
+                            "configured_control_frequency_hz": self._pig_p25_control_hz,
+                            "control_frequencies_hz": self._pig_p25_control_channels,
+                            "system_label": self._pig_p25_system_label,
+                            "evidence": "configured_network_activity",
+                        }
+                    )
                     self._put_pig_event("pig_p25", parsed)
                     self._write_pig_log(parsed)
             except Exception as exc:
@@ -993,7 +1184,10 @@ class SDRManager:
         current = threading.current_thread()
         for thread in tuple(self._threads):
             if thread is not current and thread.name in (
-                    "pig-rf-watchlist", "pig-p25-metadata", "pig-p25-stderr"):
+                "pig-rf-watchlist",
+                "pig-p25-metadata",
+                "pig-p25-stderr",
+            ):
                 thread.join(timeout=1.5)
         self._threads = [thread for thread in self._threads if thread.is_alive()]
 
@@ -1018,8 +1212,12 @@ class SDRManager:
         self._pig_channel_state = {}
         self._pig_baselines = {}
         self.p25_quality = {}
+        self._pig_p25_control_channels = ()
         self._pig_p25_last_blocks = None
         self._pig_p25_last_block_at = None
+        self._pig_p25_last_tuned_hz = None
+        self._pig_p25_last_decoded_hz = None
+        self._pig_p25_last_decoded_at = None
         with self._pig_p25_stderr_lock:
             self._pig_p25_stderr_tail.clear()
             self._pig_p25_stderr_owner = None

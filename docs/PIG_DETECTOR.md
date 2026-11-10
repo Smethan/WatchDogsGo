@@ -2,6 +2,8 @@
 
 Open **SNIFF > Pig Detector** to start the opt-in, passive observation mode. Its settings are in **SNIFF > Wardrive Settings > Pig Detector**. It subscribes to an existing wardrive job when one is running; otherwise it requests the configured multi-C5 wardrive plan (including the split Wi-Fi bands plus BLE preset), or the legacy receiver. Stopping Pig Detector releases only a scan or SDR profile it started. The mode does not change SDR power. An occupied tuner is shown as busy.
 
+For a dedicated P25 control-channel browser, site search, and recent decode log, use [P25 Monitor](P25_MONITOR.md) under **SNIFF**. The Pig Detector P25 profile remains available for combined Pig sessions.
+
 ## Evidence and location
 
 The session's `pig_observations.jsonl` contains versioned observations with receiver/session/sequence, rule evidence, channel or frequency, observer fix, and any separately broadcast position. The file is capped at 4 MiB; the live map has bounded state. Flock and Axon keep their existing alerts and mute controls. New possible Raven service UUID and Utility `BodyWorn Remote` matches can alert when product alerts are enabled. WatchGuard Video OUI, i-PRO/Getac names, and other broad vendor clues are quiet leads. `Pigvision` is not a supported product rule. The checked source and evidence limitation for each rule are kept in `watchdogs/data/notable_signatures.json`.

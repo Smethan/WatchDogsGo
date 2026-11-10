@@ -1088,3 +1088,104 @@ def test_display_controls_persist_and_invalidate_the_right_cache():
     assert ui.settings["trail_mode"] == "off"
     assert ui.trail.break_segment.call_count == 2
     assert ui.persist_settings.call_count == 5
+
+
+def test_legacy_p25_frequency_migrates_to_builtin_site_without_losing_values():
+    settings = normalize_settings(
+        {
+            "pig_p25_control_hz": 856_212_500,
+            "pig_p25_system": "Old label",
+        }
+    )
+    assert settings["p25_selected_site_id"] == "rr8438:1-002"
+    assert settings["pig_p25_control_hz"] == 856_212_500
+    assert settings["pig_p25_system"] == "Old label"
+    assert not settings["p25_custom_sites"]
+
+
+def test_changed_p25_frequency_reconciles_previous_site_selection():
+    settings = normalize_settings(
+        {
+            "p25_selected_site_id": "rr8438:1-002",
+            "pig_p25_control_hz": 851_012_500,
+            "pig_p25_system": "Travel control",
+        }
+    )
+    assert settings["p25_selected_site_id"] == "custom:legacy-p25"
+    assert settings["p25_custom_sites"][0]["control_hz"] == [851_012_500]
+
+
+def test_pig_settings_frequency_editor_updates_p25_menu_selection():
+    ui = WardriveUI.__new__(WardriveUI)
+    ui.settings = normalize_settings({"pig_p25_control_hz": 856_212_500})
+    ui.app = NS(msg=Mock())
+    ui.persist_settings = Mock()
+
+    ui.apply_pig_input(5, ["851.0125", "Travel control"])
+
+    assert ui.settings["pig_p25_control_hz"] == 851_012_500
+    assert ui.settings["p25_selected_site_id"] == "custom:legacy-p25"
+    assert ui.settings["p25_custom_sites"][0]["control_hz"] == [851_012_500]
+    ui.persist_settings.assert_called_once()
+
+
+def test_legacy_custom_p25_frequency_is_preserved_and_bounded():
+    settings = normalize_settings(
+        {
+            "pig_p25_control_hz": 851_012_500,
+            "pig_p25_system": "My local system",
+            "p25_custom_sites": [
+                {
+                    "id": "custom:valid",
+                    "region": "Local",
+                    "county": "County",
+                    "site": "Tower",
+                    "system": "Local",
+                    "control_hz": [851_012_500],
+                    "sysid": "44a",
+                    "wacn": "0xbee00",
+                },
+                {
+                    "id": "custom:invalid",
+                    "region": "",
+                    "county": "County",
+                    "site": "Bad",
+                    "control_hz": [851_000_000],
+                },
+            ],
+        }
+    )
+    assert settings["p25_selected_site_id"] == "custom:valid"
+    assert len(settings["p25_custom_sites"]) == 1
+    assert settings["p25_custom_sites"][0]["sysid"] == "0x44A"
+    assert settings["p25_custom_sites"][0]["wacn"] == "0xBEE00"
+
+
+def test_custom_p25_sites_reject_bad_frequencies_and_cap_count():
+    raw_sites = [
+        {
+            "id": f"custom:{index}",
+            "region": "Local",
+            "county": "County",
+            "site": f"Site {index}",
+            "system": "",
+            "control_hz": [24_000_000 + index],
+        }
+        for index in range(70)
+    ]
+    settings = normalize_settings({"p25_custom_sites": raw_sites})
+    assert len(settings["p25_custom_sites"]) == 64
+    bad = normalize_settings(
+        {
+            "p25_custom_sites": [
+                {
+                    "id": "custom:bad",
+                    "region": "Local",
+                    "county": "County",
+                    "site": "Bad",
+                    "control_hz": ["851012500", 2_000_000_000],
+                }
+            ]
+        }
+    )
+    assert bad["p25_custom_sites"] == []

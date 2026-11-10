@@ -26,6 +26,7 @@ from .passive_screen import PassiveScreen
 from .handshake_capture import HandshakeCapture, COMMANDS, capture_storage
 from .handshake_targets import HandshakeTargets, parse_target_record, ERRORS
 from .handshake_screen import HandshakeScreen
+from .p25_screen import P25Screen
 from .host_ble import HostBleScanner, list_ble_adapters
 from .cell_monitor import HostCellScanner, find_unclean_cell_session
 from .map_display import (
@@ -112,6 +113,7 @@ class WardriveUI:
         self.settings = (load_settings(app._app_dir) if initial_settings is None
                          else normalize_settings(initial_settings))
         self.pig = PigDetector(self.settings)
+        self.p25_screen = P25Screen(app, self)
         self._pig_p25_error = ""
         self.remote_id = RemoteIdDecoder()
         self.settings_open = False
@@ -2937,6 +2939,8 @@ class WardriveUI:
             elif action == 5:
                 draft["pig_p25_control_hz"] = int(round(float(values[0]) * 1_000_000))
                 draft["pig_p25_system"] = values[1].strip()
+                # Reconcile the catalog selection with the newly edited tune.
+                draft["p25_selected_site_id"] = ""
             elif action == 6:
                 draft["pig_gain_db"] = int(values[0])
                 draft["pig_ppm"] = int(values[1])
