@@ -82,9 +82,11 @@ def test_missing_required_dependencies_still_install(monkeypatch):
 def test_adsb_launches_resolved_binary_including_retry(monkeypatch, retry):
     binary = "/usr/local/bin/dump1090-fa"
     monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: binary)
-    process = Mock()
-    process.poll.return_value = 1 if retry else None
-    popen = Mock(return_value=process)
+    first = Mock()
+    first.poll.return_value = 1 if retry else None
+    second = Mock()
+    second.poll.return_value = None
+    popen = Mock(side_effect=[first, second] if retry else [first])
     monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
     monkeypatch.setattr(sdr_manager.subprocess, "run", Mock())
     monkeypatch.setattr(sdr_manager.time, "sleep", Mock())

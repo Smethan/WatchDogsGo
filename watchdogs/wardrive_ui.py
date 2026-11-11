@@ -276,8 +276,11 @@ class WardriveUI:
         if profile == "off":
             app._term_add("[PIG] SDR profile OFF", raw=True)
             return
-        if not getattr(app, "_sdr_enabled", False) or sdr is None:
-            app._term_add("[PIG] SDR power is OFF; Wi-Fi/BLE continues", raw=True)
+        power_ok = (app._sdr_power_allows_tuning("PIG")
+                    if hasattr(app, "_sdr_power_allows_tuning")
+                    else bool(getattr(app, "_sdr_enabled", False)))
+        if not power_ok or sdr is None:
+            app._term_add("[PIG] SDR selection skipped; Wi-Fi/BLE continues", raw=True)
             return
         desired = {"watchlist":"pig_rf", "p25":"pig_p25",
                    "433":"433", "adsb":"adsb"}[profile]
@@ -334,7 +337,12 @@ class WardriveUI:
 
         app = self.app
         sdr = getattr(app, "_sdr", None)
-        if not getattr(app, "_sdr_enabled", False) or sdr is None:
+        power = (app.refresh_sdr_power_state(force=False)
+                 if hasattr(app, "refresh_sdr_power_state")
+                 else getattr(app, "_sdr_enabled", False))
+        if power is not True or sdr is None:
+            if power is None:
+                return render("P25:?", "P25: SDR power state unknown")
             return render("P25:OFF", "P25: SDR power is off")
 
         if getattr(sdr, "running", False) and getattr(sdr, "mode", "") == "pig_p25":
@@ -992,9 +1000,11 @@ class WardriveUI:
             app._term_add(
                 "[ALL] SDR collectors disabled (Wardrive Settings > Collectors)",
                 raw=True)
-        elif not getattr(app, "_sdr_enabled", False):
+        elif not (app._sdr_power_allows_tuning("ALL")
+                  if hasattr(app, "_sdr_power_allows_tuning")
+                  else bool(getattr(app, "_sdr_enabled", False))):
             app._term_add(
-                f"[ALL] {sdr_label} selected but SDR power is off (SYSTEM > SDR)",
+                f"[ALL] {sdr_label} selection skipped because SDR power is off or unknown",
                 raw=True)
         elif sdr is None:
             app._term_add(

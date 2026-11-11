@@ -10,6 +10,7 @@ Uses ``pinctrl set/get`` directly for instant GPIO toggling.
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -46,10 +47,11 @@ def _pinctrl_set(pin: int, high: bool) -> bool:
         return False
 
 
-def _pinctrl_get(pin: int) -> bool:
+def _pinctrl_get(pin: int) -> Optional[bool]:
     """Read a GPIO pin state via ``pinctrl get <pin>``.
 
-    Returns True if pin is HIGH (``"hi"`` in output).
+    Returns True/False for a successfully read HIGH/LOW pin, or None when
+    pinctrl could not provide a recognizable state.
     """
     try:
         result = subprocess.run(
@@ -60,9 +62,20 @@ def _pinctrl_get(pin: int) -> bool:
             text=True,
             timeout=3,
         )
-        return "hi" in (result.stdout or "")
-    except Exception:
-        return False
+        if result.returncode != 0:
+            return None
+        output = (result.stdout or "").lower()
+        level = re.search(r"\blevel\s*=\s*([01])\b", output)
+        if level:
+            return level.group(1) == "1"
+        if re.search(r"\bhi\b", output):
+            return True
+        if re.search(r"\blo\b", output):
+            return False
+        return None
+    except Exception as exc:
+        log.warning("pinctrl get %s failed: %s", pin, exc)
+        return None
 
 
 class AioManager:
@@ -74,18 +87,19 @@ class AioManager:
         return shutil.which("pinctrl") is not None
 
     @staticmethod
-    def get_status() -> Optional[dict]:
-        """Read all GPIO pin states directly.
+    def get_status(features=None) -> Optional[dict]:
+        """Read selected GPIO pins, or all rails when no features are given.
 
-        Returns dict like ``{"gps": True, "lora": False, ...}``
-        or *None* if pinctrl is not available.
+        Individual values are None when a pin could not be read. Returns *None*
+        if pinctrl is unavailable. The UI can sample just SDR without blocking
+        on unrelated rails.
         """
         if not shutil.which("pinctrl"):
             return None
         try:
             status = {}
-            for feat, pin in GPIO_MAP.items():
-                status[feat] = _pinctrl_get(pin)
+            for feat in FEATURES if features is None else features:
+                status[feat] = _pinctrl_get(GPIO_MAP[feat])
             return status
         except Exception as exc:
             log.warning("GPIO status read failed: %s", exc)

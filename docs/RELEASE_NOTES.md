@@ -1,3 +1,17 @@
+# Unreleased — ADS-B receiver recovery
+
+- Refresh AIO SDR power state when an SDR action starts, including changes made
+  outside WDG. Keep the user's boot-rail preference and explicit power control.
+- Receive ADS-B aircraft from an active `readsb` SBS feed without stopping the
+  service or requiring a second decoder. Keep `dump1090` as a fallback when the
+  feed is unavailable, and report an empty feed as waiting for aircraft.
+- Make tuner handoff and ADS-B reader cleanup safe across P25, ADS-B, and rapid
+  stop/restart sequences. Preserve service ownership and the first useful error.
+
+The source and Pi feed-only checks do not prove a slow live P25 handoff. If
+`readsb` takes longer than four seconds to stop, that profile fails closed and
+WDG restores the service after the systemd job settles; the user can retry.
+
 # 0.10.9 — Managed capture visibility and repeat-run recovery — 2026-10-29
 
 - Use a complete `os.stat_result` in the Meshtastic lock test fixture.

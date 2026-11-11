@@ -111,6 +111,11 @@ class SDRManager:
         self._pig_p25_stderr_thread = None
         self._readsb_paused = False
         self._readsb_lease_lock = threading.RLock()
+        self._readsb_restore_thread = None
+        self._readsb_restore_cancel = threading.Event()
+        self._adsb_source = ""
+        self._adsb_reader_stop = None
+        self._adsb_reader_thread = None
 
         # Event queue for app.py
         self._events: Queue = Queue()
@@ -173,82 +178,135 @@ class SDRManager:
 
     def _readsb_state(self) -> str:
         """Return readsb's systemd state, or unsupported/missing when absent."""
+        return self._readsb_status()[0]
+
+    def _readsb_status(self) -> tuple[str, str]:
+        """Return readsb ActiveState and pending systemd Job description."""
+        # Keep callers that replace the legacy state probe in tests able to
+        # exercise lease behavior without emulating systemd's full show output.
+        state_override = self.__dict__.get("_readsb_state")
+        if state_override is not None:
+            return state_override(), ""
         if not shutil.which("systemctl"):
-            return "unsupported"
+            return "unsupported", ""
         result = subprocess.run(
-            ["systemctl", "show", "readsb.service",
-             "--property=LoadState", "--property=ActiveState"],
-            capture_output=True, text=True, timeout=5)
+            [
+                "systemctl",
+                "show",
+                "readsb.service",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=Job",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         if result.returncode:
             detail = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError("cannot query readsb.service" +
-                               (": " + detail[:100] if detail else ""))
+            raise RuntimeError(
+                "cannot query readsb.service" + (": " + detail[:100] if detail else "")
+            )
         properties = {}
         for line in (result.stdout or "").splitlines():
             key, separator, value = line.partition("=")
             if separator:
                 properties[key.strip()] = value.strip().lower()
         if properties.get("LoadState") == "not-found":
-            return "missing"
+            return "missing", ""
         state = properties.get("ActiveState", "")
-        if state not in ("active", "inactive", "failed"):
-            raise RuntimeError("readsb.service state is unknown" +
-                               (f" ({state})" if state else ""))
-        return state
+        if state not in ("active", "inactive", "failed", "activating", "deactivating"):
+            raise RuntimeError(
+                "readsb.service state is unknown" + (f" ({state})" if state else "")
+            )
+        return state, properties.get("Job", "").strip()
+
+    @staticmethod
+    def _readsb_has_pending_job(job: str) -> bool:
+        value = (job or "").strip().lower()
+        if value in ("", "-", "[]"):
+            return False
+        # systemd's D-Bus Job property is commonly rendered as
+        # "(uint32 0, object path /)" when no job exists.
+        return not (
+            re.search(r"uint32\s+0\b", value)
+            and re.search(r"(?:objectpath|object path)\s+['\"]?/['\"]?\s*\)?$", value)
+        )
 
     def _acquire_readsb_lease(self) -> bool:
-        """Temporarily stop active readsb so a WDG profile can own the RTL-SDR."""
+        """Stop readsb only after ruling out pending transitions and restore races."""
         with self._readsb_lease_lock:
-            if self._readsb_paused:
-                return True
             try:
-                state = self._readsb_state()
+                state, job = self._readsb_status()
             except Exception as exc:
                 self._events.put(("error", f"SDR handoff failed: {str(exc)[:120]}"))
                 return False
-            if state in ("unsupported", "missing", "inactive", "failed"):
+
+            pending_job = self._readsb_has_pending_job(job)
+            if state in ("activating", "deactivating") or pending_job:
+                self._events.put(
+                    ("error", "SDR handoff failed: readsb has a pending systemd transition")
+                )
+                return False
+            if state not in ("unsupported", "missing", "inactive", "failed", "active"):
+                self._events.put(("error", "SDR handoff failed: readsb state is unknown"))
+                return False
+
+            # Prevent a waiting restore worker from starting readsb after the
+            # state check. The lease lock serializes this with its systemctl call.
+            self._readsb_restore_cancel.set()
+            if state in ("unsupported", "missing"):
+                self._readsb_paused = False
                 return True
-            self._events.put(("status",
-                              "Pausing readsb ADS-B feed while WatchDogsGo uses the SDR"))
+            if state in ("inactive", "failed"):
+                # A stale lease flag is valid only while systemd confirms the
+                # service is fully stopped with no pending job.
+                return True
+
+            # A stale paused flag cannot authorize tuner ownership when readsb
+            # has come back. Reacquire by stopping the now-active service.
+            self._readsb_paused = False
+            self._events.put(
+                ("status", "Pausing readsb ADS-B feed while WatchDogsGo uses the SDR")
+            )
             try:
                 result = subprocess.run(
                     ["systemctl", "stop", "readsb.service"],
-                    capture_output=True, text=True, timeout=12)
+                    capture_output=True, text=True, timeout=4)
             except subprocess.TimeoutExpired:
-                # systemd may have completed the stop before the command timed out.
-                # Restore only when the service is now stopped; do not launch SDR
-                # after an uncertain handoff.
                 try:
-                    state = self._readsb_state()
+                    state, job = self._readsb_status()
                 except Exception:
-                    state = "unknown"
-                if state in ("inactive", "failed", "unknown"):
-                    # It was active before our stop request. If the follow-up
-                    # query also fails, try to restore that previous state.
+                    state, job = "unknown", "unknown"
+                if state in ("inactive", "failed") and not self._readsb_has_pending_job(job):
                     self._readsb_paused = True
                     self._release_readsb_lease()
-                self._events.put(("error", "SDR handoff failed: readsb stop timed out"))
+                elif state == "deactivating" or self._readsb_has_pending_job(job):
+                    self._readsb_paused = True
+                    self._release_readsb_lease()
+                self._events.put(
+                    ("error", "SDR handoff failed: readsb stop timed out; recovery deferred"))
                 return False
             except Exception as exc:
-                self._events.put(("error",
-                                  f"SDR handoff failed stopping readsb: {str(exc)[:100]}"))
+                self._events.put(
+                    ("error", f"SDR handoff failed stopping readsb: {str(exc)[:100]}"))
                 return False
             if result.returncode:
-                # A failed command gives us no ownership even if another actor
-                # made the service inactive at the same time.
-                self._events.put(("error",
-                                  f"SDR handoff failed: readsb stop exited {result.returncode}"))
+                self._events.put(
+                    ("error", f"SDR handoff failed: readsb stop exited {result.returncode}"))
                 return False
+
             self._readsb_paused = True
             try:
-                state = self._readsb_state()
+                state, job = self._readsb_status()
             except Exception as exc:
-                self._events.put(("error",
-                                  f"SDR handoff failed verifying readsb: {str(exc)[:100]}"))
+                self._events.put(
+                    ("error", f"SDR handoff failed verifying readsb: {str(exc)[:100]}"))
                 self._release_readsb_lease()
                 return False
-            if state not in ("inactive", "failed"):
-                self._events.put(("error", "SDR handoff failed: readsb is still active"))
+            if state not in ("inactive", "failed") or self._readsb_has_pending_job(job):
+                self._events.put(
+                    ("error", "SDR handoff failed: readsb is still transitioning"))
                 self._release_readsb_lease()
                 return False
             self._events.put(("status", "readsb ADS-B feed paused for SDR use"))
@@ -259,23 +317,86 @@ class SDRManager:
         with self._readsb_lease_lock:
             if not self._readsb_paused:
                 return True
+            try:
+                state, job = self._readsb_status()
+            except Exception as exc:
+                self._events.put(
+                    ("error", f"Could not restore readsb ADS-B feed: {str(exc)[:100]}"))
+                self._defer_readsb_restore()
+                return True
+            if state == "active" and not self._readsb_has_pending_job(job):
+                self._readsb_paused = False
+                self._events.put(("status", "readsb ADS-B feed restored"))
+                return True
+            if state in ("activating", "deactivating") or self._readsb_has_pending_job(job):
+                self._defer_readsb_restore()
+                return True
+            if state not in ("inactive", "failed"):
+                self._events.put(("error", "Could not restore readsb ADS-B feed: state is unknown"))
+                return False
             self._events.put(("status", "Restoring readsb ADS-B feed"))
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["systemctl", "start", "readsb.service"],
-                    capture_output=True, text=True, timeout=12)
-                state = self._readsb_state()
+                    capture_output=True, text=True, timeout=4)
+                state, job = self._readsb_status()
+            except subprocess.TimeoutExpired:
+                self._defer_readsb_restore()
+                return True
             except Exception as exc:
-                self._events.put(("error",
-                                  f"Could not restore readsb ADS-B feed: {str(exc)[:100]}"))
-                return False
-            if state != "active":
-                self._events.put(("error",
-                                  "Could not restore readsb ADS-B feed: service is not active"))
-                return False
+                self._events.put(
+                    ("error", f"Could not restore readsb ADS-B feed: {str(exc)[:100]}"))
+                self._defer_readsb_restore()
+                return True
+            if result.returncode or state != "active" or self._readsb_has_pending_job(job):
+                self._defer_readsb_restore()
+                return True
             self._readsb_paused = False
             self._events.put(("status", "readsb ADS-B feed restored"))
             return True
+
+    def _defer_readsb_restore(self):
+        """Retry restore off-frame; non-daemon worker holds shutdown up to 95s."""
+        thread = self._readsb_restore_thread
+        cancel = self._readsb_restore_cancel
+        if thread and thread.is_alive() and not cancel.is_set():
+            return
+        # Each worker owns its own token: scheduling a replacement must not
+        # clear the cancellation signal observed by an older live worker.
+        cancel = threading.Event()
+        self._readsb_restore_cancel = cancel
+        self._events.put(("status", "readsb restore pending; waiting for systemd job"))
+
+        def restore():
+            deadline = time.monotonic() + 95
+            while time.monotonic() < deadline and not cancel.is_set():
+                with self._readsb_lease_lock:
+                    if cancel.is_set() or not self._readsb_paused:
+                        return
+                    try:
+                        state, job = self._readsb_status()
+                        if state == "active" and not self._readsb_has_pending_job(job):
+                            self._readsb_paused = False
+                            self._events.put(("status", "readsb ADS-B feed restored"))
+                            return
+                        if (state in ("inactive", "failed")
+                                and not self._readsb_has_pending_job(job)):
+                            result = subprocess.run(
+                                ["systemctl", "start", "readsb.service"],
+                                capture_output=True, text=True, timeout=4)
+                            if result.returncode != 0:
+                                self._events.put(
+                                    ("error", "Could not restore readsb ADS-B feed: systemctl start failed"))
+                    except Exception:
+                        pass
+                cancel.wait(1)
+            if not cancel.is_set():
+                self._events.put(
+                    ("error", "Could not restore readsb ADS-B feed after systemd transition"))
+
+        self._readsb_restore_thread = threading.Thread(
+            target=restore, daemon=False, name="readsb-restore")
+        self._readsb_restore_thread.start()
 
     def _put_pig_event(self, name: str, payload: dict):
         with self._pig_events_lock:
@@ -1044,82 +1165,119 @@ class SDRManager:
             self._pig_p25_tmpdir = ""
 
     def start_adsb(self, loot_dir: str = "") -> bool:
-        """Start ADS-B tracking via dump1090."""
+        """Track ADS-B from readsb when available, otherwise run dump1090 privately."""
         if self._reject_pig_busy("ADS-B"):
             return False
         if self._rtl433_proc:
-            self._events.put((
-                "error", "433 MHz is active; stop it before starting ADS-B"))
-            return False
-        executable = find_dump1090()
-        if not executable:
-            self._events.put(("error", "dump1090 not installed"))
-            return False
-        if self._dump1090_proc:
-            return True  # already running
-        if not self._acquire_readsb_lease():
-            return False
-
-        self._stop_event.clear()
-
-        # Stop system dump1090 service if running (holds RTL-SDR device)
-        try:
-            subprocess.run(
-                ["systemctl", "stop", "dump1090-mutability", "dump1090-fa"],
-                capture_output=True, timeout=5)
-        except Exception:
-            pass
-
-        try:
-            self._dump1090_proc = subprocess.Popen(
-                [executable, *DUMP1090_ARGS],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid,
+            self._events.put(
+                ("error", "433 MHz is active; stop it before starting ADS-B")
             )
-            # Check if process died immediately (bad flags)
-            time.sleep(0.5)
-            if self._dump1090_proc.poll() is not None:
-                # Retry without --quiet
+            return False
+        if self.running and self.mode == "adsb":
+            return True
+
+        source = ""
+        try:
+            readsb_state = self._readsb_state()
+        except Exception as exc:
+            self._events.put(
+                ("error", f"Cannot check readsb ADS-B feed: {str(exc)[:100]}")
+            )
+            readsb_state = "unknown"
+        if readsb_state == "active" and self._sbs_feed_reachable():
+            source = "readsb"
+        else:
+            executable = find_dump1090()
+            if not executable:
+                self._events.put(
+                    ("error", "readsb SBS feed unavailable and dump1090 not installed")
+                )
+                return False
+            if not self._acquire_readsb_lease():
+                return False
+            self._stop_event.clear()
+            try:
+                subprocess.run(
+                    ["systemctl", "stop", "dump1090-mutability", "dump1090-fa"],
+                    capture_output=True,
+                    timeout=3,
+                )
+            except Exception:
+                pass
+            try:
                 self._dump1090_proc = subprocess.Popen(
-                    [executable, *DUMP1090_ARGS_FALLBACK],
+                    [executable, *DUMP1090_ARGS],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid,
                 )
-        except Exception as e:
-            self._events.put(("error", f"dump1090 failed: {e}"))
-            self._release_readsb_lease()
-            return False
+                time.sleep(0.2)
+                if self._dump1090_proc.poll() is not None:
+                    first = self._dump1090_proc
+                    self._dump1090_proc = subprocess.Popen(
+                        [executable, *DUMP1090_ARGS_FALLBACK],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        preexec_fn=os.setsid,
+                    )
+                    time.sleep(0.2)
+                    if self._dump1090_proc.poll() is not None:
+                        code = self._dump1090_proc.poll()
+                        self._dump1090_proc = None
+                        raise RuntimeError(
+                            f"both launch attempts exited ({first.poll()}, {code})"
+                        )
+            except Exception as exc:
+                self._dump1090_proc = None
+                self._events.put(("error", f"dump1090 failed: {exc}"))
+                self._release_readsb_lease()
+                return False
+            source = "dump1090"
 
-        # Open loot file
         if loot_dir:
             try:
-                self._adsb_log = open(
-                    os.path.join(loot_dir, "adsb_aircraft.csv"), "a")
+                os.makedirs(loot_dir, exist_ok=True)
+                self._adsb_log = open(os.path.join(loot_dir, "adsb_aircraft.csv"), "a")
                 if self._adsb_log.tell() == 0:
                     self._adsb_log.write(
                         "timestamp,icao,callsign,lat,lon,alt_ft,speed_kt,"
-                        "heading,squawk\n")
+                        "heading,squawk\n"
+                    )
             except Exception:
                 pass
 
-        # Publish ownership before the reader can observe an immediate exit.
+        self._stop_event.clear()
         self.running = True
         self.mode = "adsb"
-        t = threading.Thread(target=self._sbs_reader, daemon=True,
-                             name="adsb-sbs-reader")
+        self._adsb_source = source
+        run_stop = threading.Event()
+        self._adsb_reader_stop = run_stop
+        t = threading.Thread(
+            target=self._sbs_reader,
+            args=(run_stop,),
+            daemon=True,
+            name="adsb-sbs-reader",
+        )
+        self._adsb_reader_thread = t
         self._threads.append(t)
         t.start()
-        self._events.put(("status", "ADS-B started (dump1090)"))
+        self._events.put(("status", f"ADS-B started ({source}); waiting for aircraft"))
         return True
+
+    @staticmethod
+    def _sbs_feed_reachable() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", 30003), timeout=0.35):
+                return True
+        except OSError:
+            return False
 
     def start_433(self, loot_dir: str = "", gps_lat: float = 0.0,
                   gps_lon: float = 0.0) -> bool:
         """Start 433 MHz sensor decoding via rtl_433."""
         if self._reject_pig_busy("433 MHz"):
             return False
-        if self._dump1090_proc:
+        if self._dump1090_proc or (self.running and self.mode == "adsb"):
             self._events.put((
                 "error", "ADS-B is active; stop it before starting 433 MHz"))
             return False
@@ -1171,6 +1329,9 @@ class SDRManager:
         """Stop all SDR subprocesses."""
         self._stop_event.set()
         self._pig_stop_event.set()
+        adsb_stop = self._adsb_reader_stop
+        if adsb_stop is not None:
+            adsb_stop.set()
 
         for proc, name in [
             (self._dump1090_proc, "dump1090"),
@@ -1189,9 +1350,15 @@ class SDRManager:
                 "pig-p25-stderr",
             ):
                 thread.join(timeout=1.5)
+        adsb_thread = self._adsb_reader_thread
+        if adsb_thread and adsb_thread is not threading.current_thread():
+            adsb_thread.join(timeout=1.5)
         self._threads = [thread for thread in self._threads if thread.is_alive()]
 
         self._dump1090_proc = None
+        self._adsb_source = ""
+        self._adsb_reader_stop = None
+        self._adsb_reader_thread = None
         self._rtl433_proc = None
         self._pig_rf_proc = None
         self._pig_p25_proc = None
@@ -1275,22 +1442,27 @@ class SDRManager:
         self.stop()
         return True
 
-    def _sbs_reader(self):
-        """Connect to dump1090 SBS output and parse aircraft data."""
-        import socket
-        time.sleep(2)  # wait for dump1090 to start
-
-        while not self._stop_event.is_set():
-            if self._stop_on_owned_child_exit(
-                    self._dump1090_proc, "_dump1090_proc", "dump1090"):
+    def _sbs_reader(self, run_stop=None):
+        """Read SBS data, reconnecting transiently and stopping on sustained loss."""
+        stop_event = run_stop if run_stop is not None else self._stop_event
+        source = self._adsb_source or "dump1090"
+        disconnected_at = None
+        announced_wait = False
+        while not stop_event.is_set():
+            proc = self._dump1090_proc if source == "dump1090" else None
+            if proc and self._stop_on_owned_child_exit(
+                proc, "_dump1090_proc", "dump1090"
+            ):
                 return
+            sock = None
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                sock.connect(("127.0.0.1", 30003))
-                sock.settimeout(2)
+                sock = socket.create_connection(("127.0.0.1", 30003), timeout=1)
+                sock.settimeout(1)
+                disconnected_at = None
+                announced_wait = False
                 buf = ""
-                while not self._stop_event.is_set():
+                self._events.put(("status", f"ADS-B SBS feed connected ({source})"))
+                while not stop_event.is_set():
                     try:
                         chunk = sock.recv(4096).decode("ascii", errors="ignore")
                         if not chunk:
@@ -1300,20 +1472,42 @@ class SDRManager:
                             line, buf = buf.split("\n", 1)
                             self._parse_sbs_line(line.strip())
                     except socket.timeout:
-                        if self._stop_on_owned_child_exit(
-                                self._dump1090_proc, "_dump1090_proc", "dump1090"):
+                        if proc and self._stop_on_owned_child_exit(
+                            proc, "_dump1090_proc", "dump1090"
+                        ):
                             return
                         continue
-                    except Exception:
-                        break
-                sock.close()
-            except Exception:
-                if self._stop_event.is_set():
+                if stop_event.is_set():
                     return
-                if self._stop_on_owned_child_exit(
-                        self._dump1090_proc, "_dump1090_proc", "dump1090"):
+                self._events.put(
+                    ("status", "ADS-B SBS feed disconnected; reconnecting")
+                )
+                disconnected_at = disconnected_at or time.monotonic()
+            except OSError:
+                if stop_event.is_set():
                     return
-                time.sleep(3)  # retry connection
+                if proc and self._stop_on_owned_child_exit(
+                    proc, "_dump1090_proc", "dump1090"
+                ):
+                    return
+                if not announced_wait:
+                    self._events.put(("status", "ADS-B waiting for SBS feed; retrying"))
+                    announced_wait = True
+                disconnected_at = disconnected_at or time.monotonic()
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            if disconnected_at is not None and time.monotonic() - disconnected_at >= 60:
+                self._events.put(
+                    ("error", "ADS-B SBS feed unavailable for 60 seconds; stopping")
+                )
+                if not stop_event.is_set():
+                    self.stop()
+                return
+            stop_event.wait(1)
 
     def _parse_sbs_line(self, line: str):
         """Parse SBS BaseStation format line.

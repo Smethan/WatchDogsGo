@@ -336,8 +336,12 @@ def test_async_scan_loot_keeps_disk_writes_off_observation_path(tmp_path):
 def game(tmp_path,loot,monkeypatch):
     import watchdogs.app as appmod
     monkeypatch.setattr(appmod,"pyxel",NS(frame_count=100))
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": True, "usb": True}))
     app=WatchDogsGame.__new__(WatchDogsGame)
     app._app_dir=str(tmp_path);app.loot=loot;app._pending_cmd=None
+    app._sdr_enabled=True;app._sdr_power_checked_at=0
     app.gps=NS(available=True,fix=GpsFix(valid=True,latitude=40,longitude=-90,received_at=10))
     app.serial=NS(is_open=True,send_command=Mock());app._esp32=True
     app._term_add=Mock();app.msg=Mock();app.gain_xp=Mock();app._earn_badge=Mock()
@@ -419,6 +423,10 @@ def test_p25_settings_always_show_actionable_runtime_status(
     w.settings["pig_sdr_profile"] = "p25"
     w.settings["pig_p25_control_hz"] = 0 if state == "unset" else 856_212_500
     game._sdr_enabled = state != "off"
+    if state == "off":
+        import watchdogs.app as appmod
+        appmod.AioManager.get_status.return_value = {
+            "gps": True, "lora": True, "sdr": False, "usb": True}
     game._sdr = NS(running=False, mode="", p25_quality={})
     if state in ("waiting", "zero", "decoded"):
         game._sdr.running = True
@@ -1639,3 +1647,125 @@ def test_host_ble_menu_requires_new_firmware_without_stopping_current_scan(game)
     game._execute_item("start_wardrive_wifi_serial", "all_wardrive_host", "All Wardrive (host BLE)", [])
     game.serial.send_command.assert_not_called()
     assert "1.7.3" in game.msg.call_args.args[0]
+
+
+@pytest.mark.parametrize("rail", [False, True, None])
+def test_direct_adsb_refreshes_external_sdr_state_and_fails_closed(game, monkeypatch, rail):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": rail, "usb": True}))
+    sdr = NS(running=False, mode="", start_adsb=Mock(return_value=True))
+    game._sdr = sdr
+    game._sdr_enabled = not bool(rail)
+    game._sdr_power_checked_at = 0
+    game._sdr_adsb()
+    assert game._sdr_enabled is rail
+    if rail is True:
+        sdr.start_adsb.assert_called_once()
+    else:
+        sdr.start_adsb.assert_not_called()
+        text = game.msg.call_args.args[0]
+        assert "OFF" in text if rail is False else "unknown" in text
+
+
+def test_sdr_toggle_refreshes_before_inverting_and_unknown_cancels(game, monkeypatch):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": True, "usb": True}))
+    monkeypatch.setattr(appmod.AioManager, "toggle", Mock(return_value=True))
+    game._aio_available = True
+    game._sdr_enabled = False
+    game._sdr_power_checked_at = 0
+    game._sdr = NS(stop=Mock())
+    game.wardrive._wdg_owned_sdr = True
+    game.wardrive.pig.owns_sdr = True
+    game._toggle_sdr()
+    appmod.AioManager.toggle.assert_called_once_with("sdr", False)
+    assert game._sdr_enabled is False
+    game._sdr.stop.assert_called_once()
+
+    appmod.AioManager.get_status.return_value = {"gps": True, "lora": True,
+                                                 "sdr": None, "usb": True}
+    appmod.AioManager.toggle.reset_mock()
+    game._sdr_enabled = True
+    game._sdr_power_checked_at = 0
+    game._toggle_sdr()
+    appmod.AioManager.toggle.assert_not_called()
+    assert game._sdr_enabled is None
+
+
+def test_sdr_status_render_cache_avoids_per_frame_gpio_reads(game, monkeypatch):
+    import watchdogs.app as appmod
+    get_status = Mock(return_value={"gps": False, "lora": False,
+                                    "sdr": False, "usb": False})
+    monkeypatch.setattr(appmod.AioManager, "get_status", get_status)
+    game._sdr_power_checked_at = 0
+    assert game.refresh_sdr_power_state() is False
+    assert game.refresh_sdr_power_state() is False
+    get_status.assert_called_once()
+
+
+@pytest.mark.parametrize("rail", [False, True, None])
+def test_pig_adsb_and_p25_refresh_rail_before_tuning(game, monkeypatch, rail):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": rail, "usb": True}))
+    sdr = NS(running=False, mode="", start_adsb=Mock(return_value=True),
+             start_pig_p25=Mock(return_value=True))
+    game._sdr = sdr
+    game._sdr_enabled = not bool(rail)
+    game._sdr_power_checked_at = 0
+    game.wardrive.pig.active = True
+    game.wardrive.settings["pig_sdr_profile"] = "adsb"
+    game.wardrive.start_pig_sdr()
+    assert game._sdr_enabled is rail
+    if rail is True:
+        sdr.start_adsb.assert_called_once()
+    else:
+        sdr.start_adsb.assert_not_called()
+
+    sdr.running = False
+    game._sdr_power_checked_at = 0
+    assert not game.wardrive.p25_screen._start(scan=False)
+    sdr.start_pig_p25.assert_not_called()
+
+
+@pytest.mark.parametrize("rail", [False, True, None])
+def test_all_wardrive_refreshes_external_sdr_off_or_unknown(game, monkeypatch, rail):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": rail, "usb": True}))
+    w = game.wardrive
+    w.settings.update(wardrive_lora=False, wardrive_adsb=True,
+                      wardrive_433=False, lte_modem=False)
+    w.scan.mode = "wardrive"
+    w.scan.state = "running"
+    sdr = NS(running=False, mode="", start_adsb=Mock(return_value=True))
+    game._sdr = sdr
+    game._sdr_enabled = not bool(rail)
+    game._sdr_power_checked_at = 0
+    result = w.start_auxiliary_collectors()
+    assert result is (rail is True)
+    assert game._sdr_enabled is rail
+    if rail is True:
+        sdr.start_adsb.assert_called_once()
+    else:
+        sdr.start_adsb.assert_not_called()
+
+
+@pytest.mark.parametrize("mode,action", [("adsb", "_sdr_adsb"), ("433", "_sdr_433")])
+def test_sdr_stop_remains_available_after_external_power_loss(game, monkeypatch, mode, action):
+    import watchdogs.app as appmod
+    monkeypatch.setattr(appmod.AioManager, "get_status",
+                        Mock(return_value={"gps": True, "lora": True,
+                                           "sdr": False, "usb": True}))
+    game._sdr = NS(running=True, mode=mode, stop=Mock())
+    game._sdr_enabled = False
+    game._sdr_power_checked_at = 0
+    assert game._menu_item_unavailable_reason(action, action) == ""
+    getattr(game, action)()
+    game._sdr.stop.assert_called_once()

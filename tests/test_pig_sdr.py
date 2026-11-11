@@ -394,8 +394,241 @@ def test_readsb_stop_timeout_with_failed_query_attempts_restore(monkeypatch):
     monkeypatch.setattr(manager, "_readsb_state", state)
     monkeypatch.setattr(sdr_manager.subprocess, "run", run)
     assert not manager._acquire_readsb_lease()
-    assert calls == ["stop", "start"]
+    # The post-timeout query sees readsb already active, so no redundant start.
+    assert calls == ["stop"]
     assert manager._readsb_paused is False
+
+
+def test_adsb_uses_reachable_readsb_without_dump1090_or_aircraft(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(manager, "_readsb_state", lambda: "active")
+    monkeypatch.setattr(manager, "_sbs_feed_reachable", lambda: True)
+    monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: None)
+    popen = Mock()
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
+    thread = Mock()
+    monkeypatch.setattr(sdr_manager.threading, "Thread", Mock(return_value=thread))
+
+    assert manager.start_adsb()
+    assert manager.mode == "adsb" and manager.running
+    assert manager._adsb_source == "readsb"
+    assert manager._readsb_paused is False
+    assert manager.aircraft == {}
+    popen.assert_not_called()
+    assert any(
+        "waiting for aircraft" in message
+        for kind, message in manager.poll_events()
+        if kind == "status"
+    )
+
+
+def test_readsb_fed_adsb_rejects_433_and_reverse_order(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(manager, "_readsb_state", lambda: "active")
+    monkeypatch.setattr(manager, "_sbs_feed_reachable", lambda: True)
+    monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: None)
+    monkeypatch.setattr(sdr_manager.threading, "Thread", Mock(return_value=Mock()))
+    monkeypatch.setattr(manager, "has_rtl433", lambda: True)
+    popen = Mock()
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", popen)
+
+    assert manager.start_adsb()
+    assert not manager.start_433()
+    assert "ADS-B is active" in manager.poll_events()[-1][1]
+    manager.stop()
+
+    manager = sdr_manager.SDRManager()
+    manager._rtl433_proc = object()
+    monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: "/usr/bin/dump1090")
+    assert not manager.start_adsb()
+    assert "433 MHz is active" in manager.poll_events()[0][1]
+
+
+def test_adsb_sbs_reader_reconnects_and_preserves_parser_and_csv(tmp_path, monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager._adsb_source = "readsb"
+    manager._adsb_log = open(tmp_path / "adsb_aircraft.csv", "w")
+    stop = sdr_manager.threading.Event()
+
+    class FakeSocket:
+        def __init__(self, content=b"", stop_after_content=False):
+            self.content = content
+            self.stop_after_content = stop_after_content
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, _size):
+            if self.content:
+                content, self.content = self.content, b""
+                if self.stop_after_content:
+                    stop.set()
+                return content
+            return b""
+
+        def close(self):
+            pass
+
+    connections = [
+        FakeSocket(),
+        FakeSocket(
+            b"MSG,3,1,1,ABC123,1,2026/11/11,12:00:00.000,2026/11/11,"
+            b"12:00:00.000,,12000,250,90,37.5,-97.5,0,\n",
+            stop_after_content=True,
+        ),
+    ]
+    monkeypatch.setattr(
+        sdr_manager.socket, "create_connection", lambda *_a, **_kw: connections.pop(0)
+    )
+
+    manager._sbs_reader(stop)
+    manager._adsb_log.close()
+    assert manager.total_aircraft_seen == 1
+    aircraft = manager.aircraft["ABC123"]
+    assert (aircraft.lat, aircraft.lon, aircraft.altitude, aircraft.speed) == (
+        37.5,
+        -97.5,
+        12000,
+        250,
+    )
+    assert "ABC123" in (tmp_path / "adsb_aircraft.csv").read_text()
+    assert any(
+        "disconnected" in message
+        for kind, message in manager.poll_events()
+        if kind == "status"
+    )
+
+
+def test_adsb_fallback_requires_verified_second_launch(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(manager, "_readsb_state", lambda: "missing")
+    monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: "/usr/bin/dump1090")
+    monkeypatch.setattr(sdr_manager.time, "sleep", Mock())
+    monkeypatch.setattr(
+        sdr_manager.subprocess,
+        "run",
+        Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr="")),
+    )
+    dead = Mock()
+    dead.poll.return_value = 2
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", Mock(return_value=dead))
+    thread = Mock()
+    monkeypatch.setattr(sdr_manager.threading, "Thread", Mock(return_value=thread))
+
+    assert not manager.start_adsb()
+    assert sdr_manager.subprocess.Popen.call_count == 2
+    assert manager.mode == ""
+    assert any(
+        "both launch attempts exited" in message
+        for kind, message in manager.poll_events()
+        if kind == "error"
+    )
+
+
+def test_adsb_fast_restart_uses_a_fresh_reader_stop_token(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(manager, "_readsb_state", lambda: "active")
+    monkeypatch.setattr(manager, "_sbs_feed_reachable", lambda: True)
+    threads = []
+
+    class ThreadStub:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target, self.args = target, args
+            self.name = "adsb-sbs-reader"
+            self.started = False
+            self.is_alive = lambda: False
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout=None):
+            pass
+
+    def make_thread(**kwargs):
+        thread = ThreadStub(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(sdr_manager.threading, "Thread", make_thread)
+    assert manager.start_adsb()
+    old_stop = manager._adsb_reader_stop
+    manager.stop()
+    assert manager.start_adsb()
+    assert manager._adsb_reader_stop is not old_stop
+    assert old_stop.is_set()
+    assert not manager._adsb_reader_stop.is_set()
+    assert len(threads) == 2
+
+
+def test_profile_transition_p25_to_readsb_adsb_to_p25(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    state, calls = _mock_readsb(monkeypatch, "active")
+    monkeypatch.setattr(sdr_manager, "find_op25_rx", lambda: "/opt/op25/rx.py")
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(sdr_manager.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(sdr_manager.threading, "Thread", Mock(return_value=Mock()))
+    monkeypatch.setattr(manager, "_sbs_feed_reachable", lambda: True)
+    monkeypatch.setattr(sdr_manager, "find_dump1090", lambda: None)
+
+    assert manager.start_pig_p25(851_012_500, "Local P25")
+    assert state["value"] == "inactive"
+    manager._pig_p25_proc = None
+    manager.stop()
+    assert state["value"] == "active"
+
+    assert manager.start_adsb()
+    assert manager._adsb_source == "readsb"
+    manager.stop()
+    assert state["value"] == "active"
+
+    assert manager.start_pig_p25(851_012_500, "Local P25")
+    assert state["value"] == "inactive"
+    assert calls.count("stop") == 2
+    manager._pig_p25_proc = None
+    manager.stop()
+    assert state["value"] == "active"
+
+
+def test_readsb_stale_paused_flag_reacquires_when_service_is_active(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager._readsb_paused = True
+    state, calls = _mock_readsb(monkeypatch, "active")
+
+    assert manager._acquire_readsb_lease()
+    assert calls.count("stop") == 1
+    assert state["value"] == "inactive"
+    assert manager._readsb_paused
+
+
+@pytest.mark.parametrize("state_value", ["activating", "deactivating"])
+def test_readsb_transitional_state_without_job_fails_closed(monkeypatch, state_value):
+    manager = sdr_manager.SDRManager()
+    _state, calls = _mock_readsb(monkeypatch, state_value)
+
+    assert not manager._acquire_readsb_lease()
+    assert calls == ["show"]
+    assert not manager._readsb_paused
+
+
+@pytest.mark.parametrize("state_value", ["inactive", "failed"])
+def test_readsb_pending_job_blocks_even_stopped_state(monkeypatch, state_value):
+    manager = sdr_manager.SDRManager()
+    monkeypatch.setattr(sdr_manager.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command[1])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(f"LoadState=loaded\nActiveState={state_value}\n"
+                    "Job=(uint32 24, object path /org/freedesktop/systemd1/job/24)\n"),
+            stderr="",
+        )
+
+    monkeypatch.setattr(sdr_manager.subprocess, "run", run)
+    assert not manager._acquire_readsb_lease()
+    assert calls == ["show"]
 
 
 def test_readsb_unknown_state_fails_closed(monkeypatch):
@@ -403,6 +636,90 @@ def test_readsb_unknown_state_fails_closed(monkeypatch):
     _state, calls = _mock_readsb(monkeypatch, "activating")
     assert not manager._acquire_readsb_lease()
     assert "stop" not in calls
+
+
+def test_readsb_pending_job_blocks_new_tuner_lease(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    calls = []
+    monkeypatch.setattr(sdr_manager.shutil, "which", lambda name: "/usr/bin/systemctl")
+
+    def run(command, **kwargs):
+        calls.append(command[1])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=("LoadState=loaded\nActiveState=deactivating\n"
+                    "Job=(uint32 42, objectpath /org/freedesktop/systemd1/job/42)\n"),
+            stderr="",
+        )
+
+    monkeypatch.setattr(sdr_manager.subprocess, "run", run)
+    assert not manager._acquire_readsb_lease()
+    assert calls == ["show"]
+    assert not manager._readsb_paused
+
+
+def test_readsb_restore_waits_for_pending_stop_job(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager._readsb_paused = True
+    manager._readsb_status = Mock(return_value=("deactivating", "job 42"))
+    defer = Mock()
+    monkeypatch.setattr(manager, "_defer_readsb_restore", defer)
+    run = Mock()
+    monkeypatch.setattr(sdr_manager.subprocess, "run", run)
+
+    assert manager._release_readsb_lease()
+    defer.assert_called_once()
+    run.assert_not_called()
+    assert manager._readsb_paused
+
+
+def test_cancelled_live_restore_worker_does_not_block_replacement(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    manager._readsb_paused = True
+    manager._readsb_status = Mock(return_value=("deactivating", "job 42"))
+    cancelled = manager._readsb_restore_cancel
+    cancelled.set()
+    old_thread = SimpleNamespace(is_alive=lambda: True)
+    manager._readsb_restore_thread = old_thread
+    workers = []
+
+    class ThreadStub:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+            self.kwargs = kwargs
+            self.started = False
+
+        def is_alive(self):
+            return True
+
+        def start(self):
+            self.started = True
+
+    def make_thread(*, target, **kwargs):
+        worker = ThreadStub(target=target, **kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(sdr_manager.threading, "Thread", make_thread)
+
+    assert manager._release_readsb_lease()
+    assert len(workers) == 1
+    assert workers[0].started
+    assert workers[0].kwargs["daemon"] is False
+    assert workers[0].kwargs["name"] == "readsb-restore"
+    assert manager._readsb_restore_thread is workers[0]
+    assert manager._readsb_restore_cancel is not cancelled
+    assert cancelled.is_set()
+    assert not manager._readsb_restore_cancel.is_set()
+
+
+def test_stale_readsb_lease_does_not_start_an_already_active_service(monkeypatch):
+    manager = sdr_manager.SDRManager()
+    _state, calls = _mock_readsb(monkeypatch, "active")
+
+    assert manager._release_readsb_lease()
+    assert calls == []
+    assert not manager._readsb_paused
 
 
 def test_p25_start_failure_restores_readsb(monkeypatch):

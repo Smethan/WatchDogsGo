@@ -542,8 +542,12 @@ class P25Screen:
                 "[P25] The SDR is already owned; stop its current mode first", 8
             )
             return False
-        if not getattr(self.app, "_sdr_enabled", False):
-            self.app.msg("[P25] SDR power is off (SYSTEM > SDR)", 8)
+        power_ok = (
+            self.app._sdr_power_allows_tuning("P25")
+            if hasattr(self.app, "_sdr_power_allows_tuning")
+            else bool(getattr(self.app, "_sdr_enabled", False))
+        )
+        if not power_ok:
             return False
         site = self._selected_site()
         frequency = self._selected_frequency()
@@ -623,7 +627,13 @@ class P25Screen:
 
     def _status(self):
         sdr = getattr(self.app, "_sdr", None)
-        if not getattr(self.app, "_sdr_enabled", False):
+        if hasattr(self.app, "refresh_sdr_power_state"):
+            power = self.app.refresh_sdr_power_state(force=False)
+        else:
+            power = getattr(self.app, "_sdr_enabled", False)
+        if power is not True:
+            if power is None:
+                return "SDR POWER UNKNOWN", None, {}
             return "SDR POWER OFF", None, {}
         mode = self._running_mode()
         if mode == "pig_p25":

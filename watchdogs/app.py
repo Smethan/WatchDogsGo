@@ -519,6 +519,7 @@ class WatchDogsGame(OtaMixin):
         self._gps_enabled = False
         self._lora_enabled = False
         self._sdr_enabled = False
+        self._sdr_power_checked_at = 0.0
         if self._aio_available:
             _aio_st = AioManager.get_status() or {}
             self._usb_enabled = _aio_st.get("usb", False)
@@ -2127,8 +2128,14 @@ class WatchDogsGame(OtaMixin):
         if state_key in _MENU_WIP_STATES:
             return "Work in progress"
         if state_key in ("_sdr_adsb", "_sdr_433"):
-            if not getattr(self, "_sdr_enabled", False):
-                return "[SDR] Enable SDR first (SYSTEM > SDR)"
+            active_mode = "adsb" if state_key == "_sdr_adsb" else "433"
+            sdr = getattr(self, "_sdr", None)
+            stopping = bool(sdr and sdr.running and sdr.mode == active_mode)
+            if not stopping:
+                power = self.refresh_sdr_power_state(force=False)
+                if power is not True:
+                    return ("[SDR] Enable SDR first; power state unknown, selection disabled"
+                            if power is None else "[SDR] Enable SDR first (SYSTEM > SDR)")
         if cmd == "_meshcore":
             protocol = self._mesh_protocol()
             if protocol == "meshtastic":
@@ -2559,7 +2566,7 @@ class WatchDogsGame(OtaMixin):
             "_watch":        self._watch.connected,
             "_gps_toggle":   self._gps_enabled,
             "_lora_toggle":  self._lora_enabled,
-            "_sdr_toggle":   self._sdr_enabled,
+            "_sdr_toggle":   self.refresh_sdr_power_state(force=False),
             "_usb_toggle":   self._usb_enabled,
         }.get(state_key, False)
 
@@ -3923,10 +3930,14 @@ class WatchDogsGame(OtaMixin):
         return True
 
     def _toggle_sdr(self):
-        new_state = not self._sdr_enabled
+        current = self.refresh_sdr_power_state(force=True)
         if not self._aio_available:
             self.msg("[SDR] AIO v2 not available", C_ERROR)
             return
+        if current is None:
+            self.msg("[SDR] Power state unknown; toggle cancelled", C_ERROR)
+            return
+        new_state = not current
         ok = AioManager.toggle("sdr", new_state)
         if not ok:
             self.msg("[SDR] GPIO toggle failed", C_ERROR)
@@ -3943,16 +3954,44 @@ class WatchDogsGame(OtaMixin):
             self._term_add("[SYS] SDR disabled", raw=True)
         self.glitch_timer = 2
 
+    def refresh_sdr_power_state(self, *, force=False):
+        """Refresh cached SDR rail state; renderers use a one-second cache."""
+        now = time.monotonic()
+        if not force and now - getattr(self, "_sdr_power_checked_at", 0.0) < 1.0:
+            return getattr(self, "_sdr_enabled", None)
+        self._sdr_power_checked_at = now
+        try:
+            status = AioManager.get_status(("sdr",))
+            state = status.get("sdr") if isinstance(status, dict) else None
+            self._sdr_enabled = state if isinstance(state, bool) else None
+        except Exception as exc:
+            self._sdr_enabled = None
+            try:
+                self._term_add("[SDR] GPIO status read failed: " + str(exc)[:100], raw=True)
+            except Exception:
+                pass
+        return self._sdr_enabled
+
+    def _sdr_power_allows_tuning(self, label="SDR"):
+        state = self.refresh_sdr_power_state(force=True)
+        if state is True:
+            return True
+        message = (f"[{label}] SDR power is OFF (SYSTEM > SDR); selection skipped"
+                   if state is False else
+                   f"[{label}] SDR power state unknown; selection skipped")
+        self.msg(message, C_WARNING if state is False else C_ERROR)
+        self._term_add(message, raw=True)
+        return False
+
     def _sdr_adsb(self):
-        if not self._sdr_enabled:
-            self.msg("[SDR] Enable SDR first (SYSTEM > SDR)", C_WARNING)
-            return
         if self._sdr.running and "adsb" in self._sdr.mode:
             self._sdr.stop()
             self.wardrive._wdg_owned_sdr = False
             self.wardrive.pig.owns_sdr = False
             self.msg("[ADS-B] Stopped", C_WARNING)
             self._term_add("[SDR] ADS-B radar stopped", raw=True)
+            return
+        if not self._sdr_power_allows_tuning("ADS-B"):
             return
         try:
             loot_dir = self.loot.session_dir if self.loot else ""
@@ -3980,15 +4019,14 @@ class WatchDogsGame(OtaMixin):
         self.glitch_timer = 2
 
     def _sdr_433(self):
-        if not self._sdr_enabled:
-            self.msg("[SDR] Enable SDR first (SYSTEM > SDR)", C_WARNING)
-            return
         if self._sdr.running and "433" in self._sdr.mode:
             self._sdr.stop()
             self.wardrive._wdg_owned_sdr = False
             self.wardrive.pig.owns_sdr = False
             self.msg("[433] Stopped", C_WARNING)
             self._term_add("[SDR] 433 MHz scanner stopped", raw=True)
+            return
+        if not self._sdr_power_allows_tuning("433"):
             return
         try:
             loot_dir = self.loot.session_dir if self.loot else ""
@@ -11559,8 +11597,9 @@ class WatchDogsGame(OtaMixin):
             y += ROW_H
             pyxel.text(col3, y, "SDR", C_DIM)
             pyxel.text(col3 + 60, y,
-                       "ON" if self._sdr_enabled else "OFF",
-                       C_SUCCESS if self._sdr_enabled else C_ERROR)
+                       "ON" if self.refresh_sdr_power_state(force=False) is True
+                       else ("?" if self._sdr_enabled is None else "OFF"),
+                       C_SUCCESS if self._sdr_enabled is True else C_ERROR)
             y += ROW_H
             pyxel.text(col3, y, "USB", C_DIM)
             pyxel.text(col3 + 60, y,

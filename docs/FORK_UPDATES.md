@@ -85,7 +85,11 @@ Startup reports missing optional dependencies without rerunning setup. To instal
 them, exit WDG and run `bash setup.sh` from the checkout once. Required startup
 dependencies still trigger setup if missing.
 
-Setup, startup checks and ADS-B radar share the same executable detection:
+When `readsb.service` is active and its local SBS feed is available, ADS-B radar
+uses that feed directly. It leaves the service running and can show a waiting
+state before the first aircraft message. A private `dump1090` is the fallback
+when the feed is unavailable. Setup, startup checks and that fallback share
+the same executable detection:
 `dump1090`, `dump1090-fa`, or `dump1090-mutability`, on PATH or in standard system
 binary directories (including `/usr/local/bin` when sudo omits it from PATH).
 An existing executable is reused. If none is installed, setup builds FlightAware
