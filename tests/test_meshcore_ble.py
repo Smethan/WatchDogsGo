@@ -33,6 +33,7 @@ from watchdogs.meshcore_ble import (
     MeshCoreCompanionProtocol,
     _BluezRegistration,
     _PairingSecurity,
+    _PrivateBusGuard,
 )
 
 
@@ -221,6 +222,43 @@ def test_secure_bluez_flags_do_not_retain_unprotected_read_notify_or_write():
         "encrypt-authenticated-read", "encrypt-authenticated-notify")
     source = Path("watchdogs/meshcore_ble.py").read_text()
     assert "dbus.SystemBus(private=True)" in source
+
+
+def test_private_bus_guard_disables_native_exit_before_dispatch_and_close():
+    calls = []
+
+    class Bus:
+        def set_exit_on_disconnect(self, value):
+            calls.append(("exit_on_disconnect", value))
+
+        def call_on_disconnection(self, callback):
+            calls.append(("register_callback",))
+            self.callback = callback
+
+        def close(self):
+            calls.append(("close",))
+            self.callback(self)
+
+    bus = Bus()
+    unexpected = Mock()
+    guard = _PrivateBusGuard(bus, unexpected)
+    assert calls == [("exit_on_disconnect", False), ("register_callback",)]
+
+    guard.close()
+    assert calls[-1] == ("close",)
+    assert not guard.disconnected
+    unexpected.assert_not_called()
+
+
+def test_private_bus_guard_reports_unexpected_disconnect():
+    bus = Mock()
+    unexpected = Mock()
+    guard = _PrivateBusGuard(bus, unexpected)
+    bus.call_on_disconnection.call_args.args[0](bus)
+
+    assert guard.disconnected
+    unexpected.assert_called_once_with()
+    bus.close.assert_not_called()
 
 
 def test_bluez_registration_is_async_and_ready_only_after_both_replies():

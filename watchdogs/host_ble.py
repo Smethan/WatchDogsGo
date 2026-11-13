@@ -42,6 +42,9 @@ def _bluez_managed_objects():
             bus = dbus.SystemBus(private=True)
         except TypeError:  # older dbus-python
             bus = dbus.bus.BusConnection(dbus.bus.BUS_SYSTEM)
+        # A private bus emits Disconnected when it is closed below. Keep
+        # libdbus from exiting the whole application during GLib dispatch.
+        bus.set_exit_on_disconnect(False)
         manager = dbus.Interface(
             bus.get_object("org.bluez", "/"),
             "org.freedesktop.DBus.ObjectManager")

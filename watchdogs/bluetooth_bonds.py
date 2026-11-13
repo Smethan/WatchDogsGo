@@ -168,6 +168,9 @@ def verify_bluez_bond(
                                 dbus.bus.BUS_SYSTEM)
 
                 private_bus = bus_factory()
+                # The private bus is closed below. libdbus otherwise calls
+                # _exit(1) when GLib dispatches its Disconnected message.
+                private_bus.set_exit_on_disconnect(False)
                 object_manager = dbus.Interface(
                     private_bus.get_object("org.bluez", "/"),
                     "org.freedesktop.DBus.ObjectManager")

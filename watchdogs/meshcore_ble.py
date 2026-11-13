@@ -62,6 +62,30 @@ _BLUEZ_DEVICE_IFACE = "org.bluez.Device1"
 _ADDRESS_RE = re.compile(r"^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 
 
+class _PrivateBusGuard:
+    """Keep a private D-Bus disconnect from terminating all of WDG."""
+
+    def __init__(self, bus, on_unexpected_disconnect: Callable[[], None]):
+        self.bus = bus
+        self.disconnected = False
+        self.closing = False
+        self.on_unexpected_disconnect = on_unexpected_disconnect
+        # libdbus enables _exit(1) for bus connections. A private connection
+        # also receives Disconnected when we close it during normal cleanup.
+        bus.set_exit_on_disconnect(False)
+        bus.call_on_disconnection(self._on_disconnect)
+
+    def _on_disconnect(self, _bus) -> None:
+        if self.closing:
+            return
+        self.disconnected = True
+        self.on_unexpected_disconnect()
+
+    def close(self) -> None:
+        self.closing = True
+        self.bus.close()
+
+
 class _BluezRegistration:
     """Sequence BlueZ registration while the GLib dispatcher is running.
 
@@ -753,6 +777,8 @@ class _BluezPeripheral:
             bus = dbus.SystemBus(private=True)
         except TypeError:  # older dbus-python
             bus = dbus.bus.BusConnection(dbus.bus.BUS_SYSTEM)
+        bus_guard = _PrivateBusGuard(
+            bus, lambda: self._loop.quit() if self._loop is not None else None)
         root = dbus.Interface(
             bus.get_object("org.bluez", "/"),
             "org.freedesktop.DBus.ObjectManager")
@@ -1273,9 +1299,14 @@ class _BluezPeripheral:
         security_cleanup_ok = True
         cleanup_errors = []
         try:
+            if bus_guard.disconnected:
+                raise RuntimeError(
+                    "System D-Bus disconnected during MeshCore BLE setup")
             if not registration.begin():
                 raise RuntimeError(registration.failure)
             self._loop.run()
+            if bus_guard.disconnected and not self.stop_event.is_set():
+                raise RuntimeError("System D-Bus disconnected during MeshCore BLE")
             if registration.failure and not self.stop_event.is_set():
                 raise RuntimeError(registration.failure)
         finally:
@@ -1287,7 +1318,7 @@ class _BluezPeripheral:
             self.event_callback("stopped", "MeshCore companion BLE stopped")
             bus_close_error = ""
             try:
-                bus.close()
+                bus_guard.close()
             except Exception as exc:
                 bus_close_error = (
                     str(exc).strip() or type(exc).__name__)

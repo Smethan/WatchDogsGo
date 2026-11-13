@@ -3,7 +3,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import watchdogs.host_ble as host_ble_module
 from watchdogs.host_ble import (
@@ -193,7 +193,8 @@ def test_bluez_inventory_uses_private_bus_and_closes_it(monkeypatch):
         },
     }
     manager = NS(GetManagedObjects=Mock(return_value=objects))
-    bus = NS(get_object=Mock(return_value=object()), close=Mock())
+    bus = Mock()
+    bus.get_object.return_value = object()
     dbus = NS(
         SystemBus=Mock(return_value=bus),
         Interface=Mock(return_value=manager),
@@ -204,10 +205,15 @@ def test_bluez_inventory_uses_private_bus_and_closes_it(monkeypatch):
     dbus.SystemBus.assert_called_once_with(private=True)
     bus.get_object.assert_called_once_with("org.bluez", "/")
     dbus.Interface.assert_called_once_with(
-        bus.get_object.return_value,
-        "org.freedesktop.DBus.ObjectManager")
+        bus.get_object.return_value, "org.freedesktop.DBus.ObjectManager"
+    )
     manager.GetManagedObjects.assert_called_once_with()
-    bus.close.assert_called_once_with()
+    assert bus.method_calls.index(
+        call.set_exit_on_disconnect(False)
+    ) < bus.method_calls.index(call.get_object("org.bluez", "/"))
+    assert bus.method_calls.index(
+        call.get_object("org.bluez", "/")
+    ) < bus.method_calls.index(call.close())
 
 
 def test_bluez_adapter_merge_deduplicates_and_rejects_malformed_entries(

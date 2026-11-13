@@ -1,6 +1,8 @@
 import json
 import os
+import sys
 from types import SimpleNamespace as NS
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -250,6 +252,52 @@ def test_verify_bluez_bond_accepts_injected_object_manager():
 
     assert bonds.verify_bluez_bond(
         CONTROLLER, PHONE, object_manager=manager)["address"] == PHONE
+
+
+@pytest.mark.parametrize("legacy_bus_api", [False, True])
+def test_verify_bluez_bond_disables_exit_on_disconnect_before_close(
+    monkeypatch, legacy_bus_api
+):
+    adapter = "/org/bluez/hci0"
+    device = adapter + "/dev_AA_BB_CC_DD_EE_FF"
+    objects = {
+        adapter: {"org.bluez.Adapter1": {"Address": CONTROLLER}},
+        device: {
+            "org.bluez.Device1": {
+                "Address": PHONE,
+                "Paired": True,
+                "Bonded": True,
+                "Trusted": True,
+            }
+        },
+    }
+    manager = NS(GetManagedObjects=Mock(return_value=objects))
+    bus = Mock()
+    bus.get_object.return_value = object()
+    system_bus = Mock(return_value=bus)
+    bus_connection = Mock(return_value=bus)
+    if legacy_bus_api:
+        system_bus.side_effect = TypeError("private keyword unsupported")
+    dbus = NS(
+        SystemBus=system_bus,
+        Interface=Mock(return_value=manager),
+        bus=NS(BUS_SYSTEM="system", BusConnection=bus_connection),
+    )
+    monkeypatch.setitem(sys.modules, "dbus", dbus)
+
+    result = bonds.verify_bluez_bond(CONTROLLER, PHONE)
+
+    assert result["address"] == PHONE
+    if legacy_bus_api:
+        bus_connection.assert_called_once_with("system")
+    else:
+        system_bus.assert_called_once_with(private=True)
+    assert bus.method_calls.index(
+        call.set_exit_on_disconnect(False)
+    ) < bus.method_calls.index(call.get_object("org.bluez", "/"))
+    assert bus.method_calls.index(
+        call.get_object("org.bluez", "/")
+    ) < bus.method_calls.index(call.close())
 
 
 def test_default_store_uses_validated_real_sudo_user(monkeypatch, tmp_path):

@@ -227,6 +227,37 @@ verify the selected regional radio parameters match the local MeshCore network.
 If WDG already shows a retained phone, reconnect that device or use **Forget
 paired phone** before opening a window for a replacement.
 
+### Headless radio diagnostics
+
+The repository includes bounded probes for the radio managers, so basic
+handoffs and SDR startup/soak checks do not require opening the Pyxel UI. Run
+them from the WatchDogsGo checkout root:
+
+```sh
+sudo -E .venv/bin/python3 scripts/probe_radio_handoff.py --cycles 2
+sudo -E .venv/bin/python3 scripts/probe_sdr.py --mode adsb --seconds 900
+sudo -E .venv/bin/python3 scripts/probe_sdr.py --mode p25 --p25-hz 856212500 --seconds 900
+```
+
+The handoff probe requires the SX1262 manager to start in Meshtastic mode and
+the Meshtastic daemon socket to be available. It refuses to run while WDG is
+open, listens through the MeshCore radio path, and blocks service mutations. It
+does not transmit or exercise the MeshCore companion BLE peripheral. The SDR
+probe requires `sudo`, an enumerated RTL-SDR, and no other active WDG or SDR
+tuner process; it uses the normal SDR manager lease to restore `readsb` after
+the run and does not change the SDR power rail or WDG settings. P25 also
+requires `WDG_OP25_ROOT` to point to the pinned OP25 source when that checkout
+is outside the standard system paths. The SDR run is limited to 15 minutes.
+Without an antenna or a known signal, the probes can
+check startup and process stability but cannot prove reception or decoding.
+
+WDG's MeshCore BLE worker and the short-lived BlueZ inventory and bond checks
+use private D-Bus connections. A private bus sends a disconnect notification
+when it closes; libdbus can call `_exit(1)` if that notification is later
+processed by GLib. WDG now disables exit-on-disconnect for these connections
+and reports an unexpected MeshCore bus disconnect as a BLE worker error. This
+keeps a BlueZ disconnect from silently closing the whole WDG window.
+
 Protocol references:
 
 - [MeshCore companion protocol](https://github.com/meshcore-dev/MeshCore/blob/main/docs/companion_protocol.md)

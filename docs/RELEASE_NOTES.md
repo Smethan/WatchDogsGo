@@ -1,4 +1,4 @@
-# Unreleased — ADS-B receiver recovery
+# Unreleased — Radio process stability and ADS-B receiver recovery
 
 - Refresh AIO SDR power state when an SDR action starts, including changes made
   outside WDG. Keep the user's boot-rail preference and explicit power control.
@@ -7,6 +7,11 @@
   feed is unavailable, and report an empty feed as waiting for aircraft.
 - Make tuner handoff and ADS-B reader cleanup safe across P25, ADS-B, and rapid
   stop/restart sequences. Preserve service ownership and the first useful error.
+- Disable libdbus process exit on private BlueZ connections used by MeshCore
+  companion BLE, adapter discovery, and bond verification. Report an unexpected
+  MeshCore bus disconnect through the BLE worker instead of closing the UI.
+- Add bounded headless probes for Meshtastic/MeshCore manager handoffs and ADS-B
+  or P25 SDR sessions under `scripts/`, with service/ownership preflight checks.
 
 The source and Pi feed-only checks do not prove a slow live P25 handoff. If
 `readsb` takes longer than four seconds to stop, that profile fails closed and
