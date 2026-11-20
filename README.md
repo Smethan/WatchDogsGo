@@ -333,6 +333,39 @@ Evil Twin target list, so duplicate SSIDs remain separate.
 | HID Type | `bt_hid_type` | Type text via BLE HID |
 | Mesh Messenger | Python-native | MeshCore, Meshtastic, or experimental Reticulum/LXMF chat and discovery |
 | Flipper Zero | USB serial | SubGHz RX/TX, NFC read/emulate, signal replay |
+| Pwnagotchi | Local socket and `pwnagotchi-ctl` | Face, status, radio policy, adapter selection, and recent activity |
+
+### Pwnagotchi companion
+
+With the uConsole Pwnagotchi service installed on the same machine, WDG shows
+its face, channel, AP count, handshakes, and current status in a small map panel.
+The `PWN` badge in the map/menu top bar shows unread activity. Open **ADDONS >
+Pwnagotchi** (`g`) for three tabs: **Control**, **Activity**, and **Networks**.
+The activity list shows live status, submitted association/deauth decisions,
+training epochs, and captures. The networks tab shows Pwnagotchi's current
+eligible AP set, which is already filtered by its own whitelist. Events are
+kept in memory for the current WDG session; the Pwnagotchi journal remains the
+source for older history.
+
+On **Control**, `A` starts or stops the service now, `B` enables or disables it
+at boot, and `D` toggles its runtime deauth policy. `UP`/`DOWN` choose a Wi-Fi
+interface and `ENTER` selects it. Selecting an adapter uses the Pwnagotchi CLI
+to change both Pwnagotchi and Bettercap configuration, then restarts active
+services. Selecting an interface carrying the host connection can interrupt
+that connection. WDG never changes the radio merely by opening the menu. These
+service and adapter actions require noninteractive sudo access, or running WDG
+as root.
+The local socket also needs permission for WDG's user (the uConsole installer
+grants access through the `pi` group). WDG keeps Pwnagotchi running when WDG
+exits.
+
+The adapter selector requires the Pwnagotchi version with
+`pwnagotchi-ctl adapter list|status|set`. Deauth control and the learning epoch
+are available with its Bettercap backend. The projectZero/C5 backend reports
+passive capture telemetry and does not support the deauth switch. A submitted
+radio action means the local backend accepted it; it is not proof of a frame
+transmitted over the air. WDG keeps Dragon Drain from taking the adapter that
+Pwnagotchi is using.
 
 ### SYSTEM
 

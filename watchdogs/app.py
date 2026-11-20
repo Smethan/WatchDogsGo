@@ -27,6 +27,8 @@ from .serial_manager import SerialManager, detect_esp32_port
 from .ota_ui import OtaMixin
 from .gps_manager import GpsManager
 from .wardrive_ui import WardriveUI
+from .pwnagotchi_bridge import PwnagotchiBridge
+from .pwnagotchi_screen import PwnagotchiScreen, draw_map_card
 from .wardrive_settings import (
     load_settings as load_wardrive_settings,
     migrate_legacy_meshcore_bond,
@@ -255,6 +257,7 @@ MENU_CATS = [
         ("a", "ADS-B Radar",     "_sdr_adsb",              "_sdr_adsb",    None),
         ("4", "433 MHz Scanner", "_sdr_433",               "_sdr_433",     None),
         ("p", "PipBoy Watch",   "_watch_connect",         "_watch",       None),
+        ("g", "Pwnagotchi",     "_pwnagotchi",            "_pwnagotchi", None),
     ]),
     ("SYSTEM", [
         ("x", "STOP ALL",        "stop",                   "_stop_all",    None),
@@ -1175,6 +1178,8 @@ class WatchDogsGame(OtaMixin):
                 raw=True)
 
         self.wardrive = WardriveUI(self, initial_settings=_wardrive_settings)
+        self.pwnagotchi = PwnagotchiBridge()
+        self.pwn_screen = PwnagotchiScreen(self, self.pwnagotchi)
         from .multi_device import MultiDeviceRuntime
         self.c5_pool = MultiDeviceRuntime(self, self._initial_serial_managers, ports=self._esp_ports)
         pyxel.run(self.update, self.draw)
@@ -1889,6 +1894,10 @@ class WatchDogsGame(OtaMixin):
             # Keep transient messages aging while the capture screen is open.
             self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
             return
+        if self.pwn_screen.open:
+            self.pwn_screen.update()
+            self.msgs = [(t, tm-1, c) for t, tm, c in self.msgs if tm > 1]
+            return
 
         # Particles
         for p in self.particles:
@@ -2216,6 +2225,9 @@ class WatchDogsGame(OtaMixin):
         if state_key == "_p25_monitor":
             self.wardrive.p25_screen.show()
             return
+        if state_key == "_pwnagotchi":
+            self.pwn_screen.show()
+            return
         if state_key == "_pig_detector":
             if self.wardrive.pig.active:
                 self.wardrive.stop_pig()
@@ -2526,6 +2538,10 @@ class WatchDogsGame(OtaMixin):
         self.msg(f"[ET] Starting — SSID: {self._portal_ssid}", C_WARNING)
 
     def _is_running(self, state_key: str) -> bool:
+        if state_key == "_pwnagotchi":
+            screen = getattr(self, "pwn_screen", None)
+            state = screen.state() if screen else {}
+            return bool(state.get("service_active") or state.get("connected"))
         pool = getattr(self, 'c5_pool', None)
         if pool is not None and pool.available:
             if any(g.state_key == state_key and g.state in ('starting', 'running', 'stopping')
@@ -2621,16 +2637,21 @@ class WatchDogsGame(OtaMixin):
                 self._dragon_drain.stop()
                 self._attack_mode = ""
                 return
-            # Step 1: detect monitor interface
-            mon = self._dragon_drain.detect_monitor_ifaces()
+            pwn = self.pwn_screen.state()
+            pwn_iface = pwn.get("interface") if (pwn.get("service_active") or pwn.get("connected")) else None
+            # Step 1: detect a monitor interface not owned by Pwnagotchi.
+            mon = [iface for iface in self._dragon_drain.detect_monitor_ifaces()
+                   if iface != pwn_iface]
             if not mon:
-                managed = self._dragon_drain.detect_managed_ifaces()
+                managed = [iface for iface in self._dragon_drain.detect_managed_ifaces()
+                           if iface[0] != pwn_iface]
                 if managed:
                     self.msg(f"[DD] Enabling monitor on {managed[0][0]}...", C_WARNING)
                     self._dragon_drain.enable_monitor(managed[0][0])
-                    mon = self._dragon_drain.detect_monitor_ifaces()
+                    mon = [iface for iface in self._dragon_drain.detect_monitor_ifaces()
+                           if iface != pwn_iface]
                 if not mon:
-                    self.msg("[DD] No monitor iface — plug in WiFi adapter", C_ERROR)
+                    self.msg("[DD] No free monitor WiFi adapter; Pwnagotchi may own one", C_ERROR)
                     return
             # Step 2: scan for WPA3 APs in background
             self._attack_mode = "dragon_drain"
@@ -7123,6 +7144,9 @@ class WatchDogsGame(OtaMixin):
 
     def _cleanup(self):
         """Send stop to ESP32, close serial and GPS."""
+        pwn = getattr(self, "pwnagotchi", None)
+        if pwn is not None:
+            pwn.close()
         watch_ready_stopped = self._stop_watch_autoconnect(timeout=7.0)
         host_ble_stopped = True
         watch_stopped = True
@@ -7291,6 +7315,9 @@ class WatchDogsGame(OtaMixin):
         if self.wardrive.hs_screen.open:
             self.wardrive.hs_screen.draw()
             return
+        if self.pwn_screen.open:
+            self.pwn_screen.draw()
+            return
         if self._mitm_screen:
             self._draw_mitm_screen()
             if self.input_mode:
@@ -7357,6 +7384,8 @@ class WatchDogsGame(OtaMixin):
         self._draw_messages()
         self._draw_radar()
         self._draw_scanlines()
+        if not self.menu_open:
+            draw_map_card(pyxel, self.pwn_screen.state())
         if self._cluster_popup:
             self._draw_cluster_popup()
         # Cluster mode hint (above terminal, visible on map)
@@ -8283,6 +8312,21 @@ class WatchDogsGame(OtaMixin):
         x += 9
         pyxel.text(x, TY, hat_name, C_DIM)
         x += len(hat_name) * CW + 4
+        # Reserve a companion badge beside the zoom and battery labels.
+        pwn_state = self.pwn_screen.state()
+        pwn_visible = bool(pwn_state.get("backend") or pwn_state.get("connected")
+                           or pwn_state.get("unread"))
+        zoom_txt = f"Z:{self.proj.label}"
+        bat = self._battery_pct
+        bat_txt = f"BAT:{bat}%" if bat >= 0 else ""
+        right_info_left = (W - len(bat_txt) * CW - 4 - len(zoom_txt) * CW - 6
+                           if bat_txt else W - len(zoom_txt) * CW - 4)
+        unread = min(99, int(pwn_state.get("unread") or 0))
+        pwn_label = f"PWN+{unread}" if unread else (
+            "PWN ON" if (pwn_state.get("service_active")
+                         or pwn_state.get("connected")) else "PWN OFF")
+        pwn_width = len(pwn_label) * CW + 6
+        pwn_x = right_info_left - pwn_width - 5
         # Achievement badges
         _BADGE_HUD = [
             ("flipper",          "FLP", C_WARNING),
@@ -8297,22 +8341,24 @@ class WatchDogsGame(OtaMixin):
         for badge_id, label, color in _BADGE_HUD:
             if badge_id in self._badges:
                 lw = len(label) * CW + 4
-                if x + lw + 2 > W - 70:
+                if x + lw + 2 > (pwn_x - 4 if pwn_visible else W - 70):
                     break  # don't overflow past zoom / battery
                 pyxel.rectb(x, 2, lw, HUD_TOP - 4, color)
                 pyxel.text(x + 2, TY, label, color)
                 x += lw + 2
+        if pwn_visible and pwn_x > x + 2:
+            pwn_color = (C_WARNING if unread else
+                         C_SUCCESS if (pwn_state.get("service_active")
+                                      or pwn_state.get("connected")) else C_DIM)
+            pyxel.rectb(pwn_x, 2, pwn_width, HUD_TOP - 4, pwn_color)
+            pyxel.text(pwn_x + 3, TY, pwn_label, pwn_color)
         # Battery + Zoom — far right
-        bat = self._battery_pct
         if bat >= 0:
             bc = C_SUCCESS if bat > 25 else (C_WARNING if bat > 10 else C_ERROR)
-            bat_txt = f"BAT:{bat}%"
             bx = W - len(bat_txt) * CW - 4
             pyxel.text(bx, TY, bat_txt, bc)
-            zoom_txt = f"Z:{self.proj.label}"
             pyxel.text(bx - len(zoom_txt) * CW - 6, TY, zoom_txt, C_DIM)
         else:
-            zoom_txt = f"Z:{self.proj.label}"
             pyxel.text(W - len(zoom_txt) * CW - 4, TY, zoom_txt, C_DIM)
 
     def _draw_hud_bottom(self):
