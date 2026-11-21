@@ -52,6 +52,7 @@ class PwnagotchiBridge:
         self._actions: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
         self._events: deque[dict[str, Any]] = deque(maxlen=self.event_limit)
         self._last_activity: dict[str, tuple[str, float]] = {}
+        self._last_mood_signature: tuple[str, str] | None = None
         self._data: dict[str, Any] = {
             "connected": False,
             "snapshot": None,
@@ -397,6 +398,14 @@ class PwnagotchiBridge:
                 "sync", "Activity stream refreshed", data, message.get("ts")
             )
             return
+        if kind == "mood":
+            mood = dict(data) if isinstance(data, dict) else {}
+            with self._lock:
+                current = self._data.get("snapshot") or {}
+                current["mood"] = mood
+                self._data["snapshot"] = current
+                self._record_mood(mood, message.get("ts"))
+            return
         if kind == "ui":
             with self._lock:
                 current = self._data.get("snapshot") or {}
@@ -514,6 +523,22 @@ class PwnagotchiBridge:
         self._data["snapshot"] = deepcopy(snapshot)
         self._data["backend"] = snapshot.get("backend") or self._data["backend"]
         self._data["interface"] = snapshot.get("interface") or self._data["interface"]
+        mood = snapshot.get("mood")
+        if isinstance(mood, dict):
+            self._record_mood(mood, mood.get("since"))
+
+    def _record_mood(self, mood: dict[str, Any], ts: Any = None) -> None:
+        """Log each meaningful mood/reason change once, including resync state."""
+        name = str(mood.get("name") or "unknown").strip().lower()
+        reason = str(mood.get("reason") or "").strip()
+        signature = (name, reason)
+        if signature == self._last_mood_signature:
+            return
+        self._last_mood_signature = signature
+        summary = name.upper()
+        if reason:
+            summary += ": " + reason
+        self._append_event("mood", summary, mood, ts or mood.get("since"))
 
     @staticmethod
     def _ui_text(data: dict[str, Any]) -> str:
@@ -568,6 +593,7 @@ class PwnagotchiBridge:
                 "status": ("ui",),
                 "control": ("setting", "enabled", "persistent"),
                 "sync": ("dropped",),
+                "mood": ("name", "reason", "since", "inactive_epochs", "active_epochs"),
             }.get(kind, ())
             compact = {key: detail[key] for key in fields if key in detail}
             if kind == "brain" and isinstance(compact.get("stats"), dict):

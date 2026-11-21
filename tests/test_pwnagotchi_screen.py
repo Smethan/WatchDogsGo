@@ -9,6 +9,7 @@ from watchdogs.pwnagotchi_screen import (
     PwnagotchiScreen,
     draw_map_card,
     face_ascii,
+    format_ap_count,
     network_rows,
 )
 
@@ -42,6 +43,8 @@ def _view():
             {"name": "wlan2", "mode": "managed"},
         ],
         "snapshot": {
+            "mood": {"name": "happy", "reason": "New APs found"},
+            "ui": {"aps": "1 (23)"},
             "controls": {"supported": ["deauth", "associate"], "deauth": False},
             "radio": {"aps": [{"ssid": "lab", "bssid": "02:00:00:00:00:01"}]},
         },
@@ -57,6 +60,13 @@ def test_face_and_network_rows_are_safe_for_pyxel_font():
     assert network_rows({"radio": {"ap_bssids": ["02:00:00:00:00:01"]}}) == [
         {"bssid": "02:00:00:00:00:01"}
     ]
+    assert format_ap_count("1 (23)", 8) == "1 (23)"
+    assert format_ap_count("unknown (123)", 12) == "unknown"
+    assert format_ap_count("123456 (123456)", 14) == "123.4k/123.4k"
+    assert (
+        format_ap_count("12345678901234567890 (12345678901234567890)", 12)
+        == "999t+/999t+"
+    )
 
 
 def test_screen_controls_submit_nonblocking_actions(monkeypatch):
@@ -110,6 +120,13 @@ def test_map_card_is_hidden_without_pwnagotchi():
     assert px.calls == []
     draw_map_card(px, _view())
     assert any(name == "text" and args[2] == "PWNAGOTCHI" for name, args in px.calls)
+    labels = [args[2] for name, args in px.calls if name == "text"]
+    assert "MOOD: HAPPY" in labels
+    assert "New APs found" in labels
+    assert "AP: 1 (23)" in labels
+    assert any(
+        args[:4] == (445, 22, 138, 99) for name, args in px.calls if name == "rectb"
+    )
 
 
 def test_all_screen_tabs_render_live_controls_activity_and_networks(monkeypatch):
@@ -139,6 +156,8 @@ def test_all_screen_tabs_render_live_controls_activity_and_networks(monkeypatch)
         if tab == 0:
             assert any("Active now" in text for text in labels)
             assert any("wlan1" in text for text in labels)
+            assert any("AP:1 (23)" in text for text in labels)
+            assert "MOOD HAPPY: New APs found" in labels
         elif tab == 1:
             assert "Deauth submitted" in labels
         else:

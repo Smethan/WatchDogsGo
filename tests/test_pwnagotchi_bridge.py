@@ -400,6 +400,68 @@ def test_live_events_merge_snapshot_fields_without_losing_other_radio_data():
     assert snapshot["c5"]["ap_count"] == 4
 
 
+def test_mood_snapshot_and_events_are_persistent_and_logged_once():
+    bridge = PwnagotchiBridge(
+        socket_path="/missing/pwnagotchi.sock",
+        poll_interval=30,
+        reconnect_delay=0.1,
+        runner=_missing_cli,
+    )
+    bridge.close()
+    bridge._apply_snapshot(
+        {
+            "mood": {
+                "name": "bored",
+                "reason": "No new networks for 15 epochs",
+                "since": 100,
+            }
+        }
+    )
+    bridge._handle_message(
+        {
+            "type": "event",
+            "event": "mood",
+            "ts": 101,
+            "data": {
+                "name": "bored",
+                "reason": "No new networks for 15 epochs",
+                "since": 100,
+            },
+        }
+    )
+    bridge._handle_message(
+        {
+            "type": "event",
+            "event": "mood",
+            "ts": 200,
+            "data": {"name": "happy", "reason": "New APs found", "since": 200},
+        }
+    )
+    view = bridge.state()
+    assert view["snapshot"]["mood"] == {
+        "name": "happy",
+        "reason": "New APs found",
+        "since": 200,
+    }
+    mood_events = [event for event in view["events"] if event["kind"] == "mood"]
+    assert [event["text"] for event in mood_events] == [
+        "HAPPY: New APs found",
+        "BORED: No new networks for 15 epochs",
+    ]
+
+
+def test_old_snapshot_without_mood_does_not_invent_mood_event():
+    bridge = PwnagotchiBridge(
+        socket_path="/missing/pwnagotchi.sock",
+        poll_interval=30,
+        reconnect_delay=0.1,
+        runner=_missing_cli,
+    )
+    bridge.close()
+    bridge._apply_snapshot({"ui": {"face": "(◕‿‿◕)"}})
+    assert bridge.state()["events"] == []
+
+
 def test_repeated_ui_and_ap_events_do_not_evict_decisions_or_epochs():
     bridge = PwnagotchiBridge(
         socket_path="/missing/pwnagotchi.sock",

@@ -338,7 +338,11 @@ Evil Twin target list, so duplicate SSIDs remain separate.
 ### Pwnagotchi companion
 
 With the uConsole Pwnagotchi service installed on the same machine, WDG shows
-its face, channel, AP count, handshakes, and current status in a small map panel.
+its face, channel, AP count, handshakes, mood, and mood reason in a small map
+panel. The mood follows Pwnagotchi's activity and inactivity state: sustained
+activity can make it excited, while long quiet periods can make it bored or
+sad. Mood changes also appear in the Activity log. Older Pwnagotchi installs
+without the mood control fields show `unknown` and do not create mood events.
 The `PWN` badge in the map/menu top bar shows unread activity. Open **ADDONS >
 Pwnagotchi** (`g`) for three tabs: **Control**, **Activity**, and **Networks**.
 The activity list shows live status, submitted association/deauth decisions,

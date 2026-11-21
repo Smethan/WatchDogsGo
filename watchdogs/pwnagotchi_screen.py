@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 import pyxel
@@ -72,6 +73,48 @@ def _text(value: object, limit: int = 80) -> str:
     return "".join(c if 32 <= ord(c) <= 126 else "?" for c in raw)[:limit]
 
 
+def format_ap_count(value: object, limit: int = 12) -> str:
+    """Fit Pwnagotchi's ``current (total)`` AP count without clipping ')'."""
+    source = str(value if value is not None else "").strip()
+    raw = _text(source, 256)
+    if len(source) <= limit:
+        return raw
+    match = re.fullmatch(r"(\d+)\s*\((\d+)\)", source)
+    if not match:
+        # A backend or older peer may supply another parenthesized summary.
+        # Never leave an opening parenthesis without its closing mate.
+        fallback = raw[:limit]
+        if fallback.count("(") > fallback.count(")"):
+            fallback = fallback.rsplit("(", 1)[0].rstrip()
+        return fallback or raw[:limit].replace("(", "").replace(")", "")
+    if max(map(len, match.groups())) > 32:
+        return "999t+/999t+" if limit >= 11 else "many"
+
+    def compact(number: str) -> str:
+        value = int(number)
+        if value < 10_000:
+            return str(value)
+        for scale, suffix in (
+            (1_000, "k"),
+            (1_000_000, "m"),
+            (1_000_000_000, "b"),
+            (1_000_000_000_000, "t"),
+        ):
+            if value < scale * 1000:
+                whole, remainder = divmod(value, scale)
+                tenth = remainder * 10 // scale
+                return f"{whole}{'.' + str(tenth) if tenth else ''}{suffix}"
+        return "999t+"
+
+    current, total = (compact(part) for part in match.groups())
+    result = f"{current}/{total}"
+    if len(result) <= limit:
+        return result
+    # A tiny fixed-width counter still conveys both figures without leaving
+    # half of a parenthetical suffix on screen.
+    return "many/many" if limit >= 9 else "many"
+
+
 def network_rows(snapshot: object) -> list[dict]:
     """Return the bounded eligible AP set, or passive C5 identifiers."""
     if not isinstance(snapshot, dict):
@@ -97,7 +140,8 @@ def draw_map_card(px, state: dict) -> None:
     snapshot = state.get("snapshot") or {}
     ui = snapshot.get("ui") or {}
     capture = snapshot.get("capture") or {}
-    x, y, width, height = 445, 22, 138, 69
+    mood = snapshot.get("mood") or {}
+    x, y, width, height = 445, 22, 138, 99
     online = bool(state.get("connected"))
     px.rect(x, y, width, height, 0)
     px.rectb(x, y, width, height, 11 if online else 5)
@@ -109,16 +153,29 @@ def draw_map_card(px, state: dict) -> None:
         11 if online else 13,
     )
     if online:
-        aps = ui.get("aps", "--")
+        mood_name = _text(mood.get("name") or "unknown", 12).upper()
+        mood_reason = _text(mood.get("reason") or "Mood unavailable", 25)
+        aps = format_ap_count(ui.get("aps", "--"), limit=14)
         shakes = capture.get("handshakes_run", ui.get("shakes", "--"))
-        px.text(x + 5, y + 32, f"AP:{_text(aps, 5)}  HS:{_text(shakes, 5)}", 7)
+        px.text(x + 5, y + 30, f"MOOD: {mood_name}", 11)
+        px.text(x + 5, y + 41, mood_reason, 13)
+        px.text(x + 5, y + 53, f"AP: {aps}", 7)
         px.text(
             x + 5,
-            y + 44,
+            y + 64,
+            f"HS: {_text(shakes, 10)}",
+            7,
+        )
+        px.text(
+            x + 5,
+            y + 75,
             f"CH:{_text(ui.get('channel', '--'), 4)}  {_text(snapshot.get('mode', ''), 10)}",
             13,
         )
-        px.text(x + 5, y + 56, _text(ui.get("status") or "Scanning", 25), 3)
+        # This last line remains inside the card and shows the transient
+        # Pwnagotchi status separately from its persistent mood reason.
+        status = _text(ui.get("status") or "Scanning", 25)
+        px.text(x + 5, y + 86, status, 3)
     else:
         px.text(x + 5, y + 33, "OFFLINE", 9)
         px.text(x + 5, y + 49, "ADDONS > Pwnagotchi", 13)
@@ -197,7 +254,11 @@ class PwnagotchiScreen:
                     max(0, len(adapters) - 1), self.adapter_selection + 1
                 )
             if px.btnp(px.KEY_A):
-                self._submit("stop" if (state.get("service_active") or state.get("connected")) else "start")
+                self._submit(
+                    "stop"
+                    if (state.get("service_active") or state.get("connected"))
+                    else "start"
+                )
             if px.btnp(px.KEY_B):
                 self._submit(
                     "deactivate" if state.get("service_enabled") else "activate"
@@ -256,7 +317,7 @@ class PwnagotchiScreen:
         px.text(
             140,
             70,
-            f"CH:{_text(ui.get('channel', '--'), 4)}  AP:{_text(ui.get('aps', '--'), 5)}  "
+            f"CH:{_text(ui.get('channel', '--'), 4)}  AP:{format_ap_count(ui.get('aps', '--'), 18)}  "
             f"HS:{_text(capture.get('handshakes_run', ui.get('shakes', '--')), 5)}",
             11,
         )
@@ -266,7 +327,11 @@ class PwnagotchiScreen:
             f"AI:{'ON' if ai.get('enabled') else 'OFF'}  EPOCH:{_text(epoch.get('number', '--'), 8)}",
             13,
         )
-        px.text(140, 101, _text(ui.get("status") or "No live Pwnagotchi status", 90), 3)
+        mood = snapshot.get("mood") or {}
+        mood_name = _text(mood.get("name") or "unknown", 12).upper()
+        mood_reason = _text(mood.get("reason") or "Mood unavailable", 76)
+        px.text(140, 101, f"MOOD {mood_name}: {mood_reason}", 11)
+        px.text(140, 113, _text(ui.get("status") or "No live Pwnagotchi status", 90), 3)
 
         for index, label in enumerate(self.TABS):
             x = 8 + index * 116
